@@ -205,6 +205,10 @@ with a TypeScript lookup table or an id comparison in a component.
    select a representative or offer persona Start; a relay persona link cannot
    borrow a local sibling's management controls. See
    [the identity contract](../../../../docs/agent-profile-identity.md).
+   Availability dots read relay presence, never a saved deployment
+   receipt or runtime status. Failed/disconnected reads are unknown; lifecycle
+   actions retain their separate routing. See
+   [the availability contract](../../../../docs/agent-availability.md).
 14. **Thinking effort has two surfaces: a local-only WRITE control and a
    read-only two-facts DISPLAY.** The write control is `EffortPickerField`
    (`ui/EffortPickerField.tsx`), a self-contained section component mounted in

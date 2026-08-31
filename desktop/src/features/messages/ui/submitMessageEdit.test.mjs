@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { AgentMentionAuthorizationError } from "../lib/agentMentionRevalidation.ts";
+import { snapshotDraftMentionRefs } from "../lib/draftMentionRefs.ts";
 import { submitMessageEdit } from "./submitMessageEdit.ts";
 
 const UNRESOLVED_USER = "b".repeat(64);
@@ -23,7 +24,8 @@ function baseOptions(
     editTarget,
     editTargetId: "event-id",
     extractMentionPubkeys: () => [],
-    getMentionRefs: () => [],
+    getMentionRefs: (text, fallback) =>
+      snapshotDraftMentionRefs(text, new Map(), [], [], [], fallback),
     originalContent: content,
     ownerPubkey: "a".repeat(64),
     pendingImeta: [],

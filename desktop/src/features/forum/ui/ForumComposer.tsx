@@ -280,7 +280,8 @@ export function ForumComposer({
           if (compact) setIsCompactExpanded(true);
         }
       } catch (error) {
-        // Fresh authorization failures must be visible; preserve the draft.
+        // Authorization and ambiguous-name failures must be visible, not a
+        // silent no-op. This path has not cleared the draft or its selections.
         toast.error(error instanceof Error ? error.message : String(error));
       } finally {
         isSubmissionPendingRef.current = false;

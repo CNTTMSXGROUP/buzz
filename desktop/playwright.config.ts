@@ -76,6 +76,7 @@ export default defineConfig({
         "**/mentions.spec.ts",
         "**/remote-owned-mentions.spec.ts",
         "**/mention-spacing.spec.ts",
+        "**/mention-recipients.spec.ts",
         "**/team-mentions.spec.ts",
         "**/persistent-agent-audience.spec.ts",
         "**/relay-reconnect.spec.ts",

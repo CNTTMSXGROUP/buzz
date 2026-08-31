@@ -29,20 +29,20 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     })
 }
 
-/// A staged team update. The record persists before the two stores change so a
-/// later save or launch can replay the original membership delta.
+/// A staged team membership change. The record persists before the team and
+/// agent stores change so a later save or launch can replay the original delta.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingTeamMembershipUpdate {
-    team_id: String,
-    previous_persona_ids: Vec<String>,
-    current_persona_ids: Vec<String>,
+pub(in crate::commands) struct PendingTeamMembershipUpdate {
+    pub(in crate::commands) team_id: String,
+    pub(in crate::commands) previous_persona_ids: Vec<String>,
+    pub(in crate::commands) current_persona_ids: Vec<String>,
 }
 
-fn pending_team_membership_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn pending_team_membership_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     Ok(crate::managed_agents::managed_agents_base_dir(app)?.join("pending-team-membership.json"))
 }
 
-fn save_pending_team_membership_at(
+pub(in crate::commands) fn save_pending_team_membership_at(
     path: &std::path::Path,
     pending: Option<&PendingTeamMembershipUpdate>,
 ) -> Result<(), String> {
@@ -51,7 +51,7 @@ fn save_pending_team_membership_at(
     crate::managed_agents::storage::atomic_write_json(path, &payload)
 }
 
-fn load_pending_team_membership_at(
+pub(in crate::commands) fn load_pending_team_membership_at(
     path: &std::path::Path,
 ) -> Result<Option<PendingTeamMembershipUpdate>, String> {
     if !path.exists() {
@@ -63,20 +63,22 @@ fn load_pending_team_membership_at(
         .map_err(|error| format!("failed to parse pending team update: {error}"))
 }
 
-fn save_pending_team_membership(
-    app: &AppHandle,
+pub(in crate::commands) fn save_pending_team_membership<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     pending: &PendingTeamMembershipUpdate,
 ) -> Result<(), String> {
     save_pending_team_membership_at(&pending_team_membership_path(app)?, Some(pending))
 }
 
-fn load_pending_team_membership(
-    app: &AppHandle,
+fn load_pending_team_membership<R: tauri::Runtime>(
+    app: &AppHandle<R>,
 ) -> Result<Option<PendingTeamMembershipUpdate>, String> {
     load_pending_team_membership_at(&pending_team_membership_path(app)?)
 }
 
-fn clear_pending_team_membership(app: &AppHandle) -> Result<(), String> {
+pub(in crate::commands) fn clear_pending_team_membership<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<(), String> {
     // Write `null` through the link instead of unlinking it. The pending file
     // is shared by dev worktrees, and `atomic_write_json` preserves the link.
     save_pending_team_membership_at(&pending_team_membership_path(app)?, None)
@@ -112,7 +114,9 @@ fn pending_replay_delta(
 }
 
 /// Replay a staged membership delta. Callers hold `managed_agents_store_lock`.
-pub(crate) fn replay_pending_team_membership(app: &AppHandle) -> Result<(), String> {
+pub(crate) fn replay_pending_team_membership<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<(), String> {
     let Some(pending) = load_pending_team_membership(app)? else {
         return Ok(());
     };
@@ -234,25 +238,9 @@ fn propagate_membership_with_roster(
     Ok(())
 }
 
-/// Propagate a team's membership *change* to its members' already-running
-/// instances, best-effort: any load/save error is logged and swallowed.
-///
-/// Used by [`commit_team_create`] and by the inbound reconcile path. For a
-/// create, the team write already landed, and failing the command would make a
-/// UI retry mint a duplicate team; a missing backfill only costs a member the
-/// team instructions until boot repair runs, and it blocks nothing.
-///
-/// [`commit_team_update`] does **not** use this policy. A removal that does not
-/// reach the agent store leaves an agent bound to the team, and the delete guard
-/// then refuses the team — so an update reports the failure instead.
-///
-/// `load_agents`/`save_agents` are injected so the command wiring (prior-roster
-/// capture, delta direction, and this best-effort policy) is unit-testable
-/// without an `AppHandle`; the commands pass the real store IO.
-///
-/// Shared with the inbound reconcile path (`commands::personas::inbound`): a
-/// 30176 team edit arriving from another device must bind/detach instances the
-/// same way a local edit does, so both call this one wrapper.
+/// Apply a membership change without failing a metadata-only producer. The
+/// caller must use [`propagate_membership`] when a roster change needs durable
+/// recovery.
 pub(in crate::commands) fn propagate_membership_best_effort(
     team_id: &str,
     previous_persona_ids: &[String],
@@ -260,32 +248,45 @@ pub(in crate::commands) fn propagate_membership_best_effort(
     load_agents: impl FnOnce() -> Result<Vec<crate::managed_agents::ManagedAgentRecord>, String>,
     save_agents: impl FnOnce(&[crate::managed_agents::ManagedAgentRecord]) -> Result<(), String>,
 ) {
-    if let Err(e) = propagate_membership(
+    if let Err(error) = propagate_membership(
         team_id,
         previous_persona_ids,
         current_persona_ids,
         load_agents,
         save_agents,
     ) {
-        eprintln!("buzz-desktop: team-membership-propagate: {e}");
+        eprintln!("buzz-desktop: team-membership-propagate: {error}");
     }
 }
 
-/// In-memory core of [`create_team`]: push the built team, persist teams
-/// authoritatively, then propagate its whole roster (no prior members ⇒ the
-/// whole roster is the added delta) to live instances best-effort. Decoupled
-/// from the `AppHandle` shell via injected persistence so the create wiring is
-/// unit-testable. A `persist_teams` error propagates; agent IO is best-effort.
+/// In-memory core of [`create_team`]: stage, persist, and bind the new team's
+/// full roster to already-running instances. The function clears the stage
+/// only after both stores succeed. A failure returns an error because a success
+/// response must mean the membership binding is durable.
 fn commit_team_create(
     teams: &mut Vec<TeamRecord>,
     team: TeamRecord,
+    save_pending: impl FnOnce(&PendingTeamMembershipUpdate) -> Result<(), String>,
     persist_teams: impl FnOnce(&[TeamRecord]) -> Result<(), String>,
     load_agents: impl FnOnce() -> Result<Vec<crate::managed_agents::ManagedAgentRecord>, String>,
     save_agents: impl FnOnce(&[crate::managed_agents::ManagedAgentRecord]) -> Result<(), String>,
+    clear_pending: impl FnOnce() -> Result<(), String>,
 ) -> Result<TeamRecord, String> {
+    let membership_changed = !team.persona_ids.is_empty();
+    if membership_changed {
+        save_pending(&PendingTeamMembershipUpdate {
+            team_id: team.id.clone(),
+            previous_persona_ids: Vec::new(),
+            current_persona_ids: team.persona_ids.clone(),
+        })?;
+    }
     teams.push(team.clone());
     persist_teams(teams)?;
-    propagate_membership_best_effort(&team.id, &[], &team.persona_ids, load_agents, save_agents);
+    if membership_changed {
+        propagate_membership(&team.id, &[], &team.persona_ids, load_agents, save_agents)
+            .map_err(|error| format!("could not update the new team's agents: {error}"))?;
+        clear_pending()?;
+    }
     Ok(team)
 }
 
@@ -302,8 +303,8 @@ fn commit_team_create(
 /// agent write leaves the stage file in place. The next update or launch replays
 /// that original delta before it accepts another team edit.
 ///
-/// A create has no stable id, so it keeps a best-effort policy to avoid a
-/// duplicate team on retry.
+/// A create also stages its full roster before it writes the team. A retry
+/// replays that stage, so the command never reports a lost member binding.
 #[allow(clippy::too_many_arguments)]
 fn commit_team_update(
     teams: &mut [TeamRecord],
@@ -677,11 +678,14 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
         let team = commit_team_create(
             &mut teams,
             team,
+            |pending| save_pending_team_membership(&app, pending),
             |teams| save_teams(&app, teams),
             || load_managed_agents(&app),
             |records| save_managed_agents(&app, records),
+            || clear_pending_team_membership(&app),
         )?;
-        // Created teams are always non-builtin; publish to the relay.
+        // Created teams are always non-builtin. Retain only after the agent
+        // binding is durable, so a remote device cannot consume lost intent.
         retain_team_pending(&app, &state, &team);
         Ok(team)
     })

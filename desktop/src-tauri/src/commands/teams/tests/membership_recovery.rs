@@ -313,11 +313,13 @@ fn commit_team_create_treats_full_roster_as_added() {
         &mut teams,
         team("team-a", &["duncan"]),
         |_| Ok(()),
+        |_| Ok(()),
         || Ok(existing.clone()),
         |records| {
             spy.borrow_mut().saved = Some(records.to_vec());
             Ok(())
         },
+        || Ok(()),
     )
     .expect("create succeeds");
 
@@ -330,21 +332,52 @@ fn commit_team_create_treats_full_roster_as_added() {
     );
 }
 
-/// A failing secondary agent write after successful `save_teams` is
-/// swallowed by `create`: it still returns the persisted team. Otherwise a UI
-/// retry of a create whose team already landed would mint a duplicate.
+/// A failed create keeps its staged delta. The retry path can bind a persona
+/// even when another team also contains that persona.
 #[test]
-fn commit_create_returns_ok_when_agent_save_fails() {
-    let mut teams: Vec<TeamRecord> = Vec::new();
-    let created = commit_team_create(
+fn failed_create_keeps_a_durable_shared_persona_replay_delta() {
+    let pending_file = tempfile::NamedTempFile::new().expect("temporary stage");
+    std::fs::write(pending_file.path(), "null").expect("initialize stage");
+    let mut teams = vec![team("team-a", &["duncan"])];
+    let agents = RefCell::new(vec![instance('a', "duncan", None)]);
+
+    let error = commit_team_create(
         &mut teams,
-        team("team-a", &["duncan"]),
+        team("team-b", &["duncan"]),
+        |pending| save_pending_team_membership_at(pending_file.path(), Some(pending)),
         |_| Ok(()),
-        || Ok(vec![instance('a', "duncan", None)]),
+        || Ok(agents.borrow().clone()),
         |_| Err("disk full".to_string()),
+        || save_pending_team_membership_at(pending_file.path(), None),
     )
-    .expect("create swallows secondary-store failure");
-    assert_eq!(created.id, "team-a");
+    .expect_err("a create must report an undurable member binding");
+    assert!(
+        error.contains("could not update the new team's agents"),
+        "{error}"
+    );
+    assert_eq!(
+        teams.len(),
+        2,
+        "the team write landed before the failed binding"
+    );
+
+    let pending = load_pending_team_membership_at(pending_file.path())
+        .expect("read staged delta")
+        .expect("the failed create keeps its stage");
+    assert_eq!(pending.team_id, "team-b");
+    propagate_membership(
+        &pending.team_id,
+        &pending.previous_persona_ids,
+        &pending.current_persona_ids,
+        || Ok(agents.borrow().clone()),
+        |records| {
+            *agents.borrow_mut() = records.to_vec();
+            Ok(())
+        },
+    )
+    .expect("a launch replay binds the shared persona");
+    save_pending_team_membership_at(pending_file.path(), None).expect("clear replayed stage");
+    assert_eq!(agents.borrow()[0].team_id.as_deref(), Some("team-b"));
 }
 
 /// `update` must NOT swallow an agent-store failure while emptying a roster.
@@ -689,11 +722,13 @@ fn replay_before_create_preserves_the_new_team_binding() {
         &mut teams,
         team("team-b", &["duncan"]),
         |_| Ok(()),
+        |_| Ok(()),
         || Ok(agents.borrow().clone()),
         |records| {
             *agents.borrow_mut() = records.to_vec();
             Ok(())
         },
+        || Ok(()),
     )
     .expect("the new team binds the now-unbound persona");
 

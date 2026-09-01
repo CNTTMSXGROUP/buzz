@@ -26,6 +26,8 @@ pub mod moderation_commands;
 pub mod moderation_notices;
 /// Product-feedback validation + deployment sidecar persistence.
 pub mod product_feedback;
+/// NIP-PC collaborative Project change validation and execution.
+pub mod project_change;
 #[allow(dead_code, missing_docs)]
 pub mod push_lease;
 /// NIP-43 relay membership admin command handler (kinds 9030–9032).

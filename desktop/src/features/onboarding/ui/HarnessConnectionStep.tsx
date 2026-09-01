@@ -35,6 +35,42 @@ export type HarnessConnectionOption = {
   runtime: AcpRuntimeCatalogEntry;
 };
 
+function HarnessPreviewStep({
+  allowWideContent = false,
+  children,
+  embedded = false,
+  onBack,
+  testId,
+  total,
+}: {
+  allowWideContent?: boolean;
+  children: React.ReactNode;
+  embedded?: boolean;
+  onBack: () => void;
+  testId: string;
+  total: number;
+}) {
+  if (embedded) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col" data-testid={testId}>
+        {children}
+      </div>
+    );
+  }
+
+  return (
+    <OnboardingPreviewStep
+      allowWideContent={allowWideContent}
+      current={3}
+      onBack={onBack}
+      testId={testId}
+      total={total}
+    >
+      {children}
+    </OnboardingPreviewStep>
+  );
+}
+
 const CONNECTION_METHOD_OPTIONS = [
   { label: "Subscription", value: "subscription" },
   { label: "API", value: "api" },
@@ -324,7 +360,7 @@ export function HarnessConnectionList({
                 type="button"
               >
                 {contents}
-                <span className="flex size-10 shrink-0 items-center justify-center">
+                <span className="flex size-10 shrink-0 items-center justify-end">
                   <ChevronRight
                     aria-hidden="true"
                     className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
@@ -340,6 +376,7 @@ export function HarnessConnectionList({
 }
 
 export function HarnessConnectionPreview({
+  embedded = false,
   installedIds,
   method,
   onBack,
@@ -347,6 +384,7 @@ export function HarnessConnectionPreview({
   onSelect,
   total,
 }: {
+  embedded?: boolean;
   installedIds: ReadonlySet<string>;
   method?: HarnessConnectionMethod;
   onBack: () => void;
@@ -361,8 +399,9 @@ export function HarnessConnectionPreview({
     : HARNESS_CONNECTION_OPTIONS;
 
   return (
-    <OnboardingPreviewStep
-      current={3}
+    <HarnessPreviewStep
+      allowWideContent
+      embedded={embedded}
       onBack={onBack}
       testId="onboarding-preview-harness-connection"
       total={total}
@@ -407,7 +446,7 @@ export function HarnessConnectionPreview({
           />
         </div>
       </OnboardingSlideTransition>
-    </OnboardingPreviewStep>
+    </HarnessPreviewStep>
   );
 }
 
@@ -429,17 +468,21 @@ const CONNECTION_METHOD_CHOICES = [
 }>;
 
 export function HarnessConnectionMethodPreview({
+  embedded = false,
   onBack,
   onSelect,
+  onSetUpLater,
   total,
 }: {
+  embedded?: boolean;
   onBack: () => void;
   onSelect: (method: HarnessConnectionMethod) => void;
+  onSetUpLater: () => void;
   total: number;
 }) {
   return (
-    <OnboardingPreviewStep
-      current={3}
+    <HarnessPreviewStep
+      embedded={embedded}
       onBack={onBack}
       testId="onboarding-preview-harness-method"
       total={total}
@@ -475,7 +518,7 @@ export function HarnessConnectionMethodPreview({
                 <span className="min-w-0 flex-1">
                   <span className="block font-medium">{label}</span>
                 </span>
-                <span className="ml-auto flex size-10 shrink-0 items-center justify-center">
+                <span className="ml-auto flex size-10 shrink-0 items-center justify-end">
                   <ChevronRight
                     aria-hidden
                     className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
@@ -484,9 +527,25 @@ export function HarnessConnectionMethodPreview({
               </Button>
             ),
           )}
+          <Button
+            className="group h-auto min-h-14 w-full justify-start gap-3 rounded-xl px-2 py-2 text-left text-sm font-medium text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
+            data-testid="onboarding-preview-harness-method-later"
+            onClick={onSetUpLater}
+            type="button"
+            variant="ghost"
+          >
+            <span aria-hidden className="size-8 shrink-0" />
+            <span className="min-w-0 flex-1">Set up later</span>
+            <span className="ml-auto flex size-10 shrink-0 items-center justify-end">
+              <ChevronRight
+                aria-hidden
+                className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
+              />
+            </span>
+          </Button>
         </div>
       </OnboardingSlideTransition>
-    </OnboardingPreviewStep>
+    </HarnessPreviewStep>
   );
 }
 
@@ -699,6 +758,7 @@ function ConnectedConfiguration({
 }
 
 export function HarnessConnectionDetailPreview({
+  embedded = false,
   installed,
   lockMethod = false,
   method,
@@ -706,9 +766,11 @@ export function HarnessConnectionDetailPreview({
   onCheckAgain,
   onContinue,
   onMethodChange,
+  onUseDifferentHarness,
   option,
   total,
 }: {
+  embedded?: boolean;
   installed: boolean;
   lockMethod?: boolean;
   method: HarnessConnectionMethod;
@@ -716,6 +778,7 @@ export function HarnessConnectionDetailPreview({
   onCheckAgain: () => void;
   onContinue: () => void;
   onMethodChange: (method: HarnessConnectionMethod) => void;
+  onUseDifferentHarness?: () => void;
   option: HarnessConnectionOption;
   total: number;
 }) {
@@ -770,8 +833,8 @@ export function HarnessConnectionDetailPreview({
 
   if (!installed) {
     return (
-      <OnboardingPreviewStep
-        current={3}
+      <HarnessPreviewStep
+        embedded={embedded}
         onBack={onBack}
         testId="onboarding-preview-harness-setup-guide"
         total={total}
@@ -779,7 +842,7 @@ export function HarnessConnectionDetailPreview({
         <OnboardingSlideTransition
           className={cn(
             "flex min-h-0 w-full max-w-[500px] flex-1 flex-col",
-            cardLayout ? "items-stretch" : "items-center",
+            cardLayout || embedded ? "items-stretch" : "items-center",
           )}
           containerClassName="min-h-0 flex-1"
           transitionKey={`preview-harness-setup-${option.runtime.id}`}
@@ -828,13 +891,13 @@ export function HarnessConnectionDetailPreview({
             </Button>
           </OnboardingFooter>
         </OnboardingSlideTransition>
-      </OnboardingPreviewStep>
+      </HarnessPreviewStep>
     );
   }
 
   return (
-    <OnboardingPreviewStep
-      current={3}
+    <HarnessPreviewStep
+      embedded={embedded}
       onBack={onBack}
       testId="onboarding-preview-harness-connection-detail"
       total={total}
@@ -842,7 +905,7 @@ export function HarnessConnectionDetailPreview({
       <OnboardingSlideTransition
         className={cn(
           "flex min-h-0 w-full max-w-[500px] flex-1 flex-col",
-          cardLayout ? "items-stretch" : "items-center",
+          cardLayout || embedded ? "items-stretch" : "items-center",
         )}
         containerClassName="min-h-0 flex-1"
         transitionKey={`preview-harness-connection-${option.runtime.id}`}
@@ -965,6 +1028,20 @@ export function HarnessConnectionDetailPreview({
                   />
                 </div>
               ) : null}
+              {option.runtime.id === "buzz-agent" && onUseDifferentHarness ? (
+                <div className="flex w-full items-baseline gap-1.5 pt-1 text-sm text-foreground/70">
+                  <span>or</span>
+                  <Button
+                    className="h-auto p-0 text-sm text-foreground"
+                    data-testid="onboarding-preview-harness-use-different"
+                    onClick={onUseDifferentHarness}
+                    type="button"
+                    variant="link"
+                  >
+                    Use a different harness
+                  </Button>
+                </div>
+              ) : null}
             </form>
           )}
         </div>
@@ -983,6 +1060,6 @@ export function HarnessConnectionDetailPreview({
           </OnboardingFooter>
         ) : null}
       </OnboardingSlideTransition>
-    </OnboardingPreviewStep>
+    </HarnessPreviewStep>
   );
 }

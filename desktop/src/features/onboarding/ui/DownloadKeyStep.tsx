@@ -111,7 +111,7 @@ export function DownloadKeyStep({
         </h1>
         <p className="mt-5 text-sm leading-6 text-foreground/80">
           {showPreviewSaved
-            ? "Test your backup now to make sure it works. Drop the file here or select it from your device."
+            ? "Test your backup to make sure it works, or download another copy."
             : hasVerifiedBackup
               ? "Your file and password can restore your identity."
               : hasSelectedBackup

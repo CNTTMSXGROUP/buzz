@@ -29,6 +29,7 @@ export function useOnboardingPreviewCardLayout() {
 }
 
 export function OnboardingPreviewStep({
+  allowWideContent = false,
   allowHorizontalActionOverflow = false,
   children,
   current = 2,
@@ -37,6 +38,7 @@ export function OnboardingPreviewStep({
   testId,
   total,
 }: {
+  allowWideContent?: boolean;
   allowHorizontalActionOverflow?: boolean;
   children: React.ReactNode;
   current?: number;
@@ -82,7 +84,9 @@ export function OnboardingPreviewStep({
       {cardLayout ? (
         <Card
           className={cn(
-            "flex h-[min(41.5rem,calc(100dvh-3rem))] w-full max-w-[47rem] flex-col overflow-hidden rounded-[2rem] bg-white px-6 pb-6 pt-[4.5rem] text-left shadow-lg [--buzz-onboarding-cta-label:#fff] sm:px-[7.5rem] [&_.buzz-onboarding-transition-content]:!text-left [&_.buzz-onboarding-transition-line]:justify-center [&_h1+p]:!mx-0 [&_h1+p]:!mt-2 [&_h1+p]:!text-left [&_h1+p]:!text-base [&_h1+p]:!leading-6 [&_h1]:!text-left [&_h1]:!text-2xl [&_h1]:!leading-8 [&_h1]:!text-foreground",
+            "flex h-[min(41.5rem,calc(100dvh-3rem))] w-max min-w-[calc(38rem+2px)] max-w-[50rem] flex-col overflow-hidden rounded-[2rem] bg-white p-12 text-left shadow-lg [--buzz-onboarding-cta-label:#fff] [&_.buzz-onboarding-transition-content]:min-w-[32rem] [&_.buzz-onboarding-transition-content]:!text-left [&_.buzz-onboarding-transition-line]:justify-start [&_h1+p]:!mx-0 [&_h1+p]:!mt-2 [&_h1+p]:!text-left [&_h1+p]:!text-base [&_h1+p]:!leading-6 [&_h1]:!text-left [&_h1]:!text-2xl [&_h1]:!leading-8 [&_h1]:!text-foreground",
+            !allowWideContent &&
+              "[&_.buzz-onboarding-transition-content]:max-w-[32rem]",
           )}
           data-testid="onboarding-preview-content-card"
           ref={cardRef}

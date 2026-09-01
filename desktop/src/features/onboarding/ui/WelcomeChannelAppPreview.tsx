@@ -24,7 +24,18 @@ import { ComposerDockBackdrop } from "@/features/messages/ui/ComposerDockBackdro
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
+import { Dialog, DialogContent, DialogTitle } from "@/shared/ui/dialog";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
+import {
+  HARNESS_CONNECTION_OPTIONS,
+  HarnessConnectionDetailPreview,
+  HarnessConnectionMethodPreview,
+  type HarnessConnectionMethod,
+  HarnessConnectionPreview,
+  runtimeNeedsOnboardingConnection,
+} from "./HarnessConnectionStep";
+import { OnboardingFooterProvider } from "./OnboardingFooter";
+import { OnboardingPreviewLayoutProvider } from "./OnboardingPreviewShell";
 
 const CHANNEL_ROW_CLASS =
   "flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors hover:bg-black/[0.06]";
@@ -62,6 +73,154 @@ const PREVIEW_APP_THEME: PreviewThemeStyle = {
   "--sidebar-foreground": "0 0% 18%",
   "--sidebar-ring": "0 0% 20%",
 };
+
+type WelcomeHarnessPage = "method" | "list" | "detail";
+
+function WelcomeHarnessConnectionDialog({
+  onConnected,
+  onOpenChange,
+  open,
+}: {
+  onConnected: () => void;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
+}) {
+  const [page, setPage] = React.useState<WelcomeHarnessPage>("method");
+  const [method, setMethod] =
+    React.useState<HarnessConnectionMethod>("subscription");
+  const [selectedHarnessId, setSelectedHarnessId] =
+    React.useState("buzz-agent");
+  const [detailBackPage, setDetailBackPage] =
+    React.useState<WelcomeHarnessPage>("list");
+  const [installedIds, setInstalledIds] = React.useState(
+    () =>
+      new Set(
+        HARNESS_CONNECTION_OPTIONS.filter(
+          ({ runtime }) => runtime.availability === "available",
+        ).map(({ runtime }) => runtime.id),
+      ),
+  );
+  const selectedHarness =
+    HARNESS_CONNECTION_OPTIONS.find(
+      ({ runtime }) => runtime.id === selectedHarnessId,
+    ) ?? HARNESS_CONNECTION_OPTIONS[0];
+
+  React.useEffect(() => {
+    if (!open) return;
+    setPage("method");
+    setMethod("subscription");
+    setSelectedHarnessId("buzz-agent");
+    setDetailBackPage("list");
+  }, [open]);
+
+  const completeConnection = React.useCallback(() => {
+    onConnected();
+    onOpenChange(false);
+  }, [onConnected, onOpenChange]);
+
+  let content: React.ReactNode;
+  if (page === "method") {
+    content = (
+      <HarnessConnectionMethodPreview
+        embedded
+        onBack={() => onOpenChange(false)}
+        onSelect={(nextMethod) => {
+          setMethod(nextMethod);
+          if (nextMethod === "api") {
+            setSelectedHarnessId("buzz-agent");
+            setDetailBackPage("method");
+            setPage("detail");
+          } else {
+            setPage("list");
+          }
+        }}
+        onSetUpLater={() => onOpenChange(false)}
+        total={5}
+      />
+    );
+  } else if (page === "list") {
+    content = (
+      <HarnessConnectionPreview
+        embedded
+        installedIds={installedIds}
+        method={method}
+        onBack={() => setPage("method")}
+        onSelect={(option) => {
+          setSelectedHarnessId(option.runtime.id);
+          setDetailBackPage("list");
+          if (
+            installedIds.has(option.runtime.id) &&
+            !runtimeNeedsOnboardingConnection(method, option.runtime.id)
+          ) {
+            completeConnection();
+          } else {
+            setPage("detail");
+          }
+        }}
+        total={5}
+      />
+    );
+  } else {
+    content = (
+      <HarnessConnectionDetailPreview
+        embedded
+        installed={installedIds.has(selectedHarness.runtime.id)}
+        key={`${selectedHarness.runtime.id}-${method}`}
+        lockMethod
+        method={method}
+        onBack={() => setPage(detailBackPage)}
+        onCheckAgain={() => {
+          setInstalledIds((current) =>
+            new Set(current).add(selectedHarness.runtime.id),
+          );
+          if (
+            !runtimeNeedsOnboardingConnection(
+              method,
+              selectedHarness.runtime.id,
+            )
+          ) {
+            completeConnection();
+          }
+        }}
+        onContinue={completeConnection}
+        onMethodChange={setMethod}
+        onUseDifferentHarness={
+          method === "api" && selectedHarness.runtime.id === "buzz-agent"
+            ? () => setPage("list")
+            : undefined
+        }
+        option={selectedHarness}
+        total={5}
+      />
+    );
+  }
+
+  const backAction =
+    page === "method"
+      ? undefined
+      : {
+          onClick: () => setPage(page === "detail" ? detailBackPage : "method"),
+        };
+
+  return (
+    <Dialog onOpenChange={onOpenChange} open={open}>
+      <DialogContent
+        className="buzz-onboarding-neutral-theme !flex h-[min(41.5rem,calc(100dvh-3rem))] max-h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden rounded-[2rem] bg-white p-12 text-left text-foreground sm:max-w-[38rem] [&_.buzz-onboarding-transition-content]:min-w-[32rem] [&_.buzz-onboarding-transition-content]:!text-left [&_h1+p]:!mx-0 [&_h1+p]:!mt-2 [&_h1+p]:!text-left [&_h1+p]:!text-base [&_h1+p]:!leading-6 [&_h1]:!text-left [&_h1]:!text-2xl [&_h1]:!leading-8 [&_h1]:!text-foreground"
+        data-testid="welcome-preview-harness-dialog"
+        style={PREVIEW_APP_THEME}
+      >
+        <DialogTitle className="sr-only">Connect AI provider</DialogTitle>
+        <OnboardingPreviewLayoutProvider card>
+          <OnboardingFooterProvider backAction={backAction} placement="card">
+            <div className="flex min-h-0 min-w-[32rem] flex-1 flex-col">
+              {content}
+            </div>
+          </OnboardingFooterProvider>
+        </OnboardingPreviewLayoutProvider>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 function PreviewAvatar({
   avatarUrl,
@@ -185,25 +344,6 @@ function PreviewSidebar({
         </button>
       </div>
 
-      <div className="mt-5 px-4 text-xs font-medium text-black/45">
-        Direct messages
-      </div>
-      <div className="mt-1 space-y-0.5 px-2">
-        {WELCOME_TEAM.map((agent) => (
-          <button className={CHANNEL_ROW_CLASS} key={agent.name} type="button">
-            <span className="relative size-6 shrink-0">
-              <img
-                alt=""
-                className="size-6 rounded-lg object-contain"
-                src={agent.image}
-              />
-              <span className="absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-[#dfe5cf] bg-emerald-500" />
-            </span>
-            {agent.name}
-          </button>
-        ))}
-      </div>
-
       <button
         className="mt-auto flex items-center gap-2 rounded-xl px-2 py-2 text-left hover:bg-black/[0.05]"
         onClick={() => onPreviewAction("Profile")}
@@ -232,11 +372,12 @@ export function WelcomeChannelAppPreview({
 }) {
   const [draft, setDraft] = React.useState("");
   const [messages, setMessages] = React.useState<string[]>([]);
-  const [channelName, setChannelName] = React.useState("Welcome");
-  const [showRenamePrompt, setShowRenamePrompt] = React.useState(true);
+  const [harnessDialogOpen, setHarnessDialogOpen] = React.useState(false);
+  const [aiProviderConnected, setAiProviderConnected] = React.useState(false);
   const [activePreviewAction, setActivePreviewAction] = React.useState<
     string | null
   >(null);
+  const channelName = "Welcome";
   const profileName = displayName.trim() || "Your profile";
   const submitDraft = (event: React.FormEvent) => {
     event.preventDefault();
@@ -358,84 +499,52 @@ export function WelcomeChannelAppPreview({
               </p>
             </section>
 
-            {showRenamePrompt ? (
+            {!aiProviderConnected ? (
               <section
-                className="mx-3 mt-6 flex max-w-[680px] items-center gap-4 rounded-2xl border border-border/70 bg-background/70 px-5 py-4 text-left"
-                data-testid="welcome-preview-rename-prompt"
+                className="mx-3 mt-6 max-w-[680px] overflow-hidden rounded-2xl border border-border/70 bg-muted/35 text-left"
+                data-testid="welcome-preview-agent-activation"
               >
-                <div className="flex size-10 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
-                  <Lock className="size-4" aria-hidden />
+                <div className="flex items-center gap-4 p-5">
+                  <div className="flex shrink-0 -space-x-3">
+                    {WELCOME_TEAM.map((agent) => (
+                      <img
+                        alt={agent.name}
+                        className="size-14 rounded-2xl border-2 border-background bg-background object-contain"
+                        key={agent.name}
+                        src={agent.image}
+                      />
+                    ))}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <p className="text-base font-semibold">
+                        Bring your starter team online
+                      </p>
+                      <span className="rounded-full bg-foreground/[0.08] px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                        Not connected
+                      </span>
+                    </div>
+                    <p className="mt-1.5 text-sm leading-5 text-muted-foreground">
+                      Connect an AI provider to start Fizz, Honey, and Pollen.
+                      They can help you learn Buzz and work through something
+                      you’re building.
+                    </p>
+                  </div>
                 </div>
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold">Make this space yours</p>
-                  <p className="mt-1 text-sm leading-5 text-muted-foreground">
-                    This private channel is yours to keep. Rename it for how you
-                    want to use it.
+                <div className="flex items-center justify-between border-t border-border/60 bg-background/45 px-5 py-3">
+                  <p className="text-xs text-muted-foreground">
+                    You can change providers or agents later.
                   </p>
+                  <Button
+                    className="h-9 rounded-full px-5"
+                    onClick={() => setHarnessDialogOpen(true)}
+                    type="button"
+                  >
+                    Connect AI provider
+                  </Button>
                 </div>
-                <Button
-                  className="h-9 shrink-0 rounded-full px-5"
-                  onClick={() => {
-                    setChannelName(
-                      profileName === "Your profile"
-                        ? "My space"
-                        : `${profileName}’s space`,
-                    );
-                    setShowRenamePrompt(false);
-                    setActivePreviewAction("Channel details opened");
-                  }}
-                  type="button"
-                  variant="outline"
-                >
-                  Rename channel
-                </Button>
               </section>
             ) : null}
-
-            <section
-              className="mx-3 mt-6 max-w-[680px] overflow-hidden rounded-2xl border border-border/70 bg-muted/35 text-left"
-              data-testid="welcome-preview-agent-activation"
-            >
-              <div className="flex items-center gap-4 p-5">
-                <div className="flex shrink-0 -space-x-3">
-                  {WELCOME_TEAM.map((agent) => (
-                    <img
-                      alt={agent.name}
-                      className="size-14 rounded-2xl border-2 border-background bg-background object-contain"
-                      key={agent.name}
-                      src={agent.image}
-                    />
-                  ))}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <p className="text-base font-semibold">
-                      Bring your starter team online
-                    </p>
-                    <span className="rounded-full bg-foreground/[0.08] px-2 py-0.5 text-xs font-medium text-muted-foreground">
-                      Not connected
-                    </span>
-                  </div>
-                  <p className="mt-1.5 text-sm leading-5 text-muted-foreground">
-                    Connect an AI provider to start Fizz, Honey, and Pollen.
-                    They can help you learn Buzz and work through something
-                    you’re building.
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center justify-between border-t border-border/60 bg-background/45 px-5 py-3">
-                <p className="text-xs text-muted-foreground">
-                  You can change providers or agents later.
-                </p>
-                <Button
-                  className="h-9 rounded-full px-5"
-                  onClick={() => setActivePreviewAction("Connect AI provider")}
-                  type="button"
-                >
-                  Connect AI provider
-                </Button>
-              </div>
-            </section>
 
             {messages.map((message, index) => (
               <div
@@ -520,6 +629,11 @@ export function WelcomeChannelAppPreview({
           </div>
         ) : null}
       </main>
+      <WelcomeHarnessConnectionDialog
+        onConnected={() => setAiProviderConnected(true)}
+        onOpenChange={setHarnessDialogOpen}
+        open={harnessDialogOpen}
+      />
     </div>
   );
 }

@@ -1,4 +1,14 @@
-import { Check, CircleHelp, Eye, EyeOff, FileKey2, FileUp } from "lucide-react";
+import {
+  Check,
+  ChevronRight,
+  CircleHelp,
+  Download,
+  Eye,
+  EyeOff,
+  FileCheck2,
+  FileKey2,
+  FileUp,
+} from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 import * as React from "react";
 import { createPortal } from "react-dom";
@@ -73,6 +83,8 @@ type BackupTestFlowProps = {
   onVerified?: () => void;
   /** Replace native verification and identity reads in the dev-only preview. */
   previewMode?: boolean;
+  /** Apply the experimental V3 presentation inside the safe preview. */
+  v3Presentation?: boolean;
 };
 
 const PREVIEW_BACKUP_FILENAME = "Buzz identity backup.ncryptsec";
@@ -221,6 +233,7 @@ export function BackupTestFlow({
   onProgressChange,
   onVerified,
   previewMode = false,
+  v3Presentation = false,
 }: BackupTestFlowProps) {
   const cardLayout = useOnboardingPreviewCardLayout();
   const reduceMotion = useReducedMotion() ?? false;
@@ -404,6 +417,20 @@ export function BackupTestFlow({
   }, [isSuccessNsecRevealed, previewMode, successNsec]);
 
   const isSpotlight = variant === "spotlight";
+  const selectBackupFile = React.useCallback(() => {
+    if (previewMode && expectedNcryptsec) {
+      setError(null);
+      setAttempt("");
+      onProgressChange({
+        stage: "password",
+        fileName: PREVIEW_BACKUP_FILENAME,
+        ncryptsec: expectedNcryptsec,
+        result: null,
+      });
+      return;
+    }
+    fileInputRef.current?.click();
+  }, [expectedNcryptsec, onProgressChange, previewMode]);
 
   if (stage === "success" && result) {
     // The onboarding ceremony pins the exact file, so a success there is by
@@ -559,32 +586,69 @@ export function BackupTestFlow({
             tabIndex={-1}
             type="file"
           />
-          <Button
-            className={cn(
-              "mx-auto",
-              isSpotlight
-                ? spotlightPrimaryActionClass
-                : "h-9 px-6 text-primary-foreground",
-            )}
-            data-testid="backup-test-dropzone"
-            onClick={() => {
-              if (previewMode && expectedNcryptsec) {
-                setError(null);
-                setAttempt("");
-                onProgressChange({
-                  stage: "password",
-                  fileName: PREVIEW_BACKUP_FILENAME,
-                  ncryptsec: expectedNcryptsec,
-                  result: null,
-                });
-                return;
-              }
-              fileInputRef.current?.click();
-            }}
-            type="button"
-          >
-            <span className="font-medium text-sm">Select your backup file</span>
-          </Button>
+          {v3Presentation && cardLayout ? (
+            <div className="-mx-2 flex w-[calc(100%+1rem)] flex-col gap-2">
+              <Button
+                className="group h-auto min-h-14 w-full justify-start gap-3 rounded-xl px-2 py-2 text-left text-sm font-medium text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
+                data-testid="backup-test-dropzone"
+                onClick={selectBackupFile}
+                type="button"
+                variant="ghost"
+              >
+                <span className="flex size-8 shrink-0 items-center justify-start">
+                  <FileCheck2 aria-hidden className="!size-6" />
+                </span>
+                <span className="min-w-0 flex-1 truncate">
+                  Test your backup
+                </span>
+                <span className="ml-auto flex size-10 shrink-0 items-center justify-end">
+                  <ChevronRight
+                    aria-hidden
+                    className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
+                  />
+                </span>
+              </Button>
+              {onSaveCopy ? (
+                <Button
+                  className="group h-auto min-h-14 w-full justify-start gap-3 rounded-xl px-2 py-2 text-left text-sm font-medium text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
+                  data-testid="encrypted-backup-save-copy"
+                  disabled={isSaving}
+                  onClick={onSaveCopy}
+                  type="button"
+                  variant="ghost"
+                >
+                  <span className="flex size-8 shrink-0 items-center justify-start">
+                    <Download aria-hidden className="!size-6" />
+                  </span>
+                  <span className="min-w-0 flex-1 truncate">
+                    Download backup again
+                  </span>
+                  <span className="ml-auto flex size-10 shrink-0 items-center justify-end">
+                    <ChevronRight
+                      aria-hidden
+                      className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
+                    />
+                  </span>
+                </Button>
+              ) : null}
+            </div>
+          ) : (
+            <Button
+              className={cn(
+                "mx-auto",
+                isSpotlight
+                  ? spotlightPrimaryActionClass
+                  : "h-9 px-6 text-primary-foreground",
+              )}
+              data-testid="backup-test-dropzone"
+              onClick={selectBackupFile}
+              type="button"
+            >
+              <span className="font-medium text-sm">
+                Select your backup file
+              </span>
+            </Button>
+          )}
           {isWindowDragging ? (
             /*
              * Composer-style takeover: fills the nearest positioned host
@@ -623,7 +687,7 @@ export function BackupTestFlow({
               {error}
             </p>
           ) : null}
-          {onSaveCopy ? (
+          {onSaveCopy && !(v3Presentation && cardLayout) ? (
             <div className="flex flex-col items-center gap-2">
               <Button
                 className={cn(

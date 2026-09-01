@@ -358,7 +358,7 @@ export function CommunityChoicePreview({
                   <RouteIcon aria-hidden className="!size-6" />
                 </span>
                 <span className="min-w-0 flex-1 truncate">{label}</span>
-                <span className="ml-auto flex size-10 shrink-0 items-center justify-center">
+                <span className="ml-auto flex size-10 shrink-0 items-center justify-end">
                   <ChevronRight
                     aria-hidden
                     className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"

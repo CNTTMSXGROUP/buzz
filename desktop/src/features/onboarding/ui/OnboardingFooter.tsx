@@ -54,7 +54,7 @@ export function OnboardingFooterProvider({
         value={{ element: target, placement }}
       >
         {children}
-        <div className="mt-8 flex min-h-10 w-full shrink-0 items-center justify-between gap-4 pt-6 sm:-mx-24 sm:w-[calc(100%+12rem)]">
+        <div className="mt-8 flex min-h-10 w-full shrink-0 items-center justify-between gap-4 pt-6">
           <div className="flex min-w-0 flex-1 justify-start">
             {backAction ? (
               <Button

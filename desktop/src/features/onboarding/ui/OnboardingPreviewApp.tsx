@@ -389,7 +389,9 @@ export function OnboardingPreviewApp() {
   const [
     chooseHarnessConnectionMethodFirst,
     setChooseHarnessConnectionMethodFirst,
-  ] = React.useState(false);
+  ] = React.useState(true);
+  const [harnessDetailBackPage, setHarnessDetailBackPage] =
+    React.useState<OnboardingPreviewPage>("harness-connection");
   const [setupBackPage, setSetupBackPage] =
     React.useState<OnboardingPreviewPage>("landing");
   const [communityRoute, setCommunityRoute] =
@@ -429,6 +431,7 @@ export function OnboardingPreviewApp() {
     );
     setSelectedHarnessId("claude");
     setHarnessConnectionMethod("subscription");
+    setHarnessDetailBackPage("harness-connection");
     setRun((current) => current + 1);
     setSignInEmail("");
     setSignupPassword("");
@@ -598,8 +601,15 @@ export function OnboardingPreviewApp() {
         onBack={() => setPage(setupBackPage)}
         onSelect={(method) => {
           setHarnessConnectionMethod(method);
-          setPage("harness-connection");
+          if (method === "api") {
+            setSelectedHarnessId("buzz-agent");
+            setHarnessDetailBackPage("harness-connection-method");
+            setPage("harness-connection-detail");
+          } else {
+            setPage("harness-connection");
+          }
         }}
+        onSetUpLater={() => setPage("community-choice")}
         total={journey.totalSteps}
       />
     );
@@ -626,6 +636,7 @@ export function OnboardingPreviewApp() {
         }
         onSelect={(option) => {
           setSelectedHarnessId(option.runtime.id);
+          setHarnessDetailBackPage("harness-connection");
           const nextMethod = chooseHarnessConnectionMethodFirst
             ? harnessConnectionMethod
             : (option.methods[0] ?? "api");
@@ -653,7 +664,7 @@ export function OnboardingPreviewApp() {
         installed={installedHarnessIds.has(selectedHarness.runtime.id)}
         lockMethod={chooseHarnessConnectionMethodFirst}
         method={harnessConnectionMethod}
-        onBack={() => setPage("harness-connection")}
+        onBack={() => setPage(harnessDetailBackPage)}
         onCheckAgain={() => {
           setInstalledHarnessIds((current) =>
             new Set(current).add(selectedHarness.runtime.id),
@@ -669,6 +680,13 @@ export function OnboardingPreviewApp() {
         }}
         onContinue={() => setPage("community-choice")}
         onMethodChange={setHarnessConnectionMethod}
+        onUseDifferentHarness={
+          chooseHarnessConnectionMethodFirst &&
+          harnessConnectionMethod === "api" &&
+          selectedHarness.runtime.id === "buzz-agent"
+            ? () => setPage("harness-connection")
+            : undefined
+        }
         option={selectedHarness}
         total={journey.totalSteps}
       />

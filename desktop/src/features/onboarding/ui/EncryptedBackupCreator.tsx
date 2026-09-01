@@ -656,6 +656,7 @@ export function EncryptedBackupCreator({
           saveError={saveError}
           variant={variant}
           verifyButtonPortal={verifyButtonPortal}
+          v3Presentation={v3Presentation}
         />
       </div>
     );

@@ -1864,3 +1864,256 @@ test("test_no_publish_retry_seam_shows_terminal_warning_not_reopen", async () =>
     cap.restore();
   }
 });
+
+// ── Test family 12: P1 — combined saves (D+I, D+L) bypass recovery ─────────────
+//
+// When `publishCatalogUpdates` is true and the command throws after persist,
+// `publishFailed` is set and `firstError` suppresses I/L writes. A combined
+// D+I or D+L save must settle publication independently — before advancing —
+// so the full D+I or D+L path can complete when the retry succeeds, and must
+// name the unpublished catalog alongside the unsaved I/L remainder when it
+// fails.
+//
+// Mutation acceptance: restoring the original `!observedRemainder` gate must
+// turn these tests RED because the retry is never called for combined saves.
+
+test("test_combined_di_save_publish_retry_succeeds_continues_instance_write", async () => {
+  // D+I combined save: publish throws after persist, retry succeeds — I write
+  // must proceed and the whole save must close as full success.
+  const cap = captureToasts();
+  try {
+    const persistedDef = makeDefinition({ displayName: "Alice" });
+    const persistedInst = makeInstance({ name: "Alice" });
+    let retryCalls = 0;
+    let agentCalls = 0;
+    const opts = makeOpts({
+      ctx: {
+        kind: "instance-with-definition",
+        definition: makeDefinition({ displayName: "Alice" }),
+        instance: makeInstance(),
+      },
+      personaInput: makePersonaInput({ displayName: "Alice" }),
+      agentInput: makeAgentInput({ name: "Alice" }),
+      publishCatalogUpdates: true,
+      updatePersonaAndPublish: async () => {
+        throw new Error("failed to open retention db");
+      },
+      updateManagedAgent: async () => {
+        agentCalls++;
+        return { agent: persistedInst, profileSyncError: null };
+      },
+      refetchStores: async () => ({
+        persona: persistedDef,
+        agent: persistedInst,
+      }),
+      publishRetry: async () => {
+        retryCalls++;
+        return { persona: persistedDef, publicationStatus: "published" };
+      },
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(
+      result,
+      true,
+      "full success when retry + I write both succeed",
+    );
+    assert.equal(
+      opts._calls.onDone,
+      1,
+      "onDone must be called on full success",
+    );
+    assert.equal(
+      retryCalls,
+      1,
+      "publishRetry must be called once for the early retry",
+    );
+    assert.equal(
+      agentCalls,
+      1,
+      "instance write must proceed after retry success",
+    );
+    const warnings = cap.captured.filter((c) => c.kind === "warning");
+    assert.equal(warnings.length, 0, "no warning when everything succeeds");
+    const successes = cap.captured.filter((c) => c.kind === "success");
+    assert.equal(successes.length, 1, "success toast must fire");
+  } finally {
+    cap.restore();
+  }
+});
+
+test("test_combined_dl_save_publish_retry_succeeds_continues_policy_write", async () => {
+  // D+L combined save: publish throws after persist, retry succeeds — policy
+  // write must proceed and the whole save must close as full success.
+  const cap = captureToasts();
+  try {
+    const persistedDef = makeDefinition({ displayName: "Alice" });
+    const persistedInst = makeInstance({ autoRestartOnConfigChange: true });
+    let retryCalls = 0;
+    let policyCalls = 0;
+    const opts = makeOpts({
+      ctx: {
+        kind: "instance-with-definition",
+        definition: makeDefinition({ displayName: "Alice" }),
+        instance: makeInstance(),
+      },
+      personaInput: makePersonaInput({ displayName: "Alice" }),
+      agentInput: null,
+      policySets: [{ type: "autoRestart", pubkey: "pk-abc", value: true }],
+      publishCatalogUpdates: true,
+      updatePersonaAndPublish: async () => {
+        throw new Error("failed to open retention db");
+      },
+      setAutoRestart: async () => {
+        policyCalls++;
+      },
+      refetchStores: async () => ({
+        persona: persistedDef,
+        agent: persistedInst,
+      }),
+      publishRetry: async () => {
+        retryCalls++;
+        return { persona: persistedDef, publicationStatus: "published" };
+      },
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(
+      result,
+      true,
+      "full success when retry + policy write both succeed",
+    );
+    assert.equal(
+      opts._calls.onDone,
+      1,
+      "onDone must be called on full success",
+    );
+    assert.equal(retryCalls, 1, "publishRetry must be called once");
+    assert.equal(
+      policyCalls,
+      1,
+      "policy write must proceed after retry success",
+    );
+    const warnings = cap.captured.filter((c) => c.kind === "warning");
+    assert.equal(warnings.length, 0, "no warning when everything succeeds");
+  } finally {
+    cap.restore();
+  }
+});
+
+test("test_combined_di_save_publish_retry_failure_names_both_catalog_and_remainder", async () => {
+  // D+I combined save: publish throws, retry also fails — toast must name
+  // the profile as saved, instance settings as not saved, and catalog failure
+  // as the reason. Never claim reopen can republish the catalog.
+  const cap = captureToasts();
+  try {
+    const persistedDef = makeDefinition({ displayName: "Alice" });
+    const opts = makeOpts({
+      ctx: {
+        kind: "instance-with-definition",
+        definition: makeDefinition({ displayName: "Alice" }),
+        instance: makeInstance(),
+      },
+      personaInput: makePersonaInput({ displayName: "Alice" }),
+      agentInput: makeAgentInput({ name: "Alice-renamed" }),
+      publishCatalogUpdates: true,
+      updatePersonaAndPublish: async () => {
+        throw new Error("relay unreachable");
+      },
+      updateManagedAgent: async () => {
+        throw new Error("should not be called");
+      },
+      refetchStores: async () => ({ persona: persistedDef, agent: null }),
+      publishRetry: async () => {
+        throw new Error("still unreachable");
+      },
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(result, false, "combined failure returns false");
+    assert.equal(opts._calls.onDone, 0, "onDone must not be called");
+    // Instance write must NOT have been attempted.
+    assert.equal(
+      opts._calls.updateManagedAgent,
+      0,
+      "instance write must be skipped",
+    );
+    const warnings = cap.captured.filter((c) => c.kind === "warning");
+    assert.equal(warnings.length, 1, "exactly one warning");
+    // Must name D as saved and publication failure.
+    assert.match(
+      warnings[0].message,
+      /profile saved/i,
+      "warning must name profile as saved",
+    );
+    assert.match(
+      warnings[0].message,
+      /catalog publication failed|could not be published/i,
+      "warning must name the publication failure",
+    );
+    // Must name the I/L remainder as not saved.
+    assert.match(
+      warnings[0].message,
+      /instance settings/i,
+      "warning must name instance settings as the unsaved remainder",
+    );
+  } finally {
+    cap.restore();
+  }
+});
+
+test("test_combined_di_save_no_retry_seam_names_both_catalog_and_remainder", async () => {
+  // D+I combined save: publish throws, no retry seam provided — toast must
+  // still name catalog failure + unsaved I/L remainder without a publishRetry.
+  const cap = captureToasts();
+  try {
+    const persistedDef = makeDefinition({ displayName: "Alice" });
+    const opts = makeOpts({
+      ctx: {
+        kind: "instance-with-definition",
+        definition: makeDefinition({ displayName: "Alice" }),
+        instance: makeInstance(),
+      },
+      personaInput: makePersonaInput({ displayName: "Alice" }),
+      agentInput: makeAgentInput({ name: "Alice-renamed" }),
+      publishCatalogUpdates: true,
+      updatePersonaAndPublish: async () => {
+        throw new Error("relay unreachable");
+      },
+      refetchStores: async () => ({ persona: persistedDef, agent: null }),
+      // publishRetry intentionally omitted.
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(result, false, "combined failure without seam returns false");
+    assert.equal(opts._calls.onDone, 0, "onDone must not be called");
+    assert.equal(
+      opts._calls.updateManagedAgent,
+      0,
+      "instance write must be skipped",
+    );
+    const warnings = cap.captured.filter((c) => c.kind === "warning");
+    assert.equal(warnings.length, 1, "exactly one warning");
+    assert.match(
+      warnings[0].message,
+      /profile saved/i,
+      "warning must name profile as saved",
+    );
+    assert.match(
+      warnings[0].message,
+      /catalog publication failed|could not be published/i,
+      "warning must name the catalog failure",
+    );
+    assert.match(
+      warnings[0].message,
+      /instance settings/i,
+      "warning must name instance settings as the unsaved remainder",
+    );
+  } finally {
+    cap.restore();
+  }
+});

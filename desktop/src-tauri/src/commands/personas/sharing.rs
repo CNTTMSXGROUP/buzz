@@ -12,6 +12,16 @@ use crate::{
 
 use super::pending::{prepare_persona_publication, PreparedPersonaPublication};
 
+/// Test-only observer called immediately after the `managed_agents_store_lock`
+/// is acquired in `publish_and_refresh_teams_at`'s refresh section. Tests use
+/// this to assert `try_lock()` fails — proving the lock is held during the
+/// synchronous refresh. Moving the lock acquisition to AFTER the refresh call
+/// (recreating the TOCTOU race) causes `try_lock()` to succeed, turning the
+/// probe test RED.
+#[cfg(test)]
+pub(crate) static REFRESH_LOCK_OBSERVER: std::sync::Mutex<Option<Box<dyn Fn(&AppState) + Send>>> =
+    std::sync::Mutex::new(None);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PersonaSharePublicationStatus {
@@ -116,9 +126,34 @@ pub(crate) async fn publish_and_refresh_teams_at(
     persona_id: &str,
 ) -> Result<SetPersonaSharedResult, String> {
     let result = publish_prepared_persona(state, prepared).await?;
-    // F2: refresh any shared 30178 heads that include this persona, matching the
-    // contract of `update_persona_and_publish`. Best-effort — failures are logged.
-    let _ = crate::commands::teams::refresh_for_persona_at(base_dir, keys, db_path, persona_id);
+    // F2: refresh any shared 30178 heads that include this persona. The refresh
+    // reads the current team/persona definitions and may retain a new head — it
+    // must be serialized with team edit/unshare/delete operations that also hold
+    // `managed_agents_store_lock` and may retain/retract the same head.
+    //
+    // Without the lock a concurrent `set_team_shared(false)` can:
+    //   1. acquire the lock, retain unshared head T+1, release the lock;
+    //   2. refresh (unlocked) reads old shared head T, rebuilds, retains T+1;
+    //      `retain_event` accepts equal timestamps — the refresh wins, undoing
+    //      the explicit unshare.
+    //
+    // Acquire AFTER the network await so the lock is never held across I/O;
+    // the synchronous refresh completes entirely inside the critical section.
+    {
+        let _guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| format!("managed_agents_store_lock poisoned: {e}"))?;
+        #[cfg(test)]
+        {
+            if let Ok(obs) = REFRESH_LOCK_OBSERVER.lock() {
+                if let Some(ref f) = *obs {
+                    f(state);
+                }
+            }
+        }
+        let _ = crate::commands::teams::refresh_for_persona_at(base_dir, keys, db_path, persona_id);
+    }
     Ok(result)
 }
 
@@ -420,5 +455,69 @@ mod tests {
             .expect_err("a directory cannot be opened as the retention database");
 
         assert!(error.contains("failed to open retention db"));
+    }
+
+    /// Lock-scope regression for P1-2: the synchronous refresh inside
+    /// `publish_and_refresh_teams_at` must hold `managed_agents_store_lock`
+    /// for its entire read+retain sequence so it is serialized with concurrent
+    /// team edits, unshare, and delete operations.
+    ///
+    /// The observer fires after the lock is acquired and asserts `try_lock()`
+    /// fails — proving the lock is held. Moving the lock acquisition to AFTER
+    /// the refresh call (removing the lock scope) causes `try_lock()` to
+    /// succeed, turning this test RED.
+    #[tokio::test]
+    async fn test_retry_refresh_holds_store_lock_during_refresh() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retention.db");
+        let keys = nostr::Keys::generate();
+        let relay_url = spawn_relay(true).await;
+        let prepared = prepared(&db_path, relay_url, keys.clone(), Some(true));
+        let state = build_app_state();
+
+        // Write an empty teams.json so refresh_for_persona_at reads zero teams
+        // (no 30178 to retract). This keeps the test focused on the lock scope.
+        std::fs::write(dir.path().join("teams.json"), b"[]").unwrap();
+
+        let observer_fired = Arc::new(AtomicBool::new(false));
+        let observer_fired_clone = observer_fired.clone();
+        {
+            let mut slot = REFRESH_LOCK_OBSERVER.lock().expect("observer slot");
+            *slot = Some(Box::new(move |state: &AppState| {
+                assert!(
+                    state.managed_agents_store_lock.try_lock().is_err(),
+                    "managed_agents_store_lock must be held during the refresh — \
+                     a successful try_lock means the refresh runs outside the lock, \
+                     recreating the concurrent-unshare race condition"
+                );
+                observer_fired_clone.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        let persona_id = prepared.persona.id.clone();
+        let result = publish_and_refresh_teams_at(
+            &state,
+            prepared,
+            dir.path(),
+            &keys,
+            &db_path,
+            &persona_id,
+        )
+        .await;
+
+        // Clear observer before any assertion that could panic.
+        {
+            let mut slot = REFRESH_LOCK_OBSERVER.lock().expect("observer slot");
+            *slot = None;
+        }
+
+        result.expect("publish_and_refresh_teams_at must succeed");
+        assert!(
+            observer_fired.load(Ordering::SeqCst),
+            "the refresh lock observer must have fired — if not, the hook is not wired"
+        );
     }
 }

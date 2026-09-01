@@ -382,3 +382,156 @@ async fn retain_failure_after_persist_is_returned_not_swallowed() {
         None => std::env::remove_var("XDG_DATA_HOME"),
     }
 }
+
+/// P2 regression: linked managed-agent name and avatar propagation must
+/// complete even when the retain/publish callback returns an error.
+///
+/// Before the fix: `retain(&app, &state, &result)?` propagated the error
+/// immediately, skipping the avatar/name propagation block and `save_managed_agents`.
+/// A publish-only retry (`set_persona_shared`) then published the persona but
+/// the linked instance still carried the old name/avatar.
+///
+/// After the fix: `retain_result` is captured without `?`, all linked
+/// persistence runs to completion, and THEN the retain error is propagated.
+///
+/// Mutation acceptance: restoring `retain(&app, &state, &result)?` before
+/// the avatar/name propagation block causes `save_managed_agents` to never run
+/// and the assertion on the stored agent name turns RED.
+#[tokio::test]
+async fn linked_instance_rename_completes_before_retain_error_propagates() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home2");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_DATA_HOME");
+    {
+        let _path_guard = crate::managed_agents::lock_path_mutex();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", &home);
+    }
+
+    let app = mock_app();
+
+    // Seed persona "Alice" at R1.
+    save_personas(app.handle(), &[persona("p1", "Alice", R1)]).expect("seed must succeed");
+
+    // Seed a linked agent whose name matches the persona's display_name.
+    let agent_record = crate::managed_agents::ManagedAgentRecord {
+        pubkey: "pk-alice-p2".to_string(),
+        name: "Alice".to_string(),
+        persona_id: Some("p1".to_string()),
+        private_key_nsec: String::new(),
+        auth_tag: None,
+        relay_url: String::new(),
+        avatar_url: None,
+        acp_command: String::new(),
+        agent_command: String::new(),
+        agent_command_override: None,
+        agent_args: vec![],
+        mcp_command: String::new(),
+        turn_timeout_seconds: 0,
+        idle_timeout_seconds: None,
+        max_turn_duration_seconds: None,
+        parallelism: 1,
+        system_prompt: None,
+        model: None,
+        provider: None,
+        persona_source_version: None,
+        env_vars: std::collections::BTreeMap::new(),
+        start_on_app_launch: false,
+        auto_restart_on_config_change: false,
+        runtime_pid: None,
+        backend: Default::default(),
+        backend_agent_id: None,
+        provider_policy_pending: false,
+        provider_binary_path: None,
+        team_id: None,
+        persona_team_dir: None,
+        persona_name_in_team: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+        last_started_at: None,
+        last_stopped_at: None,
+        last_exit_code: None,
+        last_error: None,
+        last_error_code: None,
+        respond_to: Default::default(),
+        respond_to_allowlist: vec![],
+        display_name: Some("Alice".to_string()),
+        slug: None,
+        runtime: None,
+        name_pool: vec![],
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        team_catalog_source: None,
+        definition_respond_to: None,
+        definition_respond_to_allowlist: vec![],
+        definition_parallelism: None,
+        relay_mesh: None,
+        effort_level: None,
+    };
+    crate::managed_agents::save_managed_agents(app.handle(), &[agent_record])
+        .expect("agent seed must succeed");
+
+    // Submit a rename with a retain callback that always fails — simulates a
+    // strict publication/enqueue failure AFTER save_personas ran.
+    let result = update_persona_with(
+        UpdatePersonaRequest {
+            id: "p1".to_string(),
+            display_name: "Alice Renamed".to_string(),
+            avatar_url: None,
+            system_prompt: "Do the work.".to_string(),
+            runtime: None,
+            model: None,
+            provider: None,
+            name_pool: Vec::new(),
+            env_vars: None,
+            behavior: None,
+            expected_updated_at: Some(R1.to_string()),
+        },
+        app.handle().clone(),
+        |_app, _state, _persona| -> Result<(), String> {
+            Err("simulated publish failure after persona persisted".to_string())
+        },
+    )
+    .await;
+
+    // The retain error must propagate so the coordinator sees publishFailed.
+    assert!(
+        result.is_err(),
+        "update_persona_with must return Err when retain fails; \
+         if this is Ok the retain error was swallowed"
+    );
+
+    // The linked agent must have been renamed BEFORE the error propagated.
+    // If save_managed_agents was skipped (the pre-fix path), the name is still "Alice".
+    let agents = crate::managed_agents::load_managed_agents(app.handle())
+        .expect("agent reload must succeed");
+    let stored_agent = agents
+        .iter()
+        .find(|a| a.pubkey == "pk-alice-p2")
+        .expect("linked agent must still exist");
+
+    assert_eq!(
+        stored_agent.name, "Alice Renamed",
+        "linked instance name must be propagated before the retain error is returned; \
+         restoring `retain()?` before the propagation block turns this RED"
+    );
+
+    // Cleanup
+    std::env::remove_var("HOME");
+    std::env::remove_var("XDG_DATA_HOME");
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+        None => std::env::remove_var("XDG_DATA_HOME"),
+    }
+}

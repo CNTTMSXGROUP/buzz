@@ -291,7 +291,47 @@ export async function runAgentSaveCoordinator(
       // reached. Mark this so final settlement does not close as full success:
       // "save and publish" promised a relay outcome that was not delivered.
       publishFailed = true;
-      firstError = caughtError;
+      // For combined D+I or D+L saves, settle publication independently now —
+      // before advancing to I/L writes — so a transient preparation failure
+      // does not permanently bypass recovery. If retry succeeds, clear
+      // publishFailed/firstError and proceed normally. If retry fails (or no
+      // seam), set firstError to block I/L advancement: the partial-failure
+      // toast will name both the unsaved I/L remainder and the unpublished
+      // catalog, since a fresh reopen seeds persisted values with no
+      // personaInput, meaning publication is never re-attempted.
+      const hasPendingIL = agentInput !== null || policySets.length > 0;
+      if (hasPendingIL) {
+        // Combined D+I or D+L save: settle publication before advancing to I/L.
+        if (publishRetry && def) {
+          let earlyRetryError: string | null = null;
+          try {
+            const earlyRetryResult = await publishRetry(def.id);
+            publicationStatus = earlyRetryResult.publicationStatus;
+            // Retry succeeded — publication settled. Clear both flags so I/L
+            // writes can continue and the final success branch fires.
+            publishFailed = false;
+            firstError = null;
+          } catch (err) {
+            earlyRetryError =
+              err instanceof Error ? err.message : "unknown error";
+          }
+          if (publishFailed) {
+            // Retry also failed — block I/L advancement and carry the reason
+            // as firstError. The partial-failure toast will name the profile as
+            // saved and the I/L remainder as not saved, with the catalog error
+            // as the failure reason — reopen/retry is accurate for the I/L
+            // remainder; the D change IS kept, catalog publication is not.
+            firstError = `catalog publication failed: ${earlyRetryError ?? caughtError ?? "unknown error"}`;
+          }
+        } else {
+          // No retry seam — block I/L advancement for the same reason.
+          firstError = `catalog publication failed: ${caughtError ?? "unknown error"}`;
+        }
+      } else {
+        // Definition-only save: the final `!observedRemainder && publishFailed`
+        // block handles publication retry after all settlement.
+        firstError = caughtError;
+      }
     }
   }
 

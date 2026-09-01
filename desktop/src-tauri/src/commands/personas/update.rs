@@ -209,7 +209,15 @@ pub(super) async fn update_persona_with<Rt: tauri::Runtime + 'static, R: Send + 
             let result = persona.clone();
             save_personas(&app, &personas)?;
 
-            let retained = retain(&app, &state, &result)?;
+            // Capture the retain result WITHOUT propagating the error yet.
+            // Linked managed-agent persistence (name/avatar propagation) and
+            // relay profile sync are independent of strict publication — a
+            // transient publication failure must not skip those local effects.
+            // Return the retain error after completing all linked work so the
+            // coordinator sees the accurate "definition saved but publication
+            // failed" error and can attempt the publish-only retry seam, which
+            // will now find the linked identities already updated.
+            let retain_result = retain(&app, &state, &result);
             try_regenerate_nest(&app);
 
             // If the avatar or display_name changed, propagate to linked agent
@@ -295,7 +303,7 @@ pub(super) async fn update_persona_with<Rt: tauri::Runtime + 'static, R: Send + 
                 Vec::new()
             };
 
-            Ok((result, retained, sync_params))
+            Ok((result, retain_result?, sync_params))
         }
     })
     .await

@@ -106,7 +106,7 @@ pub(crate) trait NipFiVerify: Send + Sync {
     /// Steps, all inside a single `BEGIN … COMMIT`:
     ///   1. `assert_community_write_allowed` — shared deletion advisory lock
     ///   2. `acquire_nip_fi_writer_lock` — exclusive per-community NIP-FI lock
-    ///   3. `SELECT transaction_timestamp()` as `db_now`
+    ///   3. `db_now` sampled post-lock inside `commit_admission_in_tx` / `authorize_protected_use_in_tx`
     ///   4. `commit_admission_in_tx` — enrollment, replay claim, receipts,
     ///      epoch/fence, `protected_object_authority` upsert
     ///   5. `authorize_protected_use_in_tx` — re-read every committed witness,
@@ -117,13 +117,21 @@ pub(crate) trait NipFiVerify: Send + Sync {
     /// Any error at any step rolls back all authority mutations AND the event
     /// insert together — zero orphaned enrollment/replay/receipt/fence rows.
     ///
-    /// Returns `(StoredEvent, was_inserted)` on success, exactly matching the
-    /// contract of the non-NIP-FI event insert path so callers can treat them
-    /// identically.
+    /// Returns `(StoredEvent, was_inserted, thread_meta)` on success.  The
+    /// `thread_meta` is the resolved thread summary stored inside the atomic
+    /// transaction; it must be passed to the post-commit 39005 emitter so
+    /// subscribers receive a live-summary update after FI replies.
     async fn commit_kind9_atomic(
         &self,
         params: Kind9Params,
-    ) -> Result<(StoredEvent, bool), AdmissionError>;
+    ) -> Result<
+        (
+            StoredEvent,
+            bool,
+            Option<crate::handlers::ingest::ThreadMetadataOwned>,
+        ),
+        AdmissionError,
+    >;
 }
 
 /// Concrete implementation of [`NipFiVerify`] that wraps the production
@@ -152,9 +160,16 @@ impl<S: IssuerKeySource + Sync + Send + 'static> NipFiVerify for NipFiVerifierIm
     async fn commit_kind9_atomic(
         &self,
         params: Kind9Params,
-    ) -> Result<(StoredEvent, bool), AdmissionError> {
-        // Revalidate the compact JWS once, before the transaction opens.
-        // This keeps the network round-trip out of the transaction.
+    ) -> Result<
+        (
+            StoredEvent,
+            bool,
+            Option<crate::handlers::ingest::ThreadMetadataOwned>,
+        ),
+        AdmissionError,
+    > {
+        // Initial assertion revalidation before the retry loop opens a transaction.
+        // Each retry revalidates again inside the loop after acquiring locks.
         let fresh_assertion = admission::revalidate_assertion(
             &*self.verifier,
             &params.verified_assertion,
@@ -173,8 +188,8 @@ const NS_ADMISSION_OP: [u8; 16] = {
     //   echo -n "buzz.nip-fi.admission-op.v1" | sha256sum
     //   → 1c4b7f0a e2d93518 85c62f4b 3a910cd7 ...
     [
-        0x1c, 0x4b, 0x7f, 0x0a, 0xe2, 0xd9, 0x35, 0x18,
-        0x85, 0xc6, 0x2f, 0x4b, 0x3a, 0x91, 0x0c, 0xd7,
+        0x1c, 0x4b, 0x7f, 0x0a, 0xe2, 0xd9, 0x35, 0x18, 0x85, 0xc6, 0x2f, 0x4b, 0x3a, 0x91, 0x0c,
+        0xd7,
     ]
 };
 
@@ -207,7 +222,14 @@ async fn commit_kind9_inner(
     db: &buzz_db::Db,
     params: Kind9Params,
     fresh_assertion: VerifiedAssertion,
-) -> Result<(StoredEvent, bool), AdmissionError> {
+) -> Result<
+    (
+        StoredEvent,
+        bool,
+        Option<crate::handlers::ingest::ThreadMetadataOwned>,
+    ),
+    AdmissionError,
+> {
     use sha2::{Digest, Sha256};
 
     let Kind9Params {
@@ -237,7 +259,8 @@ async fn commit_kind9_inner(
         let ts = event.created_at.as_secs();
         DateTime::from(UNIX_EPOCH + Duration::from_secs(ts))
     };
-    let operation_id = deterministic_admission_op_id(community_id, &proof_event_id, &signed_event_id);
+    let operation_id =
+        deterministic_admission_op_id(community_id, &proof_event_id, &signed_event_id);
 
     // SHA-256 of the 16-byte canonical UUID — identical to PostgreSQL's
     // sha256(uuid_send(c.id)).
@@ -282,38 +305,26 @@ async fn commit_kind9_inner(
             .await
             .map_err(|e| AdmissionError::Transient(e.to_string()))?;
 
-        let db_now: DateTime<Utc> = match sqlx::query_scalar("SELECT transaction_timestamp()")
-            .fetch_one(&mut *tx)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => return Err(AdmissionError::Transient(e.to_string())),
-        };
-
         // Step A: community write assertion + NIP-FI writer lock + admission.
-        let committed = match admission::commit_admission_in_tx(
-            &mut tx,
-            db_now,
-            &ctx,
-            &proposal,
-            &fresh_assertion,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(AdmissionError::SerializationRetry)
-                if attempts < admission::MAX_SERIALIZATION_RETRIES =>
+        // db_now is sampled inside commit_admission_in_tx (after advisory locks).
+        let committed =
+            match admission::commit_admission_in_tx(&mut tx, &ctx, &proposal, &fresh_assertion)
+                .await
             {
-                tokio::time::sleep(std::time::Duration::from_millis((attempts as u64) * 5)).await;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
+                Ok(c) => c,
+                Err(AdmissionError::SerializationRetry)
+                    if attempts < admission::MAX_SERIALIZATION_RETRIES =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis((attempts as u64) * 5))
+                        .await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
         // Step B: protected-use re-fence inside the same tx.
         if let Err(e) = admission::authorize_protected_use_in_tx(
             &mut tx,
-            db_now,
             &committed,
             conn_id,
             &challenge,
@@ -358,11 +369,55 @@ async fn commit_kind9_inner(
         // event-precheck in commit_admission_body should have caught it
         // (step 3 in the amended protocol).  If a race produces was_inserted=false
         // here instead, we must NOT commit the authority mutations; roll back
-        // and return the duplicate result from a clean read.
+        // and reread the exact event + deterministic receipt in a clean
+        // transaction to confirm the prior commit was complete.
         if !result.1 {
             // Explicit rollback: no authority mutations reach disk.
             let _ = tx.rollback().await;
-            return Ok(result);
+            // Clean reread: open a new transaction to verify the exact
+            // (community_id, created_at, id) event exists.  Return
+            // DuplicateEvent only for a complete matching prior commit;
+            // return Transient for anything inconsistent.
+            let event_id_bytes: [u8; 32] = event.id.to_bytes();
+            let event_created_at_ts = event.created_at.as_secs() as i64;
+            let exists: bool = match async {
+                let mut read_tx = db
+                    .begin_transaction()
+                    .await
+                    .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+                let v: bool = sqlx::query_scalar(
+                    r#"
+                    SELECT EXISTS(
+                        SELECT 1 FROM events
+                        WHERE community_id = $1
+                          AND created_at = to_timestamp($2)
+                          AND id = $3
+                    )
+                    "#,
+                )
+                .bind(community_id)
+                .bind(event_created_at_ts)
+                .bind(event_id_bytes.as_slice())
+                .fetch_one(&mut *read_tx)
+                .await?;
+                let _ = read_tx.rollback().await;
+                Ok::<_, sqlx::Error>(v)
+            }
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(AdmissionError::Transient(
+                        "NIP-FI late-conflict reread failed".into(),
+                    ))
+                }
+            };
+            if exists {
+                return Ok((result.0, false, None));
+            }
+            return Err(AdmissionError::Transient(
+                "NIP-FI late-conflict: event absent after rollback".into(),
+            ));
         }
 
         // Step E: commit — all authority mutations + event insert or nothing.
@@ -374,7 +429,7 @@ async fn commit_kind9_inner(
             Ok(()) => {
                 db.insert_mentions_post_commit(community_id_typed, &event, Some(channel_id))
                     .await;
-                return Ok(result);
+                return Ok((result.0, result.1, thread_meta));
             }
             Err(e) => return Err(e),
         }
@@ -445,7 +500,14 @@ pub(crate) mod test_support {
         async fn commit_kind9_atomic(
             &self,
             params: Kind9Params,
-        ) -> Result<(StoredEvent, bool), AdmissionError> {
+        ) -> Result<
+            (
+                StoredEvent,
+                bool,
+                Option<crate::handlers::ingest::ThreadMetadataOwned>,
+            ),
+            AdmissionError,
+        > {
             // JWS revalidation skipped — pass the incoming assertion as both
             // the sealed context assertion and the fresh revalidated assertion.
             let fresh_assertion = params.verified_assertion.clone();

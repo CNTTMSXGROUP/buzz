@@ -369,12 +369,23 @@ async fn nip11_or_ws_handler(
             // Extract the NIP-FI assertion header BEFORE the upgrade consumes
             // the HTTP request headers.  The `Nostr-Federated-Identity` header
             // must appear exactly once with a `Bearer <compact-JWS>` value.
-            // Any malformed, missing, or repeated header is extracted as `None`
-            // (no NIP-FI for this connection — the verifier rejects if needed).
-            let nip_fi_raw_token = extract_nip_fi_bearer(&headers);
+            // Malformed or repeated headers are rejected with the canonical
+            // DenialClass HTTP response before the upgrade so the 101 is never
+            // sent for an invalid evidence presentation.
+            let nip_fi_header = extract_nip_fi_bearer(&headers);
+            if matches!(nip_fi_header, NipFiHeader::Malformed) {
+                use buzz_auth::nip_fi::DenialClass;
+                let cls = DenialClass::EvidenceRejected;
+                return (
+                    StatusCode::from_u16(cls.http_status()).unwrap_or(StatusCode::FORBIDDEN),
+                    [(header::CONTENT_TYPE, cls.content_type())],
+                    cls.http_body(),
+                )
+                    .into_response();
+            }
             limit_relay_websocket(ws, max_frame_bytes)
                 .on_upgrade(move |socket| {
-                    handle_connection(socket, state, addr, tenant, nip_fi_raw_token)
+                    handle_connection(socket, state, addr, tenant, nip_fi_header)
                 })
                 .into_response()
         }
@@ -396,38 +407,54 @@ async fn nip11_or_ws_handler(
     }
 }
 
+/// Parsed result of the `Nostr-Federated-Identity` HTTP header.
+///
+/// Distinguishes three states so the relay can apply the correct canonical
+/// denial class before allowing the WebSocket upgrade:
+/// - `Absent` — no header present; plain NIP-42 connection.
+/// - `Valid(token)` — exactly one well-formed `Bearer <token>` value.
+/// - `Malformed` — header present but invalid (repeated, non-UTF-8, bad prefix,
+///   or empty token); must not be treated as equivalent to absent.
+#[derive(Debug)]
+pub(crate) enum NipFiHeader {
+    Absent,
+    Valid(String),
+    Malformed,
+}
+
 /// Extract the NIP-FI compact JWS from the `Nostr-Federated-Identity` HTTP
 /// header, if present and well-formed.
 ///
 /// The header must appear exactly once with the value `Bearer <token>`.
-/// Returns `None` on any of:
-///   - header absent (plain NIP-42 connection)
-///   - header appears more than once (ambiguous — reject silently, caller will
-///     treat as missing and the verifier will reject if mode requires it)
-///   - header value not parseable as a valid UTF-8 string
-///   - value does not start with `Bearer ` (case-sensitive)
-///   - token after `Bearer ` is empty
+/// Returns [`NipFiHeader::Absent`] when the header is not present,
+/// [`NipFiHeader::Valid`] when it is well-formed, and [`NipFiHeader::Malformed`]
+/// when it is present but invalid (repeated, non-UTF-8, bad prefix, or empty).
 ///
-/// Note: returning `None` here means "no NIP-FI header claimed".  The
-/// connection verifier rejects if the relay is in client-attached mode and
-/// no assertion was provided — that check happens in
-/// `handle_active_connection`.
-fn extract_nip_fi_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+/// `Malformed` is never treated as `Absent` — the router rejects it before
+/// the WebSocket upgrade with the canonical `DenialClass::EvidenceRejected`
+/// response rather than silently downgrading to no-FI mode.
+fn extract_nip_fi_bearer(headers: &axum::http::HeaderMap) -> NipFiHeader {
     const HEADER_NAME: &str = "Nostr-Federated-Identity";
     const BEARER_PREFIX: &str = "Bearer ";
 
     let mut values = headers.get_all(HEADER_NAME).iter();
-    let first = values.next()?;
+    let first = match values.next() {
+        None => return NipFiHeader::Absent,
+        Some(v) => v,
+    };
     // Reject if the header appears more than once.
     if values.next().is_some() {
-        return None;
+        return NipFiHeader::Malformed;
     }
-    let value = first.to_str().ok()?;
-    let token = value.strip_prefix(BEARER_PREFIX)?;
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
+    let value = match first.to_str() {
+        Ok(s) => s,
+        Err(_) => return NipFiHeader::Malformed,
+    };
+    let token = match value.strip_prefix(BEARER_PREFIX) {
+        Some(t) if !t.is_empty() => t,
+        _ => return NipFiHeader::Malformed,
+    };
+    NipFiHeader::Valid(token.to_string())
 }
 
 fn limit_relay_websocket<F>(

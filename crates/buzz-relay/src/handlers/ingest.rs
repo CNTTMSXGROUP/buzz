@@ -3044,9 +3044,23 @@ async fn ingest_event_inner(
     // is absent (verifier not yet wired at startup), reject rather than silently
     // downgrade — this prevents a misconfiguration from bypassing the authority
     // boundary.
-    let nip_fi_atomic_result: Option<(buzz_core::StoredEvent, bool)> = if kind_u32
-        == KIND_STREAM_MESSAGE
-    {
+    //
+    // deny-protected mode: all kind-9 writes denied unconditionally with the
+    // canonical AuthorizationDenied class (no verifier needed).
+    let nip_fi_atomic_result: Option<(buzz_core::StoredEvent, bool)>;
+    let nip_fi_thread_meta: Option<ThreadMetadataOwned>;
+    (nip_fi_atomic_result, nip_fi_thread_meta) = if kind_u32 == KIND_STREAM_MESSAGE {
+        // deny-protected: reject before attempting any gate logic.
+        if matches!(
+            state.nip_fi_mode,
+            buzz_auth::nip_fi::NipFiMode::DenyProtected
+        ) {
+            return Err(IngestError::Rejected(
+                buzz_auth::nip_fi::DenialClass::AuthorizationDenied
+                    .nostr_text()
+                    .to_string(),
+            ));
+        }
         if let Some(nip_fi_ctx) = auth.nip_fi_context() {
             let conn_id = auth.conn_id().ok_or_else(|| {
                 IngestError::Rejected(
@@ -3105,57 +3119,50 @@ async fn ingest_event_inner(
                     message: "duplicate:".into(),
                 });
             }
-            let result = nip_fi_result
-                .map_err(|e| {
-                    match e {
-                        AdmissionError::ProofReplayed => {
-                            IngestError::Rejected("restricted: NIP-FI proof already used".into())
-                        }
-                        AdmissionError::ProofExpired | AdmissionError::PreparedDeadlineExpired => {
-                            IngestError::Rejected(
-                                "restricted: NIP-FI proof or assertion deadline expired".into(),
-                            )
-                        }
-                        AdmissionError::CommunityWriteFenced => {
-                            IngestError::Rejected("restricted: community writes are fenced".into())
-                        }
-                        AdmissionError::ResourceStateDenied => IngestError::Rejected(
-                            "restricted: NIP-FI channel resource denied".into(),
-                        ),
-                        AdmissionError::NoActiveBinding | AdmissionError::BindingRetired => {
-                            IngestError::Rejected("restricted: NIP-FI binding not active".into())
-                        }
-                        AdmissionError::AssertionEquivalenceViolation
-                        | AdmissionError::ContractIdChanged => IngestError::Rejected(
-                            "restricted: NIP-FI assertion changed at revalidation".into(),
-                        ),
-                        AdmissionError::EnrollmentConflict => {
-                            IngestError::Rejected("restricted: NIP-FI enrollment conflict".into())
-                        }
-                        AdmissionError::SerializationRetry => IngestError::Internal(
-                            "error: NIP-FI admission serialization retry exhausted".into(),
-                        ),
-                        _ => IngestError::Rejected(format!("restricted: NIP-FI admission: {e:?}")),
-                    }
-                })?;
-            Some(result)
+            let (stored_event, was_inserted, fi_thread_meta) = nip_fi_result.map_err(|e| {
+                use buzz_auth::nip_fi::DenialClass;
+                match e {
+                    AdmissionError::ProofReplayed
+                    | AdmissionError::NoActiveBinding
+                    | AdmissionError::BindingRetired
+                    | AdmissionError::AssertionEquivalenceViolation
+                    | AdmissionError::ContractIdChanged
+                    | AdmissionError::EnrollmentConflict
+                    | AdmissionError::ResourceStateDenied
+                    | AdmissionError::CommunityWriteFenced
+                    | AdmissionError::ProofExpired
+                    | AdmissionError::PreparedDeadlineExpired => IngestError::Rejected(
+                        DenialClass::AuthorizationDenied.nostr_text().to_string(),
+                    ),
+                    AdmissionError::SerializationRetry => IngestError::Internal(
+                        DenialClass::AuthorizationUnavailable
+                            .nostr_text()
+                            .to_string(),
+                    ),
+                    _ => IngestError::Rejected(
+                        DenialClass::AuthorizationDenied.nostr_text().to_string(),
+                    ),
+                }
+            })?;
+            (Some((stored_event, was_inserted)), fi_thread_meta)
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
     let thread_meta = if requires_h_channel_scope(kind_u32) {
         if let Some(ch_id) = channel_id {
-            // Skip for NIP-FI events — thread_meta was already resolved inside
-            // the atomic block and the event is already stored.
-            if nip_fi_atomic_result.is_none() {
+            // For NIP-FI events — thread_meta was already resolved inside
+            // the atomic block and returned alongside the result.  Use it
+            // directly so the post-commit 39005 emitter fires correctly.
+            if nip_fi_atomic_result.is_some() {
+                nip_fi_thread_meta
+            } else {
                 resolve_nip10_thread_meta(tenant.community(), &event, ch_id, state)
                     .await
                     .map_err(|msg| IngestError::Rejected(format!("invalid: {msg}")))?
-            } else {
-                None
             }
         } else {
             None

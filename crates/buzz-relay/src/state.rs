@@ -776,9 +776,17 @@ pub struct AppState {
     /// `Some` when NIP-FI is configured in enforce mode; `None` when disabled
     /// (the default in environments without federated identity configuration).
     /// Kind-9 ingest calls this after all NIP-29 membership and channel checks
-    /// have passed — a `None` verifier skips the NIP-FI gate and relies on
-    /// NIP-29 membership alone.
+    /// have passed — a `None` verifier with `nip_fi_mode == Off` skips the
+    /// NIP-FI gate and relies on NIP-29 membership alone.
     pub(crate) nip_fi: Option<Arc<dyn crate::nip_fi::NipFiVerify>>,
+
+    /// Active NIP-FI operational mode.
+    ///
+    /// Set by `init_nip_fi_from_env`.  Defaults to `Off` when NIP-FI is not
+    /// configured.  `DenyProtected` rejects all protected kind-9 writes with
+    /// the canonical `AuthorizationDenied` class before any gate logic runs,
+    /// even when `nip_fi` is `None`.
+    pub(crate) nip_fi_mode: buzz_auth::nip_fi::NipFiMode,
 }
 
 impl AppState {
@@ -955,6 +963,7 @@ impl AppState {
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
             nip_fi: None,
+            nip_fi_mode: buzz_auth::nip_fi::NipFiMode::Off,
         };
         (
             state,
@@ -1416,7 +1425,7 @@ impl std::fmt::Debug for AppState {
 /// `NipFiVerifierImpl<ProductionJwksSource<HttpJwksFetcher>>` and assigns it to
 /// `state.nip_fi`.  The relay **must** refuse to start on any configuration
 /// error (FI-INV-14: fail closed).
-pub fn init_nip_fi_from_env(state: &mut AppState) -> anyhow::Result<()> {
+pub async fn init_nip_fi_from_env(state: &mut AppState) -> anyhow::Result<()> {
     use buzz_auth::nip_fi::{
         validate_nip_fi_config, FederatedAssertionVerifier, HttpJwksFetcher, IssuerJwksConfig,
         IssuerPolicy, IssuerRegistry, JwksSourceContract, NipFiMode, ProductionJwksSource,
@@ -1438,6 +1447,10 @@ pub fn init_nip_fi_from_env(state: &mut AppState) -> anyhow::Result<()> {
             ));
         }
     };
+
+    // Store the mode unconditionally so ingest can enforce deny-protected
+    // without a configured verifier.
+    state.nip_fi_mode = mode;
 
     if !matches!(mode, NipFiMode::Enforce) {
         if matches!(mode, NipFiMode::DenyProtected) {
@@ -1502,7 +1515,7 @@ pub fn init_nip_fi_from_env(state: &mut AppState) -> anyhow::Result<()> {
 
     let jwks_config = IssuerJwksConfig {
         issuer: issuer.clone(),
-        contract,
+        contract: contract.clone(),
     };
 
     validate_nip_fi_config(
@@ -1512,12 +1525,50 @@ pub fn init_nip_fi_from_env(state: &mut AppState) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("NIP-FI startup validation failed: {e}"))?;
 
-    let key_source = ProductionJwksSource::new(vec![jwks_config], HttpJwksFetcher::new())
-        .ok_or_else(|| {
+    let key_source = Arc::new(
+        ProductionJwksSource::new(vec![jwks_config], HttpJwksFetcher::new()).ok_or_else(|| {
             anyhow::anyhow!("NIP-FI: failed to build JWKS key source (duplicate issuer?)")
-        })?;
+        })?,
+    );
 
-    let verifier = FederatedAssertionVerifier::new(registry, key_source);
+    // Bounded initial JWKS acquisition: warm every configured issuer before
+    // declaring startup successful.  A relay that cannot reach its JWKS
+    // endpoint on startup must not accept protected traffic — fail closed.
+    tracing::info!(issuer = %issuer, "NIP-FI: acquiring initial JWKS snapshot");
+    if key_source.get_snapshot(&issuer).await.is_none() {
+        return Err(anyhow::anyhow!(
+            "NIP-FI: initial JWKS acquisition failed for issuer {issuer:?} — \
+             check BUZZ_NIP_FI_JWKS_URI and network connectivity"
+        ));
+    }
+    tracing::info!(issuer = %issuer, "NIP-FI: initial JWKS snapshot acquired");
+
+    // Spawn a lifecycle-bound periodic refresh task.  The task holds a weak
+    // Arc clone and exits when the key source is dropped (relay shutdown).
+    // Refresh interval comes from the validated contract.
+    let refresh_source = Arc::clone(&key_source);
+    let refresh_issuer = issuer.clone();
+    let refresh_interval = std::time::Duration::from_secs(contract.refresh_interval_seconds());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(refresh_interval);
+        interval.tick().await; // first tick fires immediately; skip it
+        loop {
+            interval.tick().await;
+            match refresh_source.get_snapshot(&refresh_issuer).await {
+                Some(_) => {
+                    tracing::debug!(issuer = %refresh_issuer, "NIP-FI: JWKS snapshot refreshed");
+                }
+                None => {
+                    tracing::warn!(
+                        issuer = %refresh_issuer,
+                        "NIP-FI: JWKS refresh returned no snapshot — key source may be stale"
+                    );
+                }
+            }
+        }
+    });
+
+    let verifier = FederatedAssertionVerifier::new(registry, Arc::clone(&key_source));
     let db_arc = Arc::new(state.db.clone());
     let impl_ = crate::nip_fi::NipFiVerifierImpl::new(db_arc, verifier);
     state.nip_fi = Some(Arc::new(impl_) as Arc<dyn crate::nip_fi::NipFiVerify>);
@@ -2682,7 +2733,7 @@ pub(crate) mod tests {
         std::env::remove_var("BUZZ_NIP_FI_MODE");
 
         let (mut state, _) = build_minimal_app_state_for_init_test().await;
-        let result = super::init_nip_fi_from_env(&mut state);
+        let result = super::init_nip_fi_from_env(&mut state).await;
         assert!(result.is_ok(), "off mode must succeed: {result:?}");
         assert!(state.nip_fi.is_none(), "off mode must leave nip_fi = None");
 
@@ -2706,7 +2757,7 @@ pub(crate) mod tests {
         std::env::remove_var("BUZZ_NIP_FI_JWKS_URI");
 
         let (mut state, _) = build_minimal_app_state_for_init_test().await;
-        let result = super::init_nip_fi_from_env(&mut state);
+        let result = super::init_nip_fi_from_env(&mut state).await;
         assert!(
             result.is_err(),
             "enforce without BUZZ_NIP_FI_ISSUER must fail closed"

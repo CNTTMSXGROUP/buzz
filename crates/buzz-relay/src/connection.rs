@@ -160,15 +160,17 @@ impl ConnectionState {
 /// Acquires a connection semaphore permit, sends the NIP-42 AUTH challenge,
 /// then drives the send, heartbeat, and receive loops until the connection closes.
 ///
-/// `nip_fi_raw_token` is the raw compact JWS from the
-/// `Nostr-Federated-Identity: Bearer <token>` HTTP header, extracted before
-/// the WebSocket upgrade.  `None` means no NIP-FI header was present.
+/// `nip_fi_header` is the parsed NIP-FI header result from the HTTP upgrade
+/// request, extracted before the WebSocket handshake.  `Absent` means no
+/// NIP-FI evidence was presented; `Valid` carries the raw compact JWS;
+/// `Malformed` is rejected before this function is reached (pre-upgrade denial
+/// in the router), so it will never arrive here.
 pub async fn handle_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
-    nip_fi_raw_token: Option<String>,
+    nip_fi_header: crate::router::NipFiHeader,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -191,7 +193,7 @@ pub async fn handle_connection(
                 tenant,
                 conn_id,
                 control,
-                nip_fi_raw_token,
+                nip_fi_header,
             )
         },
     )
@@ -205,7 +207,7 @@ async fn handle_active_connection(
     tenant: TenantContext,
     conn_id: Uuid,
     control: CommunityConnectionControl,
-    nip_fi_raw_token: Option<String>,
+    nip_fi_header: crate::router::NipFiHeader,
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
@@ -220,9 +222,17 @@ async fn handle_active_connection(
     // Verify the NIP-FI assertion at connection time if the header was present.
     // Fail closed: if a header was present but verification fails or no verifier
     // is configured, reject the connection immediately.
-    let nip_fi_assertion = match nip_fi_raw_token {
-        None => None,
-        Some(ref token) => match state.nip_fi.as_ref() {
+    let nip_fi_assertion = match nip_fi_header {
+        crate::router::NipFiHeader::Absent => None,
+        crate::router::NipFiHeader::Malformed => {
+            // Malformed headers are rejected pre-upgrade in the router.
+            // If one arrives here it means the router check was skipped (e.g.
+            // in tests) — fail closed.
+            warn!(conn_id = %conn_id, addr = %addr,
+                "NIP-FI malformed header reached connection handler — rejecting");
+            return;
+        }
+        crate::router::NipFiHeader::Valid(ref token) => match state.nip_fi.as_ref() {
             None => {
                 // NIP-FI header present but verifier not configured.
                 warn!(conn_id = %conn_id, addr = %addr,

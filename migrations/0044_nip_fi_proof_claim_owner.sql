@@ -17,5 +17,25 @@
 --   3. Different conn_id → ProofReplayed (cross-connection reuse)
 --   4. No row → proceed; INSERT this row at step 9 of commit_admission_body
 
+-- Existing 0043-shape rows (if any) receive a synthetic owner UUID matching no
+-- live connection.  This is deliberate fail-closed: replays of pre-0044 legacy
+-- proofs from any connection are rejected as cross-connection reuse (the stored
+-- sentinel never matches a live conn_id), preventing any legacy claim from being
+-- reused post-migration.  The ownership protocol applies only to claims written
+-- after this migration; the append-only trigger continues to hold for all rows.
+--
+-- Three-step safe upgrade for populated tables:
+--   1. Add nullable column (no constraint yet — existing rows get NULL).
+--   2. Backfill NULLs with gen_random_uuid() — one random sentinel per row.
+--   3. Set NOT NULL (no DEFAULT) so future inserts must supply connection_id
+--      explicitly; any insert that omits it errors immediately rather than
+--      silently getting a wrong owner.
 ALTER TABLE nip_fi_proof_replay_claims
-    ADD COLUMN IF NOT EXISTS connection_id UUID NOT NULL;
+    ADD COLUMN IF NOT EXISTS connection_id UUID;
+
+UPDATE nip_fi_proof_replay_claims
+    SET connection_id = gen_random_uuid()
+    WHERE connection_id IS NULL;
+
+ALTER TABLE nip_fi_proof_replay_claims
+    ALTER COLUMN connection_id SET NOT NULL;

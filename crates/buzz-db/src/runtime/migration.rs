@@ -699,7 +699,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 42);
+        assert_eq!(migrations.len(), 44);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1815,6 +1815,17 @@ mod postgres_tests {
         let mut expected_fences = migration.fence_attachments.clone();
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
+        expected_fences.extend(
+            surface(
+                MIGRATOR
+                    .iter()
+                    .find(|item| item.version == 43)
+                    .expect("migration 0043")
+                    .sql
+                    .as_ref(),
+            )
+            .fence_attachments,
+        );
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

@@ -1376,8 +1376,8 @@ fn wrapper_refuses_push_via_deprecated_builtin_alias() {
     );
     // Set alias.whatchanged = -p push.
     // `-p` is a safe bare-word token (no `-c`, no `=`, no quote) that real git
-    // reparses as the --porcelain global, so `git whatchanged -p push origin
-    // main` is equivalent to `git push --porcelain origin main` at exec time.
+    // reparses as the --paginate global, so `git whatchanged -p push origin
+    // main` is equivalent to `git -p push origin main` at exec time.
     // With the deprecated-aware fix, `verify_alias_safety` follows the alias
     // (whatchanged is deprecated → alias-first), expands to effective argv with
     // subcommand `push`, and policy refuses.

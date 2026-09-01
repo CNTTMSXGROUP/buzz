@@ -545,7 +545,6 @@ export function useMentions(
       );
       if (options?.isAgent) {
         selectedAgentMentionPubkeysRef.current.add(normalizePubkey(pubkey));
-        selectedAgentMentionPubkeysRef.current.add(normalizePubkey(pubkey));
         selectedAgentMentionNamesRef.current = appendUniqueName(
           selectedAgentMentionNamesRef.current,
           trimmedName,

@@ -868,7 +868,7 @@ impl AgentPool {
 
     /// Whether `nonce` was recently forwarded to a read loop and is still within
     /// the retention window. A late retransmit that matches is a duplicate the
-    /// harness has already applied — the caller acks it success-shaped rather
+    /// harness has already forwarded — the caller acks it success-shaped rather
     /// than failing the resolved card.
     pub fn was_recently_decided(&self, nonce: &str) -> bool {
         self.recently_decided.get(nonce).is_some_and(|at| {

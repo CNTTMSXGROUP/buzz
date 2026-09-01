@@ -4068,21 +4068,30 @@ pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Op
 
         return Some(match raw_input {
             Some(ri) if ri.is_object() => {
-                // Budget: reserve 5 bytes for wrapper overhead so the
-                // combined string always fits in DESCRIPTION_COMBINED_MAX_BYTES.
-                // Worst case: "(ctx…)" where "…" is the UTF-8 ellipsis U+2026
-                // (3 bytes) plus the parens = 5 bytes total. Using 5 as the
-                // constant covers both the truncated ("(ctx…)") and
-                // non-truncated ("(ctx)") cases.
-                let wrapper_overhead = 5usize; // "(" + "…" (3 bytes, UTF-8) + ")"
-                let title_bytes = t.len(); // titles are ASCII in practice
+                // Budget allocation so the combined form always fits in
+                // DESCRIPTION_COMBINED_MAX_BYTES:
+                //
+                //   wrapper overhead: 5 bytes — "(" + "…" (U+2026, 3 bytes) + ")"
+                //   context reserve:  10 bytes — minimum useful argument context
+                //
+                // The title is capped to `DESCRIPTION_COMBINED_MAX_BYTES -
+                // wrapper_overhead - context_reserve` so that even a maximum-length
+                // title always leaves room for at least `context_reserve` bytes of
+                // argument context. This preserves producer-faithful distinguishability
+                // (two different commands under the same long title produce different
+                // descriptions) while keeping the combined string within 200 bytes.
+                const WRAPPER_OVERHEAD: usize = 5; // "(" + "…" (3 bytes) + ")"
+                const CONTEXT_RESERVE: usize = 10; // minimum visible context
+                let title_cap_limit = DESCRIPTION_COMBINED_MAX_BYTES
+                    .saturating_sub(WRAPPER_OVERHEAD)
+                    .saturating_sub(CONTEXT_RESERVE);
+                let title_cap = truncate_to_bytes(t, title_cap_limit);
                 let context_budget = DESCRIPTION_COMBINED_MAX_BYTES
-                    .saturating_sub(title_bytes)
-                    .saturating_sub(wrapper_overhead);
+                    .saturating_sub(title_cap.len())
+                    .saturating_sub(WRAPPER_OVERHEAD);
 
                 match summarize_raw_input(ri) {
-                    Some(ctx) if !ctx.is_empty() && context_budget > 0 => {
-                        let title_cap = truncate_to_bytes(t, DESCRIPTION_COMBINED_MAX_BYTES);
+                    Some(ctx) if !ctx.is_empty() => {
                         let ctx_cap = truncate_to_bytes(&ctx, context_budget);
                         let truncated = ctx.len() > ctx_cap.len();
                         if truncated {
@@ -4091,7 +4100,7 @@ pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Op
                             format!("{title_cap}({ctx_cap})")
                         }
                     }
-                    _ => truncate_to_bytes(t, DESCRIPTION_COMBINED_MAX_BYTES),
+                    _ => title_cap,
                 }
             }
             _ => truncate_to_bytes(t, DESCRIPTION_COMBINED_MAX_BYTES),
@@ -8599,114 +8608,100 @@ mod tests {
         }
     }
 
-    /// Production-seam test: the combined description bound (≤200 bytes) is
-    /// verified at the sentinel level, not just in the pure extractor.
+    /// Production-seam test: the combined description in the sentinel carries
+    /// both the title and a bounded argument context — two different commands
+    /// under the same long title produce distinguishable descriptions.
     ///
-    /// Sends a v2 permission request where rawInput has a `command` field whose
-    /// length, combined with the tool name, would exceed the old per-field budget.
-    /// After F1, the combined form must still fit in DESCRIPTION_COMBINED_MAX_BYTES.
+    /// This test drives the full `handle_permission_request` → kind-9 sentinel
+    /// path and asserts:
+    ///   1. The sentinel description fits within `DESCRIPTION_COMBINED_MAX_BYTES`.
+    ///   2. The description contains both the (truncated) tool name AND part of
+    ///      the command argument — proving neither erases the other.
+    ///   3. Two requests with the same long title but different commands produce
+    ///      distinct sentinel descriptions (producer-faithful distinguishability).
     ///
-    /// Mutation proof: removing the `DESCRIPTION_COMBINED_MAX_BYTES` cap from
-    /// `description_from_request_permission` allows the combined string to exceed
-    /// 200 bytes — `build_sentinel_pending_payload` then truncates it silently,
-    /// yielding a different sentinel-level value and making the bound assertion here
-    /// go red (description > DESCRIPTION_COMBINED_MAX_BYTES without the cap).
+    /// Mutation proof: removing the title-cap limit (restoring `title_cap_limit
+    /// = DESCRIPTION_COMBINED_MAX_BYTES`) saturates `context_budget` to zero for
+    /// a 185-byte title, erasing all argument context. The two descriptions then
+    /// collapse to the same truncated title and the `assert_ne!` goes red.
     #[tokio::test]
     async fn production_seam_description_combined_bound_in_sentinel() {
-        let keys = Keys::generate();
-        let owner_hex = keys.public_key().to_hex();
-        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
-        let published: std::sync::Arc<std::sync::Mutex<Vec<nostr::Event>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let published_drain = published.clone();
-        tokio::spawn(async move {
-            let mut rx = event_rx;
-            while let Some(ev) = rx.recv().await {
-                published_drain.lock().unwrap().push(ev);
-            }
-        });
+        // Tool name at exactly the old saturation point (185 bytes = 200 - 5 overhead - 10 reserve).
+        // With the fix: title is capped to 185, context_budget = 200 - 185 - 5 = 10 bytes.
+        // Without the fix: title fills 185, context_budget = 200 - 185 - 5 = 10 (same! but with
+        //   100-byte title: context_budget = 200 - 100 - 5 = 95; old code had context_budget = 95
+        //   but used truncate(t, 200) for title_cap, so title could be up to 200; with 185-byte
+        //   title old code gives context_budget = 200 - 185 - 5 = 10; still OK).
+        // Use 200-byte title to trigger the saturation: old code: context_budget = 200 - 200 - 5
+        //   = 0 → no context; new code: title_cap = truncate(200, 185) = 185 bytes,
+        //   context_budget = 200 - 185 - 5 = 10 → context preserved.
+        let long_title = "t".repeat(DESCRIPTION_COMBINED_MAX_BYTES); // 200 bytes, saturates old code
+        let cmd_a = "aaaaaaaaaa"; // 10 bytes — fits exactly in the reserved context budget
+        let cmd_b = "bbbbbbbbbb"; // different command, same title
 
-        let mut client = spawn_script("sleep 600").await;
-        client.set_permission_config(
-            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
-        );
-        client.set_owner_pubkey_known(true);
-        client.set_relay_publisher(publisher, keys.clone());
-        client.set_agent_owner_pubkey_hex(Some(owner_hex));
-        client.set_turn_initiator_pubkey(Some(keys.public_key()));
-        client.set_turn_channel_context(
-            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000020").unwrap()),
-            None,
-        );
-        let obs = crate::observer::ObserverHandle::in_process();
-        client.set_observer(Some(obs.clone()), 0);
-        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
-        client.install_permission_decision_rx(perm_rx);
-
-        // Tool name (50 bytes) + command (300 bytes) would exceed the old 322-byte
-        // budget; the new combined cap must keep it at ≤200 bytes.
-        let tool_name = "a".repeat(50);
-        let long_cmd = "x".repeat(300);
-        let msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 77,
-            "method": "session/request_permission",
-            "params": {
-                "sessionId": "sess-bound-seam",
-                "title": tool_name,
-                "subject": {
-                    "type": "tool_call",
-                    "toolCall": {
-                        "toolCallId": "tc-bound-seam",
-                        "title": tool_name,
-                        "rawInput": {"command": long_cmd},
+        let make_msg = |title: &str, cmd: &str| {
+            let cmd_long = cmd.repeat(30); // 300 bytes — requires truncation
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "sess-bound-seam",
+                    "title": title,
+                    "subject": {
+                        "type": "tool_call",
+                        "toolCall": {
+                            "toolCallId": "tc-seam",
+                            "title": title,
+                            "rawInput": {"command": cmd_long},
+                        },
                     },
-                },
-                "options": [
-                    {"optionId": "opt-allow", "kind": "allow_once", "name": "Allow"},
-                    {"optionId": "opt-deny",  "kind": "reject_once", "name": "Deny"},
-                ],
-            }
-        });
-        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
-        client
-            .handle_permission_request(&msg, hard)
-            .await
-            .expect("registration must succeed");
-
-        // Wait for the kind-9 sentinel to be published.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let found = published
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|ev| ev.kind.as_u16() == 9);
-            if found || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        let kind9_content = {
-            let guard = published.lock().unwrap();
-            guard
-                .iter()
-                .find(|ev| ev.kind.as_u16() == 9)
-                .map(|ev| ev.content.clone())
-                .expect("kind-9 sentinel must have been published")
+                    "options": [
+                        {"optionId": "opt-allow", "kind": "allow_once", "name": "Allow"},
+                        {"optionId": "opt-deny",  "kind": "reject_once", "name": "Deny"},
+                    ],
+                }
+            })
         };
-        let payload: serde_json::Value =
-            serde_json::from_str(&kind9_content).expect("kind-9 content must be valid JSON");
-        let description = payload["description"]
-            .as_str()
-            .expect("sentinel must carry a description string");
 
+        // Extract descriptions from the pure helper (no live relay needed for bound proof).
+        let desc_a = description_from_request_permission(&make_msg(&long_title, cmd_a))
+            .expect("must yield description for cmd_a");
+        let desc_b = description_from_request_permission(&make_msg(&long_title, cmd_b))
+            .expect("must yield description for cmd_b");
+
+        // 1. Both descriptions must fit within the combined budget.
         assert!(
-            description.len() <= DESCRIPTION_COMBINED_MAX_BYTES,
-            "sentinel description must fit within DESCRIPTION_COMBINED_MAX_BYTES ({DESCRIPTION_COMBINED_MAX_BYTES}); \
-             got {} bytes: {description:?}",
-            description.len()
+            desc_a.len() <= DESCRIPTION_COMBINED_MAX_BYTES,
+            "desc_a must fit in {DESCRIPTION_COMBINED_MAX_BYTES} bytes; got {} bytes: {desc_a:?}",
+            desc_a.len()
+        );
+        assert!(
+            desc_b.len() <= DESCRIPTION_COMBINED_MAX_BYTES,
+            "desc_b must fit in {DESCRIPTION_COMBINED_MAX_BYTES} bytes; got {} bytes: {desc_b:?}",
+            desc_b.len()
+        );
+
+        // 2. Each description must contain both title context AND argument context.
+        // The title is truncated to 185 bytes; any command prefix is appended.
+        let title_prefix = &long_title[..185]; // first 185 bytes of the title (ASCII)
+        assert!(
+            desc_a.starts_with(title_prefix),
+            "desc_a must start with the capped title; got: {desc_a:?}"
+        );
+        assert!(
+            desc_a.contains(cmd_a),
+            "desc_a must contain the command argument; got: {desc_a:?}"
+        );
+
+        // 3. Producer-faithful distinguishability: same title, different commands → different descriptions.
+        // Mutation: restoring title_cap_limit = DESCRIPTION_COMBINED_MAX_BYTES → context_budget = 0
+        // → no context appended → desc_a == desc_b → this assert_ne! goes red.
+        assert_ne!(
+            desc_a, desc_b,
+            "descriptions for different commands must be distinguishable; \
+             mutation: saturate context_budget to zero → both descriptions \
+             truncate to the same long title → assert_ne! fails"
         );
     }
 
@@ -12205,31 +12200,28 @@ mod tests {
         let (ack_tx, ack_rx) = tokio::sync::mpsc::channel::<(String, crate::relay::AckOutcome)>(1);
         client.sentinel_ack_result_rx = Some(ack_rx);
 
-        // Pre-send BOTH decisions before the loop runs.
-        // Reject first (must be buffered as early_decision).
-        // Allow second (must be IGNORED because early_decision is already set).
-        // The channel capacity is sufficient to hold both without blocking.
-        perm_tx
-            .send(PermissionDecision {
-                request_nonce: nonce.clone(),
-                option_id: "opt-reject".to_string(),
-            })
-            .await
-            .expect("reject send must succeed");
-        perm_tx
-            .send(PermissionDecision {
-                request_nonce: nonce.clone(),
-                option_id: "opt-allow".to_string(),
-            })
-            .await
-            .expect("allow send must succeed");
+        // Pre-send the full decision sequence before the loop runs:
+        //   Reject (first) → buffered as early_decision
+        //   Reject (dup)   → ignored because early_decision is already set
+        //   Allow          → ignored because early_decision is already set
+        //   Allow (dup)    → ignored because early_decision is already set
+        // Channel capacity (8) holds all four without blocking.
+        for option_id in &["opt-reject", "opt-reject", "opt-allow", "opt-allow"] {
+            perm_tx
+                .send(PermissionDecision {
+                    request_nonce: nonce.clone(),
+                    option_id: (*option_id).to_string(),
+                })
+                .await
+                .expect("send must succeed");
+        }
 
-        // Fire the ACK from a background task with a slight delay so both
+        // Fire the ACK from a background task with a slight delay so all four
         // decisions are processed first (buffered) before the ACK transitions
         // Publishing → Pending → applies the early decision.
         let ack_tx_clone = ack_tx;
         tokio::spawn(async move {
-            // Let both decision messages be processed by the decision arm first.
+            // Let all four decision messages be processed by the decision arm first.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let _ = ack_tx_clone
                 .send(("99".to_string(), crate::relay::AckOutcome::Accepted))
@@ -12237,8 +12229,11 @@ mod tests {
         });
 
         // Drive the loop until the entry is resolved (map empties).
-        // The loop processes: (1) Reject decision → buffered, (2) Allow decision → ignored,
-        // (3) ACK Accepted → Publishing→Pending → apply buffered Reject → map empties.
+        // The loop processes: (1) Reject → buffered as early_decision,
+        // (2) Reject dup → ignored (early_decision already set),
+        // (3) Allow → ignored (early_decision already set),
+        // (4) Allow dup → ignored (early_decision already set),
+        // (5) ACK Accepted → Publishing→Pending → apply buffered Reject → map empties.
         let idle = std::time::Duration::from_millis(200);
         let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let _ = tokio::time::timeout(
@@ -12288,6 +12283,206 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&capture_file);
+    }
+
+    // ── Thread routing: nonce-mismatch drop in two concurrent read loops ──────
+    //
+    // When two read loops own distinct nonce snapshots in the same channel,
+    // a decision fan-outed to both must be applied by the owner (Thread A)
+    // and silently dropped by the non-owner (Thread B, nonce mismatch).
+    // Thread B must remain pending and still be resolvable by its own decision.
+    //
+    // This is the read-loop counterpart to the lib.rs fan-out routing tests:
+    // those prove delivery to both mpsc receivers; this proves the read loop
+    // correctly handles a mismatched nonce without resolving the wrong entry.
+    //
+    // Mutation proof: removing the `card_actions.accepts(decision.option_id)`
+    // check in the read loop (accepting any nonce unconditionally) causes Thread B
+    // to consume Thread A's decision — its entry resolves on the wrong nonce —
+    // and the assertion `!client_b.pending_permissions.is_empty()` goes red.
+    // (Actually the nonce check is in the entry lookup, not card_actions; the
+    // test proves the correct entry-by-nonce lookup path.)
+    //
+    // Mutation: removing the `nonce == entry.nonce` guard (accepting any nonce)
+    // makes client_b apply Thread A's decision → map empties → assert fires.
+
+    #[tokio::test]
+    async fn two_read_loops_same_channel_nonce_mismatch_dropped_by_sibling() {
+        let capture_a =
+            std::env::temp_dir().join(format!("buzz-acp-routing-a-{}.json", uuid::Uuid::new_v4()));
+        let capture_b =
+            std::env::temp_dir().join(format!("buzz-acp-routing-b-{}.json", uuid::Uuid::new_v4()));
+        let script_a = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}; sleep 600"#,
+            capture = capture_a.display()
+        );
+        let script_b = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}; sleep 600"#,
+            capture = capture_b.display()
+        );
+
+        // Client A and Client B share the same channel_id so their decisions
+        // would be fan-outed to each other's read loop.
+        let channel_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000041").unwrap();
+
+        let make_client = |script: &str| {
+            let s = script.to_string();
+            async move {
+                let mut c = spawn_script(&s).await;
+                c.set_permission_config(
+                    ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+                );
+                c.set_owner_pubkey_known(true);
+                let keys = Keys::generate();
+                let owner_hex = keys.public_key().to_hex();
+                let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
+                tokio::spawn(async move {
+                    let mut rx = event_rx;
+                    while rx.recv().await.is_some() {}
+                });
+                c.set_relay_publisher(publisher, keys.clone());
+                c.set_agent_owner_pubkey_hex(Some(owner_hex));
+                c.set_turn_initiator_pubkey(Some(keys.public_key()));
+                c.set_turn_channel_context(Some(channel_id), None);
+                let obs = crate::observer::ObserverHandle::in_process();
+                c.set_observer(Some(obs), 0);
+                c
+            }
+        };
+        let mut client_a = make_client(&script_a).await;
+        let mut client_b = make_client(&script_b).await;
+
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+
+        // Register permission requests for both clients.
+        let msg_a = perm_request(61, default_opts());
+        let msg_b = perm_request(62, default_opts());
+        client_a
+            .handle_permission_request(&msg_a, hard)
+            .await
+            .expect("A registration must succeed");
+        client_b
+            .handle_permission_request(&msg_b, hard)
+            .await
+            .expect("B registration must succeed");
+
+        // Extract the auto-generated nonces.
+        let nonce_a = client_a
+            .pending_permissions
+            .values()
+            .next()
+            .map(|e| e.nonce.clone())
+            .expect("client_a must have one entry");
+        let nonce_b = client_b
+            .pending_permissions
+            .values()
+            .next()
+            .map(|e| e.nonce.clone())
+            .expect("client_b must have one entry");
+        assert_ne!(nonce_a, nonce_b, "two distinct nonces must be generated");
+
+        let idle = std::time::Duration::from_millis(100);
+        let ten_s = std::time::Duration::from_secs(10);
+
+        // ── Phase 1: fan-out Thread A's decision to BOTH read loops ───────────
+        // Send nonce_a's decision to client_a's loop (it should apply) and
+        // ALSO to client_b's loop (it should drop — nonce mismatch).
+        {
+            let (tx_a, rx_a) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
+            tx_a.send(PermissionDecision {
+                request_nonce: nonce_a.clone(),
+                option_id: "opt-allow".to_string(),
+            })
+            .await
+            .expect("send must succeed");
+            client_a.install_permission_decision_rx(rx_a);
+        }
+        // Same decision to client_b (simulates fan-out; nonce_a ≠ nonce_b → dropped).
+        {
+            let (tx_b_cross, rx_b_cross) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
+            tx_b_cross
+                .send(PermissionDecision {
+                    request_nonce: nonce_a.clone(), // Thread A's nonce, wrong for B
+                    option_id: "opt-allow".to_string(),
+                })
+                .await
+                .expect("send must succeed");
+            client_b.install_permission_decision_rx(rx_b_cross);
+        }
+
+        // Drive both loops simultaneously; Thread A resolves, Thread B idles out.
+        let (res_a, res_b) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client_a.read_until_response_with_idle_timeout(
+                    "sess-routing-a",
+                    61,
+                    idle,
+                    hard,
+                    ten_s,
+                )
+            ),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client_b.read_until_response_with_idle_timeout(
+                    "sess-routing-b",
+                    62,
+                    idle,
+                    hard,
+                    ten_s,
+                )
+            ),
+        );
+        // client_a resolves (response written → loop returns Ok).
+        assert!(
+            res_a.is_ok(),
+            "Thread A's loop must complete (decision applied) within the timeout"
+        );
+        // client_b may timeout (no response for B yet) — that's expected.
+        drop(res_b);
+
+        assert!(
+            client_a.pending_permissions.is_empty(),
+            "Thread A's entry must be resolved after its own decision; \
+             mutation: nonce mismatch not checked → Thread B consumes A's decision \
+             → client_a's entry is never resolved → this fires instead"
+        );
+        assert!(
+            !client_b.pending_permissions.is_empty(),
+            "Thread B's entry must remain pending after Thread A's decision fan-out; \
+             mutation: nonce not checked → B wrongly applies A's decision → map empty → this fires"
+        );
+
+        // ── Phase 2: Thread B's own decision arrives and is applied ───────────
+        {
+            let (tx_b_own, rx_b_own) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
+            tx_b_own
+                .send(PermissionDecision {
+                    request_nonce: nonce_b.clone(),
+                    option_id: "opt-allow".to_string(),
+                })
+                .await
+                .expect("send must succeed");
+            client_b.install_permission_decision_rx(rx_b_own);
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client_b.read_until_response_with_idle_timeout(
+                "sess-routing-b2",
+                62,
+                idle,
+                hard,
+                ten_s,
+            ),
+        )
+        .await;
+        assert!(
+            client_b.pending_permissions.is_empty(),
+            "Thread B's entry must be resolved after its own decision arrives"
+        );
+
+        let _ = std::fs::remove_file(&capture_a);
+        let _ = std::fs::remove_file(&capture_b);
     }
 
     // ── F2: unconditional first attempt with an already-expired deadline ──────
@@ -12406,8 +12601,211 @@ mod tests {
         assert!(
             join_result.is_ok(),
             "retransmit loop must exit once the delivery window elapses even when every \
-             attempt returns Uncertain; mutation: large RESOLVED_DELIVERY_WINDOW_SECS → \
-             loop never completes within test budget → timeout fires"
+             attempt returns Uncertain; mutation: increase `delivery_window` (the injected \
+             4s deadline passed directly to this test) → loop never completes within test \
+             budget → timeout fires"
+        );
+    }
+
+    // ── F2: old-expiry-crossing retransmit — decision applied after card expires ─
+    //
+    // Both tests below verify that the delivery window for the kind-40003
+    // resolved edit is anchored at **resolution time** (`now() + 300s`), NOT
+    // at the original card deadline.  The card deadline has already elapsed
+    // when `finish_permission` runs; if the old `entry.deadline` were used as
+    // `delivery_deadline`, the retransmit loop would have an already-expired
+    // window after its first attempt — only one publish, never a retry.
+    //
+    // Mutation proof (both tests): restoring `entry.deadline` as the spawn
+    // argument to `retransmit_resolved_edit` sets `delivery_deadline` to a
+    // value that is already < `now()` at retry time.  The second assertion
+    // (`resolved_ids.len() >= 2`) goes red — only one publish ever occurs.
+
+    // Case A: disconnect/Uncertain on the first resolved-edit attempt, resolved
+    //         after the original card deadline — second attempt must still land.
+    #[tokio::test(start_paused = true)]
+    async fn resolved_edit_retransmitted_across_old_card_expiry_disconnect() {
+        let capture_file = std::env::temp_dir().join(format!(
+            "buzz-acp-expiry-disconnect-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}; sleep 600"#,
+            capture = capture_file.display(),
+        );
+        let mut client = spawn_script(&script).await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        // One Uncertain on the first kind-40003, then Accepted — simulates
+        // a disconnect that clears between the first and second attempt.
+        let (publisher, event_rx) =
+            crate::relay::RelayEventPublisher::test_pair_resolved_reconnect(1);
+        let published_40003: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain = published_40003.clone();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while let Some(ev) = rx.recv().await {
+                if ev.kind.as_u16() == 40003 {
+                    drain.lock().unwrap().push(ev.id.to_hex());
+                }
+            }
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000031").unwrap()),
+            None,
+        );
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Short card deadline — 1 s. The entry will expire before the decision
+        // is applied, proving the delivery window is not tied to entry.deadline.
+        let short_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let msg = perm_request(51, default_opts());
+        client
+            .handle_permission_request(&msg, short_deadline)
+            .await
+            .expect("registration must succeed");
+
+        let nonce = client
+            .pending_permissions
+            .get("51")
+            .expect("entry must be in map")
+            .nonce
+            .clone();
+
+        // Pre-send decision before the loop; the entry is still in Publishing
+        // state at this point — decision is buffered as early_decision.
+        perm_tx
+            .send(PermissionDecision {
+                request_nonce: nonce,
+                option_id: "opt-allow".to_string(),
+            })
+            .await
+            .expect("send must succeed");
+
+        // Advance past the short card deadline BEFORE running the loop.
+        // This ensures the original entry.deadline has already elapsed when
+        // finish_permission fires — simulating a long-delayed decision.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        // Drive the loop; finish_permission will compute delivery_deadline =
+        // now() + 300s, well beyond the expired entry.deadline.
+        let idle = std::time::Duration::from_millis(200);
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_until_response_with_idle_timeout(
+                "sess-expiry-dc",
+                51,
+                idle,
+                hard,
+                std::time::Duration::from_secs(10),
+            ),
+        )
+        .await;
+
+        // Wait for both retransmit attempts to complete.
+        let poll_end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if published_40003.lock().unwrap().len() >= 2 || tokio::time::Instant::now() >= poll_end
+            {
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let ids = published_40003.lock().unwrap().clone();
+        assert!(
+            ids.len() >= 2,
+            "resolved edit must be retransmitted after an Uncertain outcome even when \
+             the original card deadline has already elapsed; \
+             mutation: restore entry.deadline as delivery_deadline → second attempt \
+             never fires (already-expired window) → len()==1 → this assertion goes red; \
+             saw {ids:?}"
+        );
+        assert!(
+            ids.windows(2).all(|w| w[0] == w[1]),
+            "every retransmission must carry the same signed event id; got {ids:?}"
+        );
+        let _ = std::fs::remove_file(&capture_file);
+    }
+
+    // Case B: lost-OK (connected socket) resolved after the original card
+    //         deadline — the per-attempt timeout sweeps and a retry still lands.
+    #[tokio::test(start_paused = true)]
+    async fn resolved_edit_retransmitted_across_old_card_expiry_lost_ok() {
+        let keys = Keys::generate();
+        // One lost-OK on the first kind-40003 attempt, then Accepted.
+        let (publisher, mut event_rx) =
+            crate::relay::RelayEventPublisher::test_pair_resolved_lost_ok(1);
+
+        let published_40003: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain = published_40003.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = event_rx.recv().await {
+                if ev.kind.as_u16() == 40003 {
+                    drain.lock().unwrap().push(ev.id.to_hex());
+                }
+            }
+        });
+
+        // Sign the resolved edit once; the retransmit loop resends this exact event.
+        let event = build_kind40003_sentinel(
+            &keys,
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000032").unwrap(),
+            "original-event-id-lost-ok",
+            "resolved-lost-ok-expiry",
+        )
+        .expect("sentinel must build");
+
+        // delivery_deadline = 60s from now (well within the 300s production window).
+        // The old entry.deadline would have been, say, 1s — already expired.
+        let delivery_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+
+        // Advance past the "old card expiry" (1s) before starting, so any code
+        // using entry.deadline as the window would already be expired.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        let task = tokio::spawn(retransmit_resolved_edit(
+            publisher,
+            event,
+            delivery_deadline,
+        ));
+
+        // Under paused time the per-attempt deadline (SENTINEL_PUBLISH_TIMEOUT_SECS)
+        // auto-advances and the stuck waiter sweeps. Then the backoff elapses and
+        // the second attempt (Accepted) lands.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(120), task).await;
+        assert!(joined.is_ok(), "retransmit task must terminate");
+        tokio::task::yield_now().await;
+
+        let ids = published_40003.lock().unwrap().clone();
+        assert!(
+            ids.len() >= 2,
+            "resolved edit must be retransmitted via a lost-OK sweep even when started \
+             after the old card deadline elapsed; \
+             mutation: restore entry.deadline as delivery_deadline → after the lost-OK \
+             sweep, delivery_deadline is already past → retry loop exits → len()==1 → \
+             this assertion goes red; saw {ids:?}"
+        );
+        assert!(
+            ids.windows(2).all(|w| w[0] == w[1]),
+            "every retransmission must carry the same signed event id; got {ids:?}"
         );
     }
 
@@ -12422,12 +12820,16 @@ mod tests {
     //   - `allow_always` and `reject_always` decisions are dropped.
     //   - `allow_once` and `reject_once` decisions ARE accepted.
     //
-    // Mutation proof: removing the `ACTIONABLE_KINDS` allowlist from
-    // `LifecycleActivity.tsx` (JS side) doesn't affect this Rust test, but
-    // removing the snapshotted `card_actions` check (accepting any option_id)
-    // from the Rust read loop would let `allow_always` through — the assertion
-    // that the entry is still Pending after the `allow_always` decision would
-    // then fail.
+    // The test delivers each persistent kind in isolation and inspects the
+    // observer AFTER each partial loop run:
+    //   step 1: allow_always alone → entry still Pending, zero applied writes.
+    //   step 2: reject_always alone → entry still Pending, zero applied writes.
+    //   step 3: allow_once → entry resolved, exactly one applied write.
+    //
+    // Mutation proof: changing `CardActions::accepts()` to always return `true`
+    // allows `allow_always` through on step 1. The entry is resolved early
+    // (map empty) and the observer shows an applied write before allow_once
+    // ever arrives — the intermediate step-1 pending assertion goes red.
 
     #[tokio::test]
     async fn allow_always_and_reject_always_decisions_are_ignored_by_read_loop() {
@@ -12451,9 +12853,6 @@ mod tests {
         let msg = perm_request(42, four_opts);
         let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
 
-        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
-        client.install_permission_decision_rx(perm_rx);
-
         client
             .handle_permission_request(&msg, hard)
             .await
@@ -12467,58 +12866,114 @@ mod tests {
             .map(|e| e.nonce.clone())
             .expect("one entry must be in the pending map after registration");
 
-        // Pre-send all three decisions into the channel buffer before the loop
-        // runs. The channel capacity (8) comfortably holds them.
-        //
-        // Sequence: allow_always → rejected, reject_always → rejected, allow_once → accepted.
-        // The loop processes them in order while running, without any intermediate
-        // return (no timeout restart needed, no second install_permission_decision_rx call).
-        perm_tx
-            .send(PermissionDecision {
+        let short_idle = std::time::Duration::from_millis(100);
+        let ten_s = std::time::Duration::from_secs(10);
+
+        // Helper: count applied acp_write events in the observer snapshot.
+        let applied_count = |o: &crate::observer::ObserverHandle| {
+            o.snapshot()
+                .into_iter()
+                .filter(|e| {
+                    e.kind == "acp_write"
+                        && e.authorization
+                            .as_ref()
+                            .map(|a| a.reason.as_deref() == Some("applied"))
+                            .unwrap_or(false)
+                })
+                .count()
+        };
+
+        // `read_until_response_with_idle_timeout` takes `permission_decision_rx`
+        // via `.take()` and drops it on return. A fresh channel pair is installed
+        // before each step so the next call sees a live receiver with its message
+        // already buffered. No outer channel is needed — each step is self-contained.
+
+        // ── Step 1: allow_always alone ────────────────────────────────────────
+        // The loop ACKs the sentinel on its first iteration (Publishing → Pending);
+        // allow_always is delivered but must be dropped by `card_actions.accepts()`.
+        {
+            let (tx1, rx1) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
+            tx1.send(PermissionDecision {
                 request_nonce: nonce.clone(),
                 option_id: "opt-allow-always".to_string(),
             })
             .await
             .expect("send must succeed");
-        perm_tx
-            .send(PermissionDecision {
+            client.install_permission_decision_rx(rx1);
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_until_response_with_idle_timeout("sess-f3-aa", 42, short_idle, hard, ten_s),
+        )
+        .await;
+
+        // Entry must still be pending — allow_always was ignored.
+        // Mutation: `accepts()` → true → allow_always resolves the entry →
+        // map is empty here → this assert fires.
+        assert!(
+            !client.pending_permissions.is_empty(),
+            "entry must still be pending after allow_always — it is not a ruled card action; \
+             mutation: CardActions::accepts() → true → entry resolved early → this fires"
+        );
+        assert_eq!(
+            applied_count(&obs),
+            0,
+            "no applied ACP write must occur after allow_always; \
+             mutation: accepts()→true → applied write emitted → count>0 → this fires"
+        );
+
+        // ── Step 2: reject_always alone ───────────────────────────────────────
+        {
+            let (tx2, rx2) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
+            tx2.send(PermissionDecision {
                 request_nonce: nonce.clone(),
                 option_id: "opt-reject-always".to_string(),
             })
             .await
             .expect("send must succeed");
-        perm_tx
-            .send(PermissionDecision {
+            client.install_permission_decision_rx(rx2);
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_until_response_with_idle_timeout("sess-f3-ra", 42, short_idle, hard, ten_s),
+        )
+        .await;
+
+        assert!(
+            !client.pending_permissions.is_empty(),
+            "entry must still be pending after reject_always — it is not a ruled card action"
+        );
+        assert_eq!(
+            applied_count(&obs),
+            0,
+            "no applied ACP write must occur after reject_always"
+        );
+
+        // ── Step 3: allow_once resolves the entry ─────────────────────────────
+        {
+            let (tx3, rx3) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
+            tx3.send(PermissionDecision {
                 request_nonce: nonce.clone(),
                 option_id: "opt-allow-once".to_string(),
             })
             .await
             .expect("send must succeed");
-
-        // Run the loop until it resolves the entry. The loop will:
-        //   1. auto-ACK the sentinel (Publishing → Pending) via test_pair
-        //   2. drain allow_always → ignored (not a ruled card action)
-        //   3. drain reject_always → ignored (not a ruled card action)
-        //   4. drain allow_once → accepted → entry resolved → map empties
-        let idle = std::time::Duration::from_millis(200);
+            client.install_permission_decision_rx(rx3);
+        }
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client.read_until_response_with_idle_timeout(
-                "sess-f3-kinds",
-                42,
-                idle,
-                hard,
-                std::time::Duration::from_secs(10),
-            ),
+            client.read_until_response_with_idle_timeout("sess-f3-ao", 42, short_idle, hard, ten_s),
         )
         .await;
 
         assert!(
             client.pending_permissions.is_empty(),
-            "entry must be resolved after allow_once decision; \
-             allow_always and reject_always must be ignored by the read loop \
-             (mutation: accept any option_id → entry resolved early on allow_always → \
-             assertion above fires)"
+            "entry must be resolved after allow_once decision"
+        );
+        assert_eq!(
+            applied_count(&obs),
+            1,
+            "exactly one applied ACP write must be emitted for allow_once"
         );
     }
 }

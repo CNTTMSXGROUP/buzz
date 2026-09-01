@@ -161,7 +161,7 @@ export function HarnessConnectionList({
             (previousOption === undefined ||
               installedIds.has(previousOption.runtime.id));
           const label = getRuntimeDisplayLabel(runtime);
-          const isEasiestApiOption =
+          const isRecommendedBuzzOption =
             method === "api" && runtime.id === "buzz-agent";
           const rowClassName =
             "group flex min-h-14 w-full items-center gap-3 rounded-xl px-2 py-2 text-left text-sm font-medium text-foreground transition-colors duration-150 ease-out hover:bg-foreground/[0.04] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/20 motion-reduce:transition-none";
@@ -172,7 +172,7 @@ export function HarnessConnectionList({
               </span>
               <span className="flex min-w-0 flex-1 items-center gap-2">
                 <span className="truncate">{label}</span>
-                {isEasiestApiOption ? (
+                {isRecommendedBuzzOption ? (
                   <>
                     <span
                       aria-hidden="true"
@@ -181,7 +181,7 @@ export function HarnessConnectionList({
                       ·
                     </span>
                     <span className="inline-flex shrink-0 items-center rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
-                      Easiest
+                      Recommended
                     </span>
                   </>
                 ) : null}
@@ -246,7 +246,6 @@ export function HarnessConnectionPreview({
 
   return (
     <HarnessPreviewStep
-      allowWideContent
       embedded={embedded}
       onBack={onBack}
       testId="onboarding-preview-harness-connection"
@@ -262,10 +261,20 @@ export function HarnessConnectionPreview({
             {method === "subscription"
               ? "Continue with an AI subscription"
               : method === "api"
-                ? "Continue with an AI API key"
+                ? "Choose a harness"
                 : "Connect your AI client"}
           </h1>
-          {!method ? (
+          {method === "subscription" ? (
+            <p className="mt-2 text-base leading-6 text-foreground/80">
+              Subscriptions connect through a compatible harness, like Claude
+              Code or Codex. Choose yours to sign in.
+            </p>
+          ) : method === "api" ? (
+            <p className="mt-2 text-base leading-6 text-foreground/80">
+              Choose how your agents will connect to AI providers. You can
+              change this at any time.
+            </p>
+          ) : (
             <p className="mt-2 text-base leading-6 text-foreground/80">
               Choose which AI client your agents will use. You can change this
               anytime.{" "}
@@ -281,7 +290,7 @@ export function HarnessConnectionPreview({
                 </Button>
               ) : null}
             </p>
-          ) : null}
+          )}
         </div>
         <div className="mt-6 flex min-h-0 flex-1 flex-col">
           <HarnessConnectionList
@@ -298,16 +307,21 @@ export function HarnessConnectionPreview({
 
 const CONNECTION_METHOD_CHOICES = [
   {
+    description:
+      "Simpler setup — use the harness and models included with your AI subscription",
     icon: CreditCard,
-    label: "I use a subscription",
+    label: "Log in with a subscription",
     method: "subscription",
   },
   {
+    description:
+      "More flexibility — choose a compatible harness, provider, and model",
     icon: KeyRound,
-    label: "I have an API key",
+    label: "Use an API key",
     method: "api",
   },
 ] as const satisfies ReadonlyArray<{
+  description: string;
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   method: HarnessConnectionMethod;
@@ -340,31 +354,34 @@ export function HarnessConnectionMethodPreview({
       >
         <div className="shrink-0">
           <h1 className="text-title font-normal text-foreground">
-            How do you use AI?
+            Connect your AI provider
           </h1>
           <p className="mt-2 text-base leading-6 text-foreground/80">
-            Choose the option that matches how you access AI.
+            Choose how your agents will access AI. You can change this later.
           </p>
         </div>
 
         <div className="-mx-2 mt-6 flex w-[calc(100%+1rem)] flex-1 flex-col gap-2">
           {CONNECTION_METHOD_CHOICES.map(
-            ({ icon: MethodIcon, label, method }) => (
+            ({ description, icon: MethodIcon, label, method }) => (
               <Button
-                className="group h-auto min-h-14 w-full justify-start gap-3 rounded-xl px-2 py-2 text-left text-sm text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
+                className="group h-auto min-h-20 w-full justify-start gap-3 whitespace-normal rounded-xl px-2 py-3 text-left text-sm text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
                 data-testid={`onboarding-preview-harness-method-${method}`}
                 key={method}
                 onClick={() => onSelect(method)}
                 type="button"
                 variant="ghost"
               >
-                <span className="flex size-8 shrink-0 items-center justify-start">
+                <span className="flex size-8 shrink-0 items-start justify-start pt-0.5">
                   <MethodIcon aria-hidden className="!size-6" />
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block font-medium">{label}</span>
+                  <span className="mt-1 block max-w-[390px] text-sm font-normal leading-5 text-foreground/70">
+                    {description}
+                  </span>
                 </span>
-                <span className="ml-auto flex size-10 shrink-0 items-center justify-end">
+                <span className="ml-auto flex size-10 shrink-0 items-start justify-end pt-1">
                   <ChevronRight
                     aria-hidden
                     className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
@@ -761,17 +778,23 @@ export function HarnessConnectionDetailPreview({
             <RuntimeIcon className="size-9" runtime={option.runtime} />
           </span>
           <h1 className="text-title font-normal text-foreground">
-            Connect {label}
+            {connected
+              ? "Choose your model settings"
+              : method === "api" && option.runtime.id === "buzz-agent"
+                ? "Connect with an API key"
+                : `Connect ${label}`}
           </h1>
         </div>
         <p className="mt-2 max-w-[440px] text-base leading-6 text-foreground/80">
           {connected
-            ? "Choose a model and effort level. You can change these anytime."
+            ? "Select the model and effort level your agents will use by default."
             : hasMethodChoice
               ? "Choose how you want to connect. You can change this anytime."
               : method === "subscription"
                 ? `Sign in to connect ${label}. You can change this anytime.`
-                : "Add your connection details. You can change this anytime."}
+                : option.runtime.id === "buzz-agent"
+                  ? "Choose your provider and enter an API key to connect to the Buzz harness."
+                  : "Add your connection details. You can change this anytime."}
         </p>
 
         <div className="mt-8 flex min-h-0 flex-1 flex-col gap-6">

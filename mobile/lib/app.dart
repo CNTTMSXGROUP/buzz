@@ -390,6 +390,7 @@ class App extends HookConsumerWidget {
       // route that was pushed while the store signal request was in flight.
       builder: (context, child) => switch (ageSignalState) {
         AgeSignalState.checking => const _AgeSignalLoadingPage(),
+        AgeSignalState.retryableFailure => const _AgeSignalRetryPage(),
         AgeSignalState.restricted => const AgeRestrictionPage(),
         AgeSignalState.allowed => MobileHuddleShell(
           navigatorKey: _mobileRootNavigatorKey,
@@ -459,6 +460,43 @@ class _AgeSignalLoadingPage extends StatelessWidget {
         child: BuzzLoadingIndicator(
           size: 56,
           semanticLabel: 'Checking age eligibility',
+        ),
+      ),
+    );
+  }
+}
+
+class _AgeSignalRetryPage extends ConsumerWidget {
+  const _AgeSignalRetryPage();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(Grid.sm),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Unable to check age eligibility',
+                style: context.textTheme.titleLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: Grid.xxs),
+              Text(
+                'Check your connection and try again.',
+                style: context.textTheme.bodyMedium,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: Grid.xs),
+              FilledButton(
+                onPressed: () =>
+                    unawaited(ref.read(ageSignalProvider.notifier).request()),
+                child: const Text('Try again'),
+              ),
+            ],
+          ),
         ),
       ),
     );

@@ -355,6 +355,80 @@ void main() {
       },
     );
 
+    test(
+      'age restriction clears push state and retries pending leases',
+      () async {
+        var failPendingOnce = true;
+        deactivator = (community, {generation}) async {
+          deactivatedCommunityIds.add(community.id);
+          deactivationGenerations.add(generation);
+          if (community.name == 'Pending' && failPendingOnce) {
+            failPendingOnce = false;
+            throw StateError('injected pending failure');
+          }
+        };
+        container = createContainer();
+        await container.read(communityListProvider.future);
+        final subscription = BuzzPushSubscription(
+          filter: BuzzPushFilter(kinds: const [9], pTags: ['a' * 64]),
+          notificationClass: 'default',
+        );
+        final active =
+            Community.create(
+              name: 'Active',
+              relayUrl: 'https://active.example.com',
+            ).copyWith(
+              pushNotificationsEnabled: true,
+              pushSubscriptionState: BuzzPushLeaseSubscriptionState.desired(
+                desired: [subscription],
+              ).withAccepted(subscriptions: [subscription], generation: 4),
+            );
+        final pending =
+            Community.create(
+              name: 'Pending',
+              relayUrl: 'https://pending.example.com',
+            ).copyWith(
+              pushSubscriptionState:
+                  BuzzPushLeaseSubscriptionState.desired(
+                        desired: [subscription],
+                      )
+                      .withAccepted(
+                        subscriptions: [subscription],
+                        generation: 6,
+                      )
+                      .withPendingTombstone(7),
+            );
+        final notifier = container.read(communityListProvider.notifier);
+        await notifier.addCommunity(active);
+        await notifier.addCommunity(pending);
+
+        await notifier.enforceAgeRestrictionOnPush();
+        await notifier.enforceAgeRestrictionOnPush();
+
+        final stored = await communityStorage.loadAll();
+        expect(
+          stored.every((community) => !community.pushNotificationsEnabled),
+          isTrue,
+        );
+        expect(
+          stored.every(
+            (community) =>
+                community.pushSubscriptionState.pendingTombstoneGeneration ==
+                null,
+          ),
+          isTrue,
+        );
+        expect(
+          snapshots.last.every(
+            (community) => !community.pushNotificationsEnabled,
+          ),
+          isTrue,
+        );
+        expect(deactivatedCommunityIds, [active.id, pending.id, pending.id]);
+        expect(deactivationGenerations, [5, 8, 9]);
+      },
+    );
+
     test('removeCommunity removes from list', () async {
       container = createContainer();
       await container.read(communityListProvider.future);

@@ -49,7 +49,7 @@ bool shouldBlockForAgeSignal(Map<Object?, Object?> response) {
 }
 
 /// Result of the platform age-signal check for this app launch.
-enum AgeSignalState { checking, allowed, restricted }
+enum AgeSignalState { checking, retryableFailure, allowed, restricted }
 
 class AgeSignalNotifier extends Notifier<AgeSignalState> {
   /// Creates an age-signal notifier, optionally with test request hooks.
@@ -76,6 +76,7 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
       return;
     }
 
+    state = AgeSignalState.checking;
     final request = _requestWithRetry();
     _requestInFlight = request;
     try {
@@ -102,7 +103,8 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
           continue;
         }
         // A transient native failure is not evidence that access is allowed.
-        // Keep the launch gated and leave request() retryable.
+        // Keep the launch gated and expose a deliberate retry action.
+        state = AgeSignalState.retryableFailure;
         return;
       }
 

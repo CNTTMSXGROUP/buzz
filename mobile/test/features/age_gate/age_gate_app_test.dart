@@ -9,6 +9,7 @@ import 'package:buzz/shared/auth/auth.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme_provider.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -82,6 +83,49 @@ void main() {
     expect(relaySession.builds, 1);
     expect(requests, 1);
   });
+
+  testWidgets('offers a retry after the native age check fails', (
+    tester,
+  ) async {
+    var requests = 0;
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          authProvider.overrideWith(() => _AuthenticatedAuthNotifier()),
+          ageSignalProvider.overrideWith(
+            () => AgeSignalNotifier(
+              requestSignal: () async {
+                requests += 1;
+                if (requests <= 2) {
+                  throw PlatformException(code: 'unavailable');
+                }
+                return {'status': 'noSignal', 'ageUpper': null};
+              },
+              delay: (_) async {},
+            ),
+          ),
+          savedPrefsProvider.overrideWithValue(prefs),
+        ],
+        child: const AgeSignalPushBootstrap(child: App()),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('Try again'), findsOneWidget);
+    expect(find.byType(HomePage), findsNothing);
+
+    await tester.tap(find.text('Try again'));
+    await tester.pump();
+    await tester.pump();
+
+    expect(requests, 3);
+    expect(find.text('Try again'), findsNothing);
+    expect(find.byType(HomePage), findsOneWidget);
+  });
 }
 
 class _AuthenticatedAuthNotifier extends AuthNotifier {
@@ -94,6 +138,9 @@ class _AuthenticatedAuthNotifier extends AuthNotifier {
 class _BlockingAgeSignalNotifier extends AgeSignalNotifier {
   @override
   AgeSignalState build() => AgeSignalState.restricted;
+
+  @override
+  Future<void> request() async {}
 }
 
 class _CountingRelaySessionNotifier extends RelaySessionNotifier {

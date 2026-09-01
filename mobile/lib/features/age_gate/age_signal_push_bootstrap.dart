@@ -1,7 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/widgets.dart';
+import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../../shared/community/community_provider.dart';
 import '../../shared/push/push_bootstrap.dart';
+import '../../shared/push/push_bridge.dart';
 import 'age_signal_provider.dart';
 
 /// Starts the push lifecycle only after the launch age check allows access.
@@ -13,7 +18,45 @@ class AgeSignalPushBootstrap extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    if (ref.watch(ageSignalProvider) != AgeSignalState.allowed) return child;
-    return BuzzPushBootstrap(child: child);
+    return switch (ref.watch(ageSignalProvider)) {
+      AgeSignalState.allowed => BuzzPushBootstrap(child: child),
+      AgeSignalState.restricted => _AgeRestrictedPushCleanup(child: child),
+      AgeSignalState.checking || AgeSignalState.retryableFailure => child,
+    };
+  }
+}
+
+class _AgeRestrictedPushCleanup extends HookConsumerWidget {
+  const _AgeRestrictedPushCleanup({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final communitiesReady = ref.watch(communityListProvider).hasValue;
+    final resumeGeneration = useState(0);
+
+    useEffect(() {
+      final listener = AppLifecycleListener(
+        onResume: () => resumeGeneration.value += 1,
+      );
+      return listener.dispose;
+    }, const []);
+
+    useEffect(() {
+      if (communitiesReady) {
+        unawaited(
+          ref
+              .read(communityListProvider.notifier)
+              .enforceAgeRestrictionOnPush()
+              .catchError((Object error, StackTrace stackTrace) {
+                reportPushLeaseCleanupError(error, stackTrace);
+              }),
+        );
+      }
+      return null;
+    }, [communitiesReady, resumeGeneration.value]);
+
+    return child;
   }
 }

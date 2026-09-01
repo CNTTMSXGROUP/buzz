@@ -55,7 +55,7 @@ void main() {
     );
   });
 
-  test('keeps exhausted platform failures gated and retryable', () async {
+  test('exposes a gated retry after exhausted platform failures', () async {
     var requests = 0;
     var delays = 0;
     final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
@@ -78,7 +78,7 @@ void main() {
 
     await container.read(provider.notifier).request();
 
-    expect(container.read(provider), AgeSignalState.checking);
+    expect(container.read(provider), AgeSignalState.retryableFailure);
     expect(requests, 2);
     expect(delays, 1);
 

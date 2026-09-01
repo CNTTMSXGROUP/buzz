@@ -479,6 +479,61 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     }
   }
 
+  /// Disables every stored push lease after the platform age gate restricts
+  /// access, and retries journals left pending by an earlier launch.
+  Future<void> enforceAgeRestrictionOnPush() async {
+    final attempts = <({String id, bool advanceGeneration})>[];
+    await _serializePushMutation(() async {
+      final storage = ref.read(communityStorageProvider);
+      final current = state.value ?? await storage.loadAll();
+      final updatedList = [...current];
+      var changed = false;
+
+      for (var index = 0; index < current.length; index += 1) {
+        final community = current[index];
+        final pending =
+            community.pushSubscriptionState.pendingTombstoneGeneration;
+        if (!community.pushNotificationsEnabled) {
+          if (pending != null) {
+            attempts.add((id: community.id, advanceGeneration: true));
+          }
+          continue;
+        }
+
+        var pushState = community.pushSubscriptionState;
+        if (pushState.acceptedGeneration != null ||
+            pushState.generationCursor != null) {
+          final cursor =
+              pushState.generationCursor ?? pushState.acceptedGeneration ?? 0;
+          pushState = pushState.withPendingTombstone(cursor + 1);
+          attempts.add((id: community.id, advanceGeneration: false));
+        }
+        final updated = community.copyWith(
+          pushNotificationsEnabled: false,
+          pushSubscriptionState: pushState,
+        );
+        await storage.save(updated);
+        updatedList[index] = updated;
+        changed = true;
+      }
+
+      if (changed) state = AsyncData(updatedList);
+      // A failed native clear is retried on the next restricted launch/resume.
+      await syncCommunitySnapshot(ref, updatedList);
+    });
+
+    for (final attempt in attempts) {
+      try {
+        await retryPendingPushLeaseTombstone(
+          attempt.id,
+          advanceGeneration: attempt.advanceGeneration,
+        );
+      } catch (_) {
+        // The durable journal remains available for the next launch/resume.
+      }
+    }
+  }
+
   /// Publishes a durably journaled opt-out tombstone.
   ///
   /// A retry advances the generation before network I/O. That makes an

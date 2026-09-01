@@ -31,6 +31,9 @@ void main() {
 class _AllowedAgeSignalNotifier extends AgeSignalNotifier {
   @override
   AgeSignalState build() => AgeSignalState.allowed;
+
+  @override
+  Future<void> request() async {}
 }
 
 class _FakeAuthNotifier extends AuthNotifier {

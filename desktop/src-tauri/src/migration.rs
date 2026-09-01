@@ -25,10 +25,8 @@ const CANONICAL_DEV_IDENTIFIER: &str = "xyz.block.buzz.app.dev";
 const LEGACY_CANONICAL_DEV_IDENTIFIER: &str = "xyz.block.sprout.app.dev";
 const LEGACY_RELEASE_IDENTIFIER: &str = "xyz.block.sprout.app";
 
-/// JSON files symlinked from worktree data directories to the canonical
-/// dev data directory. Only data files — never `agent-pids/` or `logs/`.
-/// `identity.key` is deliberately excluded because worktree instances
-/// receive their identity via the `BUZZ_PRIVATE_KEY` env var.
+/// JSON files shared through symlinks. `agent-pids/`, `logs/`, and `identity.key` stay local.
+/// Worktrees receive the identity through `BUZZ_PRIVATE_KEY`.
 const SHARED_AGENT_FILES: &[&str] = &[
     "agents/managed-agents.json",
     "agents/pending-team-membership.json",
@@ -1368,7 +1366,6 @@ pub fn migrate_persona_provider_to_runtime(app: &tauri::AppHandle) {
 }
 mod materialize;
 pub use materialize::materialize_agent_runtimes;
-
 mod fold;
 pub use fold::fold_personas_into_agent_store;
 use fold::load_persona_runtimes;

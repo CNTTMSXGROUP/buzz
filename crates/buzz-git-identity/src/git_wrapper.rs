@@ -236,6 +236,13 @@ pub fn run() -> i32 {
         }
     };
 
+    run_inner(argv, authority)
+}
+
+/// Inner dispatch — separated so tests can inject a controlled authority
+/// without touching the filesystem manifest.  `run()` is the public entry
+/// point; tests call `run_inner` directly.
+fn run_inner(argv: Vec<String>, authority: Option<Authority>) -> i32 {
     if let Err(msg) = enforce(&argv, authority.as_ref()) {
         eprintln!("{msg}");
         return 1;
@@ -433,6 +440,29 @@ fn is_push_command(real_git: &Path, argv: &[String], ctx: &[String]) -> PushKind
     PushKind::NotPush
 }
 
+/// Query git for its set of builtin subcommands via `--list-cmds=builtins`.
+///
+/// Git dispatches builtin commands BEFORE consulting `alias.*` config — a name
+/// that matches a builtin is never treated as an alias, regardless of any
+/// `alias.<name>` setting (see git.c `handle_builtin`).  The alias expansion
+/// loop in [`verify_alias_safety`] must honour the same precedence: stop
+/// expanding when the current command name is a builtin rather than following
+/// an alias that git would ignore.
+///
+/// Returns an empty set if the flag is unavailable (old git versions); callers
+/// treat an empty set conservatively (no builtin-precedence short-circuit).
+fn git_builtin_commands(real_git: &Path) -> std::collections::HashSet<String> {
+    let out = match capture_raw(real_git, &["--list-cmds=builtins"]) {
+        Some(o) if o.status.success() => o.stdout,
+        _ => return std::collections::HashSet::new(),
+    };
+    String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
 /// Refuse any alias the wrapper cannot *trivially* prove safe, and — on success
 /// — return the alias's fully-resolved expansion so the caller can hold it to
 /// the same policy as a directly-typed command. Git expands an alias in-process,
@@ -483,6 +513,11 @@ fn verify_alias_safety(
     // argv. Typed globals (argv[..sub_idx]) are prepended to the final result.
     let mut chain: Vec<String> = argv[sub_idx..].to_vec();
     let mut resolved_any = false;
+    // Git dispatches builtin commands BEFORE consulting alias config — a name
+    // that is a builtin is never expanded as an alias even if `alias.<name>` is
+    // set.  Fetch the authoritative list once and honour the same precedence so
+    // the wrapper's view of the resolved command always matches git's.
+    let builtins = git_builtin_commands(real_git);
     for _ in 0..MAX_ALIAS_HOPS {
         // The command word within the current chain (git re-parses leading
         // options as globals after each expansion, so a body may begin with
@@ -491,6 +526,11 @@ fn verify_alias_safety(
             break; // no command word left
         };
         let name = &chain[cmd_idx];
+        // A builtin name is never expanded as an alias — git ignores any
+        // `alias.<builtin>` entry entirely.  Treat it as a real subcommand.
+        if !builtins.is_empty() && builtins.contains(name.as_str()) {
+            break;
+        }
         let def = capture(
             real_git,
             ctx,
@@ -514,12 +554,16 @@ fn verify_alias_safety(
         return Err(alias_limit_reject_message());
     };
     let name = &chain[cmd_idx];
-    if capture(
-        real_git,
-        ctx,
-        &["config", "--get", &format!("alias.{name}")],
-    )
-    .is_some()
+    // A builtin name at the end of the chain can never be followed by another
+    // alias hop — treat it as fully resolved regardless of any alias config.
+    let is_builtin = !builtins.is_empty() && builtins.contains(name.as_str());
+    if !is_builtin
+        && capture(
+            real_git,
+            ctx,
+            &["config", "--get", &format!("alias.{name}")],
+        )
+        .is_some()
     {
         return Err(alias_limit_reject_message());
     }
@@ -910,9 +954,10 @@ fn reject_receive_pack_override(argv: &[String]) -> Result<(), String> {
     // probe into a real push before authorship/signature checks run.  Git's
     // option parser treats `--no-<flag>` forms of negatable bit options as the
     // cleared form; any unique prefix abbreviation (`--no-dry-r`, `--no-dry`,
-    // `--no-dr`) is also accepted.  No other git-push long option starts with
-    // `--no-dry`, so the `starts_with("--no-dry")` check is both correct and
-    // tight.
+    // `--no-dr`) is also accepted.  `--no-d` is AMBIGUOUS (matches both
+    // `--no-delete` and `--no-dry-run`); `--no-dr` is the minimal unique
+    // prefix — `dr` prefix-matches only `dry-run` among all git-push options.
+    // The `starts_with("--no-dr")` check covers every accepted negation form.
     let (_, sub_idx) = split_globals(argv);
     if let Some(si) = sub_idx {
         let push_args = &argv[si + 1..];
@@ -926,10 +971,11 @@ fn reject_receive_pack_override(argv: &[String]) -> Result<(), String> {
                      redirect pushes to a different endpoint, bypassing push verification."
                 ));
             }
-            // `--no-dry-run` (and any unique prefix abbreviation) would clear
-            // the `--dry-run` flag the verification probe injects after the
-            // subcommand, turning the read-only probe into a real push.
-            if t.starts_with("--no-dry") {
+            // `--no-dry-run` (and any unique prefix abbreviation, down to
+            // `--no-dr`) would clear the `--dry-run` flag the verification
+            // probe injects after the subcommand, turning the read-only
+            // probe into a real push.
+            if t.starts_with("--no-dr") {
                 return Err(format!(
                     "buzz git wrapper: refusing `{t}` — `--no-dry-run` (and its prefix \
                      abbreviations) cannot be used in managed mode. The push verification \
@@ -5982,6 +6028,35 @@ mod tests {
             "expected dry-run-negation refusal (abbreviated form); got: {err2}"
         );
 
+        // Minimal unique prefix `--no-dr` — git accepts this as the shortest
+        // unambiguous abbreviation of `--no-dry-run` (cf. `--no-d` is ambiguous
+        // between `--no-delete` and `--no-dry-run`; `--no-dr` resolves uniquely).
+        // Before the guard was extended to `starts_with("--no-dr")`, this form
+        // slipped through and turned the dry-run probe into a real push.
+        let argv_min = v(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "push",
+            "--no-dr",
+            "origin",
+            "main",
+        ]);
+        let err3 = verify_push(&real_git(), &argv_min, &argv_min, &ctx, &managed())
+            .expect_err("--no-dr must be refused — minimal unique prefix of --no-dry-run");
+        assert!(
+            err3.contains("--no-dr") || err3.contains("dry-run"),
+            "expected dry-run-negation refusal for --no-dr; got: {err3}"
+        );
+        // Mutation precondition at the minimal prefix: reject_receive_pack_override
+        // must return Err for --no-dr too — changing starts_with("--no-dr") to
+        // starts_with("--no-dry") would make this Ok and reopen the bypass.
+        let rp_min = reject_receive_pack_override(&argv_min);
+        assert!(
+            rp_min.is_err(),
+            "reject_receive_pack_override must reject --no-dr; \
+             reverting to starts_with(\"--no-dry\") would make this Ok"
+        );
+
         // Mutation precondition: removing the guard must flip this to Ok.
         // Verified by directly calling reject_receive_pack_override, which is
         // the function that contains the new check:
@@ -6186,6 +6261,166 @@ mod tests {
                  with argv-based classification the 10-hop limit makes it NotPush — bypassed",
         );
         assert!(err.contains("not authored by your agent identity"), "{err}");
+
+        let ls = std::process::Command::new("git")
+            .args(["ls-remote", remote.path().to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&ls.stdout).trim().is_empty(),
+            "destination must remain empty; remote_refs={:?}",
+            String::from_utf8_lossy(&ls.stdout)
+        );
+    }
+
+    // ── Carl R9 P1-b: builtin-shadowing alias suppresses verification ─────────
+    //
+    // `verify_alias_safety` previously looked up `alias.<name>` for EVERY
+    // command word, including builtin subcommands like `push`.  Git's own
+    // dispatch (git.c `handle_builtin`) checks builtins BEFORE alias config,
+    // so an `alias.push=status` setting is silently ignored at exec time.  The
+    // wrapper's expansion loop, however, DID follow it: with `-c alias.push=status`,
+    // it produced effective_argv with subcommand `status` → `is_push_command`
+    // returned `NotPush` → verification skipped → `exec_real_git` ran the
+    // original `push` argv → git ignored the alias → real push happened.
+    //
+    // The fix: query `git --list-cmds=builtins` once at the top of the
+    // expansion loop and break immediately when the current name is in the set,
+    // treating it as a real subcommand (no alias lookup).
+    //
+    // Regression tests use `run_inner` (the extracted inner body of `run()`)
+    // rather than `verify_push` directly, because tests that hand-construct
+    // `effective_argv` cannot catch a bug in `verify_alias_safety` itself.
+
+    /// (Carl R9 P1-b) `git push` with `alias.push=status` is still refused.
+    ///
+    /// Mutation evidence: removing the builtin-precedence check from
+    /// `verify_alias_safety` (reverting to the unconditional alias lookup) makes
+    /// this test pass (exit 0) instead of failing — the expansion would replace
+    /// `push` with `status`, classify as `NotPush`, and skip verification.
+    #[test]
+    fn verify_push_builtin_alias_shadow_does_not_bypass_verification() {
+        let (_d, repo) = human_authored_repo();
+        let remote = tempfile::tempdir().unwrap();
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .status()
+                .unwrap();
+        };
+        g(&["init", "-q", "--bare", remote.path().to_str().unwrap()]);
+        g(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            remote.path().to_str().unwrap(),
+        ]);
+        // Set alias.push=status — a builtin-shadowing alias git silently ignores.
+        g(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "config",
+            "alias.push",
+            "status",
+        ]);
+
+        // `run_inner` exercises the full verify_alias_safety → is_push_command →
+        // verify_push path with a managed authority.  The human-authored HEAD
+        // must be refused; destination must remain empty.
+        let argv = v(&["-C", repo.to_str().unwrap(), "push", "origin", "main"]);
+        let exit = run_inner(argv, Some(managed()));
+        assert_ne!(
+            exit, 0,
+            "run_inner must refuse human push even when alias.push=status is set"
+        );
+
+        // Mutation precondition: without the builtin check, verify_alias_safety
+        // would expand push→status (NotPush); with it, push is treated as a
+        // real subcommand and effective_argv retains push as the command word.
+        let ctx = vec!["-C".to_string(), repo.to_string_lossy().into_owned()];
+        let check_argv = v(&["-C", repo.to_str().unwrap(), "push", "origin", "main"]);
+        // verify_alias_safety must return Ok(None) for the builtin `push` name
+        // even when alias.push is set — no expansion should occur.
+        let expansion = verify_alias_safety(&real_git(), &check_argv, &ctx)
+            .expect("verify_alias_safety must not return Err for alias.push=status");
+        assert!(
+            expansion.is_none(),
+            "verify_alias_safety must return Ok(None) for builtin `push` (no expansion); \
+             got Some(expanded) — removing the builtin check recreates the bypass"
+        );
+
+        let ls = std::process::Command::new("git")
+            .args(["ls-remote", remote.path().to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&ls.stdout).trim().is_empty(),
+            "destination must remain empty; remote_refs={:?}",
+            String::from_utf8_lossy(&ls.stdout)
+        );
+    }
+
+    /// (Carl R9 P1-b) `git pub` with `alias.pub=push` and `alias.push=status`
+    /// is still refused — the alias chain terminates at the builtin `push` and
+    /// does not follow `alias.push=status` to `status`.
+    ///
+    /// Mutation evidence: removing the builtin-precedence check makes
+    /// `verify_alias_safety` continue beyond `push` to `status`, classify as
+    /// `NotPush`, and skip verification, allowing a real push.
+    #[test]
+    fn verify_push_alias_chain_terminating_at_builtin_is_refused() {
+        let (_d, repo) = human_authored_repo();
+        let remote = tempfile::tempdir().unwrap();
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .status()
+                .unwrap();
+        };
+        g(&["init", "-q", "--bare", remote.path().to_str().unwrap()]);
+        g(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            remote.path().to_str().unwrap(),
+        ]);
+        // alias.pub=push: user command → builtin push.
+        // alias.push=status: would further redirect if builtin precedence were ignored.
+        g(&["-C", repo.to_str().unwrap(), "config", "alias.pub", "push"]);
+        g(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "config",
+            "alias.push",
+            "status",
+        ]);
+
+        let argv = v(&["-C", repo.to_str().unwrap(), "pub", "origin", "main"]);
+        let exit = run_inner(argv, Some(managed()));
+        assert_ne!(
+            exit, 0,
+            "run_inner must refuse human push via pub→push even with alias.push=status set"
+        );
+
+        // Mutation precondition: verify_alias_safety must expand pub→push and
+        // stop there (push is builtin) — returning Some(effective_argv) with
+        // push as the subcommand, not None and not Some([..., "status", ...]).
+        let ctx = vec!["-C".to_string(), repo.to_string_lossy().into_owned()];
+        let check_argv = v(&["-C", repo.to_str().unwrap(), "pub", "origin", "main"]);
+        let expansion = verify_alias_safety(&real_git(), &check_argv, &ctx)
+            .expect("verify_alias_safety must not Err for pub→push chain");
+        let expanded = expansion
+            .expect("verify_alias_safety must expand non-builtin `pub` alias to Some(argv)");
+        let sub = subcommand(&expanded).expect("expanded argv must have a subcommand");
+        assert_eq!(
+            sub, "push",
+            "expansion must terminate at builtin `push`, not follow alias.push=status; \
+             removing the builtin check would expand further to `status`"
+        );
 
         let ls = std::process::Command::new("git")
             .args(["ls-remote", remote.path().to_str().unwrap()])

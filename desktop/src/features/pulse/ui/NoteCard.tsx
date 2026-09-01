@@ -12,6 +12,8 @@ import { useUserProfileQuery } from "@/features/profile/hooks";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { useNoteByIdQuery } from "@/features/pulse/hooks";
 import { getReplyParent, noteSnippet } from "@/features/pulse/lib/replies";
+import { parseMarketEnvelope } from "@/features/market/lib/marketProtocol";
+import { MarketEventCard } from "@/features/market/ui/MarketEventCard";
 import type { UserNote } from "@/shared/api/socialTypes";
 import type { ChannelMember, UserProfileSummary } from "@/shared/api/types";
 import { AnimatedCount } from "@/shared/ui/AnimatedCount";
@@ -134,6 +136,14 @@ function formatRelativeTime(unixSeconds: number): string {
   });
 }
 
+function MarketNoteBody({ note }: { note: UserNote }) {
+  return parseMarketEnvelope(note.content) ? (
+    <MarketEventCard authorPubkey={note.pubkey} content={note.content} />
+  ) : (
+    <Markdown content={note.content} />
+  );
+}
+
 export function NoteCard({
   note,
   profile,
@@ -221,7 +231,7 @@ export function NoteCard({
         ) : null}
 
         <div className="mt-0.5 pb-3 text-sm text-foreground">
-          <Markdown content={note.content} />
+          <MarketNoteBody note={note} />
         </div>
 
         <div className="flex flex-wrap items-center gap-5 text-xs font-medium">

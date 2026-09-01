@@ -13,6 +13,7 @@ import {
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
+import { MarketMessageBody } from "@/features/market/ui/MarketMessageBody";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
 import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -408,6 +409,8 @@ export const MessageRow = React.memo(
             />
           );
         default: {
+          const marketBody = MarketMessageBody(message.body, message.pubkey);
+          if (marketBody) return marketBody;
           const waveMessage = parseWaveMessageContent(message.body);
           if (waveMessage) {
             return (

@@ -5,6 +5,7 @@ import 'package:buzz/features/age_gate/age_restriction_page.dart';
 import 'package:buzz/features/age_gate/age_signal_provider.dart';
 import 'package:buzz/features/home/home_page.dart';
 import 'package:buzz/shared/auth/auth.dart';
+import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -43,6 +44,7 @@ void main() {
     tester,
   ) async {
     final response = Completer<Object?>();
+    final relaySession = _CountingRelaySessionNotifier();
     var requests = 0;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(ageSignalChannel, (call) {
@@ -56,6 +58,7 @@ void main() {
       ProviderScope(
         overrides: [
           authProvider.overrideWith(() => _AuthenticatedAuthNotifier()),
+          relaySessionProvider.overrideWith(() => relaySession),
           savedPrefsProvider.overrideWithValue(prefs),
         ],
         child: const App(),
@@ -66,6 +69,7 @@ void main() {
     expect(find.bySemanticsLabel('Checking age eligibility'), findsOneWidget);
     expect(find.byType(HomePage), findsNothing);
     expect(find.byType(Navigator), findsNothing);
+    expect(relaySession.builds, 0);
 
     response.complete({'status': 'noSignal', 'ageUpper': null});
     await tester.pump();
@@ -74,6 +78,7 @@ void main() {
     expect(find.bySemanticsLabel('Checking age eligibility'), findsNothing);
     expect(find.byType(HomePage), findsOneWidget);
     expect(find.byType(Navigator), findsOneWidget);
+    expect(relaySession.builds, 1);
     expect(requests, 1);
   });
 }
@@ -88,4 +93,14 @@ class _AuthenticatedAuthNotifier extends AuthNotifier {
 class _BlockingAgeSignalNotifier extends AgeSignalNotifier {
   @override
   AgeSignalState build() => AgeSignalState.restricted;
+}
+
+class _CountingRelaySessionNotifier extends RelaySessionNotifier {
+  int builds = 0;
+
+  @override
+  SessionState build() {
+    builds += 1;
+    return const SessionState(status: SessionStatus.disconnected);
+  }
 }

@@ -293,7 +293,10 @@ class App extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final communityTheme = ref.watch(communityThemeProvider);
+    final ageSignalState = ref.watch(ageSignalProvider);
+    final communityTheme = ageSignalState == AgeSignalState.allowed
+        ? ref.watch(communityThemeProvider)
+        : defaultCommunityTheme;
     final themeMode = communityTheme.mode;
     final accentIndex = effectiveAccentIndex(
       communityTheme.theme,
@@ -301,7 +304,6 @@ class App extends HookConsumerWidget {
     );
     final schemeName = communityTheme.theme;
     final authState = ref.watch(authProvider);
-    final ageSignalState = ref.watch(ageSignalProvider);
 
     useEffect(() {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -361,12 +363,16 @@ class App extends HookConsumerWidget {
     }
 
     useEffect(() {
-      applyBadge(ref.read(unreadBadgeProvider));
+      if (ageSignalState == AgeSignalState.allowed) {
+        applyBadge(ref.read(unreadBadgeProvider));
+      }
       return null;
-    }, const []);
-    ref.listen<UnreadBadgeState>(unreadBadgeProvider, (_, next) {
-      applyBadge(next);
-    });
+    }, [ageSignalState]);
+    if (ageSignalState == AgeSignalState.allowed) {
+      ref.listen<UnreadBadgeState>(unreadBadgeProvider, (_, next) {
+        applyBadge(next);
+      });
+    }
 
     return MaterialApp(
       navigatorKey: _mobileRootNavigatorKey,

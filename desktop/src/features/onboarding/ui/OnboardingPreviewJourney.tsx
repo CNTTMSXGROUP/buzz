@@ -347,18 +347,18 @@ export function CommunityChoicePreview({
 
             return cardLayout ? (
               <Button
-                className="group h-12 w-full justify-start gap-0 rounded-xl px-2 py-2 text-left text-sm font-medium text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
+                className="group h-auto min-h-14 w-full justify-start gap-3 rounded-xl px-2 py-2 text-left text-sm font-medium text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
                 data-testid={`onboarding-preview-community-${route}`}
                 key={route}
                 onClick={() => onChoose(route)}
                 type="button"
                 variant="ghost"
               >
-                <span className="flex size-8 shrink-0 items-center justify-center">
-                  <RouteIcon aria-hidden className="size-4" />
+                <span className="flex size-8 shrink-0 items-center justify-start">
+                  <RouteIcon aria-hidden className="!size-6" />
                 </span>
-                <span>{label}</span>
-                <span className="ml-auto flex size-8 shrink-0 items-center justify-center">
+                <span className="min-w-0 flex-1 truncate">{label}</span>
+                <span className="ml-auto flex size-10 shrink-0 items-center justify-center">
                   <ChevronRight
                     aria-hidden
                     className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"

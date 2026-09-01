@@ -19,8 +19,11 @@ import {
 import {
   HARNESS_CONNECTION_OPTIONS,
   HarnessConnectionDetailPreview,
+  HarnessConnectionHelpPreview,
+  HarnessConnectionMethodPreview,
   type HarnessConnectionMethod,
   HarnessConnectionPreview,
+  runtimeNeedsOnboardingConnection,
 } from "./HarnessConnectionStep";
 import { JoinPolicyNotice } from "./JoinPolicyNotice";
 import { KeySignInPreview } from "./KeySignInPreview";
@@ -383,6 +386,10 @@ export function OnboardingPreviewApp() {
     React.useState<HarnessConnectionMethod>("subscription");
   const [harnessConnectionInOnboarding, setHarnessConnectionInOnboarding] =
     React.useState(true);
+  const [
+    chooseHarnessConnectionMethodFirst,
+    setChooseHarnessConnectionMethodFirst,
+  ] = React.useState(false);
   const [setupBackPage, setSetupBackPage] =
     React.useState<OnboardingPreviewPage>("landing");
   const [communityRoute, setCommunityRoute] =
@@ -442,9 +449,20 @@ export function OnboardingPreviewApp() {
   const continueFromAccount = React.useCallback(
     (backPage: OnboardingPreviewPage) => {
       setSetupBackPage(backPage);
-      setPage(journey.afterAccount);
+      setPage(
+        variant === "v3" &&
+          harnessConnectionInOnboarding &&
+          chooseHarnessConnectionMethodFirst
+          ? "harness-connection-method"
+          : journey.afterAccount,
+      );
     },
-    [journey.afterAccount],
+    [
+      chooseHarnessConnectionMethodFirst,
+      harnessConnectionInOnboarding,
+      journey.afterAccount,
+      variant,
+    ],
   );
 
   let content: React.ReactNode;
@@ -574,32 +592,81 @@ export function OnboardingPreviewApp() {
         onNext={() => setPage("config")}
       />
     );
+  } else if (page === "harness-connection-method") {
+    content = (
+      <HarnessConnectionMethodPreview
+        onBack={() => setPage(setupBackPage)}
+        onSelect={(method) => {
+          setHarnessConnectionMethod(method);
+          setPage("harness-connection");
+        }}
+        total={journey.totalSteps}
+      />
+    );
   } else if (page === "harness-connection") {
     content = (
       <HarnessConnectionPreview
         installedIds={installedHarnessIds}
-        onBack={() => setPage(setupBackPage)}
-        onInstall={(option) => {
-          setInstalledHarnessIds((current) =>
-            new Set(current).add(option.runtime.id),
-          );
-          setSelectedHarnessId(option.runtime.id);
-          setHarnessConnectionMethod(option.methods[0] ?? "api");
-          setPage("harness-connection-detail");
-        }}
+        method={
+          chooseHarnessConnectionMethodFirst
+            ? harnessConnectionMethod
+            : undefined
+        }
+        onBack={() =>
+          setPage(
+            chooseHarnessConnectionMethodFirst
+              ? "harness-connection-method"
+              : setupBackPage,
+          )
+        }
+        onHelp={
+          chooseHarnessConnectionMethodFirst
+            ? undefined
+            : () => setPage("harness-connection-help")
+        }
         onSelect={(option) => {
           setSelectedHarnessId(option.runtime.id);
-          setHarnessConnectionMethod(option.methods[0] ?? "api");
-          setPage("harness-connection-detail");
+          const nextMethod = chooseHarnessConnectionMethodFirst
+            ? harnessConnectionMethod
+            : (option.methods[0] ?? "api");
+          setHarnessConnectionMethod(nextMethod);
+          setPage(
+            installedHarnessIds.has(option.runtime.id) &&
+              !runtimeNeedsOnboardingConnection(nextMethod, option.runtime.id)
+              ? "community-choice"
+              : "harness-connection-detail",
+          );
         }}
+        total={journey.totalSteps}
+      />
+    );
+  } else if (page === "harness-connection-help") {
+    content = (
+      <HarnessConnectionHelpPreview
+        onBack={() => setPage("harness-connection")}
         total={journey.totalSteps}
       />
     );
   } else if (page === "harness-connection-detail") {
     content = (
       <HarnessConnectionDetailPreview
+        installed={installedHarnessIds.has(selectedHarness.runtime.id)}
+        lockMethod={chooseHarnessConnectionMethodFirst}
         method={harnessConnectionMethod}
         onBack={() => setPage("harness-connection")}
+        onCheckAgain={() => {
+          setInstalledHarnessIds((current) =>
+            new Set(current).add(selectedHarness.runtime.id),
+          );
+          if (
+            !runtimeNeedsOnboardingConnection(
+              harnessConnectionMethod,
+              selectedHarness.runtime.id,
+            )
+          ) {
+            setPage("community-choice");
+          }
+        }}
         onContinue={() => setPage("community-choice")}
         onMethodChange={setHarnessConnectionMethod}
         option={selectedHarness}
@@ -700,7 +767,12 @@ export function OnboardingPreviewApp() {
   return (
     <>
       <OnboardingPreviewControls
+        chooseHarnessConnectionMethodFirst={chooseHarnessConnectionMethodFirst}
         harnessConnectionInOnboarding={harnessConnectionInOnboarding}
+        onChooseHarnessConnectionMethodFirstChange={(enabled) => {
+          setChooseHarnessConnectionMethodFirst(enabled);
+          restart();
+        }}
         onHarnessConnectionInOnboardingChange={(included) => {
           setHarnessConnectionInOnboarding(included);
           restart();

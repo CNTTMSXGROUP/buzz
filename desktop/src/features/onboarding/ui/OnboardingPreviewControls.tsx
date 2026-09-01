@@ -11,13 +11,17 @@ const PREVIEW_VARIANT_OPTIONS = [
 ] as const;
 
 export function OnboardingPreviewControls({
+  chooseHarnessConnectionMethodFirst,
   harnessConnectionInOnboarding,
+  onChooseHarnessConnectionMethodFirstChange,
   onHarnessConnectionInOnboardingChange,
   onRestart,
   onVariantChange,
   variant,
 }: {
+  chooseHarnessConnectionMethodFirst: boolean;
   harnessConnectionInOnboarding: boolean;
+  onChooseHarnessConnectionMethodFirstChange: (enabled: boolean) => void;
   onHarnessConnectionInOnboardingChange: (included: boolean) => void;
   onRestart: () => void;
   onVariantChange: (variant: OnboardingPreviewVariant) => void;
@@ -62,20 +66,38 @@ export function OnboardingPreviewControls({
         value={variant}
       />
       {variant === "v3" ? (
-        <label
-          className="flex cursor-pointer items-center gap-2 text-xs font-medium text-foreground"
-          htmlFor="onboarding-preview-harness-placement"
-        >
-          <Checkbox
-            checked={harnessConnectionInOnboarding}
-            className="border-foreground data-[state=checked]:bg-foreground data-[state=checked]:text-background"
-            id="onboarding-preview-harness-placement"
-            onCheckedChange={(checked) =>
-              onHarnessConnectionInOnboardingChange(checked === true)
-            }
-          />
-          <span>Harness connection in onboarding</span>
-        </label>
+        <div className="space-y-2">
+          <label
+            className="flex cursor-pointer items-center gap-2 text-xs font-medium text-foreground"
+            htmlFor="onboarding-preview-harness-placement"
+          >
+            <Checkbox
+              checked={harnessConnectionInOnboarding}
+              className="border-foreground data-[state=checked]:bg-foreground data-[state=checked]:text-background"
+              id="onboarding-preview-harness-placement"
+              onCheckedChange={(checked) =>
+                onHarnessConnectionInOnboardingChange(checked === true)
+              }
+            />
+            <span>Harness connection in onboarding</span>
+          </label>
+          {harnessConnectionInOnboarding ? (
+            <label
+              className="flex cursor-pointer items-center gap-2 pl-6 text-xs font-medium text-foreground"
+              htmlFor="onboarding-preview-harness-method-first"
+            >
+              <Checkbox
+                checked={chooseHarnessConnectionMethodFirst}
+                className="border-foreground data-[state=checked]:bg-foreground data-[state=checked]:text-background"
+                id="onboarding-preview-harness-method-first"
+                onCheckedChange={(checked) =>
+                  onChooseHarnessConnectionMethodFirstChange(checked === true)
+                }
+              />
+              <span>Choose subscription or API first</span>
+            </label>
+          ) : null}
+        </div>
       ) : null}
     </aside>
   );

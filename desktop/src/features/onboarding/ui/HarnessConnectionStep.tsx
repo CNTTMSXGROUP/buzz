@@ -1,4 +1,5 @@
-import { ChevronRight } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { ChevronRight, CreditCard, ExternalLink, KeyRound } from "lucide-react";
 import * as React from "react";
 
 import { AgentDropdownSelect } from "@/features/agents/ui/agentConfigControls";
@@ -42,11 +43,13 @@ const CONNECTION_METHOD_OPTIONS = [
 function previewRuntime({
   available = false,
   id,
+  installInstructionsUrl = "https://github.com/block/buzz",
   label,
   source = "preset",
 }: {
   available?: boolean;
   id: string;
+  installInstructionsUrl?: string;
   label: string;
   source?: AcpRuntimeCatalogEntry["source"];
 }): AcpRuntimeCatalogEntry {
@@ -63,7 +66,7 @@ function previewRuntime({
     defaultArgs: [],
     id,
     installHint: `Install ${label} to connect it to Buzz.`,
-    installInstructionsUrl: "https://github.com/block/buzz",
+    installInstructionsUrl,
     label,
     loginHint: null,
     maxRoundsEnvVar: null,
@@ -82,23 +85,31 @@ function previewRuntime({
 /** Fixed workshop catalog. Availability changes only in React memory. */
 export const HARNESS_CONNECTION_OPTIONS: readonly HarnessConnectionOption[] = [
   {
-    methods: ["subscription", "api"],
+    methods: ["subscription"],
     runtime: previewRuntime({
       available: true,
       id: "claude",
+      installInstructionsUrl: "https://code.claude.com/docs/en/getting-started",
       label: "Claude Code",
       source: "builtin",
     }),
   },
   {
-    methods: ["subscription", "api"],
-    runtime: previewRuntime({ id: "codex", label: "Codex", source: "builtin" }),
+    methods: ["subscription"],
+    runtime: previewRuntime({
+      id: "codex",
+      installInstructionsUrl: "https://developers.openai.com/codex/cli/",
+      label: "Codex",
+      source: "builtin",
+    }),
   },
   {
     methods: ["api"],
     runtime: previewRuntime({
       available: true,
       id: "goose",
+      installInstructionsUrl:
+        "https://goose-docs.ai/docs/getting-started/installation/",
       label: "Goose",
       source: "builtin",
     }),
@@ -114,39 +125,75 @@ export const HARNESS_CONNECTION_OPTIONS: readonly HarnessConnectionOption[] = [
   },
   {
     methods: ["subscription"],
-    runtime: previewRuntime({ id: "cursor", label: "Cursor" }),
+    runtime: previewRuntime({
+      id: "cursor",
+      installInstructionsUrl: "https://cursor.com/downloads",
+      label: "Cursor",
+    }),
   },
   {
     methods: ["subscription"],
-    runtime: previewRuntime({ id: "devin", label: "Devin" }),
+    runtime: previewRuntime({
+      id: "devin",
+      installInstructionsUrl: "https://docs.devin.ai/cli",
+      label: "Devin",
+    }),
   },
   {
     methods: ["api"],
-    runtime: previewRuntime({ id: "omp", label: "Oh My Pi" }),
+    runtime: previewRuntime({
+      id: "omp",
+      installInstructionsUrl: "https://omp.sh/",
+      label: "Oh My Pi",
+    }),
   },
   {
     methods: ["api"],
-    runtime: previewRuntime({ id: "grok", label: "Grok Build" }),
+    runtime: previewRuntime({
+      id: "grok",
+      installInstructionsUrl: "https://build.x.ai/docs",
+      label: "Grok Build",
+    }),
   },
   {
     methods: ["api"],
-    runtime: previewRuntime({ id: "opencode", label: "OpenCode" }),
+    runtime: previewRuntime({
+      id: "opencode",
+      installInstructionsUrl: "https://opencode.ai/docs",
+      label: "OpenCode",
+    }),
   },
   {
     methods: ["api"],
-    runtime: previewRuntime({ id: "kimi", label: "Kimi Code" }),
+    runtime: previewRuntime({
+      id: "kimi",
+      installInstructionsUrl: "https://kimi.ai/download",
+      label: "Kimi Code",
+    }),
   },
   {
     methods: ["subscription"],
-    runtime: previewRuntime({ id: "amp", label: "Amp" }),
+    runtime: previewRuntime({
+      id: "amp",
+      installInstructionsUrl: "https://github.com/tao12345666333/amp-acp",
+      label: "Amp",
+    }),
   },
   {
     methods: ["api"],
-    runtime: previewRuntime({ id: "hermes", label: "Hermes Agent" }),
+    runtime: previewRuntime({
+      id: "hermes",
+      installInstructionsUrl: "https://hermes-agent.nousresearch.com",
+      label: "Hermes Agent",
+    }),
   },
   {
     methods: ["api"],
-    runtime: previewRuntime({ id: "openclaw", label: "OpenClaw" }),
+    runtime: previewRuntime({
+      id: "openclaw",
+      installInstructionsUrl: "https://docs.openclaw.ai/start/getting-started",
+      label: "OpenClaw",
+    }),
   },
 ];
 
@@ -157,12 +204,12 @@ export const HARNESS_CONNECTION_OPTIONS: readonly HarnessConnectionOption[] = [
  */
 export function HarnessConnectionList({
   installedIds,
-  onInstall,
+  method,
   onSelect,
   options,
 }: {
   installedIds: ReadonlySet<string>;
-  onInstall: (option: HarnessConnectionOption) => void;
+  method?: HarnessConnectionMethod;
   onSelect: (option: HarnessConnectionOption) => void;
   options: readonly HarnessConnectionOption[];
 }) {
@@ -223,27 +270,56 @@ export function HarnessConnectionList({
         onScroll={updateScrollEdges}
         ref={scrollRef}
       >
-        {orderedOptions.map((option) => {
+        {orderedOptions.map((option, index) => {
           const { runtime } = option;
           const installed = installedIds.has(runtime.id);
+          const previousOption = orderedOptions[index - 1];
+          const startsNotInstalledSection =
+            !installed &&
+            (previousOption === undefined ||
+              installedIds.has(previousOption.runtime.id));
           const label = getRuntimeDisplayLabel(runtime);
+          const isEasiestApiOption =
+            method === "api" && runtime.id === "buzz-agent";
           const rowClassName =
             "group flex min-h-14 w-full items-center gap-3 rounded-xl px-2 py-2 text-left text-sm font-medium text-foreground transition-colors duration-150 ease-out hover:bg-foreground/[0.04] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/20 motion-reduce:transition-none";
           const contents = (
             <>
-              <span className="flex size-10 shrink-0 items-center justify-center">
+              <span className="flex size-10 shrink-0 items-center justify-start">
                 <RuntimeIcon className="size-9" runtime={runtime} />
               </span>
-              <span className="min-w-0 flex-1 truncate">{label}</span>
+              <span className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="truncate">{label}</span>
+                {isEasiestApiOption ? (
+                  <>
+                    <span
+                      aria-hidden="true"
+                      className="shrink-0 text-muted-foreground/50"
+                    >
+                      ·
+                    </span>
+                    <span className="inline-flex shrink-0 items-center rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                      Easiest
+                    </span>
+                  </>
+                ) : null}
+              </span>
             </>
           );
 
-          if (installed) {
-            return (
+          return (
+            <React.Fragment key={runtime.id}>
+              {startsNotInstalledSection ? (
+                <p
+                  className="px-2 pb-1 pt-4 text-xs font-medium text-muted-foreground"
+                  data-testid="onboarding-preview-harness-not-installed"
+                >
+                  Not installed
+                </p>
+              ) : null}
               <button
                 className={rowClassName}
                 data-testid={`onboarding-preview-harness-${runtime.id}`}
-                key={runtime.id}
                 onClick={() => onSelect(option)}
                 type="button"
               >
@@ -251,27 +327,11 @@ export function HarnessConnectionList({
                 <span className="flex size-10 shrink-0 items-center justify-center">
                   <ChevronRight
                     aria-hidden="true"
-                    className="size-4 text-muted-foreground transition-[color,transform] duration-150 ease-out group-hover:translate-x-0.5 group-hover:text-foreground motion-reduce:transition-none"
+                    className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
                   />
                 </span>
               </button>
-            );
-          }
-
-          return (
-            <div className={rowClassName} key={runtime.id}>
-              {contents}
-              <Button
-                aria-label={`Install ${label}`}
-                className="ml-auto h-7 shrink-0 rounded-full bg-foreground px-3 text-xs text-background shadow-none hover:bg-foreground/85"
-                data-testid={`onboarding-preview-harness-install-${runtime.id}`}
-                onClick={() => onInstall(option)}
-                size="xs"
-                type="button"
-              >
-                Install
-              </Button>
-            </div>
+            </React.Fragment>
           );
         })}
       </div>
@@ -281,17 +341,25 @@ export function HarnessConnectionList({
 
 export function HarnessConnectionPreview({
   installedIds,
+  method,
   onBack,
-  onInstall,
+  onHelp,
   onSelect,
   total,
 }: {
   installedIds: ReadonlySet<string>;
+  method?: HarnessConnectionMethod;
   onBack: () => void;
-  onInstall: (option: HarnessConnectionOption) => void;
+  onHelp?: () => void;
   onSelect: (option: HarnessConnectionOption) => void;
   total: number;
 }) {
+  const options = method
+    ? HARNESS_CONNECTION_OPTIONS.filter(({ methods }) =>
+        methods.includes(method),
+      )
+    : HARNESS_CONNECTION_OPTIONS;
+
   return (
     <OnboardingPreviewStep
       current={3}
@@ -306,20 +374,209 @@ export function HarnessConnectionPreview({
       >
         <div className="shrink-0">
           <h1 className="text-title font-normal text-foreground">
-            Connect your AI client
+            {method === "subscription"
+              ? "Continue with an AI subscription"
+              : method === "api"
+                ? "Continue with an AI API key"
+                : "Connect your AI client"}
           </h1>
-          <p className="mt-2 text-base leading-6 text-foreground/80">
-            Choose which AI client your agents will use. You can change this
-            anytime.
-          </p>
+          {!method ? (
+            <p className="mt-2 text-base leading-6 text-foreground/80">
+              Choose which AI client your agents will use. You can change this
+              anytime.{" "}
+              {onHelp ? (
+                <Button
+                  className="inline-flex h-auto p-0 align-baseline text-base leading-6 text-foreground underline decoration-foreground/45 underline-offset-4 hover:decoration-foreground"
+                  data-testid="onboarding-preview-harness-help-trigger"
+                  onClick={onHelp}
+                  type="button"
+                  variant="link"
+                >
+                  Need help choosing?
+                </Button>
+              ) : null}
+            </p>
+          ) : null}
         </div>
         <div className="mt-6 flex min-h-0 flex-1 flex-col">
           <HarnessConnectionList
             installedIds={installedIds}
-            onInstall={onInstall}
+            method={method}
             onSelect={onSelect}
-            options={HARNESS_CONNECTION_OPTIONS}
+            options={options}
           />
+        </div>
+      </OnboardingSlideTransition>
+    </OnboardingPreviewStep>
+  );
+}
+
+const CONNECTION_METHOD_CHOICES = [
+  {
+    icon: CreditCard,
+    label: "I use a subscription",
+    method: "subscription",
+  },
+  {
+    icon: KeyRound,
+    label: "I have an API key",
+    method: "api",
+  },
+] as const satisfies ReadonlyArray<{
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  method: HarnessConnectionMethod;
+}>;
+
+export function HarnessConnectionMethodPreview({
+  onBack,
+  onSelect,
+  total,
+}: {
+  onBack: () => void;
+  onSelect: (method: HarnessConnectionMethod) => void;
+  total: number;
+}) {
+  return (
+    <OnboardingPreviewStep
+      current={3}
+      onBack={onBack}
+      testId="onboarding-preview-harness-method"
+      total={total}
+    >
+      <OnboardingSlideTransition
+        className="flex min-h-0 flex-1 flex-col"
+        containerClassName="min-h-0 flex-1"
+        transitionKey="preview-harness-method"
+      >
+        <div className="shrink-0">
+          <h1 className="text-title font-normal text-foreground">
+            How do you use AI?
+          </h1>
+          <p className="mt-2 text-base leading-6 text-foreground/80">
+            Choose the option that matches how you access AI.
+          </p>
+        </div>
+
+        <div className="-mx-2 mt-6 flex w-[calc(100%+1rem)] flex-1 flex-col gap-2">
+          {CONNECTION_METHOD_CHOICES.map(
+            ({ icon: MethodIcon, label, method }) => (
+              <Button
+                className="group h-auto min-h-14 w-full justify-start gap-3 rounded-xl px-2 py-2 text-left text-sm text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
+                data-testid={`onboarding-preview-harness-method-${method}`}
+                key={method}
+                onClick={() => onSelect(method)}
+                type="button"
+                variant="ghost"
+              >
+                <span className="flex size-8 shrink-0 items-center justify-start">
+                  <MethodIcon aria-hidden className="!size-6" />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium">{label}</span>
+                </span>
+                <span className="ml-auto flex size-10 shrink-0 items-center justify-center">
+                  <ChevronRight
+                    aria-hidden
+                    className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"
+                  />
+                </span>
+              </Button>
+            ),
+          )}
+        </div>
+      </OnboardingSlideTransition>
+    </OnboardingPreviewStep>
+  );
+}
+
+function HarnessCompatibilityList({
+  method,
+}: {
+  method: HarnessConnectionMethod;
+}) {
+  const options = HARNESS_CONNECTION_OPTIONS.filter(({ methods }) =>
+    methods.includes(method),
+  );
+
+  return (
+    <ul
+      className="mt-4 grid grid-cols-2 gap-x-5 gap-y-3"
+      data-testid={`onboarding-preview-harness-help-${method}-list`}
+    >
+      {options.map(({ runtime }) => (
+        <li className="flex min-w-0 items-center gap-2" key={runtime.id}>
+          <span className="flex size-7 shrink-0 items-center justify-center">
+            <RuntimeIcon className="size-6" runtime={runtime} />
+          </span>
+          <span className="truncate text-sm font-medium text-foreground">
+            {getRuntimeDisplayLabel(runtime)}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+export function HarnessConnectionHelpPreview({
+  onBack,
+  total,
+}: {
+  onBack: () => void;
+  total: number;
+}) {
+  return (
+    <OnboardingPreviewStep
+      current={3}
+      onBack={onBack}
+      testId="onboarding-preview-harness-help"
+      total={total}
+    >
+      <OnboardingSlideTransition
+        className="flex min-h-0 w-full max-w-[500px] flex-1 flex-col items-stretch text-left"
+        containerClassName="min-h-0 flex-1"
+        transitionKey="preview-harness-help"
+      >
+        <div className="shrink-0">
+          <h1 className="text-title font-normal text-foreground">
+            Choose how to connect
+          </h1>
+          <p className="mt-2 text-base leading-6 text-foreground/80">
+            Connect an AI client using a subscription or API key.
+          </p>
+        </div>
+
+        <div className="mt-8 min-h-0 flex-1 space-y-7 overflow-y-auto pb-4 pr-1">
+          <section aria-labelledby="harness-subscription-heading">
+            <h2
+              className="text-base font-medium text-foreground"
+              id="harness-subscription-heading"
+            >
+              I use a subscription
+            </h2>
+            <p className="mt-2 text-sm leading-6 text-foreground/75">
+              Choose this if you sign in to a paid AI product, such as ChatGPT
+              or Claude.
+            </p>
+            <HarnessCompatibilityList method="subscription" />
+          </section>
+
+          <section
+            aria-labelledby="harness-api-heading"
+            className="border-t border-[#e2e2e2] pt-7"
+          >
+            <h2
+              className="text-base font-medium text-foreground"
+              id="harness-api-heading"
+            >
+              I use an API key
+            </h2>
+            <p className="mt-2 text-sm leading-6 text-foreground/75">
+              Choose this if you have an API key from an AI provider or your
+              team.
+            </p>
+            <HarnessCompatibilityList method="api" />
+          </section>
         </div>
       </OnboardingSlideTransition>
     </OnboardingPreviewStep>
@@ -342,6 +599,15 @@ const SUBSCRIPTION_NAMES: Record<string, string> = {
 function defaultApiProvider(runtimeId: string) {
   if (runtimeId === "codex") return "openai";
   return "anthropic";
+}
+
+export function runtimeNeedsOnboardingConnection(
+  method: HarnessConnectionMethod,
+  runtimeId: string,
+) {
+  return (
+    method === "subscription" || runtimeSupportsLlmProviderSelection(runtimeId)
+  );
 }
 
 function apiKeyLabel(provider: string) {
@@ -433,15 +699,21 @@ function ConnectedConfiguration({
 }
 
 export function HarnessConnectionDetailPreview({
+  installed,
+  lockMethod = false,
   method,
   onBack,
+  onCheckAgain,
   onContinue,
   onMethodChange,
   option,
   total,
 }: {
+  installed: boolean;
+  lockMethod?: boolean;
   method: HarnessConnectionMethod;
   onBack: () => void;
+  onCheckAgain: () => void;
   onContinue: () => void;
   onMethodChange: (method: HarnessConnectionMethod) => void;
   option: HarnessConnectionOption;
@@ -449,7 +721,7 @@ export function HarnessConnectionDetailPreview({
 }) {
   const cardLayout = useOnboardingPreviewCardLayout();
   const label = getRuntimeDisplayLabel(option.runtime);
-  const hasMethodChoice = option.methods.length > 1;
+  const hasMethodChoice = option.methods.length > 1 && !lockMethod;
   const [provider, setProvider] = React.useState(() =>
     defaultApiProvider(option.runtime.id),
   );
@@ -494,6 +766,70 @@ export function HarnessConnectionDetailPreview({
       return;
     }
     if (canConnect) setConnected(true);
+  }
+
+  if (!installed) {
+    return (
+      <OnboardingPreviewStep
+        current={3}
+        onBack={onBack}
+        testId="onboarding-preview-harness-setup-guide"
+        total={total}
+      >
+        <OnboardingSlideTransition
+          className={cn(
+            "flex min-h-0 w-full max-w-[500px] flex-1 flex-col",
+            cardLayout ? "items-stretch" : "items-center",
+          )}
+          containerClassName="min-h-0 flex-1"
+          transitionKey={`preview-harness-setup-${option.runtime.id}`}
+        >
+          <div className="flex items-center gap-3">
+            <span className="flex size-10 shrink-0 items-center justify-center">
+              <RuntimeIcon className="size-9" runtime={option.runtime} />
+            </span>
+            <h1 className="text-title font-normal text-foreground">
+              Set up {label}
+            </h1>
+          </div>
+          <p className="mt-2 max-w-[440px] text-base leading-6 text-foreground/80">
+            Follow the setup guide to install {label}. When you’re done, come
+            back and check again.
+          </p>
+
+          <div className="mt-8 flex min-h-0 flex-1 flex-col">
+            <div className="rounded-xl bg-[#e2e2e2]/30 px-4 py-4">
+              <p className="text-sm font-medium text-foreground">
+                CLI not detected
+              </p>
+              <Button
+                className="mt-1 h-auto justify-start p-0 text-sm text-foreground underline decoration-foreground/45 underline-offset-4 hover:decoration-foreground"
+                data-testid="onboarding-preview-harness-open-setup-guide"
+                onClick={() =>
+                  void openUrl(option.runtime.installInstructionsUrl)
+                }
+                type="button"
+                variant="link"
+              >
+                Open setup guide
+                <ExternalLink aria-hidden />
+              </Button>
+            </div>
+          </div>
+
+          <OnboardingFooter>
+            <Button
+              className={ONBOARDING_PRIMARY_CTA_CLASS}
+              data-testid="onboarding-preview-harness-check-again"
+              onClick={onCheckAgain}
+              type="button"
+            >
+              Check again
+            </Button>
+          </OnboardingFooter>
+        </OnboardingSlideTransition>
+      </OnboardingPreviewStep>
+    );
   }
 
   return (

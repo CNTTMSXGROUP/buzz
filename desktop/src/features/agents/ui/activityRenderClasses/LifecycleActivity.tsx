@@ -82,6 +82,7 @@ function PermissionDecisionButtons({
   requestNonce,
   deliveryFailed,
   deadlineSecs,
+  _deliveryFn,
 }: {
   agentPubkey: string;
   channelId: string;
@@ -97,7 +98,14 @@ function PermissionDecisionButtons({
    * Effective expiry deadline (unix seconds) bounding the retransmit loop.
    */
   deadlineSecs: number;
+  /**
+   * Seam for testing — injects a mock delivery function without needing
+   * `mock.module`. Production callers omit this; the real
+   * `startPermissionDecisionDelivery` is used by default.
+   */
+  _deliveryFn?: typeof startPermissionDecisionDelivery;
 }) {
+  const deliveryFn = _deliveryFn ?? startPermissionDecisionDelivery;
   const [pending, setPending] = React.useState<string | null>(null);
 
   // Re-enable buttons when the reducer signals delivery failure (non-`sent`
@@ -140,7 +148,7 @@ function PermissionDecisionButtons({
             disabled={pending !== null}
             onClick={() => {
               setPending(optionId);
-              void startPermissionDecisionDelivery({
+              void deliveryFn({
                 agentPubkey,
                 channelId,
                 requestNonce,
@@ -172,7 +180,15 @@ function PermissionDecisionButtons({
   );
 }
 
-export function LifecycleActivity(props: ActivityRenderClassItemProps) {
+export function LifecycleActivity(
+  props: ActivityRenderClassItemProps & {
+    /**
+     * Seam for testing — injected mock delivery function threaded through to
+     * `PermissionDecisionButtons`. Production callers omit this prop.
+     */
+    _deliveryFn?: typeof startPermissionDecisionDelivery;
+  },
+) {
   if (props.item.type === "tool") {
     return <ToolActivity {...props} />;
   }
@@ -230,6 +246,7 @@ export function LifecycleActivity(props: ActivityRenderClassItemProps) {
               props.item.timestamp,
               Date.now() / 1000,
             )}
+            _deliveryFn={props._deliveryFn}
           />
         ) : null}
         {/* Row 5: decision — only when outcome is resolved */}

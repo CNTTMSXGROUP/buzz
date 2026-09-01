@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { after, afterEach, before, mock, test } from "node:test";
 
+import { JSDOM } from "jsdom";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -43,8 +44,61 @@ function pendingPermissionItem(options) {
 }
 
 // ---------------------------------------------------------------------------
-// allow_once — renders a green actionable Allow button
+// jsdom + fake-timer setup (required for the interactive delivery-seam tests)
+// The static renderToStaticMarkup tests do not use document/window but the
+// setup is harmless for them: it only assigns globals they never read.
 // ---------------------------------------------------------------------------
+
+const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+  url: "http://localhost",
+});
+
+// Deterministic wall-clock epoch — far from real time to avoid expiry surprises.
+// expiresAt is set to FAKE_NOW_SECS + 9_999_999 in the interactive tests so
+// the card never expires during the test.
+const FAKE_NOW_MS = 1_000_000_000_000;
+
+before(() => {
+  mock.timers.enable({ apis: ["setInterval", "Date"], now: FAKE_NOW_MS });
+
+  Object.assign(globalThis, {
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    IS_REACT_ACT_ENVIRONMENT: true,
+    window: dom.window,
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+      takeRecords() {
+        return [];
+      }
+    },
+    ResizeObserver: class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  });
+  dom.window.matchMedia = () => ({
+    matches: false,
+    addEventListener() {},
+    removeEventListener() {},
+  });
+  dom.window.MutationObserver = globalThis.MutationObserver;
+  dom.window.ResizeObserver = globalThis.ResizeObserver;
+});
+
+afterEach(async () => {
+  const { cleanup } = await import("@testing-library/react");
+  cleanup();
+  mock.timers.reset();
+  mock.timers.enable({ apis: ["setInterval", "Date"], now: FAKE_NOW_MS });
+});
+
+after(() => {
+  mock.timers.reset();
+  dom.window.close();
+});
 
 test("test_allow_once_renders_actionable_allow_button", () => {
   const html = renderToStaticMarkup(
@@ -460,5 +514,177 @@ test("test_f3_cross_layer_four_options_acp_read_to_lifecycle_activity_two_button
     buttonCount,
     2,
     `cross-layer four-option card must render exactly 2 buttons; got ${buttonCount}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// F3 interactive delivery-seam: acp_read → buildTranscript → LifecycleActivity
+// click buttons → assert _deliveryFn called with ruled allow_once/reject_once IDs
+//
+// Mutation proof: removing `allow_once` from ACTIONABLE_KINDS → the allow_once
+// button is not rendered → fireEvent.click finds no element → first delivery
+// assertion fails. Removing `reject_once` → same for reject_once.
+// Removing both → zero delivery calls → both assertions fail.
+// ---------------------------------------------------------------------------
+
+test("test_f3_interactive_delivery_seam_allow_once_and_reject_once_fire_delivery", async () => {
+  const { createElement, act } = await import("react");
+  const { render, fireEvent } = await import("@testing-library/react");
+
+  const FAKE_NOW_SECS = Math.floor(FAKE_NOW_MS / 1000);
+  const FUTURE_EXPIRY = FAKE_NOW_SECS + 9_999_999;
+
+  // Record delivery calls: { optionId, requestNonce }[]
+  const deliveryCalls = [];
+  function mockDeliveryFn({ optionId, requestNonce }) {
+    deliveryCalls.push({ optionId, requestNonce });
+    // Resolve as "acked" so the component doesn't re-enable the button.
+    return Promise.resolve("acked");
+  }
+
+  // Build the transcript card from a real acp_read event carrying all four
+  // option kinds — same wire shape as the static cross-layer test above.
+  const acpReadEvent = {
+    seq: 1,
+    timestamp: "2026-09-01T10:00:00.000Z",
+    kind: "acp_read",
+    agentIndex: 0,
+    channelId: "ch-interactive",
+    sessionId: "sess-interactive",
+    turnId: "turn-interactive",
+    payload: {
+      jsonrpc: "2.0",
+      id: "req-interactive",
+      method: "session/request_permission",
+      params: {
+        title: "Tool requires approval",
+        toolCallId: "tc-interactive",
+        options: [
+          {
+            optionId: "opt-allow-once",
+            kind: "allow_once",
+            name: "Allow once",
+          },
+          { optionId: "opt-reject-once", kind: "reject_once", name: "Deny" },
+          {
+            optionId: "opt-allow-always",
+            kind: "allow_always",
+            name: "Always allow",
+          },
+          {
+            optionId: "opt-reject-always",
+            kind: "reject_always",
+            name: "Always deny",
+          },
+        ],
+      },
+    },
+    authorization: {
+      requestNonce: "nonce-interactive",
+      actionable: true,
+      expiresAt: FUTURE_EXPIRY,
+    },
+  };
+
+  const transcript = buildTranscript([acpReadEvent]);
+  const card = transcript.find((item) => item.renderClass === "permission");
+  assert.ok(card, "transcript must contain a permission card");
+  assert.ok(card.actionable, "card must be actionable");
+
+  let container;
+  await act(async () => {
+    ({ container } = render(
+      createElement(LifecycleActivity, {
+        ...BASE_PROPS,
+        item: card,
+        _deliveryFn: mockDeliveryFn,
+      }),
+    ));
+  });
+
+  // ── Click allow_once — must call delivery with opt-allow-once ─────────────
+  const allowBtn = container.querySelector(
+    '[data-testid="permission-decision-opt-allow-once"]',
+  );
+  assert.ok(
+    allowBtn !== null,
+    "allow_once button must be present (ACTIONABLE_KINDS must include allow_once)",
+  );
+  await act(async () => {
+    fireEvent.click(allowBtn);
+    // Drain microtasks so the async delivery fn resolves.
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  assert.equal(
+    deliveryCalls.length,
+    1,
+    "exactly one delivery call after clicking allow_once; mutation: remove allow_once from ACTIONABLE_KINDS → zero calls",
+  );
+  assert.equal(
+    deliveryCalls[0].optionId,
+    "opt-allow-once",
+    "delivery must be called with the allow_once optionId; mutation: wrong id → fails",
+  );
+  assert.equal(
+    deliveryCalls[0].requestNonce,
+    "nonce-interactive",
+    "delivery must carry the card's requestNonce",
+  );
+
+  // ── allow_always must NOT have a button (not in ACTIONABLE_KINDS) ─────────
+  assert.equal(
+    container.querySelector(
+      '[data-testid="permission-decision-opt-allow-always"]',
+    ),
+    null,
+    "allow_always must not render a clickable button",
+  );
+
+  // ── reject_always must NOT have a button either ───────────────────────────
+  assert.equal(
+    container.querySelector(
+      '[data-testid="permission-decision-opt-reject-always"]',
+    ),
+    null,
+    "reject_always must not render a clickable button",
+  );
+
+  // ── Render a fresh card and click reject_once ──────────────────────────────
+  // Use a separate render to avoid the pending-state from the allow_once click
+  // disabling the reject_once button.
+  deliveryCalls.length = 0;
+  let container2;
+  await act(async () => {
+    ({ container: container2 } = render(
+      createElement(LifecycleActivity, {
+        ...BASE_PROPS,
+        item: card,
+        _deliveryFn: mockDeliveryFn,
+      }),
+    ));
+  });
+
+  const rejectBtn = container2.querySelector(
+    '[data-testid="permission-decision-opt-reject-once"]',
+  );
+  assert.ok(
+    rejectBtn !== null,
+    "reject_once button must be present (ACTIONABLE_KINDS must include reject_once)",
+  );
+  await act(async () => {
+    fireEvent.click(rejectBtn);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  assert.equal(
+    deliveryCalls.length,
+    1,
+    "exactly one delivery call after clicking reject_once; mutation: remove reject_once from ACTIONABLE_KINDS → zero calls",
+  );
+  assert.equal(
+    deliveryCalls[0].optionId,
+    "opt-reject-once",
+    "delivery must be called with the reject_once optionId; mutation: wrong id → fails",
   );
 });

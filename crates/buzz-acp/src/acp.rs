@@ -4255,9 +4255,11 @@ fn build_kind40003_sentinel(
 ///
 /// `delivery_deadline` is computed at resolution time as
 /// `Instant::now() + RESOLVED_DELIVERY_WINDOW_SECS`, independent of the original
-/// card/click deadline. This guarantees at least one publish attempt for every
-/// terminal outcome, including ordinary timeouts (where the card deadline is
-/// already past when `finish_permission` fires).
+/// card/click deadline. The first publish attempt is **unconditional** — the
+/// deadline is only consulted before each *retry* so that the relay always sees
+/// at least one publication even when the caller supplies an already-expired
+/// deadline (e.g. during ordinary timeouts where `entry_deadline` was already
+/// past when `finish_permission` fired).
 ///
 /// Spawned detached so it never blocks the read loop. `event` is consumed and
 /// resent by clone each attempt so the signature and id are stable across retries.
@@ -4266,8 +4268,13 @@ async fn retransmit_resolved_edit(
     event: nostr::Event,
     delivery_deadline: tokio::time::Instant,
 ) {
+    let mut first_attempt = true;
     loop {
-        if tokio::time::Instant::now() >= delivery_deadline {
+        // The first attempt is unconditional — an already-expired deadline must
+        // not prevent the single relay write that resolves the card. Subsequent
+        // retries (Uncertain outcome) are gated by the deadline so the loop
+        // terminates once the delivery window closes.
+        if !first_attempt && tokio::time::Instant::now() >= delivery_deadline {
             tracing::warn!(
                 target: "acp::permission",
                 "resolved edit {} not accepted before delivery window — giving up",
@@ -4275,10 +4282,11 @@ async fn retransmit_resolved_edit(
             );
             return;
         }
+        first_attempt = false;
         // Per-attempt ACK deadline: min(fixed publish timeout, delivery_deadline).
         // Capping each attempt at SENTINEL_PUBLISH_TIMEOUT sweeps a stuck waiter
-        // promptly so the same signed event is resent, while the loop-top check
-        // keeps the overall delivery window as the outer bound.
+        // promptly so the same signed event is resent, while the deadline check
+        // above keeps the overall delivery window as the outer bound.
         let attempt_deadline = (tokio::time::Instant::now()
             + std::time::Duration::from_secs(SENTINEL_PUBLISH_TIMEOUT_SECS))
         .min(delivery_deadline);
@@ -12280,69 +12288,116 @@ mod tests {
         let _ = std::fs::remove_file(&capture_file);
     }
 
+    // ── F2: unconditional first attempt with an already-expired deadline ──────
+    //
+    // The retransmit loop must publish the resolved edit at least once even when
+    // the delivery_deadline has already elapsed at call time. This covers the
+    // ordinary-timeout path where the card's entry_deadline expired before
+    // `finish_permission` called `retransmit_resolved_edit`.
+    //
+    // Mutation proof: reverting the `!first_attempt &&` guard (i.e. making the
+    // deadline check unconditional at loop-top) causes the loop to return
+    // immediately on an already-expired deadline without publishing — the
+    // assertion that a kind-40003 event was emitted goes red.
+
+    #[tokio::test(start_paused = true)]
+    async fn retransmit_resolved_edit_unconditional_first_attempt_on_expired_deadline() {
+        let keys = Keys::generate();
+
+        let event = nostr::EventBuilder::new(nostr::Kind::from(40003), "resolved-expired")
+            .sign(&keys)
+            .unwrap();
+        let event_id = event.id.to_hex();
+
+        // Use an accepting publisher — we only need to confirm the event is
+        // attempted once despite the expired deadline.
+        let (publisher, mut event_rx) = crate::relay::RelayEventPublisher::test_pair();
+
+        let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_drain = collected.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = event_rx.recv().await {
+                if ev.kind.as_u16() == 40003 {
+                    collected_drain.lock().unwrap().push(ev.id.to_hex());
+                }
+            }
+        });
+
+        // Supply an already-expired deadline.
+        // Under start_paused, Instant::now() is fixed at epoch; subtract 1ns.
+        let already_expired = tokio::time::Instant::now() - std::time::Duration::from_nanos(1);
+        let handle = tokio::spawn(retransmit_resolved_edit(publisher, event, already_expired));
+
+        // Advance time past the per-attempt timeout so the spawned task drains.
+        tokio::time::advance(std::time::Duration::from_secs(
+            SENTINEL_PUBLISH_TIMEOUT_SECS + 1,
+        ))
+        .await;
+        tokio::task::yield_now().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), handle).await;
+        tokio::task::yield_now().await;
+
+        let seen = collected.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "retransmit must publish even when delivery_deadline is already expired at call time; \
+             mutation: unconditional loop-top deadline check → zero publishes → this goes red"
+        );
+        assert_eq!(
+            seen[0], event_id,
+            "published event must carry the same stable signed id"
+        );
+    }
+
     // ── F2: always-Uncertain bounded-exit ─────────────────────────────────────
     //
-    // A retransmit loop that never receives `Accepted` must still terminate
-    // once the delivery window (300s) elapses. Under paused time we advance past
-    // the window and confirm the loop exits — i.e. the spawned task finishes
-    // without hanging forever.
+    // A retransmit loop that perpetually receives `Uncertain` (via test_pair_silent
+    // which drops ack_tx so every await resolves as RecvError → Uncertain) must
+    // still terminate once the delivery window elapses. Under paused tokio time
+    // we advance past the window and confirm the loop exits.
     //
-    // Same signed event ID across retries: the same `nostr::Event` struct
-    // (identical id + signature) is re-submitted on every `Uncertain` retry.
-    // The relay's idempotency guarantee only holds when the id is stable.
-    //
-    // Mutation proof: replacing `RESOLVED_DELIVERY_WINDOW_SECS` with a very
-    // large value (e.g. `u64::MAX / 2`) makes the loop effectively infinite
-    // under the test's time budget — the `JoinHandle` would never complete.
+    // Mutation proof: replacing `RESOLVED_DELIVERY_WINDOW_SECS` with a very large
+    // value (e.g. `u64::MAX / 2`) makes the loop effectively infinite under the
+    // test's time budget — the JoinHandle would never complete and the timeout
+    // assertion fails.
 
     #[tokio::test(start_paused = true)]
     async fn retransmit_resolved_edit_always_uncertain_bounded_exit() {
-        // Verify two properties of `retransmit_resolved_edit`:
-        //
-        // 1. **Bounded exit**: the loop terminates when the delivery window closes.
-        //    Exercised by dropping the publisher's event receiver immediately so
-        //    the first `register_publish_ack` call returns `Err` (channel closed)
-        //    — the loop treats that as terminal and exits.
-        //
-        // 2. **Same signed event ID across retries**: the same `nostr::Event`
-        //    struct (identical id + signature) must be re-submitted on every
-        //    attempt. Verified by comparing `id.to_hex()` on the original and a
-        //    clone — these must match.
         let keys = Keys::generate();
 
-        let event = nostr::EventBuilder::new(nostr::Kind::from(40003), "resolved")
+        let event = nostr::EventBuilder::new(nostr::Kind::from(40003), "resolved-uncertain")
             .sign(&keys)
             .unwrap();
 
-        // Drop the receiver immediately so the publisher channel is closed before
-        // the first attempt — the loop exits on the `Err(channel closed)` path.
-        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
-        drop(event_rx);
+        // test_pair_silent drops ack_tx on each PublishEventAcked → every
+        // ack_rx.await yields Err(RecvError) → unwrapped as Uncertain.
+        let (publisher, _event_rx) = crate::relay::RelayEventPublisher::test_pair_silent();
 
-        let delivery_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        // Short delivery window to advance past quickly.
+        let delivery_window = std::time::Duration::from_secs(4);
+        let delivery_deadline = tokio::time::Instant::now() + delivery_window;
         let handle = tokio::spawn(retransmit_resolved_edit(
             publisher,
-            event.clone(),
+            event,
             delivery_deadline,
         ));
 
-        // Advance time to let the spawned task run its first iteration.
-        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        // Each Uncertain attempt is followed by RESOLVED_RETRANSMIT_BACKOFF sleep.
+        // Under paused time the runtime auto-advances through parked timers.
+        // Advance well past the delivery window to drain all retry cycles.
+        tokio::time::advance(
+            delivery_window + std::time::Duration::from_secs(SENTINEL_PUBLISH_TIMEOUT_SECS * 3),
+        )
+        .await;
+        tokio::task::yield_now().await;
 
-        // The loop must exit (channel closed = terminal).
-        let join_result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        let join_result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         assert!(
             join_result.is_ok(),
-            "retransmit loop must exit when publisher channel closes (bounded-exit property)"
-        );
-
-        // Same event ID across clones — the relay idempotency guarantee requires
-        // the same signed event (same id) on every retry attempt.
-        let id_original = event.id.to_hex();
-        let id_cloned = event.clone().id.to_hex();
-        assert_eq!(
-            id_original, id_cloned,
-            "event ID must be stable across clones (same signed event retransmitted on retry)"
+            "retransmit loop must exit once the delivery window elapses even when every \
+             attempt returns Uncertain; mutation: large RESOLVED_DELIVERY_WINDOW_SECS → \
+             loop never completes within test budget → timeout fires"
         );
     }
 

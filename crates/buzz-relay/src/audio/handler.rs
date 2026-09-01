@@ -225,6 +225,7 @@ async fn handle_active_audio_connection(
 
     // Extract NIP-OA auth tag before verify_auth_event consumes the event.
     let auth_tag_json = crate::handlers::auth::extract_auth_tag_json(&auth_msg.event);
+    let signed_auth_created_at = auth_msg.event.created_at.as_secs();
 
     let relay_url = crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &tenant);
     let auth_ctx = match state
@@ -256,6 +257,7 @@ async fn handle_active_audio_connection(
         tenant.community(),
         pubkey.as_bytes(),
         auth_tag_json.as_deref(),
+        Some(signed_auth_created_at),
     )
     .await
     .is_err()
@@ -305,6 +307,7 @@ async fn handle_active_audio_connection(
         channel_id,
         &pubkey,
         auth_tag_json.as_deref(),
+        signed_auth_created_at,
     )
     .await;
 
@@ -1447,9 +1450,14 @@ async fn derive_audio_peer_role(
     channel_id: Uuid,
     pubkey: &nostr::PublicKey,
     auth_tag_json: Option<&str>,
+    signed_auth_created_at: u64,
 ) -> crate::audio::room::AudioPeerRole {
-    let has_valid_owner_attestation =
-        crate::api::relay_members::extract_nip_oa_owner(pubkey.as_bytes(), auth_tag_json).is_some();
+    let has_valid_owner_attestation = crate::api::relay_members::extract_nip_oa_owner(
+        pubkey.as_bytes(),
+        auth_tag_json,
+        Some(signed_auth_created_at),
+    )
+    .is_some();
     let membership_role = match state
         .db
         .get_member_role(community, channel_id, pubkey.as_bytes())

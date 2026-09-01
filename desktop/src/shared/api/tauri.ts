@@ -988,7 +988,7 @@ export async function getBakedBuildEnvKeys(): Promise<string[]> {
  *
  * The value is already masked in Rust for secret keys (keys not in the
  * explicit safe-to-reveal allowlist: `BUZZ_AGENT_PROVIDER`, `BUZZ_AGENT_MODEL`,
- * `DATABRICKS_HOST`, `DATABRICKS_MODEL`). Non-allowlisted keys have their
+ * `DATABRICKS_HOST`, `DATABRICKS_MODEL`, `DATABRICKS_MODEL_FILTER`). Non-allowlisted keys have their
  * values replaced with `••••••`. Non-secret values are shown as-is.
  * Empty-value keys are filtered out.
  */
@@ -1071,22 +1071,6 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
-export async function applyCommunity(
-  relayUrl: string,
-  nsec?: string,
-  token?: string,
-  reposDir?: string,
-  agentManagedProfiles?: boolean,
-): Promise<void> {
-  await invokeTauri("apply_workspace", {
-    relayUrl,
-    nsec: nsec ?? null,
-    token: token ?? null,
-    reposDir: reposDir ?? null,
-    agentManagedProfiles: agentManagedProfiles ?? false,
-  });
-}
-
 // Validate a candidate repos dir without mutating the filesystem. Rejects
 // with a human-readable reason; resolves for a valid or empty path.
 export async function validateReposDir(dir: string): Promise<void> {
@@ -1095,9 +1079,6 @@ export async function validateReposDir(dir: string): Promise<void> {
 
 export const setPreventSleepActive = (active: boolean) =>
   invokeTauri("set_prevent_sleep_active", { active });
-
-export const setAgentManagedProfiles = (enabled: boolean) =>
-  invokeTauri("set_agent_managed_profiles", { enabled });
 
 /** Returns true on macOS, Windows, and Linux AppImage installs.
  *  Returns false on Linux non-AppImage packages (e.g. .deb) where

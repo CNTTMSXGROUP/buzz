@@ -97,19 +97,19 @@ export function StaffingTab({
   const handleAdd = async () => {
     const trimmed = addPubkey.trim().toLowerCase();
     if (!trimmed) return;
+    // Enforce create-only invariant: reject if the roster hasn't loaded —
+    // the disabled button is the primary UI gate, but this guard closes the
+    // boundary at the mutation call site itself.
+    if (listState.status !== "ok") return;
     setAddError(null);
 
     // Reject any pubkey already present in the authoritative roster.
-    // Guard is bypassed when the list hasn't loaded — the button is already
-    // disabled in that state (see disabled condition below).
-    if (listState.status === "ok") {
-      const existing = listState.data.find((op) => op.pubkey === trimmed);
-      if (existing) {
-        setAddError(
-          `Already an operator: ${existing.effectiveRole}. Use Remove to revoke before re-adding with a different role.`,
-        );
-        return;
-      }
+    const existing = listState.data.find((op) => op.pubkey === trimmed);
+    if (existing) {
+      setAddError(
+        `Already an operator: ${existing.effectiveRole}. Use Remove to revoke before re-adding with a different role.`,
+      );
+      return;
     }
 
     setIsAdding(true);

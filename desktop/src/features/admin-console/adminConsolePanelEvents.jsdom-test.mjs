@@ -5721,6 +5721,21 @@ test("staffing-add-duplicate-guard: submitting an existing key produces zero PUT
       `inline error must name the existing effective role "operator"; found: ${errEls.map((e) => e.textContent).join(", ")}`,
     );
 
+    // The existing row must still be present with its original role after the
+    // rejected duplicate submit — the roster must be unmodified.
+    await settle(10);
+    const existingRow = container.querySelector(
+      `[data-testid='staffing-row-${existingPubkey}']`,
+    );
+    assert.ok(
+      existingRow !== null,
+      "existing operator row must still render after duplicate-submit rejection",
+    );
+    assert.ok(
+      existingRow.textContent.includes("operator"),
+      `existing row must still show the "operator" role after rejection; got: ${existingRow.textContent}`,
+    );
+
     // ── Case 2: clear the input and submit a genuinely new pubkey ──
     await act(async () => {
       fireEvent.change(pubkeyInput, { target: { value: newPubkey } });

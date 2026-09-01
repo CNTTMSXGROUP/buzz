@@ -37,6 +37,17 @@ internal fun noAgeSignalPayload(): Map<String, Any?> {
     )
 }
 
+internal fun replyWithAgeSignalError(
+    result: MethodChannel.Result,
+    error: Exception,
+) {
+    result.error(
+        "age_signal_unavailable",
+        "The age signal request failed.",
+        error.javaClass.simpleName,
+    )
+}
+
 internal object AndroidImageProcessor {
     fun decodeSrgbBitmap(bytes: ByteArray): Bitmap? {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -171,12 +182,12 @@ class MainActivity : FlutterFragmentActivity() {
                     .addOnSuccessListener { ageSignalsResult ->
                         replyWithAgeSignal(result, ageSignalsResult.ageUpper())
                     }
-                    .addOnFailureListener {
-                        replyWithNoAgeSignal(result)
+                    .addOnFailureListener { error ->
+                        replyWithAgeSignalError(result, error)
                     }
             }
-            .addOnFailureListener {
-                replyWithNoAgeSignal(result)
+            .addOnFailureListener { error ->
+                replyWithAgeSignalError(result, error)
             }
     }
 

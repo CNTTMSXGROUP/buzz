@@ -54,16 +54,54 @@ void main() {
   });
 
   test('allows when the platform request throws', () async {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(ageSignalChannel, (_) async {
+    var requests = 0;
+    var delays = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, bool>(
+      () => AgeSignalNotifier(
+        requestSignal: () async {
+          requests += 1;
           throw PlatformException(code: 'unavailable');
-        });
+        },
+        delay: (duration) async {
+          expect(duration, ageSignalRetryDelay);
+          delays += 1;
+        },
+      ),
+    );
     final container = ProviderContainer();
     addTearDown(container.dispose);
 
-    await container.read(ageSignalProvider.notifier).request();
+    await container.read(provider.notifier).request();
+    await container.read(provider.notifier).request();
 
-    expect(container.read(ageSignalProvider), isFalse);
+    expect(container.read(provider), isFalse);
+    expect(requests, 2);
+    expect(delays, 1);
+  });
+
+  test('retries a transient platform failure and applies the signal', () async {
+    var requests = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, bool>(
+      () => AgeSignalNotifier(
+        requestSignal: () async {
+          requests += 1;
+          if (requests == 1) {
+            throw PlatformException(code: 'age_signal_unavailable');
+          }
+          return {'status': 'signal', 'ageUpper': 17};
+        },
+        delay: (duration) async {
+          expect(duration, ageSignalRetryDelay);
+        },
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+
+    expect(container.read(provider), isTrue);
+    expect(requests, 2);
   });
 
   test('rejects malformed and unexpected platform responses', () async {

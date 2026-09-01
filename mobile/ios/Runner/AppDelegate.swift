@@ -271,7 +271,13 @@ import os.log
           result(Self.noAgeSignalResponse)
         }
       } catch {
-        result(Self.noAgeSignalResponse)
+        result(
+          FlutterError(
+            code: "age_signal_unavailable",
+            message: "The age signal request failed.",
+            details: String(describing: type(of: error))
+          )
+        )
       }
     }
   }

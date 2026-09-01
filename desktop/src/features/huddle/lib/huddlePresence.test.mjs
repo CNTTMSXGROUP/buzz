@@ -294,7 +294,7 @@ test("accepts lower revisions from a new relay room generation", () => {
   assert.equal(hydrated.has(CHARLIE), true);
 });
 
-test("rejects stale lifecycle events after liveness advances the generation", () => {
+test("rejects lifecycle events after liveness advances the generation", () => {
   const tracker = new HuddlePresenceTracker(RELAY);
   tracker.apply(event({ id: "1", kind: 48100 }));
   tracker.apply(
@@ -303,20 +303,17 @@ test("rejects stale lifecycle events after liveness advances the generation", ()
       kind: 48101,
       admissionId: "generation-1",
       rosterRevision: 1,
-      generation: "generation-1",
+      generation: "1",
     }),
   );
-  tracker.reconcileLiveness(
-    new Map([["room", "generation-2"]]),
-    new Map([["room", "generation-1"]]),
-  );
+  tracker.reconcileLiveness(new Map([["room", "1"]]), new Map([["room", "1"]]));
   tracker.apply(
     participantEvent({
       id: "3",
       kind: 48101,
       admissionId: "generation-2",
       rosterRevision: 1,
-      generation: "generation-2",
+      generation: "2",
       tags: [["p", CHARLIE]],
     }),
   );
@@ -328,11 +325,54 @@ test("rejects stale lifecycle events after liveness advances the generation", ()
         kind: 48102,
         admissionId: "generation-1",
         rosterRevision: 2,
-        generation: "generation-1",
+        generation: "1",
       }),
     ),
     false,
   );
+  assert.equal(
+    tracker.apply(
+      participantEvent({
+        id: "5",
+        kind: 48101,
+        admissionId: "delayed-generation-1",
+        rosterRevision: 3,
+        generation: "1",
+      }),
+    ),
+    false,
+  );
+  assert.equal(tracker.snapshot().has(BOB), false);
+  assert.equal(tracker.snapshot().has(CHARLIE), true);
+});
+
+test("accepts a new generation join before liveness establishes authority", () => {
+  const tracker = new HuddlePresenceTracker(RELAY);
+  tracker.apply(event({ id: "start", kind: 48100 }));
+  tracker.apply(
+    participantEvent({
+      id: "old",
+      kind: 48101,
+      admissionId: "old-admission",
+      rosterRevision: 1,
+      generation: "1",
+    }),
+  );
+
+  assert.equal(
+    tracker.apply(
+      participantEvent({
+        id: "new",
+        kind: 48101,
+        admissionId: "new-admission",
+        rosterRevision: 1,
+        generation: "2",
+        tags: [["p", CHARLIE]],
+      }),
+    ),
+    true,
+  );
+  assert.equal(tracker.snapshot().has(BOB), false);
   assert.equal(tracker.snapshot().has(CHARLIE), true);
 });
 
@@ -590,7 +630,7 @@ test("lifecycle generation change clears equal-revision stale admissions", () =>
       admissionId: "old-admission",
       rosterRevision: 1,
       createdAt: 2,
-      generation: "generation-1",
+      generation: "1",
     }),
   );
   tracker.apply(
@@ -600,7 +640,7 @@ test("lifecycle generation change clears equal-revision stale admissions", () =>
       admissionId: "new-admission",
       rosterRevision: 1,
       createdAt: 3,
-      generation: "generation-2",
+      generation: "2",
       tags: [["p", CHARLIE]],
     }),
   );

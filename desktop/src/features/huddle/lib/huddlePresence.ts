@@ -30,6 +30,7 @@ type HuddleSession = {
   latestRosterCreatedAt: number;
   latestRosterEventId: string;
   generation: LivenessGeneration | null;
+  generationIsAuthoritative: boolean;
   departedAdmissions: Map<string, AdmissionState>;
   compactedRosterRevisionFloor: number | null;
 };
@@ -40,6 +41,20 @@ type LifecycleContent = {
   admissionId: string | null;
   generation: string | null;
 };
+
+function compareHuddleGenerations(
+  candidate: LivenessGeneration,
+  current: LivenessGeneration,
+): number | null {
+  if (!/^\d+$/.test(candidate) || !/^\d+$/.test(current)) return null;
+  const candidateEpoch = BigInt(candidate);
+  const currentEpoch = BigInt(current);
+  return candidateEpoch < currentEpoch
+    ? -1
+    : candidateEpoch > currentEpoch
+      ? 1
+      : 0;
+}
 
 function lifecycleContent(event: RelayEvent): LifecycleContent {
   try {
@@ -272,6 +287,7 @@ export class HuddlePresenceTracker {
         latestRosterCreatedAt: 0,
         latestRosterEventId: "",
         generation: null,
+        generationIsAuthoritative: false,
         departedAdmissions: new Map(),
         compactedRosterRevisionFloor: null,
       });
@@ -290,11 +306,10 @@ export class HuddlePresenceTracker {
         session.generation !== null &&
         generation !== session.generation
       ) {
-        session.admissionsByParticipant.clear();
-        session.legacyStateByParticipant.clear();
-        session.departedAdmissions.clear();
-        session.compactedRosterRevisionFloor = null;
-        session.creatorPresent = false;
+        // Teardown from an older room generation must not end the currently
+        // live room. A relay-authenticated JOIN or liveness snapshot is the
+        // authoritative boundary between generations.
+        return false;
       }
       if (generation !== null) session.generation = generation;
       const nextEnd: AdmissionState = {
@@ -331,9 +346,16 @@ export class HuddlePresenceTracker {
       session.generation !== null &&
       generation !== session.generation
     ) {
+      const generationOrder = compareHuddleGenerations(
+        generation,
+        session.generation,
+      );
+      if (session.generationIsAuthoritative && generationOrder !== 1) {
+        return false;
+      }
       if (event.kind === KIND_HUDDLE_PARTICIPANT_LEFT) return false;
-      // A relay-authenticated JOIN is affirmative proof of the current room
-      // generation. Teardown from an older socket must never roll it back.
+      // Mesh generations are monotonic. An authenticated higher-generation JOIN
+      // may supersede liveness; opaque non-mesh epochs require a fresh snapshot.
       session.admissionsByParticipant.clear();
       session.legacyStateByParticipant.clear();
       session.departedAdmissions.clear();
@@ -463,6 +485,7 @@ export class HuddlePresenceTracker {
         session.creatorPresent = false;
       }
       session.generation = generation;
+      session.generationIsAuthoritative = true;
     }
   }
 

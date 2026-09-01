@@ -229,15 +229,22 @@ export function startHuddlePresenceRuntime(
       if (disposed) return;
       if (requestVersion !== livenessRequestVersion) {
         const mergedGenerations = new Map(activeSessionGenerations);
-        for (const [sessionId, generation] of nextActiveSessionGenerations) {
-          if (!requestedSessionGenerations.has(sessionId)) continue;
-          if (
-            activeSessionGenerations.get(sessionId) !==
-            requestedSessionGenerations.get(sessionId)
-          ) {
+        for (const [
+          sessionId,
+          requestedGeneration,
+        ] of requestedSessionGenerations) {
+          if (activeSessionGenerations.get(sessionId) !== requestedGeneration) {
             continue;
           }
-          mergedGenerations.set(sessionId, generation);
+          const liveGeneration = nextActiveSessionGenerations.get(sessionId);
+          if (liveGeneration === undefined) {
+            // The snapshot authoritatively omitted this unchanged requested
+            // session, even though an unrelated lifecycle mutation made the
+            // overall request stale.
+            mergedGenerations.delete(sessionId);
+          } else {
+            mergedGenerations.set(sessionId, liveGeneration);
+          }
         }
         tracker.reconcileLiveness(mergedGenerations, activeSessionGenerations);
         activeSessionGenerations = mergedGenerations;

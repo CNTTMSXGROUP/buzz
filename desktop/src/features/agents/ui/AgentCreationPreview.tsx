@@ -149,7 +149,6 @@ export function AgentCreationPreview({
     },
     processImage,
   });
-
   useEmojiMartStyles(
     emojiPickerContainerRef,
     isAvatarMenuOpen && activeTab === "emoji",
@@ -157,7 +156,6 @@ export function AgentCreationPreview({
     isOnboarding ? "light" : null,
     isOnboarding,
   );
-
   // Emoji Mart mounts its search input inside a shadow root. Wait for it
   // before focusing so the surrounding Radix popover cannot win the race.
   React.useEffect(() => {
@@ -670,7 +668,7 @@ export function AgentCreationPreview({
                     ? isCompact
                       ? "rounded-2xl"
                       : "rounded-[2rem]"
-                    : "rounded-full",
+                    : "rounded-[30%]",
                 )}
                 role="img"
                 style={{ backgroundColor: emojiAvatarPreview.color }}
@@ -696,6 +694,7 @@ export function AgentCreationPreview({
             ) : (
               <ProfileAvatar
                 avatarUrl={avatarUrl}
+                shape="squircle"
                 className={cn(
                   "h-full w-full",
                   isCompact ? "text-base" : "text-4xl",
@@ -891,6 +890,7 @@ export function AgentCreationPreview({
                   }
                   className={isCompact ? "h-16 w-16" : "h-36 w-36"}
                   clipTestId={`${testIdPrefix}-mask`}
+                  cornerRadius={(isCompact ? 64 : 144) * 0.3}
                   cutout={
                     isCompact
                       ? { cx: 58, cy: 58, r: 16.5 }
@@ -902,7 +902,7 @@ export function AgentCreationPreview({
                   {emojiAvatarPreview ? (
                     <div
                       aria-label={`${label} ${assetLabel}`}
-                      className="relative flex h-full w-full shrink-0 items-center justify-center overflow-hidden rounded-full shadow-xs transition-[background-color] duration-200 ease-out"
+                      className="relative flex h-full w-full shrink-0 items-center justify-center overflow-hidden rounded-[30%] shadow-xs transition-[background-color] duration-200 ease-out"
                       role="img"
                       style={{
                         backgroundColor: emojiAvatarPreview.color,
@@ -928,6 +928,7 @@ export function AgentCreationPreview({
                   ) : (
                     <ProfileAvatar
                       avatarUrl={avatarUrl}
+                      shape="squircle"
                       className={cn(
                         "h-full w-full transition-shadow duration-150",
                         isCompact ? "text-base" : "text-4xl",
@@ -950,7 +951,7 @@ export function AgentCreationPreview({
                         ? isCompact
                           ? "rounded-2xl"
                           : "rounded-[2rem]"
-                        : "rounded-full",
+                        : "rounded-[30%]",
                       isDragOverAvatar &&
                         !isAvatarMenuOpen &&
                         "border-primary/70 bg-primary/5 ring-2 ring-primary/15",

@@ -21,6 +21,7 @@ const SIZE_CLASSES: Record<SegmentedControlSize, string> = {
 export function SegmentedControl<Value extends string>({
   appearance = "default",
   className,
+  disabled = false,
   indicatorTestId,
   legend,
   onPreviewChange,
@@ -33,6 +34,7 @@ export function SegmentedControl<Value extends string>({
 }: {
   appearance?: SegmentedControlAppearance;
   className?: string;
+  disabled?: boolean;
   indicatorTestId?: string;
   legend: string;
   onPreviewChange?: (value: Value | null) => void;
@@ -195,10 +197,12 @@ export function SegmentedControl<Value extends string>({
           : "h-8 rounded-md bg-muted/45 p-0.5",
         SIZE_CLASSES[size],
         onPreviewChange && "touch-none select-none cursor-ew-resize",
+        "disabled:pointer-events-none disabled:opacity-50",
         className,
       )}
       data-slot="segmented-control"
       data-testid={testId}
+      disabled={disabled}
       onLostPointerCapture={handleLostPointerCapture}
       onPointerCancel={handlePointerCancel}
       onPointerDown={handlePointerDown}

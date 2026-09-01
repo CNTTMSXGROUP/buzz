@@ -66,22 +66,22 @@ void main() {
     expect(container.read(ageSignalProvider), isFalse);
   });
 
-  test('allows malformed and unexpected platform responses', () async {
-    expect(
-      await requestWithResponse({'status': 'unknown', 'ageUpper': null}),
-      isFalse,
+  test('rejects malformed and unexpected platform responses', () async {
+    await expectLater(
+      requestWithResponse({'status': 'unknown', 'ageUpper': null}),
+      throwsA(isA<StateError>()),
     );
-    expect(
-      await requestWithResponse({'status': 'signal', 'ageUpper': '17'}),
-      isFalse,
+    await expectLater(
+      requestWithResponse({'status': 'signal', 'ageUpper': '17'}),
+      throwsA(isA<StateError>()),
     );
-    expect(
-      await requestWithResponse({
-        'status': 'signal',
-        'ageUpper': 17,
-        'ageLower': 13,
-      }),
-      isFalse,
+    await expectLater(
+      requestWithResponse({'status': 'signal', 'ageUpper': 17, 'ageLower': 13}),
+      throwsA(isA<StateError>()),
+    );
+    await expectLater(
+      requestWithResponse({'status': 'noSignal', 'ageUpper': 17}),
+      throwsA(isA<StateError>()),
     );
     expect(await requestWithResponse(null), isFalse);
   });

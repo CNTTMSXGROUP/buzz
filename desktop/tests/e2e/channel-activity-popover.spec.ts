@@ -244,7 +244,11 @@ async function seedChannelActivity(
     );
   }
 
-  await expect(page.getByTestId("channel-unread-dot-general")).toBeVisible();
+  // The seeded activity includes an in-thread @mention, so the row shows the
+  // numeric mention badge rather than the plain thread-activity dot. The
+  // hover preview popover must still work either way.
+  await expect(page.getByTestId("channel-unread-general")).toBeVisible();
+  await expect(page.getByTestId("channel-unread-dot-general")).toHaveCount(0);
   if (includeAgent) {
     await expect(page.getByTestId("channel-working-general")).toBeVisible();
   }
@@ -276,6 +280,12 @@ test.describe("channel activity hover preview", () => {
   }) => {
     await seedChannelActivity(page, { extraThreadCount: 5 });
     const popover = await openActivityPopover(page);
+
+    await waitForAnimations(page);
+    const enterScale = await popover.evaluate((element) =>
+      getComputedStyle(element).getPropertyValue("--tw-enter-scale"),
+    );
+    expect(enterScale).toBe("1");
 
     const heading = popover.getByRole("heading", {
       name: "Channel activity",
@@ -537,7 +547,7 @@ test.describe("channel activity hover preview", () => {
 
     await expect(page.getByTestId("channel-general")).toHaveCSS(
       "font-weight",
-      "600",
+      "700",
     );
     for (const [index, itemId] of inboxItemIds.entries()) {
       const inboxRow = page.getByTestId(`home-inbox-item-${itemId}`);
@@ -546,13 +556,13 @@ test.describe("channel activity hover preview", () => {
       if (index === 0) {
         await expect(page.getByTestId("channel-general")).toHaveCSS(
           "font-weight",
-          "600",
+          "700",
         );
       }
     }
     await expect(page.getByTestId("channel-general")).not.toHaveCSS(
       "font-weight",
-      "600",
+      "700",
     );
     for (const itemId of inboxItemIds) {
       const inboxRow = page.getByTestId(`home-inbox-item-${itemId}`);
@@ -562,7 +572,7 @@ test.describe("channel activity hover preview", () => {
 
     await expect(page.getByTestId("channel-general")).toHaveCSS(
       "font-weight",
-      "600",
+      "700",
     );
     await expect(page.getByTestId("channel-unread-dot-general")).toBeVisible();
     await page.getByTestId("channel-general").click();
@@ -588,7 +598,7 @@ test.describe("channel activity hover preview", () => {
     await expect(page.getByTestId("channel-unread-dot-general")).toBeVisible();
     await expect(page.getByTestId("channel-general")).toHaveCSS(
       "font-weight",
-      "600",
+      "400",
     );
 
     await page.mouse.move(900, 680);
@@ -626,7 +636,7 @@ test.describe("channel activity hover preview", () => {
     await expect(page.getByTestId("chat-title")).toHaveText("random");
     await expect(page.getByTestId("channel-general")).not.toHaveCSS(
       "font-weight",
-      "600",
+      "700",
     );
   });
 
@@ -688,7 +698,7 @@ test.describe("channel activity hover preview", () => {
     await page.getByTestId("channel-random").click();
     await expect(page.getByTestId("channel-general")).toHaveCSS(
       "font-weight",
-      "600",
+      "700",
     );
   });
 
@@ -722,7 +732,7 @@ test.describe("channel activity hover preview", () => {
     }
     await expect(page.getByTestId("channel-general")).toHaveCSS(
       "font-weight",
-      "600",
+      "700",
     );
     await expect.poll(() => getForcedUnreadSources(page)).toEqual(["inbox"]);
 
@@ -734,7 +744,7 @@ test.describe("channel activity hover preview", () => {
       if (index === 0) {
         await expect(page.getByTestId("channel-general")).toHaveCSS(
           "font-weight",
-          "600",
+          "700",
         );
         await expect
           .poll(() => getForcedUnreadSources(page))
@@ -767,10 +777,11 @@ test.describe("channel activity hover preview", () => {
     await rootRow.hover();
     const actionBar = page.getByTestId(`message-action-bar-${root.id}`);
     await expect(actionBar).toBeVisible();
-    await actionBar
-      .getByRole("button", { name: /^React with / })
-      .first()
-      .click();
+    await actionBar.getByRole("button", { name: "Open reactions" }).click();
+    const picker = page.locator("em-emoji-picker");
+    await expect(picker).toBeVisible();
+    await picker.locator("input[type='search']").fill("thumbs up");
+    await picker.getByRole("button", { name: "👍" }).first().click();
     await expect(
       rootRow.getByRole("button", { name: /^Toggle .* reaction$/ }),
     ).toBeVisible();

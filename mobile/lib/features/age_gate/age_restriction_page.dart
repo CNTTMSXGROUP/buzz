@@ -17,10 +17,12 @@ class AgeRestrictionPage extends StatelessWidget {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(
-                    Icons.lock_outline,
-                    size: 48,
-                    color: context.colors.primary,
+                  ExcludeSemantics(
+                    child: Icon(
+                      Icons.lock_outline,
+                      size: 48,
+                      color: context.colors.primary,
+                    ),
                   ),
                   const SizedBox(height: Grid.lg),
                   Text(

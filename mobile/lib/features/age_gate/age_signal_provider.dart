@@ -12,6 +12,9 @@ bool shouldBlockForAgeSignal(Map<Object?, Object?> response) {
 
   final status = response['status'];
   if (status == 'noSignal') {
+    if (response['ageUpper'] != null) {
+      throw StateError('Unexpected age signal upper bound.');
+    }
     return false;
   }
   if (status != 'signal') {
@@ -40,15 +43,21 @@ class AgeSignalNotifier extends Notifier<bool> {
     }
     _requested = true;
 
+    final Map<Object?, Object?>? response;
     try {
-      final response = await ageSignalChannel.invokeMapMethod<Object?, Object?>(
+      response = await ageSignalChannel.invokeMapMethod<Object?, Object?>(
         'requestAgeSignal',
       );
-      if (response != null) {
-        state = shouldBlockForAgeSignal(response);
-      }
-    } on Object {
+    } on PlatformException {
       state = false;
+      return;
+    } on MissingPluginException {
+      state = false;
+      return;
+    }
+
+    if (response != null) {
+      state = shouldBlockForAgeSignal(response);
     }
   }
 }

@@ -25,8 +25,25 @@ pub(crate) fn runtime_metadata_env_vars<'a>(
 }
 
 /// Env var carrying the session title to the harness. Shared with
-/// `spawn_hash` so the restart badge hashes the same key the spawn writes.
+/// `spawn_snapshot` so the restart badge records the same key the spawn writes.
 pub(crate) const SESSION_TITLE_ENV_VAR: &str = "BUZZ_ACP_SESSION_TITLE";
+/// Stable agent display name forwarded to the ACP tool surface for git
+/// attribution and private-conversation provenance.
+pub(crate) const DISPLAY_NAME_ENV_VAR: &str = "BUZZ_ACP_DISPLAY_NAME";
+
+/// Apply the shared stable agent name to both session display metadata and
+/// git attribution, clearing both keys when no usable name is available.
+pub(crate) fn apply_agent_display_env(command: &mut std::process::Command, title: Option<String>) {
+    if let Some(title) = title {
+        command
+            .env(SESSION_TITLE_ENV_VAR, &title)
+            .env(DISPLAY_NAME_ENV_VAR, title);
+    } else {
+        command
+            .env_remove(SESSION_TITLE_ENV_VAR)
+            .env_remove(DISPLAY_NAME_ENV_VAR);
+    }
+}
 
 /// Resolve the session title for an agent: its `display_name` when it has one,
 /// otherwise its unique `name` handle. `None` when both are blank, so the
@@ -55,6 +72,17 @@ pub(crate) fn resolve_session_title(display_name: Option<&str>, name: &str) -> O
                 .to_string()
         })
         .find(|value| !value.is_empty())
+}
+
+/// Build the `RUST_LOG` value forwarded to the agent child: keep an existing
+/// filter that already mentions `buzz_acp`, append `buzz_acp=info` to any other
+/// non-empty filter, and default to `buzz_acp=info` when unset.
+pub(crate) fn child_rust_log_filter() -> String {
+    match std::env::var("RUST_LOG") {
+        Ok(existing) if existing.contains("buzz_acp") => existing,
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
+        _ => "buzz_acp=info".to_string(),
+    }
 }
 
 #[cfg(test)]

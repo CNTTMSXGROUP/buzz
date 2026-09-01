@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.ColorSpace
 import android.graphics.ImageDecoder
 import android.media.MediaExtractor
+import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.os.Build
 import androidx.annotation.RequiresApi
@@ -14,7 +15,7 @@ import com.google.android.play.agesignals.AgeSignalsManager
 import com.google.android.play.agesignals.AgeSignalsManagerFactory
 import com.google.android.play.agesignals.AgeSignalsRequest
 import com.google.android.play.agesignals.model.AgeSignalsStatus
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
@@ -95,12 +96,18 @@ internal object AndroidImageProcessor {
     }
 }
 
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
     private var mediaUploadChannel: MethodChannel? = null
     private var ageSignalChannel: MethodChannel? = null
+    private var huddleMediaPlugin: HuddleMediaPlugin? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        huddleMediaPlugin = HuddleMediaPlugin(
+            this,
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
 
         mediaUploadChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -116,6 +123,9 @@ class MainActivity : FlutterActivity() {
                     }
                     TRANSCODE_VIDEO_TO_MP4_METHOD -> {
                         handleTranscodeVideoToMp4(call.arguments, result)
+                    }
+                    GENERATE_VIDEO_POSTER_METHOD -> {
+                        handleGenerateVideoPoster(call.arguments, result)
                     }
                     REQUIRES_LEGACY_MEDIA_STORAGE_PERMISSION_METHOD -> {
                         result.success(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
@@ -179,6 +189,21 @@ class MainActivity : FlutterActivity() {
 
     private fun replyWithNoAgeSignal(result: MethodChannel.Result) {
         result.success(noAgeSignalPayload())
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        huddleMediaPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    }
+
+    override fun onDestroy() {
+        huddleMediaPlugin?.dispose()
+        huddleMediaPlugin = null
+        super.onDestroy()
     }
 
     private fun handleSanitizeImageForUpload(
@@ -350,6 +375,55 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
+    private fun handleGenerateVideoPoster(
+        arguments: Any?,
+        result: MethodChannel.Result,
+    ) {
+        val sourcePath = arguments as? String ?: run {
+            invalidArguments(result, "Expected source file path as String.")
+            return
+        }
+
+        Thread {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(sourcePath)
+                val source = retriever.getFrameAtTime(
+                    0,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                ) ?: retriever.getFrameAtTime(
+                    100_000,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                ) ?: throw IllegalArgumentException("Unable to decode a video frame.")
+                val scale = minOf(1f, 720f / maxOf(source.width, source.height))
+                val frame = if (scale < 1f) {
+                    Bitmap.createScaledBitmap(
+                        source,
+                        (source.width * scale).toInt(),
+                        (source.height * scale).toInt(),
+                        true,
+                    ).also { source.recycle() }
+                } else {
+                    source
+                }
+                val bytes = AndroidImageProcessor.encodeAndScrub(
+                    frame,
+                    Bitmap.CompressFormat.JPEG,
+                ) ?: throw IllegalArgumentException("Unable to encode a video preview.")
+                frame.recycle()
+                result.success(bytes)
+            } catch (e: Exception) {
+                result.error(
+                    "poster_failed",
+                    "Unable to create a video preview.",
+                    e.message,
+                )
+            } finally {
+                retriever.release()
+            }
+        }.start()
+    }
+
     private fun invalidArguments(
         result: MethodChannel.Result,
         message: String,
@@ -364,6 +438,7 @@ class MainActivity : FlutterActivity() {
         private const val SANITIZE_IMAGE_FOR_UPLOAD_METHOD = "sanitizeImageForUpload"
         private const val TRANSCODE_IMAGE_TO_JPEG_METHOD = "transcodeImageToJpeg"
         private const val TRANSCODE_VIDEO_TO_MP4_METHOD = "transcodeVideoToMp4"
+        private const val GENERATE_VIDEO_POSTER_METHOD = "generateVideoPoster"
         private const val REQUIRES_LEGACY_MEDIA_STORAGE_PERMISSION_METHOD =
             "requiresLegacyMediaStoragePermission"
     }

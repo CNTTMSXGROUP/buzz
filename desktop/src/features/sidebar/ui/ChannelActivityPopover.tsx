@@ -16,11 +16,19 @@ import type { Channel, FeedItem, HomeFeedResponse } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { useNow } from "@/shared/lib/useNow";
 import { Markdown } from "@/shared/ui/markdown";
-import { Popover, PopoverAnchor, PopoverContent } from "@/shared/ui/popover";
+import {
+  DEFAULT_POPOVER_HOVER_OPEN_DELAY_MS,
+  Popover,
+  PopoverAnchor,
+  PopoverContent,
+} from "@/shared/ui/popover";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 
-const HOVER_OPEN_DELAY_MS = 250;
 const HOVER_CLOSE_DELAY_MS = 180;
+const ACTIVITY_POPOVER_MOTION_STYLE = {
+  "--tw-enter-scale": "1",
+  "--tw-exit-scale": "1",
+} as React.CSSProperties;
 
 function buildChannelActivityFeed(items: FeedItem[]): HomeFeedResponse {
   return {
@@ -70,11 +78,13 @@ function RowActionButton({
 }
 
 function ThreadPreviewRow({
+  isAgent,
   item,
   onMarkRead,
   onOpen,
   onRemindLater,
 }: {
+  isAgent: boolean;
   item: InboxItem;
   onMarkRead: () => void;
   onOpen: () => void;
@@ -96,6 +106,7 @@ function ThreadPreviewRow({
           avatarUrl={item.avatarUrl}
           className="h-9 w-9 shrink-0"
           displayName={item.senderLabel}
+          shape={isAgent ? "squircle" : "circle"}
           size="md"
         />
         <div className="min-w-0 flex-1">
@@ -160,6 +171,7 @@ function WorkingAgentRow({
         avatarUrl={avatarUrl}
         className="h-9 w-9 shrink-0"
         displayName={name}
+        shape="squircle"
         size="md"
       />
       <div className="min-w-0 flex-1">
@@ -306,7 +318,7 @@ export function ChannelActivityPopover({
     clearHoverTimer();
     hoverTimerRef.current = setTimeout(() => {
       setOpen(true);
-    }, HOVER_OPEN_DELAY_MS);
+    }, DEFAULT_POPOVER_HOVER_OPEN_DELAY_MS);
   }, [clearHoverTimer, hasContent]);
   const openImmediately = React.useCallback(() => {
     if (!hasContent) return;
@@ -365,19 +377,17 @@ export function ChannelActivityPopover({
 
   return (
     <Popover onOpenChange={setOpen} open={open}>
-      <PopoverAnchor asChild>
-        {/* biome-ignore lint/a11y/noStaticElementInteractions: hover/focus events bubble from the nested channel button while this wrapper supplies the popover anchor box. */}
-        <div
-          className="w-full min-w-0"
-          onBlur={closeWithDelay}
-          onContextMenu={() => setOpen(false)}
-          onFocus={openImmediately}
-          onMouseEnter={openWithDelay}
-          onMouseLeave={closeWithDelay}
-        >
-          {children}
-        </div>
-      </PopoverAnchor>
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: hover/focus events bubble from the nested channel button while the wrapper keeps the preview interactive. */}
+      <div
+        className="w-full min-w-0"
+        onBlur={closeWithDelay}
+        onContextMenu={() => setOpen(false)}
+        onFocus={openImmediately}
+        onMouseEnter={openWithDelay}
+        onMouseLeave={closeWithDelay}
+      >
+        <PopoverAnchor asChild>{children}</PopoverAnchor>
+      </div>
       <PopoverContent
         align="start"
         className="w-96 overflow-hidden p-0"
@@ -387,7 +397,8 @@ export function ChannelActivityPopover({
         onMouseLeave={closeWithDelay}
         onOpenAutoFocus={(event) => event.preventDefault()}
         side="right"
-        sideOffset={8}
+        sideOffset={0}
+        style={ACTIVITY_POPOVER_MOTION_STYLE}
       >
         <section
           aria-label="Channel activity"
@@ -417,6 +428,10 @@ export function ChannelActivityPopover({
             {activityItems.length > 0
               ? activityItems.map((item) => (
                   <ThreadPreviewRow
+                    isAgent={
+                      profiles?.[normalizePubkey(item.item.pubkey)]?.isAgent ===
+                      true
+                    }
                     item={item}
                     key={item.conversationId}
                     onMarkRead={() => handleMarkRead(item)}

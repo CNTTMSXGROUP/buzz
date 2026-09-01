@@ -448,7 +448,8 @@ jobs:
       contents: read
     services:
       postgres:
-        image: postgres:16
+        # Match docker-compose.yml: wake FTS migration uses PG17 SET EXPRESSION.
+        image: postgres:17
         env:
           POSTGRES_USER: buzz
           POSTGRES_PASSWORD: ${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}

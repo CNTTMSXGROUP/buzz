@@ -163,6 +163,7 @@ mod tests {
             id: id.to_string(),
             display_name: "Def".to_string(),
             avatar_url: None,
+            description: None,
             system_prompt: String::new(),
             runtime: None,
             model: None,

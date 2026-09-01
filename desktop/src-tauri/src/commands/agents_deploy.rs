@@ -46,6 +46,7 @@ pub(crate) fn resolve_deploy_model_provider(
 /// `descriptor.env` is the authoritative six-layer environment for ordinary
 /// values. Desktop-owned settings are reserved, stripped from that layer, and
 /// emitted through `policy_env` so local and provider launches agree.
+#[allow(clippy::too_many_arguments)]
 fn build_launch_block_for_policy(
     record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
@@ -312,6 +313,21 @@ pub(super) fn deploy_payload_json(
     })
 }
 
+/// Extract the effective permission policy from a deploy payload produced by
+/// `build_deploy_payload`. The value is the byte-identical policy the deploy
+/// path will stamp as the applied receipt; a missing or unparseable value is a
+/// broken invariant on the JSON boundary. Callers must fail the deploy rather
+/// than stamping a silent `None` that would suppress the drift row.
+pub(super) fn extract_applied_permission_policy(
+    agent_json: &serde_json::Value,
+) -> Result<crate::managed_agents::permission_policy::PermissionPolicy, String> {
+    let raw = agent_json["launch"]["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"]
+        .as_str()
+        .ok_or("deploy payload is missing launch.policy_env.BUZZ_ACP_PERMISSION_POLICY")?;
+    serde_json::from_value(serde_json::Value::String(raw.to_string()))
+        .map_err(|_| format!("deploy payload has unrecognized permission policy {raw:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +430,7 @@ mod tests {
             None,
             "owner-hex",
             crate::managed_agents::AcpSessionPolicy::Thread,
+            None,
         );
 
         assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "thread");
@@ -442,6 +459,7 @@ mod tests {
             None,
             Some("claude-opus-4"),
             "owner-hex",
+            None,
         );
         assert_eq!(
             launch["policy_env"]["ANTHROPIC_MODEL"], "claude-opus-4",
@@ -478,6 +496,7 @@ mod tests {
             None,
             Some("claude-opus-4"),
             "owner-hex",
+            None,
         );
 
         // Canonical model rides policy_env alone.

@@ -1313,45 +1313,46 @@ fn wrapper_refuses_push_via_builtin_shadowing_alias() {
     );
 }
 
-/// R9 real-wrapper regression: `alias.whatchanged = push origin main` must be
-/// expanded and held to policy on Git 2.52+ where deprecated builtins are
-/// alias-first.
+/// R9/P5 real-wrapper regression: `alias.whatchanged = -p push origin main`
+/// must be expanded and held to policy on binaries where `--list-cmds=deprecated`
+/// succeeds and lists `whatchanged` (i.e. deprecated builtins are alias-first).
 ///
 /// **Bypass shape (without the fix):**
-/// `git_builtin_commands` on 2.52+ includes `whatchanged`; the prior code broke
-/// out of the alias expansion loop when it saw a builtin name, classifying the
-/// command as `NotPush` without looking at the alias definition.  Real git on
-/// 2.52+ calls `handle_alias()` before `handle_builtin()` for deprecated
-/// commands, so it DID expand the alias and executed `push origin main`.
-/// The wrapper skipped verification; the human-authored commit reached the
-/// remote.
+/// When `!deprecated.contains(name)` is removed, `verify_alias_safety` breaks
+/// at `whatchanged` (it is in `--list-cmds=builtins`) and returns `Ok(None)`.
+/// The fallback `is_push_command` then reads `alias.whatchanged = -p push` and
+/// takes `-p` as the first command word (no `alias.-p` → `NotPush`).  Real git,
+/// however, reparses `-p` as a global option and executes `push` — the command
+/// executes unverified.  The destination acquires commits and the
+/// `for-each-ref` assertion below fires.
+///
+/// **Why `-p push` and not plain `push`:**
+/// With a plain `alias.whatchanged = push` body the fallback `is_push_command`
+/// (git_wrapper.rs:318-332) also follows the alias and returns `Push` on its own,
+/// so `verify_push` still runs and the test stays green even without the
+/// deprecated-aware fix.  The `-p push` body breaks that secondary path while
+/// remaining transparent to real git, making this test genuinely sensitive to
+/// the deprecated-exclusion fix.
 ///
 /// **Fix:** `git_deprecated_commands(real_git)` queries `--list-cmds=deprecated`
 /// for the same binary.  The short-circuit now requires `builtin AND NOT
-/// deprecated`: deprecated-builtin names stay in the alias expansion path.
+/// deprecated`: when `whatchanged` is in both sets, alias expansion continues,
+/// resolves to `push`, and policy refuses the human-authored commit.
 ///
-/// **Mutation evidence:**
-/// Removing the `!deprecated.contains(name.as_str())` qualifier from the
-/// builtin short-circuit in `verify_alias_safety` recreates the bypass for
-/// `whatchanged` on 2.52+: expansion is skipped, the command is classified
-/// `NotPush`, verification is omitted, and the remote receives the commit.
-/// The `for-each-ref` assertion below would fire.
-///
-/// Self-gate: this test is only meaningful on a Git binary that supports
-/// `--list-cmds=deprecated` (introduced in 2.52) and lists `whatchanged` as
-/// deprecated.  On older binaries the test skips rather than asserting an
-/// incorrect result.
+/// Self-gate: skips cleanly on binaries where `--list-cmds=deprecated` exits
+/// non-zero or does not list `whatchanged` — those binaries do not have the
+/// alias-first deprecated dispatch, so there is no bypass to test.
 #[test]
 fn wrapper_refuses_push_via_deprecated_builtin_alias() {
     // Probe whether the PATH git supports --list-cmds=deprecated and actually
-    // lists whatchanged.  Skip on pre-2.52 binaries where the deprecated-builtin
+    // lists whatchanged.  Skip on binaries where the deprecated-builtin
     // alias-first path does not exist.
     let probe = Command::new("git")
         .args(["--list-cmds=deprecated"])
         .output()
         .unwrap();
     if !probe.status.success() {
-        eprintln!("skip: git --list-cmds=deprecated unsupported (pre-2.52 binary)");
+        eprintln!("skip: git --list-cmds=deprecated unsupported on this binary");
         return;
     }
     let deprecated_list = String::from_utf8_lossy(&probe.stdout);
@@ -1373,23 +1374,32 @@ fn wrapper_refuses_push_via_deprecated_builtin_alias() {
         repo.path(),
         &["remote", "add", "origin", remote.path().to_str().unwrap()],
     );
-    // Set alias.whatchanged=push — on 2.52+ git expands this alias because
-    // deprecated builtins are alias-first.  The alias body is just `push`; the
-    // remote and refspec come from the caller's trailing argv so that
-    // `resolve_push_sources` can replay the dry-run via the alias name
-    // (git expands `whatchanged --dry-run --porcelain --no-verify origin main`
-    // the same way as `push --dry-run --porcelain --no-verify origin main`).
-    wrapper(&path, repo.path(), &["config", "alias.whatchanged", "push"]);
+    // Set alias.whatchanged = -p push.
+    // `-p` is a safe bare-word token (no `-c`, no `=`, no quote) that real git
+    // reparses as the --porcelain global, so `git whatchanged -p push origin
+    // main` is equivalent to `git push --porcelain origin main` at exec time.
+    // With the deprecated-aware fix, `verify_alias_safety` follows the alias
+    // (whatchanged is deprecated → alias-first), expands to effective argv with
+    // subcommand `push`, and policy refuses.
+    // Without the fix, the builtin short-circuit fires at `whatchanged`,
+    // verify_alias_safety returns Ok(None), and the fallback is_push_command
+    // reads alias.whatchanged = -p push but takes `-p` as the command word
+    // (no alias.-p exists → NotPush) — verification is skipped, real git
+    // reparses -p as a global and executes the push unverified.
+    wrapper(
+        &path,
+        repo.path(),
+        &["config", "alias.whatchanged", "-p push"],
+    );
 
-    // Invoke via the deprecated builtin name `whatchanged` — not `push`.
-    // Pass `origin main` so the dry-run probe can replay via the alias name:
-    // git expands `whatchanged --dry-run … origin main` to
-    // `push --dry-run … origin main`, which resolves the `origin` remote.
+    // Invoke via the deprecated builtin name `whatchanged`.
+    // Pass `origin main` as trailing argv so verify_push / resolve_push_sources
+    // can identify the destination.
     let out = wrapper(&path, repo.path(), &["whatchanged", "origin", "main"]);
     assert!(
         !out.status.success(),
-        "alias.whatchanged=push must be expanded and refused (deprecated builtin is \
-         alias-first on 2.52+); stderr={}",
+        "alias.whatchanged=-p push must be expanded and refused (deprecated builtin is \
+         alias-first on this binary); stderr={}",
         String::from_utf8_lossy(&out.stderr),
     );
     assert!(

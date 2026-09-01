@@ -442,19 +442,18 @@ fn is_push_command(real_git: &Path, argv: &[String], ctx: &[String]) -> PushKind
 
 /// Query git for its set of builtin subcommands via `--list-cmds=builtins`.
 ///
-/// Git 2.51 and earlier dispatches builtin commands BEFORE consulting `alias.*`
-/// config — a name that matches a builtin is never treated as an alias.  Git
-/// 2.52+ introduced an exception: **deprecated** builtins (`whatchanged`,
-/// `pack-redundant`) are alias-first on the same binary because
-/// `run_argv()` calls `handle_alias()` before `handle_builtin()` when
-/// `is_deprecated_command()` is true.
+/// By default, git dispatches builtin commands BEFORE consulting `alias.*`
+/// config — a name that matches a builtin is never treated as an alias.
+/// However, on binaries where `--list-cmds=deprecated` succeeds, deprecated
+/// builtins (`whatchanged`, `pack-redundant`) are alias-first: `run_argv()`
+/// calls `handle_alias()` before `handle_builtin()` for those names.
 ///
 /// The expansion loop in [`verify_alias_safety`] must mirror this behaviour
 /// exactly: break on a builtin that is NOT deprecated (builtin-first), but
 /// continue expanding aliases on a deprecated builtin (alias-first).  When git
-/// does not support `--list-cmds=deprecated` (pre-2.52, where the call exits
-/// non-zero), the deprecated set is empty and ALL builtins are treated as
-/// builtin-first, which is correct for those older git versions.
+/// does not support `--list-cmds=deprecated` (where the call exits non-zero),
+/// the deprecated set is empty and ALL builtins are treated as builtin-first,
+/// which is correct for those binaries.
 ///
 /// Returns an empty set if the flag is unavailable; callers treat an empty set
 /// conservatively (no builtin-precedence short-circuit — falls back to alias
@@ -473,13 +472,15 @@ fn git_builtin_commands(real_git: &Path) -> std::collections::HashSet<String> {
 
 /// Query git for its set of deprecated subcommands via `--list-cmds=deprecated`.
 ///
-/// On Git 2.52+, deprecated builtins (`whatchanged`, `pack-redundant`) are
-/// handled alias-first by `run_argv()`, so an `alias.<name>` setting for such a
-/// command IS expanded even though the name appears in `--list-cmds=builtins`.
+/// On binaries where this query succeeds, deprecated builtins (`whatchanged`,
+/// `pack-redundant`) are handled alias-first: `run_argv()` calls
+/// `handle_alias()` before `handle_builtin()` for those names, so an
+/// `alias.<name>` setting IS expanded even though the name appears in
+/// `--list-cmds=builtins`.
 ///
-/// Returns an empty set if the flag is unsupported (pre-2.52 git); callers use
-/// the empty set to infer that ALL builtins are builtin-first on that binary
-/// (the exception did not exist yet).
+/// Returns an empty set if the flag is unsupported (the query exits non-zero);
+/// callers use the empty set to infer that ALL builtins are builtin-first on
+/// that binary (the alias-first exception does not apply).
 fn git_deprecated_commands(real_git: &Path) -> std::collections::HashSet<String> {
     let out = match capture_raw(real_git, &["--list-cmds=deprecated"]) {
         Some(o) if o.status.success() => o.stdout,
@@ -542,14 +543,15 @@ fn verify_alias_safety(
     // argv. Typed globals (argv[..sub_idx]) are prepended to the final result.
     let mut chain: Vec<String> = argv[sub_idx..].to_vec();
     let mut resolved_any = false;
-    // Git 2.51-: ALL builtins are dispatched before alias config — an
+    // By default, ALL builtins are dispatched before alias config — an
     // `alias.<builtin>` entry is silently ignored.
-    // Git 2.52+: deprecated builtins (`whatchanged`, `pack-redundant`) are
-    // alias-FIRST; `run_argv()` calls `handle_alias()` before `handle_builtin()`
-    // for those.  We model this by treating a name as a non-builtin (continuing
-    // alias lookup) when it is in BOTH the builtins and the deprecated lists.
-    // When `--list-cmds=deprecated` exits non-zero (pre-2.52), `deprecated` is
-    // empty and we apply builtin-first for every builtin — correct for that git.
+    // On binaries where `--list-cmds=deprecated` succeeds, deprecated builtins
+    // (`whatchanged`, `pack-redundant`) are alias-FIRST; `run_argv()` calls
+    // `handle_alias()` before `handle_builtin()` for those.  We model this by
+    // treating a name as a non-builtin (continuing alias lookup) when it is in
+    // BOTH the builtins and the deprecated lists.
+    // When `--list-cmds=deprecated` exits non-zero, `deprecated` is empty and we
+    // apply builtin-first for every builtin — correct for that binary.
     let builtins = git_builtin_commands(real_git);
     let deprecated = git_deprecated_commands(real_git);
     for _ in 0..MAX_ALIAS_HOPS {
@@ -561,9 +563,9 @@ fn verify_alias_safety(
         };
         let name = &chain[cmd_idx];
         // A non-deprecated builtin is dispatched before alias config — break.
-        // A deprecated builtin on git 2.52+ is alias-first — fall through to
-        // the alias lookup below so the wrapper's expansion matches git's real
-        // dispatch order.
+        // A deprecated builtin on a binary where --list-cmds=deprecated succeeds
+        // is alias-first — fall through to the alias lookup below so the
+        // wrapper's expansion matches that binary's real dispatch order.
         let is_nondeprecated_builtin = !builtins.is_empty()
             && builtins.contains(name.as_str())
             && !deprecated.contains(name.as_str());
@@ -6331,21 +6333,19 @@ mod tests {
     // expansion loop and break immediately when the current name is in the set,
     // treating it as a real subcommand (no alias lookup).
     //
-    // P5 P1 (Thufir pass 5, this round): Git 2.52+ introduced a dispatch
-    // exception for DEPRECATED builtins (`whatchanged`, `pack-redundant`):
-    // `run_argv()` calls `handle_alias()` BEFORE `handle_builtin()` for those,
-    // so `alias.whatchanged = push …` IS expanded by git on 2.52+.  The
-    // unconditional builtin short-circuit from R9 therefore created another
-    // bypass: `verify_alias_safety` would break at `whatchanged` (it is in
-    // builtins), classify as NotPush, skip verification — while real git expands
-    // the alias and pushes.
+    // P5 P1 (Thufir pass 5, this round): on binaries where `--list-cmds=deprecated`
+    // succeeds, deprecated builtins (`whatchanged`, `pack-redundant`) are
+    // alias-first: `run_argv()` calls `handle_alias()` BEFORE `handle_builtin()`
+    // for those.  The unconditional builtin short-circuit from R9 therefore
+    // created another bypass: `verify_alias_safety` would break at `whatchanged`
+    // (it is in builtins), classify as NotPush, skip verification — while real
+    // git on such binaries expands the alias and pushes.
     //
     // P5 fix: query `git --list-cmds=deprecated` for the same binary.  A name
     // that is in BOTH sets is alias-first on this binary; skip the builtin
     // short-circuit and continue alias lookup.  When `--list-cmds=deprecated`
-    // exits non-zero (pre-2.52, where the exception did not exist), the
-    // deprecated set is empty and ALL builtins are treated as builtin-first —
-    // matching that git's actual dispatch.
+    // exits non-zero, the deprecated set is empty and ALL builtins are treated
+    // as builtin-first — matching that binary's actual dispatch.
     //
     // Regression tests use `run_inner` (the extracted inner body of `run()`)
     // rather than `verify_push` directly, because tests that hand-construct
@@ -6494,24 +6494,25 @@ mod tests {
         );
     }
 
-    /// (Pass 5 P1) A deprecated builtin with `alias.<name> = push …` on Git
-    /// 2.52+ is still refused — the wrapper must NOT short-circuit at the
-    /// deprecated builtin name and must expand the alias, classify the result as
-    /// Push, and enforce policy.
+    /// (Pass 5 P1) A deprecated builtin with `alias.<name> = push …` on a binary
+    /// where `--list-cmds=deprecated` succeeds is still refused — the wrapper must
+    /// NOT short-circuit at the deprecated builtin name and must expand the alias,
+    /// classify the result as Push, and enforce policy.
     ///
-    /// Background: Git 2.52 changed `run_argv()` to call `handle_alias()` BEFORE
-    /// `handle_builtin()` for deprecated builtins (`whatchanged`, `pack-redundant`).
-    /// The R9 fix short-circuited at every builtin, treating ALL of them as
-    /// builtin-first; that left `alias.whatchanged = push origin main` reachable.
+    /// Background: on binaries where `--list-cmds=deprecated` succeeds, deprecated
+    /// builtins (`whatchanged`, `pack-redundant`) are alias-first: `run_argv()`
+    /// calls `handle_alias()` before `handle_builtin()` for those names.  The R9
+    /// fix short-circuited at every builtin, treating ALL of them as builtin-first;
+    /// that left `alias.whatchanged = push origin main` reachable as a bypass.
     ///
     /// Fix: when a name is in BOTH `--list-cmds=builtins` AND
-    /// `--list-cmds=deprecated`, it is alias-first on this git binary.  Skip the
+    /// `--list-cmds=deprecated`, it is alias-first on this binary.  Skip the
     /// short-circuit and follow the alias — which then hits `push`, is classified
     /// as Push, and is refused.
     ///
-    /// Dispatch gate: if the installed git does not support `--list-cmds=deprecated`
-    /// (pre-2.52), it also does not have the deprecated-builtin exception, so the
-    /// test is skipped cleanly.
+    /// Dispatch gate: skips cleanly on binaries where `--list-cmds=deprecated`
+    /// exits non-zero or does not list `whatchanged` — those binaries do not have
+    /// the alias-first deprecated dispatch exception.
     ///
     /// Mutation preconditions:
     /// 1. `verify_alias_safety` returns `Ok(None)` when the deprecated set is
@@ -6523,8 +6524,8 @@ mod tests {
     #[test]
     fn verify_push_deprecated_builtin_alias_is_expanded_and_refused() {
         // Skip cleanly when the installed git does not support --list-cmds=deprecated
-        // (that git also lacks the deprecated-builtin dispatch exception, so there
-        // is nothing to test on that binary).
+        // (those binaries also lack the deprecated-builtin dispatch exception, so
+        // there is nothing to test).
         let deprecated_set = git_deprecated_commands(&real_git());
         if deprecated_set.is_empty() {
             return;
@@ -6564,8 +6565,9 @@ mod tests {
         ]);
 
         // Wire alias.whatchanged = push origin main.
-        // On git 2.52+, git expands this alias even though `whatchanged` is in
-        // --list-cmds=builtins, because it is also deprecated.
+        // On binaries where --list-cmds=deprecated succeeds, git expands this
+        // alias even though `whatchanged` is in --list-cmds=builtins, because
+        // it is also deprecated (alias-first on such binaries).
         g(&[
             "-C",
             repo.to_str().unwrap(),
@@ -6601,9 +6603,9 @@ mod tests {
         );
 
         // End-to-end: run_inner must refuse the human-authored commit that would
-        // reach `origin` via the alias.  On git 2.52+, real git expands the alias
-        // to `push origin main` and sends the commit; the wrapper must intercept
-        // it via the expanded classification.
+        // reach `origin` via the alias.  On binaries where --list-cmds=deprecated
+        // succeeds, real git expands the alias to `push origin main` and sends the
+        // commit; the wrapper must intercept it via the expanded classification.
         let argv = v(&["-C", repo.to_str().unwrap(), "whatchanged"]);
         let exit = run_inner(argv, Some(managed()));
         assert_ne!(

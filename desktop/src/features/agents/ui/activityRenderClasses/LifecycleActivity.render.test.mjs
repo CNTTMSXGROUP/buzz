@@ -5,6 +5,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { LifecycleActivity } from "./LifecycleActivity.tsx";
+import { buildTranscript } from "../agentSessionTranscript.ts";
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -353,5 +354,111 @@ test("test_four_option_contract_only_allow_once_and_reject_once_actionable", () 
     buttonCount,
     2,
     `four-option card must render exactly 2 buttons (allow_once + reject_once); got ${buttonCount}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// F3 cross-layer: acp_read → buildTranscript → LifecycleActivity
+//
+// Starts with all four adapter option kinds in the request payload.
+// Drives the event through the full transcript reducer so the card is built
+// from the real processing path, not a hand-rolled fixture.
+// Then renders via LifecycleActivity and confirms the two-button contract.
+// ---------------------------------------------------------------------------
+
+test("test_f3_cross_layer_four_options_acp_read_to_lifecycle_activity_two_buttons", () => {
+  // Build an acp_read event carrying all four adapter option kinds.
+  // This is the real wire shape the observer feed emits when the agent
+  // requests permission with a full four-option set.
+  const acpReadEvent = {
+    seq: 1,
+    timestamp: "2026-09-01T10:00:00.000Z",
+    kind: "acp_read",
+    agentIndex: 0,
+    channelId: "ch-f3-cross",
+    sessionId: "sess-f3-cross",
+    turnId: "turn-f3-cross",
+    payload: {
+      jsonrpc: "2.0",
+      id: "req-f3",
+      method: "session/request_permission",
+      params: {
+        title: "Tool requires approval",
+        toolCallId: "tc-f3",
+        // Four option kinds offered by the adapter.
+        options: [
+          {
+            optionId: "opt-allow-once",
+            kind: "allow_once",
+            name: "Allow once",
+          },
+          { optionId: "opt-reject-once", kind: "reject_once", name: "Deny" },
+          {
+            optionId: "opt-allow-always",
+            kind: "allow_always",
+            name: "Always allow",
+          },
+          {
+            optionId: "opt-reject-always",
+            kind: "reject_always",
+            name: "Always deny",
+          },
+        ],
+      },
+    },
+    // Authorization envelope: marks the card as actionable with a nonce.
+    authorization: {
+      requestNonce: "nonce-f3-cross",
+      actionable: true,
+    },
+  };
+
+  // 1. Drive through the transcript reducer.
+  const transcript = buildTranscript([acpReadEvent]);
+  const card = transcript.find((item) => item.renderClass === "permission");
+  assert.ok(card, "transcript must contain a permission card");
+  assert.equal(
+    card.requestNonce,
+    "nonce-f3-cross",
+    "card must carry the request nonce",
+  );
+  assert.ok(card.actionable, "card must be actionable");
+  assert.ok(Array.isArray(card.options), "card must have options");
+  assert.equal(card.options.length, 4, "all four options must be on the card");
+
+  // 2. Render via LifecycleActivity and assert the two-button contract.
+  const html = renderToStaticMarkup(
+    React.createElement(LifecycleActivity, {
+      ...BASE_PROPS,
+      item: card,
+    }),
+  );
+
+  // Only allow_once and reject_once render buttons (ACTIONABLE_KINDS contract).
+  assert.ok(
+    html.includes("permission-decision-opt-allow-once"),
+    "allow_once must render a button via cross-layer path",
+  );
+  assert.ok(
+    html.includes("permission-decision-opt-reject-once"),
+    "reject_once must render a button via cross-layer path",
+  );
+
+  // allow_always and reject_always must NOT render buttons.
+  assert.ok(
+    !html.includes("permission-decision-opt-allow-always"),
+    "allow_always must not render a button via cross-layer path",
+  );
+  assert.ok(
+    !html.includes("permission-decision-opt-reject-always"),
+    "reject_always must not render a button via cross-layer path",
+  );
+
+  // Exactly two <button> elements.
+  const buttonCount = (html.match(/<button/g) ?? []).length;
+  assert.equal(
+    buttonCount,
+    2,
+    `cross-layer four-option card must render exactly 2 buttons; got ${buttonCount}`,
   );
 });

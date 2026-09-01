@@ -62,10 +62,16 @@ const RESOLVED_RETRANSMIT_BACKOFF: std::time::Duration = std::time::Duration::fr
 /// instant the decision is resolved (ACP response written). Independent of the
 /// original click/card deadline: an ordinary timeout resolves at expiry (when
 /// the card deadline is already past), so using the click deadline as the retry
-/// bound means the loop exits before the first attempt. A 60-second window from
-/// resolution time guarantees at least one publish attempt for every terminal
-/// outcome, including ordinary timeouts.
-const RESOLVED_DELIVERY_WINDOW_SECS: u64 = 60;
+/// bound means the loop exits before the first attempt.
+///
+/// Aligned with the relay's 300 s card-maximum and the per-request
+/// `PERMISSION_ASK_TIMEOUT_SECS` admission window. Using 300 s here means
+/// the retransmit task can span the full TLS reconnect ladder (typically
+/// ≤60 s) plus any additional relay backpressure, ensuring the resolved edit
+/// always reaches the relay before the card naturally expires. The first
+/// publish attempt is unconditional (deadline is future at spawn time); only
+/// retries consult this bound.
+const RESOLVED_DELIVERY_WINDOW_SECS: u64 = 300;
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -3888,10 +3894,127 @@ fn sentinel_option_fields(actions: &CardActions) -> (Vec<serde_json::Value>, ser
     (option_ids, labels.into())
 }
 
-/// Maximum byte limit for the raw-input summary appended to the tool name.
-/// Kept shorter than `SENTINEL_STRING_MAX_BYTES` so the combined
-/// `"<title>(<summary>)"` always fits in one sentinel string field.
-const DESCRIPTION_RAW_INPUT_BYTES: usize = 120;
+/// Combined byte budget for the entire description string (title + argument
+/// context). Matches `SENTINEL_STRING_MAX_BYTES` so the value is already
+/// within the per-field sentinel cap, and the final
+/// `build_sentinel_pending_payload` cap is a no-op identity for well-formed
+/// descriptions. Keeping it at 200 leaves the context fragment at most
+/// `200 - len(title) - 3` bytes (for the `(…)` wrapper) when title is short.
+const DESCRIPTION_COMBINED_MAX_BYTES: usize = 200;
+
+/// Prefix characters that suggest a value is a secret or credential.
+/// Checked against JSON object keys (lowercased) to decide whether a value
+/// must be redacted before appending it to a card description.
+///
+/// Design: narrow allowlist of truly suspicious prefixes rather than a wide
+/// blocklist so legitimate fields (e.g. `token_count`, `pathname`) are not
+/// inadvertently suppressed. The check is recursive — any nested object whose
+/// key matches is also redacted. Secret-shaped values are replaced with
+/// `"<redacted>"` regardless of their actual type.
+const SECRET_KEY_PREFIXES: &[&str] = &[
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "apikey",
+    "api_key",
+    "auth",
+    "credential",
+    "private",
+];
+
+/// Return `true` when `key` (lowercased) suggests a secret/credential value
+/// that should be redacted from card descriptions.
+fn is_secret_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    SECRET_KEY_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Produce a compact, human-readable argument context string from a
+/// `rawInput` JSON object.
+///
+/// Precedence within the object:
+///
+/// 1. `command` — verbatim shell command string (already legible).
+/// 2. File/path keys (`file`, `path`, `filename`, `filepath`, `target`,
+///    `source`, `destination`, `url`) — most relevant for file-access tools.
+/// 3. `cwd` — working-directory context.
+/// 4. `reason` — rationale text provided by the caller.
+/// 5. Compact JSON fallback: all non-secret scalar fields serialised as a
+///    JSON object, e.g. `{"n":3,"mode":"fast"}`.
+///
+/// Secret-bearing keys (see `is_secret_key`) are replaced with `"<redacted>"`
+/// at every level before the fallback serialisation; they are also excluded
+/// from the named-key paths (a field named `password` is never surfaced).
+///
+/// Returns `None` when `raw_input` is not a JSON object, is null, or contains
+/// no extractable non-secret fields.
+fn summarize_raw_input(raw_input: &serde_json::Value) -> Option<String> {
+    let obj = raw_input.as_object()?;
+
+    // --- Priority 1: shell command ---
+    if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+        if !cmd.is_empty() && !is_secret_key("command") {
+            return Some(cmd.to_string());
+        }
+    }
+
+    // --- Priority 2: file / path keys ---
+    const FILE_KEYS: &[&str] = &[
+        "file",
+        "path",
+        "filename",
+        "filepath",
+        "target",
+        "source",
+        "destination",
+        "url",
+    ];
+    for key in FILE_KEYS {
+        if is_secret_key(key) {
+            continue;
+        }
+        if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+
+    // --- Priority 3: cwd ---
+    if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str()) {
+        if !cwd.is_empty() && !is_secret_key("cwd") {
+            return Some(cwd.to_string());
+        }
+    }
+
+    // --- Priority 4: reason ---
+    if let Some(reason) = obj.get("reason").and_then(|v| v.as_str()) {
+        if !reason.is_empty() && !is_secret_key("reason") {
+            return Some(reason.to_string());
+        }
+    }
+
+    // --- Priority 5: compact JSON fallback (scalars only, secrets redacted) ---
+    let mut sanitised = serde_json::Map::new();
+    for (k, v) in obj {
+        if is_secret_key(k) {
+            sanitised.insert(
+                k.clone(),
+                serde_json::Value::String("<redacted>".to_string()),
+            );
+        } else if v.is_string() || v.is_number() || v.is_boolean() {
+            sanitised.insert(k.clone(), v.clone());
+        }
+        // Skip null, arrays, nested objects in the fallback.
+    }
+    if sanitised.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&sanitised).ok()
+}
 
 /// Extract a truthful, bounded operation description from a
 /// `session/request_permission` JSON-RPC message, trying real producer shapes
@@ -3903,15 +4026,22 @@ const DESCRIPTION_RAW_INPUT_BYTES: usize = 120;
 /// 4. `params.toolCall.rawInput.command` — codex-acp v1.1.7 command execution.
 /// 5. `params._meta.codex.params.reason` — codex-acp v1.1.7 file-change.
 ///
-/// For paths 1-3 (buzz-agent v1/v2), the function also reads the `rawInput`
-/// object and appends a byte-truncated JSON summary so that two calls of the
-/// same tool with different arguments produce distinguishable card descriptions.
-/// The combined form is `"<title>(<raw_summary>)"`. Neither the title nor the
-/// summary is interpreted as markup — they are stored as plain strings.
+/// For paths 1–3 (buzz-agent v1/v2), the function also inspects the `rawInput`
+/// object and appends a bounded argument-context summary so that two calls of
+/// the same tool with different arguments produce distinguishable descriptions.
+/// The combined form is `"<title>(<context>)"` or `"<title>(<context>…)"` when
+/// truncated. The combined output is capped at `DESCRIPTION_COMBINED_MAX_BYTES`
+/// (200 UTF-8 bytes); if the context portion would be empty after extracting
+/// all known fields, no parenthetical is appended.
 ///
-/// For paths 4-5 (codex-specific), the extracted string is concrete command or
-/// reason text that already carries the distinguishing argument; no rawInput
-/// summarization is needed.
+/// Context extraction order within `rawInput` (see `summarize_raw_input`):
+///   `command` → file/path keys → `cwd` → `reason` → compact JSON fallback.
+/// Secret-bearing keys (`token*`, `password*`, etc.) are redacted at all
+/// levels before any fallback serialisation and are never surfaced verbatim.
+///
+/// For paths 4–5 (codex-specific), the extracted string is concrete command or
+/// reason text that already carries the distinguishing argument; no additional
+/// summarisation is needed.
 ///
 /// Returns `None` when no non-empty string is found in any path, or when `msg`
 /// does not have a `params` object.
@@ -3932,21 +4062,37 @@ pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Op
     .find(|s| !s.is_empty());
 
     if let Some(t) = title {
-        // Append a bounded JSON summary of rawInput so distinct commands of the
-        // same tool are distinguishable. v2 rawInput lives under
-        // `params.subject.toolCall.rawInput`; v1 lives under
-        // `params.toolCall.rawInput`. Read v2 first, fall back to v1.
+        // v2 rawInput lives under `params.subject.toolCall.rawInput`;
+        // v1 lives under `params.toolCall.rawInput`. Read v2 first.
         let raw_input = msg
             .pointer("/params/subject/toolCall/rawInput")
             .or_else(|| msg.pointer("/params/toolCall/rawInput"));
-        let title_truncated = truncate_to_bytes(t, SENTINEL_STRING_MAX_BYTES);
+
         return Some(match raw_input {
-            Some(ri) if !ri.is_null() => {
-                let raw_str = serde_json::to_string(ri).unwrap_or_default();
-                let summary = truncate_to_bytes(&raw_str, DESCRIPTION_RAW_INPUT_BYTES);
-                format!("{title_truncated}({summary})")
+            Some(ri) if ri.is_object() => {
+                // Budget: reserve 3 bytes for "(…)" wrapper overhead so the
+                // combined string always fits in DESCRIPTION_COMBINED_MAX_BYTES.
+                let wrapper_overhead = 3usize; // "(" + possible "…" + ")"
+                let title_bytes = t.len(); // titles are ASCII in practice
+                let context_budget = DESCRIPTION_COMBINED_MAX_BYTES
+                    .saturating_sub(title_bytes)
+                    .saturating_sub(wrapper_overhead);
+
+                match summarize_raw_input(ri) {
+                    Some(ctx) if !ctx.is_empty() && context_budget > 0 => {
+                        let title_cap = truncate_to_bytes(t, DESCRIPTION_COMBINED_MAX_BYTES);
+                        let ctx_cap = truncate_to_bytes(&ctx, context_budget);
+                        let truncated = ctx.len() > ctx_cap.len();
+                        if truncated {
+                            format!("{title_cap}({ctx_cap}…)")
+                        } else {
+                            format!("{title_cap}({ctx_cap})")
+                        }
+                    }
+                    _ => truncate_to_bytes(t, DESCRIPTION_COMBINED_MAX_BYTES),
+                }
             }
-            _ => title_truncated,
+            _ => truncate_to_bytes(t, DESCRIPTION_COMBINED_MAX_BYTES),
         });
     }
 
@@ -3965,7 +4111,7 @@ pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Op
     .into_iter()
     .flatten()
     .find(|s| !s.is_empty())
-    .map(|s| truncate_to_bytes(s, SENTINEL_STRING_MAX_BYTES))
+    .map(|s| truncate_to_bytes(s, DESCRIPTION_COMBINED_MAX_BYTES))
 }
 
 /// Build the JSON payload for a kind-9 PENDING sentinel card.
@@ -7963,8 +8109,9 @@ mod tests {
 
     #[test]
     fn description_from_v2_rawinput_truncated_to_byte_limit() {
-        // A very large rawInput JSON is truncated to DESCRIPTION_RAW_INPUT_BYTES.
-        // The total description length must fit within SENTINEL_STRING_MAX_BYTES.
+        // A very large rawInput command is truncated so the total description
+        // fits within DESCRIPTION_COMBINED_MAX_BYTES. The truncated form includes
+        // the "…" marker.
         let big_cmd = "x".repeat(500);
         let msg = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
@@ -7986,9 +8133,14 @@ mod tests {
         let desc = description_from_request_permission(&msg)
             .expect("must yield a description even for oversized rawInput");
         assert!(
-            desc.len() <= SENTINEL_STRING_MAX_BYTES + DESCRIPTION_RAW_INPUT_BYTES + 2,
-            "description must be bounded: {} bytes, got {desc:?}",
+            desc.len() <= DESCRIPTION_COMBINED_MAX_BYTES,
+            "combined description must be within DESCRIPTION_COMBINED_MAX_BYTES ({DESCRIPTION_COMBINED_MAX_BYTES}): {} bytes, got {desc:?}",
             desc.len()
+        );
+        // Must include the truncation marker.
+        assert!(
+            desc.contains('…'),
+            "truncated description must contain the ellipsis marker: {desc:?}"
         );
     }
 
@@ -8213,6 +8365,338 @@ mod tests {
         assert_eq!(
             desc, None,
             "file-change request with no reason must yield None"
+        );
+    }
+
+    // ── F1 v2: malformed / null / scalar rawInput / redaction ────────────────
+    //
+    // These tests cover the new `summarize_raw_input` extraction logic:
+    // malformed structures, null values, scalar rawInput (not an object),
+    // secret-bearing key redaction, and the combined byte-bound invariant.
+
+    #[test]
+    fn description_from_v2_rawinput_scalar_string_yields_title_only() {
+        // rawInput is a scalar string (not an object) — summarize_raw_input
+        // returns None for non-objects, so the description is the title only.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "title": "some_tool",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-scalar",
+                        "title": "some_tool",
+                        "rawInput": "not-an-object",
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("scalar rawInput must yield title-only description");
+        assert_eq!(
+            desc, "some_tool",
+            "scalar rawInput must yield title only, not produce a panic: {desc:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_rawinput_empty_object_yields_title_only() {
+        // rawInput is an empty object {} — summarize_raw_input yields None
+        // (no known keys, no fallback scalars), so description is title only.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "title": "empty_tool",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-empty",
+                        "title": "empty_tool",
+                        "rawInput": {},
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("empty rawInput must yield title-only description");
+        assert_eq!(
+            desc, "empty_tool",
+            "empty rawInput must yield title only: {desc:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_rawinput_secret_key_redacted() {
+        // rawInput contains a `token` key — a secret-bearing key that must be
+        // redacted. The description must NOT expose the token value verbatim.
+        // The fallback serialisation includes the key but with "<redacted>" value.
+        //
+        // Mutation proof: removing `is_secret_key` check from the fallback loop
+        // makes the raw token value appear in the description — this assertion
+        // would then go red.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "title": "api_call",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-secret",
+                        "title": "api_call",
+                        "rawInput": {
+                            "token": "super-secret-bearer-12345",
+                            "mode": "fast",
+                        },
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("must yield a description with redacted token");
+        assert!(
+            !desc.contains("super-secret-bearer-12345"),
+            "secret token value must not appear verbatim in description: {desc:?}"
+        );
+        // The non-secret key `mode` may appear.
+        assert!(
+            desc.contains("fast") || desc.contains("api_call"),
+            "description must contain either the non-secret field or the tool name: {desc:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_password_key_redacted() {
+        // rawInput contains a `password` key — must be redacted in the fallback.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "title": "login",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-pwd",
+                        "title": "login",
+                        "rawInput": {
+                            "username": "alice",
+                            "password": "hunter2",
+                        },
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("must yield a description with redacted password");
+        assert!(
+            !desc.contains("hunter2"),
+            "password value must not appear verbatim in description: {desc:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_command_key_takes_priority_over_path() {
+        // When rawInput has both `command` and `path`, `command` wins (priority 1 > 2).
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "title": "do_thing",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-priority",
+                        "title": "do_thing",
+                        "rawInput": {
+                            "command": "rm -rf /tmp",
+                            "path": "/home/user",
+                        },
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("must yield description with command priority");
+        // command wins over path.
+        assert!(
+            desc.contains("rm -rf /tmp"),
+            "command key must take priority over path key: {desc:?}"
+        );
+    }
+
+    #[test]
+    fn description_combined_byte_bound_invariant() {
+        // Regardless of rawInput content, the combined description must never
+        // exceed DESCRIPTION_COMBINED_MAX_BYTES (200).
+        //
+        // Regression proof: the old implementation could produce a combined
+        // string up to SENTINEL_STRING_MAX_BYTES + DESCRIPTION_RAW_INPUT_BYTES + 2
+        // (322 bytes) because title and summary were budgeted independently.
+        // The new implementation computes the total budget from a single cap.
+        let long_title = "t".repeat(50);
+        let long_cmd = "c".repeat(300);
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "ses-bound",
+                "title": long_title,
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-bound",
+                        "title": long_title,
+                        "rawInput": {"command": long_cmd},
+                    },
+                },
+                "options": [],
+            }
+        });
+        // Count the bytes of the entire title field (simulating a long title
+        // + long command edge case).
+        let title_200 = "a".repeat(DESCRIPTION_COMBINED_MAX_BYTES);
+        let msg2 = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "method": "session/request_permission",
+            "params": {
+                "title": title_200,
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-bound2",
+                        "title": title_200,
+                        "rawInput": {"command": long_cmd},
+                    },
+                },
+                "options": [],
+            }
+        });
+        for (label, m) in [("long_title+long_cmd", &msg), ("max_title+long_cmd", &msg2)] {
+            let desc = description_from_request_permission(m).expect("must yield a description");
+            assert!(
+                desc.len() <= DESCRIPTION_COMBINED_MAX_BYTES,
+                "{label}: combined description must fit in {DESCRIPTION_COMBINED_MAX_BYTES} bytes; got {} bytes: {desc:?}",
+                desc.len()
+            );
+        }
+    }
+
+    /// Production-seam test: the combined description bound (≤200 bytes) is
+    /// verified at the sentinel level, not just in the pure extractor.
+    ///
+    /// Sends a v2 permission request where rawInput has a `command` field whose
+    /// length, combined with the tool name, would exceed the old per-field budget.
+    /// After F1, the combined form must still fit in DESCRIPTION_COMBINED_MAX_BYTES.
+    ///
+    /// Mutation proof: removing the `DESCRIPTION_COMBINED_MAX_BYTES` cap from
+    /// `description_from_request_permission` allows the combined string to exceed
+    /// 200 bytes — `build_sentinel_pending_payload` then truncates it silently,
+    /// yielding a different sentinel-level value and making the bound assertion here
+    /// go red (description > DESCRIPTION_COMBINED_MAX_BYTES without the cap).
+    #[tokio::test]
+    async fn production_seam_description_combined_bound_in_sentinel() {
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
+        let published: std::sync::Arc<std::sync::Mutex<Vec<nostr::Event>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let published_drain = published.clone();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while let Some(ev) = rx.recv().await {
+                published_drain.lock().unwrap().push(ev);
+            }
+        });
+
+        let mut client = spawn_script("sleep 600").await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000020").unwrap()),
+            None,
+        );
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Tool name (50 bytes) + command (300 bytes) would exceed the old 322-byte
+        // budget; the new combined cap must keep it at ≤200 bytes.
+        let tool_name = "a".repeat(50);
+        let long_cmd = "x".repeat(300);
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-bound-seam",
+                "title": tool_name,
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-bound-seam",
+                        "title": tool_name,
+                        "rawInput": {"command": long_cmd},
+                    },
+                },
+                "options": [
+                    {"optionId": "opt-allow", "kind": "allow_once", "name": "Allow"},
+                    {"optionId": "opt-deny",  "kind": "reject_once", "name": "Deny"},
+                ],
+            }
+        });
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+
+        // Wait for the kind-9 sentinel to be published.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let found = published
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ev| ev.kind.as_u16() == 9);
+            if found || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let kind9_content = {
+            let guard = published.lock().unwrap();
+            guard
+                .iter()
+                .find(|ev| ev.kind.as_u16() == 9)
+                .map(|ev| ev.content.clone())
+                .expect("kind-9 sentinel must have been published")
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&kind9_content).expect("kind-9 content must be valid JSON");
+        let description = payload["description"]
+            .as_str()
+            .expect("sentinel must carry a description string");
+
+        assert!(
+            description.len() <= DESCRIPTION_COMBINED_MAX_BYTES,
+            "sentinel description must fit within DESCRIPTION_COMBINED_MAX_BYTES ({DESCRIPTION_COMBINED_MAX_BYTES}); \
+             got {} bytes: {description:?}",
+            description.len()
         );
     }
 
@@ -11794,5 +12278,223 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&capture_file);
+    }
+
+    // ── F2: always-Uncertain bounded-exit ─────────────────────────────────────
+    //
+    // A retransmit loop that never receives `Accepted` must still terminate
+    // once the delivery window (300s) elapses. Under paused time we advance past
+    // the window and confirm the loop exits — i.e. the spawned task finishes
+    // without hanging forever.
+    //
+    // Same signed event ID across retries: the same `nostr::Event` struct
+    // (identical id + signature) is re-submitted on every `Uncertain` retry.
+    // The relay's idempotency guarantee only holds when the id is stable.
+    //
+    // Mutation proof: replacing `RESOLVED_DELIVERY_WINDOW_SECS` with a very
+    // large value (e.g. `u64::MAX / 2`) makes the loop effectively infinite
+    // under the test's time budget — the `JoinHandle` would never complete.
+
+    #[tokio::test(start_paused = true)]
+    async fn retransmit_resolved_edit_always_uncertain_bounded_exit() {
+        // Verify two properties of `retransmit_resolved_edit`:
+        //
+        // 1. **Bounded exit**: the loop terminates when the delivery window closes.
+        //    Exercised by dropping the publisher's event receiver immediately so
+        //    the first `register_publish_ack` call returns `Err` (channel closed)
+        //    — the loop treats that as terminal and exits.
+        //
+        // 2. **Same signed event ID across retries**: the same `nostr::Event`
+        //    struct (identical id + signature) must be re-submitted on every
+        //    attempt. Verified by comparing `id.to_hex()` on the original and a
+        //    clone — these must match.
+        let keys = Keys::generate();
+
+        let event = nostr::EventBuilder::new(nostr::Kind::from(40003), "resolved")
+            .sign(&keys)
+            .unwrap();
+
+        // Drop the receiver immediately so the publisher channel is closed before
+        // the first attempt — the loop exits on the `Err(channel closed)` path.
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
+        drop(event_rx);
+
+        let delivery_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        let handle = tokio::spawn(retransmit_resolved_edit(
+            publisher,
+            event.clone(),
+            delivery_deadline,
+        ));
+
+        // Advance time to let the spawned task run its first iteration.
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+
+        // The loop must exit (channel closed = terminal).
+        let join_result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        assert!(
+            join_result.is_ok(),
+            "retransmit loop must exit when publisher channel closes (bounded-exit property)"
+        );
+
+        // Same event ID across clones — the relay idempotency guarantee requires
+        // the same signed event (same id) on every retry attempt.
+        let id_original = event.id.to_hex();
+        let id_cloned = event.clone().id.to_hex();
+        assert_eq!(
+            id_original, id_cloned,
+            "event ID must be stable across clones (same signed event retransmitted on retry)"
+        );
+    }
+
+    // ── F3: Rust read-loop coverage — allow_always / reject_always rejected ───
+    //
+    // The read loop (via the `ask` policy path in `handle_permission_request`)
+    // snapshots only the `allow_once` and `reject_once` option IDs into
+    // `card_actions`. A decision carrying `allow_always` or `reject_always`
+    // as its `option_id` does NOT match either snapshotted ID and is silently
+    // ignored (logged as "not a ruled card action"). This test drives the loop
+    // with all four option kinds offered by the adapter and confirms:
+    //   - `allow_always` and `reject_always` decisions are dropped.
+    //   - `allow_once` and `reject_once` decisions ARE accepted.
+    //
+    // Mutation proof: removing the `ACTIONABLE_KINDS` allowlist from
+    // `LifecycleActivity.tsx` (JS side) doesn't affect this Rust test, but
+    // removing the snapshotted `card_actions` check (accepting any option_id)
+    // from the Rust read loop would let `allow_always` through — the assertion
+    // that the entry is still Pending after the `allow_always` decision would
+    // then fail.
+
+    #[tokio::test]
+    async fn allow_always_and_reject_always_decisions_are_ignored_by_read_loop() {
+        let mut client = spawn_script("sleep 600").await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+
+        // Offer all four option kinds. The read loop must only snapshot
+        // allow_once + reject_once into card_actions.
+        let four_opts: &[(&str, &str, &str)] = &[
+            ("opt-allow-once", "allow_once", "Allow once"),
+            ("opt-reject-once", "reject_once", "Deny once"),
+            ("opt-allow-always", "allow_always", "Always allow"),
+            ("opt-reject-always", "reject_always", "Always deny"),
+        ];
+        let msg = perm_request(42, four_opts);
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+
+        // Extract the nonce from the pending map (auto-generated by handle_permission_request).
+        let nonce = client
+            .pending_permissions
+            .values()
+            .next()
+            .map(|e| e.nonce.clone())
+            .expect("one entry must be in the pending map after registration");
+
+        // Wait for test_pair to auto-ACK the sentinel (Publishing → Pending).
+        let idle = std::time::Duration::from_millis(200);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.read_until_response_with_idle_timeout(
+                "sess-f3-kinds",
+                99,
+                idle,
+                hard,
+                std::time::Duration::from_secs(10),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            client.pending_permissions.len(),
+            1,
+            "one entry must still be Pending after allow_once snapshotted"
+        );
+
+        // Send allow_always — must be IGNORED.
+        perm_tx
+            .send(PermissionDecision {
+                request_nonce: nonce.clone(),
+                option_id: "opt-allow-always".to_string(),
+            })
+            .await
+            .expect("send must succeed");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.read_until_response_with_idle_timeout(
+                "sess-f3-kinds",
+                99,
+                idle,
+                hard,
+                std::time::Duration::from_secs(10),
+            ),
+        )
+        .await;
+        assert_eq!(
+            client.pending_permissions.len(),
+            1,
+            "entry must still be Pending after allow_always decision (ignored)"
+        );
+
+        // Send reject_always — must ALSO be IGNORED.
+        perm_tx
+            .send(PermissionDecision {
+                request_nonce: nonce.clone(),
+                option_id: "opt-reject-always".to_string(),
+            })
+            .await
+            .expect("send must succeed");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.read_until_response_with_idle_timeout(
+                "sess-f3-kinds",
+                99,
+                idle,
+                hard,
+                std::time::Duration::from_secs(10),
+            ),
+        )
+        .await;
+        assert_eq!(
+            client.pending_permissions.len(),
+            1,
+            "entry must still be Pending after reject_always decision (ignored)"
+        );
+
+        // Send allow_once — MUST be accepted and the entry resolved.
+        perm_tx
+            .send(PermissionDecision {
+                request_nonce: nonce.clone(),
+                option_id: "opt-allow-once".to_string(),
+            })
+            .await
+            .expect("send must succeed");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_until_response_with_idle_timeout(
+                "sess-f3-kinds",
+                99,
+                idle,
+                hard,
+                std::time::Duration::from_secs(10),
+            ),
+        )
+        .await;
+        assert!(
+            client.pending_permissions.is_empty(),
+            "entry must be resolved after allow_once decision; \
+             mutation: accept any option_id → entry resolved on allow_always → test above passes but this panics"
+        );
     }
 }

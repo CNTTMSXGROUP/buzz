@@ -1948,7 +1948,18 @@ fn handle_switch_model_control(
 /// delivers a [`crate::acp::PermissionDecision`] to the in-flight read loop
 /// via the per-task `permission_decision_tx` mpsc channel.
 ///
-/// If there is no in-flight task for the channel, or the sender is gone, the
+/// **Fan-out routing (same-channel multi-thread safety):** The relay supports
+/// concurrent thread-scoped tasks in one channel. Finding only the first task
+/// by `channel_id` would let the wrong sibling consume-and-ignore a frame whose
+/// nonce belongs to a different thread, stranding that thread's decision until
+/// timeout. Instead this function fans out to **all** tasks whose `channel_id`
+/// matches — the nonce is unguessable, so every read loop that receives the
+/// decision drops it immediately when it has no matching pending entry (the
+/// `"no matching pending entry"` trace path in `acp.rs`), while the owning loop
+/// accepts it. Ownership signature validation was already performed upstream
+/// before this function is called.
+///
+/// If there is no in-flight task for the channel, or all senders are gone, the
 /// frame is dropped silently (the per-request 300s timeout will fail the entry
 /// closed on its own).
 fn handle_permission_decision_control(
@@ -1988,9 +1999,9 @@ fn handle_permission_decision_control(
         option_id: option_id.to_string(),
     };
 
-    // Deliver via the in-flight task's mpsc if one exists for this channel.
-    // Compute the send result in a scope that releases the task_map borrow
-    // before we touch the pool-level recently-decided set.
+    // Collect all same-channel tasks that have a permission_decision_tx
+    // installed. Fan out: every eligible read loop in the channel receives the
+    // decision and lets the nonce select the owning entry.
     enum Delivery {
         Sent,
         Full,
@@ -1998,84 +2009,86 @@ fn handle_permission_decision_control(
         NoChannel,
         NoTask,
     }
-    let delivery = {
-        let entry = pool
+
+    // Gather delivery results for all matching tasks.
+    let deliveries: Vec<Delivery> = {
+        let matching: Vec<_> = pool
             .task_map_mut()
             .values_mut()
-            .find(|m| m.channel_id == Some(channel_id));
-        match entry {
-            Some(meta) => match &meta.permission_decision_tx {
-                Some(tx) => match tx.try_send(decision) {
-                    Ok(()) => Delivery::Sent,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Delivery::Full,
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Delivery::Closed,
-                },
-                None => Delivery::NoChannel,
-            },
-            None => Delivery::NoTask,
+            .filter(|m| m.channel_id == Some(channel_id))
+            .collect();
+
+        if matching.is_empty() {
+            vec![Delivery::NoTask]
+        } else {
+            matching
+                .into_iter()
+                .map(|meta| match &meta.permission_decision_tx {
+                    Some(tx) => match tx.try_send(decision.clone()) {
+                        Ok(()) => Delivery::Sent,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Delivery::Full,
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Delivery::Closed,
+                    },
+                    None => Delivery::NoChannel,
+                })
+                .collect()
         }
     };
 
-    let status = match delivery {
-        Delivery::Sent => {
-            tracing::info!(
+    // Record the nonce as soon as at least one task received the decision.
+    let any_sent = deliveries.iter().any(|d| matches!(d, Delivery::Sent));
+    if any_sent {
+        pool.record_permission_decision(request_nonce);
+    }
+
+    // Summarise into a single status for the observer frame. Priority:
+    // Sent > Full > Closed > NoChannel > NoTask.
+    let status = if deliveries.iter().any(|d| matches!(d, Delivery::Sent)) {
+        tracing::info!(
+            channel = %channel_id,
+            nonce = %request_nonce,
+            option_id = %option_id,
+            tasks_fanned = deliveries.len(),
+            "permission_decision delivered to read loop(s)"
+        );
+        "sent"
+    } else if deliveries.iter().any(|d| matches!(d, Delivery::Full)) {
+        tracing::warn!(
+            channel = %channel_id,
+            "permission_decision channel full — dropping (will timeout)"
+        );
+        "channel_full"
+    } else if deliveries.iter().any(|d| matches!(d, Delivery::Closed)) {
+        tracing::warn!(
+            channel = %channel_id,
+            "permission_decision channel closed — read loop already exited"
+        );
+        if pool.was_recently_decided(request_nonce) {
+            "already_decided"
+        } else {
+            "channel_closed"
+        }
+    } else if deliveries.iter().any(|d| matches!(d, Delivery::NoChannel)) {
+        tracing::warn!(
+            channel = %channel_id,
+            "permission_decision_tx not installed for in-flight task"
+        );
+        "no_channel"
+    } else {
+        // NoTask — no in-flight task at all.
+        if pool.was_recently_decided(request_nonce) {
+            tracing::debug!(
                 channel = %channel_id,
                 nonce = %request_nonce,
-                option_id = %option_id,
-                "permission_decision delivered to read loop"
+                "permission_decision retransmit for an already-decided nonce — acking success-shaped"
             );
-            // Record the nonce so a later retransmit that arrives after this
-            // task ends is recognized as an already-applied duplicate rather
-            // than a delivery failure.
-            pool.record_permission_decision(request_nonce);
-            "sent"
-        }
-        Delivery::Full => {
+            "already_decided"
+        } else {
             tracing::warn!(
                 channel = %channel_id,
-                "permission_decision channel full — dropping (will timeout)"
+                "permission_decision control frame for channel with no in-flight task"
             );
-            "channel_full"
-        }
-        Delivery::Closed => {
-            tracing::warn!(
-                channel = %channel_id,
-                "permission_decision channel closed — read loop already exited"
-            );
-            // The read loop that owned this decision has exited. If we already
-            // forwarded this nonce, the decision was applied and this is a late
-            // retransmit — ack it success-shaped.
-            if pool.was_recently_decided(request_nonce) {
-                "already_decided"
-            } else {
-                "channel_closed"
-            }
-        }
-        Delivery::NoChannel => {
-            tracing::warn!(
-                channel = %channel_id,
-                "permission_decision_tx not installed for in-flight task"
-            );
-            "no_channel"
-        }
-        Delivery::NoTask => {
-            // No in-flight task. If this nonce was already delivered and applied
-            // by a task that has since returned, a retransmit landing after the
-            // card resolved must not flip it to failed — ack it success-shaped.
-            if pool.was_recently_decided(request_nonce) {
-                tracing::debug!(
-                    channel = %channel_id,
-                    nonce = %request_nonce,
-                    "permission_decision retransmit for an already-decided nonce — acking success-shaped"
-                );
-                "already_decided"
-            } else {
-                tracing::warn!(
-                    channel = %channel_id,
-                    "permission_decision control frame for channel with no in-flight task"
-                );
-                "no_active_turn"
-            }
+            "no_active_turn"
         }
     };
 
@@ -11153,6 +11166,109 @@ mod permission_decision_control_tests {
             "already_decided",
             "closed channel for an already-delivered nonce acks success-shaped"
         );
+    }
+
+    /// Routing hazard regression: two concurrent thread-scoped tasks in the
+    /// same channel. A `permission_decision` frame must be fanned out to BOTH
+    /// tasks so the correct owning read loop can accept the decision by nonce.
+    ///
+    /// **Scenario:**
+    ///  - Thread A and Thread B both have `permission_decision_tx` installed.
+    ///  - A decision arrives whose nonce belongs to Thread A.
+    ///  - The fix fans out to BOTH channels; Thread A receives it.
+    ///  - Thread B also receives it (fan-out), but its read loop drops it on
+    ///    nonce mismatch — that is correct and expected.
+    ///
+    /// **Mutation proof:** reverting the fan-out to a `.find()` (first-match
+    /// only) and running with Thread B installed first makes Thread A's channel
+    /// empty (`try_recv` returns an error), and the assertion on Thread A fails.
+    #[tokio::test]
+    async fn two_threads_same_channel_fan_out_routes_to_owning_thread() {
+        let observer = ObserverHandle::in_process();
+        let mut rx_obs = observer.subscribe();
+        let channel_id = Uuid::new_v4();
+        let nonce_a = "nonce-thread-a";
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+
+        // Install Thread B first — a `.find()`-only implementation would pick
+        // Thread B and deliver there, stranding Thread A's decision.
+        let mut rx_b = install_task(&mut pool, channel_id);
+        let mut rx_a = install_task(&mut pool, channel_id);
+
+        // Deliver a decision with Thread A's nonce.
+        handle_permission_decision_control(
+            &decision_payload(channel_id, nonce_a),
+            &mut pool,
+            Some(&observer),
+        );
+        assert_eq!(
+            control_result_status(&mut rx_obs),
+            "sent",
+            "decision must be delivered (status sent)"
+        );
+
+        // Thread A's channel MUST have received the decision.
+        let received_a = rx_a.try_recv();
+        assert!(
+            received_a.is_ok(),
+            "Thread A must receive the decision — fan-out failure would leave this empty; got: {received_a:?}"
+        );
+        assert_eq!(received_a.unwrap().request_nonce, nonce_a);
+
+        // Thread B also received it (fan-out). Its read loop would drop it on
+        // nonce mismatch; here we just confirm fan-out delivered to both.
+        let received_b = rx_b.try_recv();
+        assert!(
+            received_b.is_ok(),
+            "Thread B should also receive via fan-out (nonce mismatch handled by the read loop)"
+        );
+    }
+
+    /// Cross-thread isolation: a decision for Thread A must NOT strand Thread B.
+    ///
+    /// Both threads are running concurrently. After Thread A's decision is
+    /// applied (its entry resolved), Thread B can still receive its own
+    /// decision independently.
+    #[tokio::test]
+    async fn two_threads_same_channel_thread_b_not_stranded() {
+        let observer = ObserverHandle::in_process();
+        let mut rx_obs = observer.subscribe();
+        let channel_id = Uuid::new_v4();
+        let nonce_a = "nonce-strand-a";
+        let nonce_b = "nonce-strand-b";
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let mut rx_b = install_task(&mut pool, channel_id);
+        let mut rx_a = install_task(&mut pool, channel_id);
+
+        // Deliver Thread A's decision.
+        handle_permission_decision_control(
+            &decision_payload(channel_id, nonce_a),
+            &mut pool,
+            Some(&observer),
+        );
+        assert_eq!(control_result_status(&mut rx_obs), "sent");
+        // Drain both channels.
+        let _ = rx_a.try_recv();
+        let _ = rx_b.try_recv();
+
+        // Now deliver Thread B's decision.
+        let payload_b = serde_json::json!({
+            "channelId": channel_id.to_string(),
+            "requestNonce": nonce_b,
+            "optionId": "opt-deny",
+        });
+        handle_permission_decision_control(&payload_b, &mut pool, Some(&observer));
+        assert_eq!(control_result_status(&mut rx_obs), "sent");
+
+        // Thread B must receive its own decision.
+        let received_b_2 = rx_b.try_recv();
+        assert!(
+            received_b_2.is_ok(),
+            "Thread B must receive its own decision after Thread A's was handled: {received_b_2:?}"
+        );
+        assert_eq!(received_b_2.unwrap().request_nonce, nonce_b);
     }
 }
 

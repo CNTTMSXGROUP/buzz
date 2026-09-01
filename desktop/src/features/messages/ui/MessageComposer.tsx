@@ -52,6 +52,7 @@ import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
 import { focusMentionOptionsTrigger } from "./MentionAutocomplete";
 import { MessageComposerAutocompletes } from "./MessageComposerAutocompletes";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
+import { ComposerUploadError } from "./ComposerUploadError";
 import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
 import { useComposerVoiceNote } from "./useComposerVoiceNote";
@@ -897,18 +898,10 @@ function MessageComposerImpl({
               onOptionsRevealComplete={completeMentionOptionsReveal}
               onToggleAlwaysAddressAgent={toggleAlwaysAddressAgent}
             />
-            {media.uploadState.status === "error" ? (
-              <div className="mb-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                Upload failed: {media.uploadState.message}
-                <button
-                  className="ml-2 underline"
-                  onClick={() => media.setUploadState({ status: "idle" })}
-                  type="button"
-                >
-                  Dismiss
-                </button>
-              </div>
-            ) : null}
+            <ComposerUploadError
+              uploadState={media.uploadState}
+              onDismiss={() => media.setUploadState({ status: "idle" })}
+            />
             {composerLinkPreviews}
             <output
               aria-live="polite"

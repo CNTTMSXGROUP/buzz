@@ -19,6 +19,8 @@ const RELATED_CHANNEL_CAP: usize = 64;
 pub struct ProjectRelatedChannelChange<'a> {
     /// Owner pubkey from the canonical kind:30621 coordinate.
     pub project_owner: &'a [u8],
+    /// Owner currently attested by the actor, after event-level verification.
+    pub delegated_owner: Option<&'a [u8]>,
     /// Verbatim `d` value from the canonical kind:30621 coordinate.
     pub project_d_tag: &'a str,
     /// Relational revision the actor observed.
@@ -120,6 +122,12 @@ fn validate_patch(change: ProjectRelatedChannelChange<'_>) -> Option<String> {
     if change.project_owner.len() != 32 {
         return Some("Project owner must be 32 bytes".into());
     }
+    if change
+        .delegated_owner
+        .is_some_and(|owner| owner.len() != 32)
+    {
+        return Some("delegated Project owner must be 32 bytes".into());
+    }
     if change.project_d_tag.is_empty() || change.project_d_tag.len() > crate::event::D_TAG_MAX_LEN {
         return Some("Project d tag is empty or too long".into());
     }
@@ -200,6 +208,25 @@ impl Db {
             });
         }
 
+        let actor = event.pubkey.to_bytes();
+        let delegated_owner = if let Some(owner) = change.delegated_owner {
+            let registered: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE community_id=$1 AND pubkey=$2 \
+                   AND agent_owner_pubkey=$3)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(actor.as_slice())
+            .bind(owner)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !registered {
+                return Ok(ProjectChangeApplyResult::Forbidden);
+            }
+            Some(owner)
+        } else {
+            None
+        };
+
         let head = sqlx::query(
             "SELECT revision, deleted, identity_event_id FROM project_state_heads \
              WHERE community_id=$1 AND project_owner=$2 AND project_d_tag=$3 FOR UPDATE",
@@ -269,8 +296,9 @@ impl Db {
             1
         };
 
-        let actor = event.pubkey.to_bytes();
-        if actor.as_slice() != change.project_owner {
+        let actor_owns_project = actor.as_slice() == change.project_owner;
+        let delegate_owns_project = delegated_owner == Some(change.project_owner);
+        if !actor_owns_project && !delegate_owns_project {
             let Some(home_channel) = home_channel else {
                 return Ok(ProjectChangeApplyResult::Forbidden);
             };
@@ -280,20 +308,23 @@ impl Db {
                 home_channel,
             )
             .await?;
-            let role: Option<String> = sqlx::query_scalar(
+            let authorized_role: Option<String> = sqlx::query_scalar(
                 "SELECT member.role::text FROM channel_members member \
                  JOIN channels channel ON channel.community_id=member.community_id \
                    AND channel.id=member.channel_id \
-                 WHERE member.community_id=$1 AND member.channel_id=$2 AND member.pubkey=$3 \
+                 WHERE member.community_id=$1 AND member.channel_id=$2 \
+                   AND (member.pubkey=$3 OR member.pubkey=$4) \
+                   AND member.role IN ('owner', 'admin') \
                    AND member.removed_at IS NULL AND channel.archived_at IS NULL \
-                   AND channel.deleted_at IS NULL FOR SHARE OF channel, member",
+                   AND channel.deleted_at IS NULL LIMIT 1 FOR SHARE OF channel, member",
             )
             .bind(community_id.as_uuid())
             .bind(home_channel)
             .bind(actor.as_slice())
+            .bind(delegated_owner)
             .fetch_optional(&mut *tx)
             .await?;
-            if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            if authorized_role.is_none() {
                 return Ok(ProjectChangeApplyResult::Forbidden);
             }
         }
@@ -460,6 +491,27 @@ mod tests {
         let owner = Keys::generate();
         let admin = Keys::generate();
         let member = Keys::generate();
+        let owner_agent = Keys::generate();
+        let admin_agent = Keys::generate();
+        for principal in [&owner, &admin, &owner_agent, &admin_agent] {
+            db.ensure_user(community, principal.public_key().to_bytes().as_slice())
+                .await
+                .expect("ensure authorization principal");
+        }
+        db.set_agent_owner(
+            community,
+            owner_agent.public_key().to_bytes().as_slice(),
+            owner.public_key().to_bytes().as_slice(),
+        )
+        .await
+        .expect("register Project owner's agent");
+        db.set_agent_owner(
+            community,
+            admin_agent.public_key().to_bytes().as_slice(),
+            admin.public_key().to_bytes().as_slice(),
+        )
+        .await
+        .expect("register home admin's agent");
         let home = Uuid::new_v4();
         crate::channel::create_channel_with_id(
             &pool,
@@ -510,6 +562,7 @@ mod tests {
                 &first,
                 ProjectRelatedChannelChange {
                     project_owner: owner_bytes.as_slice(),
+                    delegated_owner: None,
                     project_d_tag: "shared",
                     expected_revision: 1,
                     add: &[added],
@@ -532,6 +585,7 @@ mod tests {
                 &later,
                 ProjectRelatedChannelChange {
                     project_owner: owner_bytes.as_slice(),
+                    delegated_owner: None,
                     project_d_tag: "shared",
                     expected_revision: 2,
                     add: &[],
@@ -548,6 +602,7 @@ mod tests {
                 &first,
                 ProjectRelatedChannelChange {
                     project_owner: owner_bytes.as_slice(),
+                    delegated_owner: None,
                     project_d_tag: "shared",
                     expected_revision: 1,
                     add: &[added],
@@ -570,6 +625,7 @@ mod tests {
                 &denied,
                 ProjectRelatedChannelChange {
                     project_owner: owner_bytes.as_slice(),
+                    delegated_owner: None,
                     project_d_tag: "shared",
                     expected_revision: 3,
                     add: &[denied_channel],
@@ -589,6 +645,107 @@ mod tests {
                 .expect("count rejected event");
         assert_eq!(rejected_rows, 0);
 
+        let stale_mapping_channel = Uuid::new_v4();
+        let stale_mapping = command(
+            &owner_agent,
+            &owner,
+            "shared",
+            3,
+            &[stale_mapping_channel],
+            &[],
+        );
+        assert_eq!(
+            db.apply_project_related_channel_change(
+                community,
+                &stale_mapping,
+                ProjectRelatedChannelChange {
+                    project_owner: owner_bytes.as_slice(),
+                    delegated_owner: None,
+                    project_d_tag: "shared",
+                    expected_revision: 3,
+                    add: &[stale_mapping_channel],
+                    remove: &[],
+                },
+            )
+            .await
+            .expect("stale mapping alone cannot authorize"),
+            ProjectChangeApplyResult::Forbidden
+        );
+
+        let mismatched_owner = admin.public_key().to_bytes();
+        assert_eq!(
+            db.apply_project_related_channel_change(
+                community,
+                &stale_mapping,
+                ProjectRelatedChannelChange {
+                    project_owner: owner_bytes.as_slice(),
+                    delegated_owner: Some(mismatched_owner.as_slice()),
+                    project_d_tag: "shared",
+                    expected_revision: 3,
+                    add: &[stale_mapping_channel],
+                    remove: &[],
+                },
+            )
+            .await
+            .expect("mismatched registered owner cannot authorize"),
+            ProjectChangeApplyResult::Forbidden
+        );
+
+        let delegated_owner = owner.public_key().to_bytes();
+        assert!(matches!(
+            db.apply_project_related_channel_change(
+                community,
+                &stale_mapping,
+                ProjectRelatedChannelChange {
+                    project_owner: owner_bytes.as_slice(),
+                    delegated_owner: Some(delegated_owner.as_slice()),
+                    project_d_tag: "shared",
+                    expected_revision: 3,
+                    add: &[stale_mapping_channel],
+                    remove: &[],
+                },
+            )
+            .await
+            .expect("registered owner's current credential authorizes"),
+            ProjectChangeApplyResult::Applied(ProjectStateSnapshot { revision: 4, .. })
+        ));
+
+        let delegated_admin_channel = Uuid::new_v4();
+        let delegated_admin = command(
+            &admin_agent,
+            &owner,
+            "shared",
+            4,
+            &[delegated_admin_channel],
+            &[],
+        );
+        let admin_bytes = admin.public_key().to_bytes();
+        assert!(matches!(
+            db.apply_project_related_channel_change(
+                community,
+                &delegated_admin,
+                ProjectRelatedChannelChange {
+                    project_owner: owner_bytes.as_slice(),
+                    delegated_owner: Some(admin_bytes.as_slice()),
+                    project_d_tag: "shared",
+                    expected_revision: 4,
+                    add: &[delegated_admin_channel],
+                    remove: &[],
+                },
+            )
+            .await
+            .expect("registered home admin credential authorizes"),
+            ProjectChangeApplyResult::Applied(ProjectStateSnapshot { revision: 5, .. })
+        ));
+        let stored_author: Vec<u8> =
+            sqlx::query_scalar("SELECT pubkey FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(delegated_admin.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("load delegated command author");
+        assert_eq!(stored_author, admin_agent.public_key().to_bytes());
+
         let stale_channel = Uuid::new_v4();
         let stale = command(&owner, &owner, "shared", 2, &[stale_channel], &[]);
         assert_eq!(
@@ -597,6 +754,7 @@ mod tests {
                 &stale,
                 ProjectRelatedChannelChange {
                     project_owner: owner_bytes.as_slice(),
+                    delegated_owner: None,
                     project_d_tag: "shared",
                     expected_revision: 2,
                     add: &[stale_channel],
@@ -606,7 +764,7 @@ mod tests {
             .await
             .expect("reject stale CAS"),
             ProjectChangeApplyResult::Conflict {
-                current_revision: 3
+                current_revision: 5
             }
         );
     }

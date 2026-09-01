@@ -55,13 +55,14 @@ The kind segment is the literal `30621`, the owner is exactly 64 lowercase hexad
   "pubkey": "<actor-pubkey-hex>",
   "tags": [
     ["a", "30621:<owner-pubkey-hex>:<project-d>"],
-    ["expected-revision", "7"]
+    ["expected-revision", "7"],
+    ["auth", "<owner-pubkey-hex>", "kind=47010", "<signature-hex>"]
   ],
   "content": "{\"v\":1,\"patch\":{\"related_channels\":{\"add\":[\"11111111-1111-4111-8111-111111111111\"],\"remove\":[]}}}"
 }
 ```
 
-The event MUST contain exactly one two-element `a` tag and exactly one two-element `expected-revision` tag. The expected revision is a canonical base-10 integer in `1..=9223372036854775807`: digits only, no sign, and no leading zero. The command compares this value with the authoritative relational revision, never with a Project State event id.
+The event MUST contain exactly one two-element `a` tag and exactly one two-element `expected-revision` tag. It MAY additionally contain exactly one canonical four-element NIP-OA `auth` tag; no other tags are permitted. When present, the relay MUST verify the credential and every condition against this command event. The expected revision is a canonical base-10 integer in `1..=9223372036854775807`: digits only, no sign, and no leading zero. The command compares this value with the authoritative relational revision, never with a Project State event id.
 
 The JSON content has this version 1 shape:
 
@@ -85,9 +86,9 @@ Version 1 decoders MUST reject unknown JSON fields. This prevents a newer client
 
 ## Authorization
 
-The Project owner is always authorized to issue a version 1 change.
+The command signer is the actor and remains the sole event author. A valid current NIP-OA credential does not rewrite authorship; it identifies an optional delegated authorization principal. The relay MUST use that principal only when it also matches the actor's immutable registered owner in the current community. A stored relationship without a valid credential on this command grants no authority.
 
-A different actor is authorized only when the effective Project state has a resolvable home channel and the actor is an active `owner` or `admin` of that channel. An archived or deleted home channel grants no authority. Authorization reads the current relational Project state and current channel membership under the same serialization boundary as the CAS; an event projection or stale client snapshot is not an authorization source.
+The actor is authorized when the actor is the Project owner. The delegated principal, when present and registered, is independently authorized when it is the Project owner. Otherwise, the effective Project state must have a resolvable home channel and either the actor or the delegated principal must independently be an active `owner` or `admin` of that channel. Privileges from the two principals MUST NOT be combined. An archived or deleted home channel grants no authority. Authorization reads the current relational Project state and current channel membership under the same serialization boundary as the CAS; an event projection or stale client snapshot is not an authorization source.
 
 No Project relationship grants authority over a related channel. Adding a channel records grouping metadata only.
 

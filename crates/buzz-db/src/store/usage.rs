@@ -13,12 +13,183 @@
 //! to Prometheus labels and calls `metrics::gauge!(...).set(...)`.
 
 use buzz_datastore_tracing::datastore_span;
+use chrono::{DateTime, Duration, Utc};
 use sqlx::postgres::PgConnection;
-use sqlx::{Connection as _, PgPool};
+use sqlx::{Connection as _, Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::{observability, Db};
+use crate::{observability, Db, RouteDecision, RoutePredicate};
+
+/// Fixed-row fleet adoption snapshot used when per-community telemetry is disabled.
+#[derive(Debug, sqlx::FromRow)]
+pub struct FleetStockSnapshot {
+    /// Planner estimate for the number of communities.
+    pub communities_estimated: i64,
+    /// Active human users.
+    pub users_human: i64,
+    /// Active agent users.
+    pub users_agent: i64,
+    /// Non-deleted stream channels.
+    pub channels_stream: i64,
+    /// Non-deleted forum channels.
+    pub channels_forum: i64,
+    /// Non-deleted direct-message channels.
+    pub channels_dm: i64,
+    /// Non-deleted workflow channels.
+    pub channels_workflow: i64,
+    /// Relay owners.
+    pub members_owner: i64,
+    /// Relay administrators.
+    pub members_admin: i64,
+    /// Relay members.
+    pub members_member: i64,
+    /// Active workflows.
+    pub workflows_active: i64,
+    /// Disabled workflows.
+    pub workflows_disabled: i64,
+    /// Archived workflows.
+    pub workflows_archived: i64,
+    /// Registered Git repositories.
+    pub git_repos: i64,
+}
+
+/// Fixed-row 1d/7d/30d active-user snapshot derived from one 30-day scan.
+#[derive(Debug, sqlx::FromRow)]
+pub struct FleetActiveUsersSnapshot {
+    /// Human publishers active in the last day.
+    pub human_1d: i64,
+    /// Agent publishers active in the last day.
+    pub agent_1d: i64,
+    /// Unclassified publishers active in the last day.
+    pub unknown_1d: i64,
+    /// Human publishers active in the last seven days.
+    pub human_7d: i64,
+    /// Agent publishers active in the last seven days.
+    pub agent_7d: i64,
+    /// Unclassified publishers active in the last seven days.
+    pub unknown_7d: i64,
+    /// Human publishers active in the last thirty days.
+    pub human_30d: i64,
+    /// Agent publishers active in the last thirty days.
+    pub agent_30d: i64,
+    /// Unclassified publishers active in the last thirty days.
+    pub unknown_30d: i64,
+}
+
+/// Collect one fixed-row fleet adoption snapshot on the supplied executor.
+pub async fn fleet_stock_snapshot_on<'e, E>(executor: E) -> Result<FleetStockSnapshot>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_as::<_, FleetStockSnapshot>(
+        r#"
+        WITH user_counts AS (
+            SELECT
+                COUNT(*) FILTER (WHERE agent_owner_pubkey IS NULL) AS human,
+                COUNT(*) FILTER (WHERE agent_owner_pubkey IS NOT NULL) AS agent
+            FROM users
+            WHERE deactivated_at IS NULL
+        ),
+        channel_counts AS (
+            SELECT
+                COUNT(*) FILTER (WHERE channel_type = 'stream') AS stream,
+                COUNT(*) FILTER (WHERE channel_type = 'forum') AS forum,
+                COUNT(*) FILTER (WHERE channel_type = 'dm') AS dm,
+                COUNT(*) FILTER (WHERE channel_type = 'workflow') AS workflow
+            FROM channels
+            WHERE deleted_at IS NULL
+        ),
+        member_counts AS (
+            SELECT
+                COUNT(*) FILTER (WHERE role = 'owner') AS owner,
+                COUNT(*) FILTER (WHERE role = 'admin') AS admin,
+                COUNT(*) FILTER (WHERE role = 'member') AS member
+            FROM relay_members
+        ),
+        workflow_counts AS (
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'active') AS active,
+                COUNT(*) FILTER (WHERE status = 'disabled') AS disabled,
+                COUNT(*) FILTER (WHERE status = 'archived') AS archived
+            FROM workflows
+        )
+        SELECT
+            COALESCE((SELECT GREATEST(reltuples, 0)::bigint FROM pg_class WHERE oid = 'communities'::regclass), 0) AS communities_estimated,
+            users.human AS users_human,
+            users.agent AS users_agent,
+            channels.stream AS channels_stream,
+            channels.forum AS channels_forum,
+            channels.dm AS channels_dm,
+            channels.workflow AS channels_workflow,
+            members.owner AS members_owner,
+            members.admin AS members_admin,
+            members.member AS members_member,
+            workflows.active AS workflows_active,
+            workflows.disabled AS workflows_disabled,
+            workflows.archived AS workflows_archived,
+            (SELECT COUNT(*) FROM git_repo_names) AS git_repos
+        FROM user_counts users
+        CROSS JOIN channel_counts channels
+        CROSS JOIN member_counts members
+        CROSS JOIN workflow_counts workflows
+        "#,
+    )
+    .fetch_one(executor)
+    .await?)
+}
+
+/// Collect all fleet active-user windows with one bounded 30-day event scan.
+pub async fn fleet_active_users_on<'e, E>(
+    executor: E,
+    observed_at: DateTime<Utc>,
+) -> Result<FleetActiveUsersSnapshot>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let start_30d = observed_at - Duration::days(30);
+    let start_7d = observed_at - Duration::days(7);
+    let start_1d = observed_at - Duration::days(1);
+    Ok(sqlx::query_as::<_, FleetActiveUsersSnapshot>(
+        r#"
+        WITH publishers AS (
+            SELECT
+                e.community_id,
+                e.pubkey,
+                MAX(e.created_at) AS last_active_at,
+                CASE
+                    WHEN u.pubkey IS NULL THEN 'unknown'
+                    WHEN u.agent_owner_pubkey IS NULL THEN 'human'
+                    ELSE 'agent'
+                END AS author_type
+            FROM events e
+            LEFT JOIN users u
+                ON u.community_id = e.community_id AND u.pubkey = e.pubkey
+            WHERE e.created_at >= $1
+              AND e.created_at < $2
+              AND e.deleted_at IS NULL
+            GROUP BY e.community_id, e.pubkey, u.pubkey, u.agent_owner_pubkey
+        )
+        SELECT
+            COUNT(*) FILTER (WHERE last_active_at >= $4 AND author_type = 'human') AS human_1d,
+            COUNT(*) FILTER (WHERE last_active_at >= $4 AND author_type = 'agent') AS agent_1d,
+            COUNT(*) FILTER (WHERE last_active_at >= $4 AND author_type = 'unknown') AS unknown_1d,
+            COUNT(*) FILTER (WHERE last_active_at >= $3 AND author_type = 'human') AS human_7d,
+            COUNT(*) FILTER (WHERE last_active_at >= $3 AND author_type = 'agent') AS agent_7d,
+            COUNT(*) FILTER (WHERE last_active_at >= $3 AND author_type = 'unknown') AS unknown_7d,
+            COUNT(*) FILTER (WHERE author_type = 'human') AS human_30d,
+            COUNT(*) FILTER (WHERE author_type = 'agent') AS agent_30d,
+            COUNT(*) FILTER (WHERE author_type = 'unknown') AS unknown_30d
+        FROM publishers
+        "#,
+    )
+    .bind(start_30d)
+    .bind(observed_at)
+    .bind(start_7d)
+    .bind(start_1d)
+    .fetch_one(executor)
+    .await?)
+}
 
 /// Owns the detached Postgres session holding the relay usage-metrics advisory lock.
 ///
@@ -406,6 +577,50 @@ impl Db {
         }
     }
 
+    /// Collect fleet adoption stocks from a proved read-replica snapshot.
+    ///
+    /// Returns `None` instead of falling back to the writer when a proved
+    /// reader is unavailable. Usage telemetry is allowed to be stale or
+    /// skipped and must not add load to the serving database.
+    #[datastore_span(name = "usage_fleet_stock_snapshot", system = "postgresql")]
+    pub async fn usage_fleet_stock_snapshot(&self) -> Result<Option<FleetStockSnapshot>> {
+        let path = "usage_fleet_stock";
+        match self.route_read(path, RoutePredicate::Bounded).await {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                sqlx::query("SET LOCAL statement_timeout = '5s'")
+                    .execute(&mut *tx)
+                    .await?;
+                let snapshot = fleet_stock_snapshot_on(&mut *tx).await?;
+                Self::record_route(path, "replica", reason);
+                Ok(Some(snapshot))
+            }
+            RouteDecision::Writer => Ok(None),
+        }
+    }
+
+    /// Collect all fleet active-user windows from a proved read-replica snapshot.
+    ///
+    /// Returns `None` instead of falling back to the writer when a proved
+    /// reader is unavailable.
+    #[datastore_span(name = "usage_fleet_active_users", system = "postgresql")]
+    pub async fn usage_fleet_active_users(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<FleetActiveUsersSnapshot>> {
+        let path = "usage_fleet_active_users";
+        match self.route_read(path, RoutePredicate::Bounded).await {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                sqlx::query("SET LOCAL statement_timeout = '15s'")
+                    .execute(&mut *tx)
+                    .await?;
+                let snapshot = fleet_active_users_on(&mut *tx, observed_at).await?;
+                Self::record_route(path, "replica", reason);
+                Ok(Some(snapshot))
+            }
+            RouteDecision::Writer => Ok(None),
+        }
+    }
+
     /// Return total number of communities on this relay.
     #[datastore_span(name = "usage_community_count", system = "postgresql")]
     pub async fn usage_community_count(&self) -> Result<i64> {
@@ -781,6 +996,24 @@ mod tests {
         make_community(&pool).await;
         let after = community_count(&pool).await.expect("count after");
         assert!(after > before, "count should increase after insert");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fleet_snapshots_have_fixed_result_shapes() {
+        let pool = get_pool().await;
+        let stock = fleet_stock_snapshot_on(&pool)
+            .await
+            .expect("fleet stock snapshot");
+        assert!(stock.communities_estimated >= 0);
+
+        let now = chrono::Utc::now();
+        let activity = fleet_active_users_on(&pool, now)
+            .await
+            .expect("fleet activity snapshot");
+        assert!(activity.human_1d >= 0);
+        assert!(activity.human_7d >= activity.human_1d);
+        assert!(activity.human_30d >= activity.human_7d);
     }
 
     /// git_repo_counts queries git_repo_names (not git_repos) and is scoped per community.

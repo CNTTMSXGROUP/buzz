@@ -258,8 +258,7 @@ class _CommunitySnapshotSync {
   }
 
   Future<void> suspendForAgeCheck() => _serializeAgeGateMutation(() async {
-    if (_ageRestricted) return;
-    _ageCheckSuspended = true;
+    if (!_ageRestricted) _ageCheckSuspended = true;
     await _waitForWrites();
     await write(const <Community>[], useAgeGateWriter: true);
   });
@@ -347,7 +346,7 @@ Future<void> _enforceAgeRestrictedCommunitySnapshot(Ref ref) async {
   try {
     await ref
         .read(_communitySnapshotSyncProvider)
-        .write(const [], enforceAgeRestriction: true);
+        .write(const [], enforceAgeRestriction: true, useAgeGateWriter: true);
     pushCommunitySnapshotError.value = null;
   } catch (error, stackTrace) {
     reportPushCommunitySnapshotError(error, stackTrace);

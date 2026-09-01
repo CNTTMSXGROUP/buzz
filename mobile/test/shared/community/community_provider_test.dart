@@ -104,6 +104,39 @@ void main() {
       },
     );
 
+    test(
+      'age gate strict clear keeps retrying after restriction becomes final',
+      () async {
+        var strictAttempts = 0;
+        container = ProviderContainer(
+          overrides: [
+            communityStorageProvider.overrideWithValue(communityStorage),
+            communitySnapshotWriterProvider.overrideWithValue((_) async {}),
+            ageGateCommunitySnapshotWriterProvider.overrideWithValue((
+              communities,
+            ) async {
+              strictAttempts += 1;
+              expect(communities, isEmpty);
+              if (strictAttempts < 3) {
+                throw StateError('strict snapshot unavailable');
+              }
+            }),
+          ],
+        );
+
+        await expectLater(
+          container.read(suspendCommunitySnapshotForAgeCheckProvider)(),
+          throwsStateError,
+        );
+        await container
+            .read(communityListProvider.notifier)
+            .enforceAgeRestrictionOnPush();
+        await container.read(suspendCommunitySnapshotForAgeCheckProvider)();
+
+        expect(strictAttempts, 3);
+      },
+    );
+
     test('exports migrated communities on startup', () async {
       final community = Community.create(
         name: 'Migrated',

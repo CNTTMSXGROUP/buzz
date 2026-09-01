@@ -1259,7 +1259,7 @@ fn summarize_body(body: &str, tags: &serde_json::Value) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use super::*;
     use auth::ADMIN_API_PREFIX;
     use axum::{
@@ -1269,6 +1269,12 @@ mod tests {
     use sqlx::Row as _;
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    fn database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string() // sadscan:disable np.postgres.1 -- local test-only credentials
+        })
+    }
 
     /// Deterministic operator keypair for the default authorized test state.
     /// Rostered as a config operator in `test_state()` so `authorized()` can
@@ -2024,6 +2030,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
     async fn nip98_mode_unrostered_signer_does_not_consume_a_replay_slot() {
         // Regression: the replay ID must be claimed only AFTER principal
         // resolution succeeds. A validly-signing but unrostered key (any
@@ -2398,12 +2405,9 @@ mod tests {
             auth: crate::config::AdminAuth::Nip98,
             web_dir: None,
         });
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
@@ -3302,12 +3306,9 @@ mod tests {
         // At the DB level: claim_report with two concurrent UUIDs on the same report_id.
         // FOR UPDATE row lock ensures serial execution; first commit wins, second
         // returns NotOpen. moderation_actions must have exactly 1 row.
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         let community_id = {
             let id = uuid::Uuid::new_v4();
@@ -3404,12 +3405,9 @@ mod tests {
     async fn same_request_id_retry_returns_existing_action() {
         // Two POST /reports/{id}/resolve calls with the same requestId UUID.
         // Both should return 200 with the same actionId.
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         let community_id = {
             let id = uuid::Uuid::new_v4();
@@ -3510,12 +3508,9 @@ mod tests {
         //
         // resolve_report_decision_atomic CASes on status='open'; if the report is
         // already 'processing', the transaction rolls back with no audit row.
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         let community_id = {
             let id = uuid::Uuid::new_v4();
@@ -3610,12 +3605,9 @@ mod tests {
         // After an enforcement action reaches mutation_committed step_marker,
         // attempting to cancel the action record must fail (cancel is only
         // legal pre-mutation).
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         let community_id = {
             let id = uuid::Uuid::new_v4();
@@ -3808,12 +3800,9 @@ mod tests {
     async fn reports_default_lists_escalated_only() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let escalated = seed_admin_host_report(&pool, "escalated").await;
         let open = seed_admin_host_report(&pool, "open").await;
 
@@ -3835,12 +3824,9 @@ mod tests {
     async fn reports_scope_all_lists_every_status() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let escalated = seed_admin_host_report(&pool, "escalated").await;
         let open = seed_admin_host_report(&pool, "open").await;
 
@@ -3859,12 +3845,9 @@ mod tests {
     async fn reports_explicit_status_filter_overrides_default() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let escalated = seed_admin_host_report(&pool, "escalated").await;
         let open = seed_admin_host_report(&pool, "open").await;
 
@@ -3884,12 +3867,9 @@ mod tests {
     async fn reopen_route_returns_report_to_open_and_writes_audit_row() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let report_id = seed_admin_host_report(&pool, "resolved").await;
 
         let request_id = Uuid::new_v4();
@@ -3949,12 +3929,9 @@ mod tests {
         let operator_keys = nostr::Keys::generate();
         let operator_bytes = operator_keys.public_key().to_bytes();
         let state = nip98_state(vec![operator_keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let report_id = seed_admin_host_report(&pool, "open").await;
 
         // Unique per-invocation correlation: `reason` flows to the audit row's
@@ -4046,12 +4023,9 @@ mod tests {
         // Only the operator is config-backed (Operator role); the target is a
         // fresh, mutable, non-config key.
         let state = nip98_state(vec![operator_keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         let target_keys = nostr::Keys::generate();
         let target_hex = target_keys.public_key().to_hex();
@@ -4150,12 +4124,9 @@ mod tests {
     async fn resolve_route_rejects_adversarial_expiration_and_leaves_report_open() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         // 0, over-cap, i64::MAX magnitude, and a value that casts to a negative
         // i64 (wrapped-past-expiry) — all must reject before any state change.
@@ -4219,12 +4190,9 @@ mod tests {
     async fn mixed_case_non_config_staffing_normalizes_to_one_row() {
         let operator_keys = nostr::Keys::generate();
         let state = nip98_state(vec![operator_keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         let target_keys = nostr::Keys::generate();
         let lower_hex = target_keys.public_key().to_hex();
@@ -4312,12 +4280,9 @@ mod tests {
     async fn reopen_route_rejects_non_terminal_report_with_409() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let report_id = seed_admin_host_report(&pool, "open").await;
 
         let body = serde_json::json!({ "requestId": Uuid::new_v4() }).to_string();
@@ -4345,12 +4310,9 @@ mod tests {
     async fn cancel_route_returns_open_and_embeds_the_cancelled_action_dto() {
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
         let report_id = seed_admin_host_report(&pool, "open").await;
         let community_id: Uuid =
             sqlx::query_scalar("SELECT community_id FROM moderation_reports WHERE id = $1")
@@ -4467,12 +4429,9 @@ mod tests {
         // community fence — can block this: it is the sharper negative case.
         let keys = nostr::Keys::generate();
         let state = nip98_state(vec![keys.public_key().to_hex()]).await;
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         // Two reports on the same admin.example community, each driven to
         // `processing` with its own distinct pre-mutation `failed` action.
@@ -4614,12 +4573,9 @@ mod tests {
         // Simulate a crash after mutation_committed but before finalization.
         // Re-drive from persisted step state must produce exactly one
         // enforcement, one report transition, one audit chain, one reporter notice.
-        let pool = sqlx::PgPool::connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()),
-        )
-        .await
-        .expect("connect to test DB");
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect to test DB");
 
         let community_id = {
             let id = uuid::Uuid::new_v4();
@@ -4829,8 +4785,7 @@ mod tests {
     }
 
     async fn e2e_pool() -> sqlx::PgPool {
-        let url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let url = database_url();
         sqlx::PgPool::connect(&url)
             .await
             .expect("connect to test DB")
@@ -7377,8 +7332,7 @@ mod tests {
         // Our outbox row's created_at is ~10 s ago → trigger fires on insert_event.
         // This pool is fully isolated: no other pool or test is affected, and there
         // is no cleanup dependence (dropping the pool closes all its connections).
-        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let db_url = database_url();
         let floor_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .after_connect(|conn, _meta| {

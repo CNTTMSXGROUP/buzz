@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { toast } from "sonner";
@@ -31,6 +32,16 @@ function captureToasts() {
 }
 
 // ── Shared fixtures ────────────────────────────────────────────────────────────
+
+const partialPublishOutcomeContract = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../../../test-fixtures/update-persona-publish-partial-outcome.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
 
 function makeDefinition(overrides = {}) {
   return {
@@ -1712,31 +1723,68 @@ test("test_publish_throws_post_persist_returns_false_not_partial_failure_toast",
 // tests cover the retry layer on top.
 
 test("test_publish_retry_succeeds_settles_as_full_success", async () => {
-  // Initial updatePersonaAndPublish throws (retain step failed), but the
-  // persona IS observed as persisted. publishRetry succeeds → coordinator
-  // should call onDone and return true.
+  // Consume the same observed partial-outcome contract as the Rust command
+  // test: the rename persisted, the command returned the strict preparation
+  // error, and recovery is therefore a publish-only retry.
   const cap = captureToasts();
   try {
-    const persisted = makeDefinition({ displayName: "Alice" });
+    const contract = partialPublishOutcomeContract;
+    const persisted = makeDefinition({
+      id: contract.personaId,
+      displayName: contract.afterDisplayName,
+    });
     let retryCalls = 0;
+    let announceRetryStarted;
+    const retryStarted = new Promise((resolve) => {
+      announceRetryStarted = resolve;
+    });
+    let allowRetryCompletion;
+    const retryCompletionGate = new Promise((resolve) => {
+      allowRetryCompletion = resolve;
+    });
     const opts = makeOpts({
       ctx: {
         kind: "definition-only",
-        definition: makeDefinition({ displayName: "Alice" }),
+        definition: makeDefinition({
+          id: contract.personaId,
+          displayName: contract.beforeDisplayName,
+        }),
       },
-      personaInput: makePersonaInput({ displayName: "Alice" }),
+      personaInput: makePersonaInput({
+        id: contract.personaId,
+        displayName: contract.afterDisplayName,
+      }),
       publishCatalogUpdates: true,
       updatePersonaAndPublish: async () => {
-        throw new Error("failed to open retention db");
+        throw new Error(contract.commandErrorContains);
       },
       refetchStores: async () => ({ persona: persisted, agent: null }),
-      publishRetry: async () => {
+      publishRetry: async (personaId) => {
+        assert.equal(
+          personaId,
+          contract.personaId,
+          "retry must target the definition from the observed command outcome",
+        );
         retryCalls++;
-        return { persona: persisted, publicationStatus: "published" };
+        announceRetryStarted();
+        await retryCompletionGate;
+        return {
+          persona: persisted,
+          publicationStatus: contract.retryPublicationStatus,
+        };
       },
     });
 
-    const result = await runAgentSaveCoordinator(opts);
+    const coordinatorResult = runAgentSaveCoordinator(opts);
+    await retryStarted;
+    assert.equal(
+      opts._calls.onDone,
+      0,
+      "dialog must remain open while the publish retry is still in flight",
+    );
+
+    allowRetryCompletion();
+    const result = await coordinatorResult;
 
     assert.equal(
       result,
@@ -1746,7 +1794,7 @@ test("test_publish_retry_succeeds_settles_as_full_success", async () => {
     assert.equal(
       opts._calls.onDone,
       1,
-      "onDone must be called on retry success",
+      "dialog closes exactly once after retry completion",
     );
     assert.equal(retryCalls, 1, "publishRetry must be called exactly once");
     const warnings = cap.captured.filter((c) => c.kind === "warning");

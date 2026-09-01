@@ -1553,7 +1553,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read committed projection marker");
-        assert_eq!(marker, (3, relay_a_bytes.to_vec()));
+        assert_eq!(marker, (5, relay_a_bytes.to_vec()));
         assert!(db
             .load_pending_project_state_projections(relay_a_bytes.as_slice(), 10)
             .await
@@ -1571,22 +1571,23 @@ mod tests {
         assert_eq!(rotation_candidate.previous_created_at(), None);
 
         let newest = Uuid::new_v4();
-        let next = command(&owner, &owner, "shared", 3, &[newest], &[]);
+        let next = command(&owner, &owner, "shared", 5, &[newest], &[]);
         assert!(matches!(
             db.apply_project_related_channel_change(
                 community,
                 &next,
                 ProjectRelatedChannelChange {
                     project_owner: owner_bytes.as_slice(),
+                    delegated_owner: None,
                     project_d_tag: "shared",
-                    expected_revision: 3,
+                    expected_revision: 5,
                     add: &[newest],
                     remove: &[],
                 },
             )
             .await
             .expect("advance Project after candidate load"),
-            ProjectChangeApplyResult::Applied(ProjectStateSnapshot { revision: 4, .. })
+            ProjectChangeApplyResult::Applied(ProjectStateSnapshot { revision: 6, .. })
         ));
         let stale_event = projection(&rotation_candidate, &relay_b, initial_timestamp + 1);
         assert_eq!(
@@ -1651,7 +1652,7 @@ mod tests {
             .expect("apply recovery");
         assert_eq!(recovery_result.status, ProjectLifecycleStatus::Applied);
         let recovery_state = recovery_result.snapshot.expect("recovery state");
-        assert_eq!(recovery_state.revision, 5);
+        assert_eq!(recovery_state.revision, 7);
         assert_eq!(recovery_state.related_channels, vec![recovered]);
         assert_eq!(
             db.apply_project_identity_event(community, &recovery)
@@ -1704,7 +1705,7 @@ mod tests {
         assert_eq!(deleted.status, ProjectLifecycleStatus::Applied);
         assert_eq!(
             deleted.snapshot.as_ref().map(|state| state.revision),
-            Some(6)
+            Some(8)
         );
         assert_eq!(
             db.apply_project_deletion_event(
@@ -1750,7 +1751,7 @@ mod tests {
         assert_eq!(recreated.status, ProjectLifecycleStatus::Applied);
         assert_eq!(
             recreated.snapshot.as_ref().map(|state| state.revision),
-            Some(7)
+            Some(9)
         );
 
         let live_identity_deletion = EventBuilder::new(Kind::EventDeletion, "")
@@ -1771,7 +1772,7 @@ mod tests {
         assert_eq!(deleted_by_id.status, ProjectLifecycleStatus::Applied);
         assert_eq!(
             deleted_by_id.snapshot.as_ref().map(|state| state.revision),
-            Some(8)
+            Some(10)
         );
 
         drop_scratch_db(admin_pool, pool, &scratch_name).await;

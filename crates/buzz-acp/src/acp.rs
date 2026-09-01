@@ -5461,6 +5461,7 @@ mod tests {
     #[test]
     fn install_git_identity_user_mode_installs_credential_helper_but_no_attribution() {
         use nostr::ToBech32;
+        let _guard = clear_git_config_env();
 
         let nsec = nostr::Keys::generate().secret_key().to_bech32().unwrap();
         let mut cmd = tokio::process::Command::new("true");
@@ -5544,6 +5545,7 @@ mod tests {
     #[test]
     fn install_git_identity_agent_mode_enforces_and_installs_credential_helper() {
         use nostr::ToBech32;
+        let _guard = clear_git_config_env();
 
         let nsec = nostr::Keys::generate().secret_key().to_bech32().unwrap();
         let mut cmd = tokio::process::Command::new("true");
@@ -5582,6 +5584,7 @@ mod tests {
     #[test]
     fn install_git_identity_agent_mode_preserves_desktop_credential_config() {
         use nostr::ToBech32;
+        let _guard = clear_git_config_env();
 
         let nsec = nostr::Keys::generate().secret_key().to_bech32().unwrap();
         let mut cmd = tokio::process::Command::new("true");
@@ -5648,22 +5651,7 @@ mod tests {
         // so the false-case assertion below is only meaningful with no ambient
         // `GIT_CONFIG_*`. Snapshot every such var, clear them for the test, and
         // restore them on drop — a review host may legitimately carry one.
-        struct GitConfigEnvGuard(Vec<(std::ffi::OsString, std::ffi::OsString)>);
-        impl Drop for GitConfigEnvGuard {
-            fn drop(&mut self) {
-                for (k, v) in self.0.drain(..) {
-                    std::env::set_var(k, v);
-                }
-            }
-        }
-        let _guard = GitConfigEnvGuard(
-            std::env::vars_os()
-                .filter(|(k, _)| k.to_str().is_some_and(|k| k.starts_with("GIT_CONFIG_")))
-                .collect(),
-        );
-        for (k, _) in &_guard.0 {
-            std::env::remove_var(k);
-        }
+        let _guard = clear_git_config_env();
 
         // Bare credential.helper.
         let mut bare = tokio::process::Command::new("true");
@@ -5713,6 +5701,39 @@ mod tests {
             })
             .take_while(|(k, _)| k.is_some())
             .filter_map(|(k, v)| Some((k?.into_string().ok()?, v?.into_string().ok()?)))
+    }
+
+    /// Snapshot and clear every `GIT_CONFIG_*` env var from the process
+    /// environment, restoring them on drop.
+    ///
+    /// `credential_helper_configured()` scans the **process env** in addition
+    /// to cmd-staged config (because a desktop harness legitimately stages its
+    /// relay credential helper there).  Tests that assert the helper IS or IS
+    /// NOT installed must run with a clean process env so that ambient
+    /// `GIT_CONFIG_*` vars from a review host do not silently flip the outcome.
+    #[cfg(unix)]
+    struct GitConfigEnvGuard(Vec<(std::ffi::OsString, std::ffi::OsString)>);
+
+    #[cfg(unix)]
+    impl Drop for GitConfigEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                std::env::set_var(k, v);
+            }
+        }
+    }
+
+    /// Clear ambient `GIT_CONFIG_*` for the duration of a test.  Returns the
+    /// guard; keep it alive (bound to `_guard`) for the test's full scope.
+    #[cfg(unix)]
+    fn clear_git_config_env() -> GitConfigEnvGuard {
+        let saved: Vec<_> = std::env::vars_os()
+            .filter(|(k, _)| k.to_str().is_some_and(|k| k.starts_with("GIT_CONFIG_")))
+            .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+        GitConfigEnvGuard(saved)
     }
 
     /// An unrecognized value fails the spawn loudly rather than silently

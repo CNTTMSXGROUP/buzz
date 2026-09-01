@@ -44,27 +44,24 @@ function permissionOutcomeTone(outcome: string): "approve" | "deny" | "cancel" {
 
 /**
  * Exact recognized permission-option kinds the observer feed can act on.
- * `allow_once` grants once; `reject_once` / `reject_always` deny (persistent
- * denial only reduces authority, so it stays actionable and fail-safe). Any
- * kind not in this set — including unrecognized `reject_*` variants — is
- * treated as unknown and rendered non-actionable.
+ * Only `allow_once` and `reject_once` are actionable — matching the thread
+ * card's two-option contract. `reject_always` is deliberately excluded: the
+ * read loop accepts only the two snapshotted ruled IDs (allow_once/reject_once),
+ * so a `reject_always` click would be sent, acknowledged as "sent", but silently
+ * ignored by the loop — the request would stay pending until timeout with no
+ * persistent denial installed. Any kind not in this set is treated as unknown
+ * and rendered non-actionable.
  */
-const ACTIONABLE_KINDS = new Set([
-  "allow_once",
-  "reject_once",
-  "reject_always",
-]);
+const ACTIONABLE_KINDS = new Set(["allow_once", "reject_once"]);
 
 function isActionableKind(kind: string): boolean {
   return ACTIONABLE_KINDS.has(kind);
 }
 
 /**
- * Default button label when the harness omits one. `reject_always` must read
- * "Always deny" so a user never silently chooses persistent denial.
+ * Default button label when the harness omits one.
  */
 function defaultOptionLabel(kind: string): string {
-  if (kind === "reject_always") return "Always deny";
   if (kind === "reject_once") return "Deny";
   return "Allow";
 }
@@ -120,18 +117,15 @@ function PermissionDecisionButtons({
   const actionableOptions = options.filter(({ kind }) =>
     isActionableKind(kind),
   );
-  const hasPersistentGrant = options.some(
-    ({ kind }) => kind === "allow_always",
-  );
 
-  if (actionableOptions.length === 0 && !hasPersistentGrant) {
+  if (actionableOptions.length === 0) {
     return null;
   }
 
   return (
     <div className="mt-1.5 flex flex-wrap gap-1.5">
       {actionableOptions.map(({ optionId, kind, label }) => {
-        const isDeny = kind === "reject_once" || kind === "reject_always";
+        const isDeny = kind === "reject_once";
         const displayLabel = label ?? defaultOptionLabel(kind);
         return (
           <button
@@ -174,17 +168,6 @@ function PermissionDecisionButtons({
           </button>
         );
       })}
-      {/* allow_always: non-actionable badge — the thread card is the correct
-          surface for persistent grants (D5 disclosure). The observer feed
-          shows it as an informational note only. */}
-      {hasPersistentGrant ? (
-        <span
-          className="rounded px-2 py-0.5 text-xs font-medium border border-amber-500/30 text-amber-600 dark:text-amber-400 opacity-70 cursor-default"
-          data-testid="permission-decision-persistent-grant"
-        >
-          Permanent grant — use request card
-        </span>
-      ) : null}
     </div>
   );
 }

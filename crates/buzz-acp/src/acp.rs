@@ -58,6 +58,15 @@ pub(crate) const SENTINEL_PUBLISH_TIMEOUT_SECS: u64 = 10;
 /// expiry.
 const RESOLVED_RETRANSMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Delivery window for the resolved-edit retransmit loop, measured from the
+/// instant the decision is resolved (ACP response written). Independent of the
+/// original click/card deadline: an ordinary timeout resolves at expiry (when
+/// the card deadline is already past), so using the click deadline as the retry
+/// bound means the loop exits before the first attempt. A 60-second window from
+/// resolution time guarantees at least one publish attempt for every terminal
+/// outcome, including ordinary timeouts.
+const RESOLVED_DELIVERY_WINDOW_SECS: u64 = 60;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -1651,12 +1660,18 @@ impl AcpClient {
                                 // permanently strand the card as "Timed out" —
                                 // the same signed event is idempotently resent on
                                 // Uncertain until the relay accepts it or the
-                                // card expires. Detached so the read loop is
-                                // never blocked.
+                                // delivery window closes. The delivery window
+                                // starts now (resolution time), independent of
+                                // the original card/click deadline, so ordinary
+                                // timeouts (where entry_deadline is already past)
+                                // still get at least one publish attempt.
+                                // Detached so the read loop is never blocked.
+                                let delivery_deadline = tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(RESOLVED_DELIVERY_WINDOW_SECS);
                                 tokio::spawn(retransmit_resolved_edit(
                                     publisher,
                                     event,
-                                    entry_deadline,
+                                    delivery_deadline,
                                 ));
                             }
                         }
@@ -2302,15 +2317,26 @@ impl AcpClient {
 
                             match entry_state {
                                 Some(PermissionEntryState::Publishing) => {
-                                    // Buffer the decision; apply on ACK.
+                                    // Buffer the first valid decision; apply on ACK.
+                                    // Subsequent valid decisions for the same nonce
+                                    // are ignored — first-wins prevents a later
+                                    // opposing decision from overwriting the first
+                                    // while the card publish is awaiting ACK.
                                     if let Some(entry) =
                                         self.pending_permissions.get_mut(&id_str)
                                     {
-                                        entry.early_decision = Some(decision);
-                                        tracing::debug!(
-                                            target: "acp::permission",
-                                            "permission_decision buffered during Publishing for id={id_str}"
-                                        );
+                                        if entry.early_decision.is_none() {
+                                            entry.early_decision = Some(decision);
+                                            tracing::debug!(
+                                                target: "acp::permission",
+                                                "permission_decision buffered during Publishing for id={id_str}"
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                target: "acp::permission",
+                                                "permission_decision ignored — first decision already buffered for id={id_str}"
+                                            );
+                                        }
                                     }
                                 }
                                 Some(PermissionEntryState::Pending) => {
@@ -3862,39 +3888,77 @@ fn sentinel_option_fields(actions: &CardActions) -> (Vec<serde_json::Value>, ser
     (option_ids, labels.into())
 }
 
-/// Extract a human-readable description from a `session/request_permission`
-/// JSON-RPC message, trying real producer shapes in priority order:
+/// Maximum byte limit for the raw-input summary appended to the tool name.
+/// Kept shorter than `SENTINEL_STRING_MAX_BYTES` so the combined
+/// `"<title>(<summary>)"` always fits in one sentinel string field.
+const DESCRIPTION_RAW_INPUT_BYTES: usize = 120;
+
+/// Extract a truthful, bounded operation description from a
+/// `session/request_permission` JSON-RPC message, trying real producer shapes
+/// in priority order:
 ///
-/// 1. `params.title` — buzz-agent v2 top-level string (`request_permission_params`
-///    in `crates/buzz-agent/src/wire.rs`, version >= 2).
-/// 2. `params.subject.toolCall.title` — v2 nested fallback (same value, different
-///    path).
-/// 3. `params.toolCall.title` — buzz-agent v1 and codex-acp permissions-request
-///    (`buildPermissionsRequest`, kind "other", in codex-acp `CodexApprovalHandler.ts`).
-/// 4. `params.toolCall.rawInput.command` — codex-acp v1.1.7 command execution
-///    requests (`buildCommandPermissionRequest`): no title, command string in rawInput.
-///    Verbatim wire shape from codex-acp tag v1.1.7.
-/// 5. `params._meta.codex.params.reason` — codex-acp v1.1.7 file-change requests
-///    (`buildFileChangePermissionRequest`): no title or rawInput command, reason is
-///    in codex-supplied metadata. Verbatim wire shape from codex-acp tag v1.1.7.
+/// 1. `params.title` — buzz-agent v2 top-level string (= `call.name`).
+/// 2. `params.subject.toolCall.title` — v2 nested fallback (same value).
+/// 3. `params.toolCall.title` — buzz-agent v1 / codex-acp permissions-request.
+/// 4. `params.toolCall.rawInput.command` — codex-acp v1.1.7 command execution.
+/// 5. `params._meta.codex.params.reason` — codex-acp v1.1.7 file-change.
 ///
-/// Returns `None` when no non-empty string is found in any of these paths, or when
-/// the `msg` argument does not have a `params` object.
+/// For paths 1-3 (buzz-agent v1/v2), the function also reads the `rawInput`
+/// object and appends a byte-truncated JSON summary so that two calls of the
+/// same tool with different arguments produce distinguishable card descriptions.
+/// The combined form is `"<title>(<raw_summary>)"`. Neither the title nor the
+/// summary is interpreted as markup — they are stored as plain strings.
 ///
-/// Extracted as a pure function (rather than inline in the event handler) so
-/// tests can exercise it with verbatim wire shapes without going through the full
-/// permission-request lifecycle.
+/// For paths 4-5 (codex-specific), the extracted string is concrete command or
+/// reason text that already carries the distinguishing argument; no rawInput
+/// summarization is needed.
+///
+/// Returns `None` when no non-empty string is found in any path, or when `msg`
+/// does not have a `params` object.
+///
+/// Extracted as a pure function so tests can exercise it with verbatim wire
+/// shapes without going through the full permission-request lifecycle.
 pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Option<String> {
-    [
+    // Paths 1-3: tool-name title (buzz-agent v1/v2).
+    let title = [
         msg.pointer("/params/title").and_then(|v| v.as_str()),
         msg.pointer("/params/subject/toolCall/title")
             .and_then(|v| v.as_str()),
         msg.pointer("/params/toolCall/title")
             .and_then(|v| v.as_str()),
-        // codex-acp v1.1.7 command execution: toolCall.rawInput.command
+    ]
+    .into_iter()
+    .flatten()
+    .find(|s| !s.is_empty());
+
+    if let Some(t) = title {
+        // Append a bounded JSON summary of rawInput so distinct commands of the
+        // same tool are distinguishable. v2 rawInput lives under
+        // `params.subject.toolCall.rawInput`; v1 lives under
+        // `params.toolCall.rawInput`. Read v2 first, fall back to v1.
+        let raw_input = msg
+            .pointer("/params/subject/toolCall/rawInput")
+            .or_else(|| msg.pointer("/params/toolCall/rawInput"));
+        let title_truncated = truncate_to_bytes(t, SENTINEL_STRING_MAX_BYTES);
+        return Some(match raw_input {
+            Some(ri) if !ri.is_null() => {
+                let raw_str = serde_json::to_string(ri).unwrap_or_default();
+                let summary = truncate_to_bytes(&raw_str, DESCRIPTION_RAW_INPUT_BYTES);
+                format!("{title_truncated}({summary})")
+            }
+            _ => title_truncated,
+        });
+    }
+
+    // Paths 4-5: codex-specific fallbacks — concrete argument text.
+    [
+        // codex-acp v1.1.7 command execution: toolCall.rawInput.command.
+        // Verbatim wire shape from codex-acp tag v1.1.7,
+        // `buildCommandPermissionRequest` in `CodexApprovalHandler.ts`.
         msg.pointer("/params/toolCall/rawInput/command")
             .and_then(|v| v.as_str()),
-        // codex-acp v1.1.7 file-change: reason lives in _meta.codex.params
+        // codex-acp v1.1.7 file-change: reason in _meta.codex.params.
+        // Verbatim wire shape from `buildFileChangePermissionRequest`.
         msg.pointer("/params/_meta/codex/params/reason")
             .and_then(|v| v.as_str()),
     ]
@@ -4030,7 +4094,7 @@ fn build_kind40003_sentinel(
 }
 
 /// Retransmit an already-signed resolved kind-40003 edit until the relay
-/// accepts it, bounded by the card's expiry deadline.
+/// accepts it, bounded by `delivery_deadline`.
 ///
 /// The permission decision is irreversible before this runs (`finish_permission`
 /// has already written the ACP response and removed the entry). A plain
@@ -4041,36 +4105,37 @@ fn build_kind40003_sentinel(
 /// retransmits the *same signed event* (idempotent by event id) on every
 /// `Uncertain` outcome, pausing [`RESOLVED_RETRANSMIT_BACKOFF`] between tries so
 /// a reconnect can carry it through. `Accepted`/`Rejected` are terminal (the
-/// relay saw it); past `expiry_deadline` the card is timed-out anyway, so that
-/// is the natural retry bound.
+/// relay saw it).
+///
+/// `delivery_deadline` is computed at resolution time as
+/// `Instant::now() + RESOLVED_DELIVERY_WINDOW_SECS`, independent of the original
+/// card/click deadline. This guarantees at least one publish attempt for every
+/// terminal outcome, including ordinary timeouts (where the card deadline is
+/// already past when `finish_permission` fires).
 ///
 /// Spawned detached so it never blocks the read loop. `event` is consumed and
 /// resent by clone each attempt so the signature and id are stable across retries.
 async fn retransmit_resolved_edit(
     publisher: RelayEventPublisher,
     event: nostr::Event,
-    expiry_deadline: tokio::time::Instant,
+    delivery_deadline: tokio::time::Instant,
 ) {
     loop {
-        if tokio::time::Instant::now() >= expiry_deadline {
+        if tokio::time::Instant::now() >= delivery_deadline {
             tracing::warn!(
                 target: "acp::permission",
-                "resolved edit {} not accepted before card expiry — giving up",
+                "resolved edit {} not accepted before delivery window — giving up",
                 event.id.to_hex()
             );
             return;
         }
-        // Per-attempt ACK deadline: min(fixed publish timeout, card expiry),
-        // mirroring the pending sentinel path. A connected socket can write the
-        // EVENT frame yet never see the relay's `OK` (lost response, no observed
-        // disconnect); with the raw card expiry as the waiter deadline that
-        // single attempt would park for the whole ≤300s window and exit with
-        // zero retransmissions. Capping each attempt at SENTINEL_PUBLISH_TIMEOUT
-        // sweeps the stuck waiter Uncertain promptly so the same signed event is
-        // resent, while the loop-top check keeps card expiry as the overall bound.
+        // Per-attempt ACK deadline: min(fixed publish timeout, delivery_deadline).
+        // Capping each attempt at SENTINEL_PUBLISH_TIMEOUT sweeps a stuck waiter
+        // promptly so the same signed event is resent, while the loop-top check
+        // keeps the overall delivery window as the outer bound.
         let attempt_deadline = (tokio::time::Instant::now()
             + std::time::Duration::from_secs(SENTINEL_PUBLISH_TIMEOUT_SECS))
-        .min(expiry_deadline);
+        .min(delivery_deadline);
         match publisher
             .register_publish_ack(event.clone(), attempt_deadline)
             .await
@@ -7728,7 +7793,9 @@ mod tests {
     #[test]
     fn description_from_v2_params_title() {
         // buzz-agent v2: `request_permission_params(2, ...)` from wire.rs.
-        // `params.title` is the top-level string; `params.subject` is an OBJECT.
+        // `params.title` = call.name; `params.subject.toolCall.rawInput` = call.arguments.
+        // The description must include BOTH the tool name AND a summary of rawInput
+        // so two calls of the same tool with different commands are distinguishable.
         // Verbatim shape from `request_permission_params` in
         // `crates/buzz-agent/src/wire.rs` (version >= 2 branch).
         let msg = serde_json::json!({
@@ -7737,30 +7804,229 @@ mod tests {
             "method": "session/request_permission",
             "params": {
                 "sessionId": "ses-1",
-                "title": "Run shell command",
+                "title": "fake__shell",
                 "subject": {
                     "type": "tool_call",
                     "toolCall": {
                         "toolCallId": "tc-abc",
-                        "title": "Run shell command",
-                        "rawInput": {"cmd": "ls"},
+                        "title": "fake__shell",
+                        "rawInput": {"command": "ls -la /tmp"},
                     },
                 },
                 "options": [],
             }
         });
         let desc = description_from_request_permission(&msg);
-        assert_eq!(
-            desc.as_deref(),
-            Some("Run shell command"),
-            "v2 params.title must be extracted as description"
+        // Must include the tool name AND the rawInput summary.
+        let desc_str = desc.as_deref().expect("v2 must yield a description");
+        assert!(
+            desc_str.starts_with("fake__shell("),
+            "v2 description must include tool name; got {desc_str:?}"
+        );
+        assert!(
+            desc_str.contains("ls -la /tmp"),
+            "v2 description must include rawInput command; got {desc_str:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_two_distinct_commands_are_distinguishable() {
+        // Two v2 calls of the SAME tool (fake__shell) with different commands must
+        // produce different descriptions — the informed-consent requirement.
+        let make_msg = |cmd: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "ses-x",
+                    "title": "fake__shell",
+                    "subject": {
+                        "type": "tool_call",
+                        "toolCall": {
+                            "toolCallId": "tc-x",
+                            "title": "fake__shell",
+                            "rawInput": {"command": cmd},
+                        },
+                    },
+                    "options": [],
+                }
+            })
+        };
+        let desc_ls = description_from_request_permission(&make_msg("ls /tmp"))
+            .expect("must yield a description");
+        let desc_rm = description_from_request_permission(&make_msg("rm -rf /home"))
+            .expect("must yield a description");
+        assert_ne!(
+            desc_ls, desc_rm,
+            "different shell commands must produce distinguishable descriptions"
+        );
+        assert!(
+            desc_ls.contains("ls /tmp"),
+            "description must carry the actual command: {desc_ls:?}"
+        );
+        assert!(
+            desc_rm.contains("rm -rf /home"),
+            "description must carry the actual command: {desc_rm:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_file_path_argument_is_visible() {
+        // A file-read tool call with a path argument must surface the path in the
+        // description so the owner can identify which file is being accessed.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "ses-y",
+                "title": "read_file",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-y",
+                        "title": "read_file",
+                        "rawInput": {"path": "/etc/secrets/api.key"},
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg).expect("must yield a description");
+        assert!(
+            desc.contains("/etc/secrets/api.key"),
+            "file path must appear in description: {desc:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_hostile_markup_in_rawinput_is_safe() {
+        // rawInput containing HTML/script tags is stored as a plain JSON string —
+        // not interpreted as markup by the extractor. The description is used in
+        // a React text node, not dangerouslySetInnerHTML, so the content is safe
+        // at render time. This test confirms the extractor does not strip or
+        // reject hostile content (stripping would defeat truthfulness).
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "ses-z",
+                "title": "eval_code",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-z",
+                        "title": "eval_code",
+                        "rawInput": {"code": "<script>alert(1)</script>"},
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg).expect("must yield a description");
+        // The raw tag text is preserved verbatim (safe in a text node), not stripped.
+        assert!(
+            desc.contains("script"),
+            "hostile markup must be preserved as plain text: {desc:?}"
+        );
+        // The description is a regular Rust String — valid UTF-8, no panic.
+        assert!(!desc.is_empty());
+    }
+
+    #[test]
+    fn description_from_v2_control_characters_in_rawinput_are_preserved() {
+        // Control characters in rawInput are encoded as \uXXXX in JSON, so the
+        // compact JSON form is safe ASCII. The extractor does not reject them.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "ses-ctrl",
+                "title": "exec",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-ctrl",
+                        "title": "exec",
+                        "rawInput": {"cmd": "echo\x00\x01\x1b"},
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("must yield a description for control-char input");
+        assert!(
+            desc.starts_with("exec("),
+            "description must start with tool name: {desc:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v2_rawinput_truncated_to_byte_limit() {
+        // A very large rawInput JSON is truncated to DESCRIPTION_RAW_INPUT_BYTES.
+        // The total description length must fit within SENTINEL_STRING_MAX_BYTES.
+        let big_cmd = "x".repeat(500);
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "ses-big",
+                "title": "fake__shell",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-big",
+                        "title": "fake__shell",
+                        "rawInput": {"command": big_cmd},
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("must yield a description even for oversized rawInput");
+        assert!(
+            desc.len() <= SENTINEL_STRING_MAX_BYTES + DESCRIPTION_RAW_INPUT_BYTES + 2,
+            "description must be bounded: {} bytes, got {desc:?}",
+            desc.len()
+        );
+    }
+
+    #[test]
+    fn description_from_v2_utf8_truncation_on_char_boundary() {
+        // rawInput with multibyte characters (e.g. emoji) is truncated on a
+        // character boundary so the result is always valid UTF-8.
+        let emoji_cmd = "🚀".repeat(40); // 4 bytes each → 160 bytes > 120 limit
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "ses-utf8",
+                "title": "run",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-utf8",
+                        "title": "run",
+                        "rawInput": {"cmd": emoji_cmd},
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("must yield a description for multibyte rawInput");
+        assert!(
+            std::str::from_utf8(desc.as_bytes()).is_ok(),
+            "description must be valid UTF-8 after truncation: {desc:?}"
         );
     }
 
     #[test]
     fn description_from_v1_toolcall_title() {
         // buzz-agent v1: `request_permission_params(1, ...)` from wire.rs.
-        // No top-level `title`; `params.toolCall.title` carries the name.
+        // No top-level `title`; `params.toolCall.title` carries the name and
+        // `params.toolCall.rawInput` carries the arguments.
         // Also matches codex-acp's permissions-request variant (kind: "other").
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
@@ -7770,19 +8036,79 @@ mod tests {
                 "sessionId": "ses-2",
                 "toolCall": {
                     "toolCallId": "tc-def",
-                    "title": "Allow file access",
+                    "title": "read_file",
                     "kind": "other",
-                    "rawInput": {},
+                    "rawInput": {"path": "/etc/hosts"},
                 },
                 "options": [],
             }
         });
         let desc = description_from_request_permission(&msg);
-        assert_eq!(
-            desc.as_deref(),
-            Some("Allow file access"),
-            "v1 params.toolCall.title must be extracted as description"
+        let desc_str = desc.as_deref().expect("v1 must yield a description");
+        assert!(
+            desc_str.starts_with("read_file("),
+            "v1 description must include tool name; got {desc_str:?}"
         );
+        assert!(
+            desc_str.contains("/etc/hosts"),
+            "v1 description must include path argument; got {desc_str:?}"
+        );
+    }
+
+    #[test]
+    fn description_from_v1_two_distinct_commands_are_distinguishable() {
+        // Two v1 calls of the SAME tool with different rawInputs must be
+        // distinguishable — matching the requirement for v2 above.
+        let make_msg = |path: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "ses-v1",
+                    "toolCall": {
+                        "toolCallId": "tc-v1",
+                        "title": "read_file",
+                        "kind": "other",
+                        "rawInput": {"path": path},
+                    },
+                    "options": [],
+                }
+            })
+        };
+        let desc_a = description_from_request_permission(&make_msg("/etc/hosts"))
+            .expect("must yield description");
+        let desc_b = description_from_request_permission(&make_msg("/etc/shadow"))
+            .expect("must yield description");
+        assert_ne!(
+            desc_a, desc_b,
+            "different paths must yield different descriptions"
+        );
+    }
+
+    #[test]
+    fn description_title_only_when_rawinput_is_null() {
+        // rawInput = null means no argument context is available; description
+        // is the tool name alone.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "ses-null",
+                "title": "noop_tool",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-null",
+                        "title": "noop_tool",
+                        "rawInput": null,
+                    },
+                },
+                "options": [],
+            }
+        });
+        let desc = description_from_request_permission(&msg)
+            .expect("must yield a description even with null rawInput");
+        assert_eq!(desc, "noop_tool", "null rawInput must yield title only");
     }
 
     // ── Pinned §3: duplicate option IDs ──────────────────────────────────────
@@ -11060,5 +11386,413 @@ mod tests {
             "acp_read and acp_write must carry the same nonce so Desktop can retire the card; \
              read={read_nonce}, write={write_nonce}"
         );
+    }
+
+    // ── F1: production-seam — description reaches the pending card ────────────
+    //
+    // Carl's bar: a regression that goes through `handle_permission_request` and
+    // asserts the extracted description makes it into the published sentinel
+    // content — not just the pure extractor function.
+    //
+    // Shape: buzz-agent v2 (`params.title` + `params.subject.toolCall.rawInput`).
+    // The published kind-9 content is captured from the relay test publisher's
+    // event channel and parsed to confirm the `description` field carries the
+    // expected `"<tool_name>(<rawInput_json>)"` form.
+
+    #[tokio::test]
+    async fn production_seam_description_reaches_pending_card_sentinel() {
+        // Script: read one line (the permission response when decided), then idle.
+        let capture_file =
+            std::env::temp_dir().join(format!("buzz-acp-desc-seam-{}.json", uuid::Uuid::new_v4()));
+        let script = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}; sleep 5"#,
+            capture = capture_file.display(),
+        );
+        let mut client = spawn_script(&script).await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+
+        // Capture every published event, including the kind-9 pending sentinel.
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
+        let published: std::sync::Arc<std::sync::Mutex<Vec<nostr::Event>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let published_drain = published.clone();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while let Some(ev) = rx.recv().await {
+                published_drain.lock().unwrap().push(ev);
+            }
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000010").unwrap()),
+            None,
+        );
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // v2 buzz-agent wire shape: params.title = tool name,
+        // params.subject.toolCall.rawInput = call.arguments object.
+        // Two distinct commands (ls vs rm) must produce distinguishable descriptions.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 55,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-seam",
+                "title": "fake__shell",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": "tc-seam",
+                        "title": "fake__shell",
+                        "rawInput": {"command": "ls -la /tmp"},
+                    },
+                },
+                "options": [
+                    {"optionId": "opt-allow", "kind": "allow_once", "name": "Allow"},
+                    {"optionId": "opt-deny",  "kind": "reject_once", "name": "Deny"},
+                ],
+            }
+        });
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+
+        // Wait for the kind-9 sentinel to be published (auto-ACKed by test_pair).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let found = published
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ev| ev.kind.as_u16() == 9);
+            if found || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Extract the kind-9 event content and parse the sentinel payload.
+        let kind9_content = {
+            let guard = published.lock().unwrap();
+            guard
+                .iter()
+                .find(|ev| ev.kind.as_u16() == 9)
+                .map(|ev| ev.content.clone())
+                .expect("kind-9 sentinel must have been published")
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&kind9_content).expect("kind-9 content must be valid JSON");
+
+        // The description field must carry the tool name and the rawInput summary —
+        // confirming that `description_from_request_permission` is wired to the real
+        // sentinel-building path, not just tested as a pure function.
+        let description = payload["description"]
+            .as_str()
+            .expect("description must be a string in the published kind-9 content");
+        assert!(
+            description.starts_with("fake__shell("),
+            "sentinel description must include the tool name; got: {description:?}"
+        );
+        assert!(
+            description.contains("ls -la /tmp"),
+            "sentinel description must carry the rawInput command; got: {description:?}"
+        );
+
+        // Regression binding: removing `description_from_request_permission` from the
+        // `handle_permission_request` path (passing None always) turns this test red
+        // because `payload["description"]` becomes null and `as_str()` fails.
+
+        let _ = std::fs::remove_file(&capture_file);
+    }
+
+    // ── F2: ordinary-timeout path publishes the resolved edit ─────────────────
+    //
+    // Bug reproduced: `retransmit_resolved_edit` was spawned with `entry_deadline`,
+    // which is ALREADY PAST when an ordinary timeout fires (the entry expired →
+    // deadline = then, now > then → loop exits immediately with zero publish
+    // attempts). Fix: compute `delivery_deadline = Instant::now() +
+    // RESOLVED_DELIVERY_WINDOW_SECS` at resolution time.
+    //
+    // Mutation proof: reverting the production path back to `entry_deadline`
+    // (already past at resolution time) makes the retransmit task exit without
+    // publishing any kind-40003 event — this test goes red.
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_timeout_publishes_resolved_edit() {
+        // Script: capture the permission response (timed_out denial), then idle.
+        let capture_file = std::env::temp_dir().join(format!(
+            "buzz-acp-timeout-retransmit-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}; sleep 600"#,
+            capture = capture_file.display(),
+        );
+        let mut client = spawn_script(&script).await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+
+        // Collect every published event so we can count kind-40003 resolved edits.
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        // test_pair auto-ACKs every sentinel → entry transitions Publishing→Pending.
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
+        let published_40003: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain_40003 = published_40003.clone();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while let Some(ev) = rx.recv().await {
+                if ev.kind.as_u16() == 40003 {
+                    drain_40003.lock().unwrap().push(ev.id.to_hex());
+                }
+            }
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000011").unwrap()),
+            None,
+        );
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Register the permission request with a short deadline (10s from now,
+        // under paused time so it won't actually elapse without explicit advance).
+        let perm_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let msg = perm_request(1, default_opts());
+        client
+            .handle_permission_request(&msg, perm_deadline)
+            .await
+            .expect("registration must succeed");
+
+        let idle = std::time::Duration::from_millis(200);
+        let max_dur = std::time::Duration::from_secs(60);
+
+        // Pass 1: let the loop run briefly to pick up the auto-ACK from test_pair
+        // (the background ACK task runs immediately since test_pair resolves Accepted).
+        // This transitions the entry from Publishing → Pending.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.read_until_response_with_idle_timeout(
+                "sess-timeout-retransmit",
+                999,
+                idle,
+                hard_deadline,
+                max_dur,
+            ),
+        )
+        .await;
+
+        // Advance virtual time past the permission deadline (10s) so the expired
+        // Pending entry is visible to the next loop iteration.
+        tokio::time::advance(std::time::Duration::from_secs(
+            SENTINEL_PUBLISH_TIMEOUT_SECS + 11,
+        ))
+        .await;
+
+        // Pass 2: drive the loop to detect the expired entry → finish_permission
+        // writes the timed_out denial and spawns the resolved-edit retransmit task.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.read_until_response_with_idle_timeout(
+                "sess-timeout-retransmit",
+                999,
+                std::time::Duration::from_millis(50),
+                hard_deadline,
+                max_dur,
+            ),
+        )
+        .await;
+
+        // Entry must be removed (timed_out).
+        assert!(
+            client.pending_permissions.is_empty(),
+            "entry must be gone after ordinary timeout"
+        );
+
+        // Wait for the detached retransmit task to publish the resolved kind-40003 edit.
+        // Under paused time, advance a generous window for the first attempt.
+        let retransmit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(65);
+        loop {
+            let count = published_40003.lock().unwrap().len();
+            if count >= 1 || tokio::time::Instant::now() >= retransmit_deadline {
+                break;
+            }
+            // Advance time in small steps to let the spawned task run its first attempt.
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        }
+
+        let resolved_count = published_40003.lock().unwrap().len();
+        assert!(
+            resolved_count >= 1,
+            "ordinary timeout must publish at least one kind-40003 resolved edit \
+             (would be 0 with the old entry_deadline which is already past at timeout); \
+             got {resolved_count} publish(es)"
+        );
+
+        let _ = std::fs::remove_file(&capture_file);
+    }
+
+    // ── F4: first-wins — early_decision guards subsequent valid decisions ──────
+    //
+    // Regression: before F4, `entry.early_decision = Some(decision)` was
+    // unconditional, so a later conflicting decision could overwrite the first.
+    // After F4, the guard `if entry.early_decision.is_none()` ensures only the
+    // FIRST valid decision is buffered; subsequent ones are ignored.
+    //
+    // Mutation proof: removing the `is_none()` guard (changing it back to an
+    // unconditional assignment) lets the second Allow overwrite the first Reject,
+    // so the applied write carries "opt-allow" and the assertion on "opt-reject"
+    // goes red.
+
+    #[tokio::test]
+    async fn early_decision_first_wins_reject_then_allow_reject_applied() {
+        // Script: capture the decision response (one JSON-RPC result line).
+        let capture_file =
+            std::env::temp_dir().join(format!("buzz-acp-first-wins-{}.json", uuid::Uuid::new_v4()));
+        let script = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}; sleep 5"#,
+            capture = capture_file.display(),
+        );
+        let mut client = spawn_script(&script).await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Manually insert a Publishing entry — the sentinel is already "published"
+        // from the agent's perspective (we own the ack_tx). The test controls when
+        // the ACK fires so both decisions arrive before the transition to Pending.
+        let nonce = "nonce-first-wins".to_string();
+        let entry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client.pending_permissions.insert(
+            "99".to_string(),
+            PermissionEntry {
+                nonce: nonce.clone(),
+                options_snapshot: default_opts()
+                    .iter()
+                    .map(|(id, kind, name)| {
+                        serde_json::json!({"optionId": id, "kind": kind, "name": name})
+                    })
+                    .collect(),
+                card_actions: test_card_actions(),
+                state: PermissionEntryState::Publishing,
+                deadline: entry_deadline,
+                expiry_unix_secs: 0,
+                sentinel_event_id: Some("sentinel-fw".to_string()),
+                early_decision: None,
+                description: None,
+            },
+        );
+        // Install a manual ACK channel so we control when the ACK fires.
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel::<(String, crate::relay::AckOutcome)>(1);
+        client.sentinel_ack_result_rx = Some(ack_rx);
+
+        // Pre-send BOTH decisions before the loop runs.
+        // Reject first (must be buffered as early_decision).
+        // Allow second (must be IGNORED because early_decision is already set).
+        // The channel capacity is sufficient to hold both without blocking.
+        perm_tx
+            .send(PermissionDecision {
+                request_nonce: nonce.clone(),
+                option_id: "opt-reject".to_string(),
+            })
+            .await
+            .expect("reject send must succeed");
+        perm_tx
+            .send(PermissionDecision {
+                request_nonce: nonce.clone(),
+                option_id: "opt-allow".to_string(),
+            })
+            .await
+            .expect("allow send must succeed");
+
+        // Fire the ACK from a background task with a slight delay so both
+        // decisions are processed first (buffered) before the ACK transitions
+        // Publishing → Pending → applies the early decision.
+        let ack_tx_clone = ack_tx;
+        tokio::spawn(async move {
+            // Let both decision messages be processed by the decision arm first.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = ack_tx_clone
+                .send(("99".to_string(), crate::relay::AckOutcome::Accepted))
+                .await;
+        });
+
+        // Drive the loop until the entry is resolved (map empties).
+        // The loop processes: (1) Reject decision → buffered, (2) Allow decision → ignored,
+        // (3) ACK Accepted → Publishing→Pending → apply buffered Reject → map empties.
+        let idle = std::time::Duration::from_millis(200);
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_until_response_with_idle_timeout(
+                "sess-first-wins",
+                999,
+                idle,
+                hard,
+                std::time::Duration::from_secs(10),
+            ),
+        )
+        .await;
+
+        // Entry must be gone — decision was applied.
+        assert!(
+            client.pending_permissions.is_empty(),
+            "entry must be removed after ACK + early decision applied"
+        );
+
+        // Observer must show exactly one applied write with the REJECT option id.
+        let events = obs.snapshot();
+        let applied_writes: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.kind == "acp_write"
+                    && e.authorization
+                        .as_ref()
+                        .map(|a| a.reason.as_deref() == Some("applied"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            applied_writes.len(),
+            1,
+            "exactly one applied write must be emitted; got: {applied_writes:?}"
+        );
+        // The applied write's payload carries the decision optionId in the ACP
+        // result. Use the same path as the existing denial-optionId tests.
+        let payload = &applied_writes[0].payload;
+        assert_eq!(
+            payload["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-reject"),
+            "applied decision must be the first (Reject) — not the second (Allow); \
+             mutation: remove is_none() guard → Allow overwrites → this assertion goes red; \
+             got: {payload}"
+        );
+
+        let _ = std::fs::remove_file(&capture_file);
     }
 }

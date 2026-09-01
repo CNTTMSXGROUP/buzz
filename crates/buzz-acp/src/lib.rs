@@ -6115,6 +6115,7 @@ mod owner_control_command_tests {
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                permission_decision_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -9824,6 +9825,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: Some(batch),
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -11034,6 +11036,7 @@ mod permission_decision_control_tests {
             TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                scope: None,
                 turn_id: "test-turn".into(),
                 recoverable_batch: None,
                 control_tx: None,

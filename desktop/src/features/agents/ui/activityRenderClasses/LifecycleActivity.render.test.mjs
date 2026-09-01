@@ -98,10 +98,15 @@ test("test_reject_once_renders_actionable_deny_button", () => {
 });
 
 // ---------------------------------------------------------------------------
-// allow_always — non-actionable badge, no clickable button
+// allow_always — not actionable, no badge (F3: persistent-grant badge removed)
 // ---------------------------------------------------------------------------
 
-test("test_allow_always_renders_non_actionable_persistent_grant_badge", () => {
+test("test_allow_always_renders_no_button_and_no_badge", () => {
+  // After F3: allow_always is NOT in ACTIONABLE_KINDS and the persistent-grant
+  // badge has been removed. A card with only allow_always renders nothing
+  // actionable — no button and no badge — because the two-option contract
+  // (allow_once / reject_once only) is enforced at both the Rust sentinel and
+  // the observer surface.
   const html = renderToStaticMarkup(
     React.createElement(LifecycleActivity, {
       ...BASE_PROPS,
@@ -111,25 +116,25 @@ test("test_allow_always_renders_non_actionable_persistent_grant_badge", () => {
     }),
   );
 
-  // Must show the non-actionable badge.
-  assert.ok(
-    html.includes("permission-decision-persistent-grant"),
-    "allow_always option should render the persistent-grant badge",
-  );
-  assert.ok(
-    html.includes("Permanent grant"),
-    "persistent-grant badge should contain differentiating copy",
-  );
-
-  // Must NOT render a clickable button for this optionId.
+  // No button for allow_always.
   assert.ok(
     !html.includes("permission-decision-opt-always"),
     "allow_always option must not render an actionable button",
   );
-  // No <button> element inside the buttons container at all.
+  // No <button> element at all — no actionable options.
   assert.ok(
     !html.includes("<button"),
     "allow_always-only card must not render any button element",
+  );
+  // The persistent-grant badge is gone — it was the only surface that showed
+  // allow_always and it has been removed in F3.
+  assert.ok(
+    !html.includes("permission-decision-persistent-grant"),
+    "persistent-grant badge must not render after F3 removal",
+  );
+  assert.ok(
+    !html.includes("Permanent grant"),
+    "persistent-grant copy must not render after F3 removal",
   );
 });
 
@@ -205,10 +210,15 @@ test("test_unknown_reject_prefixed_kind_fails_closed_renders_nothing", () => {
 });
 
 // ---------------------------------------------------------------------------
-// reject_always with no label — actionable Deny labelled "Always deny"
+// reject_always — not actionable (F3: removed from ACTIONABLE_KINDS)
 // ---------------------------------------------------------------------------
 
-test("test_reject_always_without_label_renders_always_deny_button", () => {
+test("test_reject_always_renders_no_button", () => {
+  // After F3: reject_always is removed from ACTIONABLE_KINDS. The thread card
+  // cannot grant permanent denial; the ACP read loop accepts only allow_once and
+  // reject_once. A reject_always option must render as inert — no clickable
+  // button. The outer card shell is still rendered (the activity still appears
+  // in the transcript), but no action can be taken on it.
   const html = renderToStaticMarkup(
     React.createElement(LifecycleActivity, {
       ...BASE_PROPS,
@@ -218,23 +228,37 @@ test("test_reject_always_without_label_renders_always_deny_button", () => {
     }),
   );
 
-  // Persistent denial stays actionable (fail-safe), but the harness omitted a
-  // label — the default must disclose persistence, not read generic "Deny".
+  // Must NOT render a clickable button for reject_always.
   assert.ok(
-    html.includes("permission-decision-opt-reject-always"),
-    "reject_always should render an actionable button",
+    !html.includes("permission-decision-opt-reject-always"),
+    "reject_always must not render an actionable button after F3",
   );
+  // No button element at all — no actionable options present.
   assert.ok(
-    html.includes("Always deny"),
-    "reject_always without a label must default to 'Always deny', not 'Deny'",
+    !html.includes("<button"),
+    "reject_always-only card must not render any button element after F3",
+  );
+  // No persistent-grant badge either.
+  assert.ok(
+    !html.includes("permission-decision-persistent-grant"),
+    "reject_always card must not render the persistent-grant badge",
+  );
+  // The outer card shell IS rendered.
+  assert.ok(
+    html.includes("transcript-permission-item"),
+    "reject_always still renders the outer permission card shell",
   );
 });
 
 // ---------------------------------------------------------------------------
-// Mixed options — allow_once + allow_always in same card
+// Mixed options — allow_once + allow_always: only allow_once actionable
+// No persistent-grant badge after F3 removal
 // ---------------------------------------------------------------------------
 
-test("test_mixed_allow_once_and_allow_always_allow_once_actionable_always_non_actionable", () => {
+test("test_mixed_allow_once_and_allow_always_only_allow_once_actionable", () => {
+  // After F3: allow_always is not in ACTIONABLE_KINDS and the persistent-grant
+  // badge is removed. A mixed card renders only the allow_once button; allow_always
+  // is inert context with no UI surface.
   const html = renderToStaticMarkup(
     React.createElement(LifecycleActivity, {
       ...BASE_PROPS,
@@ -255,9 +279,79 @@ test("test_mixed_allow_once_and_allow_always_allow_once_actionable_always_non_ac
     !html.includes("permission-decision-opt-always"),
     "allow_always in mixed card must not render a button",
   );
-  // The non-actionable persistent-grant badge appears.
+  // No persistent-grant badge — it has been removed.
   assert.ok(
-    html.includes("permission-decision-persistent-grant"),
-    "mixed card should show the persistent-grant badge for allow_always",
+    !html.includes("permission-decision-persistent-grant"),
+    "mixed card must not render the persistent-grant badge after F3 removal",
+  );
+  assert.ok(
+    !html.includes("Permanent grant"),
+    "mixed card must not render persistent-grant copy after F3 removal",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// F3 contract: all four adapter option kinds — only allow_once + reject_once
+// are actionable; allow_always and reject_always are inert.
+// ---------------------------------------------------------------------------
+
+test("test_four_option_contract_only_allow_once_and_reject_once_actionable", () => {
+  // The two-option contract: the thread card may only action allow_once and
+  // reject_once. This test covers all four recognized adapter option kinds in
+  // a single card and verifies the exact set of rendered buttons.
+  //
+  // Mutation proof: removing "reject_once" from ACTIONABLE_KINDS in
+  // LifecycleActivity.tsx makes "permission-decision-opt-deny" absent — the
+  // assertion on opt-deny goes red. Removing "allow_once" makes opt-allow
+  // absent similarly. The ACP read loop on the Rust side accepts only the
+  // two option IDs snapshotted into CardActions (allow_once / reject_once);
+  // sending an allow_always or reject_always option ID is silently ignored.
+  const html = renderToStaticMarkup(
+    React.createElement(LifecycleActivity, {
+      ...BASE_PROPS,
+      item: pendingPermissionItem([
+        { optionId: "opt-allow", kind: "allow_once", label: "Allow once" },
+        { optionId: "opt-deny", kind: "reject_once", label: "Deny" },
+        { optionId: "opt-always", kind: "allow_always", label: "Always allow" },
+        {
+          optionId: "opt-reject-always",
+          kind: "reject_always",
+          label: "Always deny",
+        },
+      ]),
+    }),
+  );
+
+  // Only allow_once and reject_once render buttons.
+  assert.ok(
+    html.includes("permission-decision-opt-allow"),
+    "allow_once must render an actionable button",
+  );
+  assert.ok(
+    html.includes("permission-decision-opt-deny"),
+    "reject_once must render an actionable button",
+  );
+
+  // allow_always and reject_always must NOT render buttons.
+  assert.ok(
+    !html.includes("permission-decision-opt-always"),
+    "allow_always must not render a button in a mixed four-option card",
+  );
+  assert.ok(
+    !html.includes("permission-decision-opt-reject-always"),
+    "reject_always must not render a button in a mixed four-option card",
+  );
+
+  // No persistent-grant badge — removed in F3.
+  assert.ok(
+    !html.includes("permission-decision-persistent-grant"),
+    "four-option card must not render the persistent-grant badge",
+  );
+  // Exactly two <button> elements (allow_once + reject_once).
+  const buttonCount = (html.match(/<button/g) ?? []).length;
+  assert.equal(
+    buttonCount,
+    2,
+    `four-option card must render exactly 2 buttons (allow_once + reject_once); got ${buttonCount}`,
   );
 });

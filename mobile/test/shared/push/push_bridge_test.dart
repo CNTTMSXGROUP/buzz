@@ -60,6 +60,36 @@ void main() {
     },
   );
 
+  test('strict age-gate snapshot requires a native handler', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, null);
+
+    await expectLater(
+      registerBuzzPushCommunitySnapshotStrict(const []),
+      throwsA(isA<MissingPluginException>()),
+    );
+  });
+
+  test(
+    'strict age-gate snapshot uses the acknowledged native method',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_channel, (call) async {
+            expect(call.method, 'syncAgeGatePushSnapshot');
+            expect(call.arguments, {
+              'section': 'communities',
+              'communities': <Object?>[],
+              'signingKeys': <String, String>{},
+            });
+            return null;
+          });
+
+      await registerBuzzPushCommunitySnapshotStrict(const []);
+    },
+  );
+
   test('reads native notification authorization status', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

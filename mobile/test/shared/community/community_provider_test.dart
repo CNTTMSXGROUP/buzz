@@ -44,12 +44,15 @@ void main() {
   tearDown(() => container.dispose());
 
   ProviderContainer createContainer() {
+    Future<void> writeSnapshot(List<Community> communities) async {
+      snapshots.add(List.of(communities));
+    }
+
     return ProviderContainer(
       overrides: [
         communityStorageProvider.overrideWithValue(communityStorage),
-        communitySnapshotWriterProvider.overrideWithValue((communities) async {
-          snapshots.add(List.of(communities));
-        }),
+        communitySnapshotWriterProvider.overrideWithValue(writeSnapshot),
+        ageGateCommunitySnapshotWriterProvider.overrideWithValue(writeSnapshot),
         communityPushLeaseDeactivatorProvider.overrideWithValue(deactivator),
         communityPushLeaseRevocationEnqueuerProvider.overrideWithValue((
           community,
@@ -71,6 +74,35 @@ void main() {
       expect(communities, isEmpty);
       expect(snapshots, [isEmpty]);
     });
+
+    test(
+      'age gate strict clear is not deduplicated against an ordinary clear',
+      () async {
+        final ordinarySnapshots = <List<Community>>[];
+        final ageGateSnapshots = <List<Community>>[];
+        container = ProviderContainer(
+          overrides: [
+            communityStorageProvider.overrideWithValue(communityStorage),
+            communitySnapshotWriterProvider.overrideWithValue((
+              communities,
+            ) async {
+              ordinarySnapshots.add(List.of(communities));
+            }),
+            ageGateCommunitySnapshotWriterProvider.overrideWithValue((
+              communities,
+            ) async {
+              ageGateSnapshots.add(List.of(communities));
+            }),
+          ],
+        );
+
+        await container.read(communityListProvider.future);
+        await container.read(suspendCommunitySnapshotForAgeCheckProvider)();
+
+        expect(ordinarySnapshots, [isEmpty]);
+        expect(ageGateSnapshots, [isEmpty]);
+      },
+    );
 
     test('exports migrated communities on startup', () async {
       final community = Community.create(
@@ -457,6 +489,11 @@ void main() {
               }
               completedSnapshots.add(captured);
             }),
+            ageGateCommunitySnapshotWriterProvider.overrideWithValue((
+              communities,
+            ) async {
+              completedSnapshots.add(List.of(communities));
+            }),
           ],
         );
 
@@ -503,6 +540,11 @@ void main() {
                 await releaseStaleWrite.future;
               }
               completedSnapshots.add(captured);
+            }),
+            ageGateCommunitySnapshotWriterProvider.overrideWithValue((
+              communities,
+            ) async {
+              completedSnapshots.add(List.of(communities));
             }),
           ],
         );

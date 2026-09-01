@@ -251,9 +251,19 @@ void reportPushLeaseCleanupError(Object error, StackTrace stackTrace) {
   debugPrintStack(stackTrace: stackTrace);
 }
 
-Future<void> registerBuzzPushCommunitySnapshot(
+Future<void> registerBuzzPushCommunitySnapshot(List<Community> communities) =>
+    _registerBuzzPushCommunitySnapshot(communities, strict: false);
+
+/// Writes the age-gate snapshot through a native path that must acknowledge
+/// both the app-group store and signing-key update.
+Future<void> registerBuzzPushCommunitySnapshotStrict(
   List<Community> communities,
-) async {
+) => _registerBuzzPushCommunitySnapshot(communities, strict: true);
+
+Future<void> _registerBuzzPushCommunitySnapshot(
+  List<Community> communities, {
+  required bool strict,
+}) async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
     final snapshots = [
@@ -283,12 +293,16 @@ Future<void> registerBuzzPushCommunitySnapshot(
         // Native storage is fail-closed; malformed keys are never exported.
       }
     }
-    await _channel.invokeMethod<void>('syncPushSnapshot', {
-      'section': 'communities',
-      'communities': [for (final snapshot in snapshots) snapshot.toJson()],
-      'signingKeys': signingKeys,
-    });
+    await _channel.invokeMethod<void>(
+      strict ? 'syncAgeGatePushSnapshot' : 'syncPushSnapshot',
+      {
+        'section': 'communities',
+        'communities': [for (final snapshot in snapshots) snapshot.toJson()],
+        'signingKeys': signingKeys,
+      },
+    );
   } on MissingPluginException {
+    if (strict) rethrow;
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }
 }

@@ -1,4 +1,5 @@
 import BuzzPushKit
+import Flutter
 import Intents
 import UserNotifications
 import XCTest
@@ -175,6 +176,33 @@ final class BuzzCommunicationNotificationTests: XCTestCase {
 }
 
 final class BuzzPushSnapshotEnrichmentTests: XCTestCase {
+  func testStrictAgeGateWriteFailsWhenAppGroupStoreIsUnavailable() {
+    let bridge = BuzzPushSnapshotBridge(
+      appGroupIdentifier: nil,
+      endpointGrantStore: BuzzPushEndpointGrantKeychainStore(accessGroup: nil),
+      keychainAccessGroup: nil
+    )
+    let completed = expectation(description: "strict write rejected")
+
+    XCTAssertTrue(
+      bridge.handle(
+        FlutterMethodCall(
+          methodName: "syncAgeGatePushSnapshot",
+          arguments: [
+            "section": "communities",
+            "communities": [[String: Any]](),
+            "signingKeys": [String: String](),
+          ]
+        )
+      ) { value in
+        XCTAssertEqual((value as? FlutterError)?.code, "snapshot_sync_unavailable")
+        completed.fulfill()
+      }
+    )
+
+    wait(for: [completed], timeout: 1)
+  }
+
   func testMetadataAuthorityUsesCurrentAppProfileForMatchingRelay() {
     let correctProfile = grant(
       appProfile: BuzzDevPushEnrollmentDriver.appProfile,

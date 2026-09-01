@@ -22,6 +22,14 @@ void main() {
         .setMockMethodCallHandler(ageSignalChannel, null);
   });
 
+  test('backs off repeated snapshot transition failures', () {
+    expect(ageSignalPushSnapshotRetryDelay(0), const Duration(seconds: 5));
+    expect(ageSignalPushSnapshotRetryDelay(1), const Duration(seconds: 10));
+    expect(ageSignalPushSnapshotRetryDelay(5), const Duration(seconds: 160));
+    expect(ageSignalPushSnapshotRetryDelay(6), const Duration(minutes: 5));
+    expect(ageSignalPushSnapshotRetryDelay(100), const Duration(minutes: 5));
+  });
+
   testWidgets('blocks authenticated app content', (tester) async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();

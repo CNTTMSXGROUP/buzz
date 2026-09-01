@@ -10,7 +10,20 @@ import '../../shared/push/push_bridge.dart';
 import 'age_signal_provider.dart';
 
 /// Delay between failed age-gate snapshot transitions.
-const ageSignalPushSnapshotRetryDelay = Duration(seconds: 5);
+const ageSignalPushSnapshotInitialRetryDelay = Duration(seconds: 5);
+
+/// Maximum delay between failed age-gate snapshot transitions.
+const ageSignalPushSnapshotMaximumRetryDelay = Duration(minutes: 5);
+
+/// Exponential retry delay for a zero-based consecutive failure count.
+Duration ageSignalPushSnapshotRetryDelay(int failures) {
+  final boundedFailures = failures.clamp(0, 6);
+  final seconds =
+      ageSignalPushSnapshotInitialRetryDelay.inSeconds * (1 << boundedFailures);
+  return Duration(
+    seconds: seconds.clamp(0, ageSignalPushSnapshotMaximumRetryDelay.inSeconds),
+  );
+}
 
 /// Waits before retrying a failed age-gate snapshot transition.
 typedef AgeSignalPushSnapshotRetryWait =
@@ -40,18 +53,31 @@ class AgeSignalPushBootstrap extends HookConsumerWidget {
     );
     final waitBeforeRetry = ref.watch(ageSignalPushSnapshotRetryWaitProvider);
     final retryGeneration = useState(0);
+    final consecutiveFailures = useRef(0);
+    final previousState = useRef<AgeSignalState?>(null);
 
     useEffect(
       () {
+        if (previousState.value != state) {
+          previousState.value = state;
+          consecutiveFailures.value = 0;
+        }
         var cancelled = false;
         unawaited(() async {
           try {
             await (state == AgeSignalState.allowed
                 ? resumeSnapshot()
                 : suspendSnapshot());
+            consecutiveFailures.value = 0;
           } catch (_) {
-            await waitBeforeRetry(ageSignalPushSnapshotRetryDelay);
-            if (!cancelled) retryGeneration.value += 1;
+            final delay = ageSignalPushSnapshotRetryDelay(
+              consecutiveFailures.value,
+            );
+            await waitBeforeRetry(delay);
+            if (!cancelled) {
+              consecutiveFailures.value += 1;
+              retryGeneration.value += 1;
+            }
           }
         }());
         return () => cancelled = true;

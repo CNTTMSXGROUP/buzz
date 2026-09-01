@@ -89,8 +89,17 @@ final communitySnapshotWriterProvider = Provider<CommunitySnapshotWriter>((
   return registerBuzzPushCommunitySnapshot;
 });
 
+/// Strict writer used only for security-sensitive launch age-gate transitions.
+final ageGateCommunitySnapshotWriterProvider =
+    Provider<CommunitySnapshotWriter>((ref) {
+      return registerBuzzPushCommunitySnapshotStrict;
+    });
+
 final _communitySnapshotSyncProvider = Provider<_CommunitySnapshotSync>((ref) {
-  return _CommunitySnapshotSync(ref.read(communitySnapshotWriterProvider));
+  return _CommunitySnapshotSync(
+    ref.read(communitySnapshotWriterProvider),
+    ref.read(ageGateCommunitySnapshotWriterProvider),
+  );
 });
 
 /// Suspends or restores notification-service state at the launch age gate.
@@ -216,11 +225,13 @@ Future<void> _deactivateCommunityPushLease(
 }
 
 class _CommunitySnapshotSync {
-  _CommunitySnapshotSync(this._writer);
+  _CommunitySnapshotSync(this._writer, this._ageGateWriter);
 
   final CommunitySnapshotWriter _writer;
+  final CommunitySnapshotWriter _ageGateWriter;
   final Set<Future<void>> _writesInFlight = {};
   String? _lastSuccessfulSnapshot;
+  String? _lastSuccessfulAgeGateSnapshot;
   bool _ageRestricted = false;
   bool _ageCheckSuspended = false;
   Future<void> _ageGateMutationTail = Future.value();
@@ -250,7 +261,7 @@ class _CommunitySnapshotSync {
     if (_ageRestricted) return;
     _ageCheckSuspended = true;
     await _waitForWrites();
-    await write(const <Community>[]);
+    await write(const <Community>[], useAgeGateWriter: true);
   });
 
   Future<void> resumeAfterAgeCheck(List<Community> communities) =>
@@ -258,12 +269,13 @@ class _CommunitySnapshotSync {
         if (_ageRestricted) return;
         await _waitForWrites();
         _ageCheckSuspended = false;
-        await write(communities);
+        await write(communities, useAgeGateWriter: true);
       });
 
   Future<void> write(
     List<Community> communities, {
     bool enforceAgeRestriction = false,
+    bool useAgeGateWriter = false,
   }) async {
     if (enforceAgeRestriction) {
       _ageRestricted = true;
@@ -294,10 +306,13 @@ class _CommunitySnapshotSync {
           ].join('\u0000'),
         )
         .join('\u0001');
-    if (fingerprint == _lastSuccessfulSnapshot) return;
+    final lastSuccessfulSnapshot = useAgeGateWriter
+        ? _lastSuccessfulAgeGateSnapshot
+        : _lastSuccessfulSnapshot;
+    if (fingerprint == lastSuccessfulSnapshot) return;
 
     late final Future<void> writeFuture;
-    writeFuture = _writer(
+    writeFuture = (useAgeGateWriter ? _ageGateWriter : _writer)(
       effectiveCommunities,
     ).whenComplete(() => _writesInFlight.remove(writeFuture));
     _writesInFlight.add(writeFuture);
@@ -305,7 +320,11 @@ class _CommunitySnapshotSync {
     if (_ageRestricted && effectiveCommunities.isNotEmpty) {
       await write(const <Community>[], enforceAgeRestriction: true);
     } else {
-      _lastSuccessfulSnapshot = fingerprint;
+      if (useAgeGateWriter) {
+        _lastSuccessfulAgeGateSnapshot = fingerprint;
+      } else {
+        _lastSuccessfulSnapshot = fingerprint;
+      }
     }
   }
 }

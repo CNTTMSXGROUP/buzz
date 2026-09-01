@@ -31,14 +31,20 @@ final class BuzzPushSnapshotBridge {
 
   @discardableResult
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) -> Bool {
-    guard call.method == "syncPushSnapshot",
+    let strictAgeGateWrite = call.method == "syncAgeGatePushSnapshot"
+    guard strictAgeGateWrite || call.method == "syncPushSnapshot",
       let arguments = call.arguments as? [String: Any],
       let section = arguments["section"] as? String
     else {
       return false
     }
     switch section {
-    case "communities": syncCommunities(arguments, result: result)
+    case "communities":
+      syncCommunities(
+        arguments,
+        requiresStore: strictAgeGateWrite,
+        result: result
+      )
     case "profiles": cacheProfiles(arguments, result: result)
     case "channels": cacheChannels(arguments, result: result)
     case "avatar": cacheAvatar(arguments, result: result)
@@ -47,7 +53,11 @@ final class BuzzPushSnapshotBridge {
     return true
   }
 
-  private func syncCommunities(_ arguments: [String: Any], result: @escaping FlutterResult) {
+  private func syncCommunities(
+    _ arguments: [String: Any],
+    requiresStore: Bool,
+    result: @escaping FlutterResult
+  ) {
     guard let communities = arguments["communities"] as? [[String: Any]],
       let signingKeys = arguments["signingKeys"] as? [String: String],
       communities.count <= BuzzPushPresentationCacheStore.maximumCommunities
@@ -63,8 +73,30 @@ final class BuzzPushSnapshotBridge {
     }
     queue.async { [weak self] in
       do {
-        guard let self, let store else {
-          Self.complete(result, value: nil)
+        guard let self else {
+          Self.complete(
+            result,
+            value: requiresStore
+              ? FlutterError(
+                code: "snapshot_sync_unavailable",
+                message: "The push snapshot bridge is unavailable.",
+                details: nil
+              )
+              : nil
+          )
+          return
+        }
+        guard let store else {
+          Self.complete(
+            result,
+            value: requiresStore
+              ? FlutterError(
+                code: "snapshot_sync_unavailable",
+                message: "The push snapshot store is unavailable.",
+                details: nil
+              )
+              : nil
+          )
           return
         }
         // Relay-metadata enrichment is optional presentation state. A damaged

@@ -101,8 +101,8 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
           await _delay(ageSignalRetryDelay);
           continue;
         }
-        _completed = true;
-        state = AgeSignalState.allowed;
+        // A transient native failure is not evidence that access is allowed.
+        // Keep the launch gated and leave request() retryable.
         return;
       }
 

@@ -55,14 +55,17 @@ void main() {
     );
   });
 
-  test('allows when the platform request throws', () async {
+  test('keeps exhausted platform failures gated and retryable', () async {
     var requests = 0;
     var delays = 0;
     final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
       () => AgeSignalNotifier(
         requestSignal: () async {
           requests += 1;
-          throw PlatformException(code: 'unavailable');
+          if (requests <= 2) {
+            throw PlatformException(code: 'unavailable');
+          }
+          return {'status': 'noSignal', 'ageUpper': null};
         },
         delay: (duration) async {
           expect(duration, ageSignalRetryDelay);
@@ -74,10 +77,15 @@ void main() {
     addTearDown(container.dispose);
 
     await container.read(provider.notifier).request();
+
+    expect(container.read(provider), AgeSignalState.checking);
+    expect(requests, 2);
+    expect(delays, 1);
+
     await container.read(provider.notifier).request();
 
     expect(container.read(provider), AgeSignalState.allowed);
-    expect(requests, 2);
+    expect(requests, 3);
     expect(delays, 1);
   });
 

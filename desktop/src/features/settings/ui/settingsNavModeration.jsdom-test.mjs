@@ -1,13 +1,13 @@
 /**
- * Behavior tests for Settings → Moderation nav reachability.
+ * Behavior tests for Settings → Relay admin nav reachability.
  *
- * Wes P2 round-6 finding #1: Moderation must be independently reachable
+ * Wes P2 round-6 finding #1: Relay admin must be independently reachable
  * without NIP-11 discovery — absent, invalid, or error discovery must not
- * hide the nav entry or redirect a direct ?section=moderation link away.
+ * hide the nav entry or redirect a direct ?section=relay-admin link away.
  *
  * Tests render the real SettingsView and assert on the sidebar DOM.
  *
- * Mutation: restoring `shouldShowModerationNav(moderationNav)` + the
+ * Mutation: restoring `shouldShowRelayAdminNav(relayAdminNav)` + the
  * useModerationNavResolution hook in SettingsView.tsx hides the nav entry
  * when discovery yields "none" or stays pending, causing these tests RED.
  */
@@ -101,7 +101,7 @@ function makeQueryClient(pubkeyHex) {
 }
 
 function mountSettingsView({
-  section = "moderation",
+  section = "relay-admin",
   onSectionChange = () => {},
 } = {}) {
   const qc = makeQueryClient("ab".repeat(32));
@@ -151,7 +151,7 @@ afterEach(() => {
 });
 
 // ── Core IPC stubs shared across all nav tests ────────────────────────────────
-// These return the "no origin, no discovery" state so useModerationNavResolution
+// These return the "no origin, no discovery" state so the nav resolution hook
 // (if it were still active) would resolve to {originSource:"none"}.
 
 function stubNoOrigin() {
@@ -163,7 +163,7 @@ function stubNoOrigin() {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-test("moderation-nav-visible-no-origin: nav renders when no origin saved and discovery returns null", async () => {
+test("relay-admin-nav-visible-no-origin: nav renders when no origin saved and discovery returns null", async () => {
   // With the old predicate: hook resolves to {originSource:"none"} → hidden → RED.
   // With the current fix: nav is always present regardless of discovery state.
   stubNoOrigin();
@@ -172,15 +172,15 @@ test("moderation-nav-visible-no-origin: nav renders when no origin saved and dis
     await doRender();
     await settle();
     assert.ok(
-      container.querySelector("[data-testid='settings-nav-moderation']"),
-      "Moderation nav must render when no origin and discovery returns null",
+      container.querySelector("[data-testid='settings-nav-relay-admin']"),
+      "Relay admin nav must render when no origin and discovery returns null",
     );
   } finally {
     await unmount();
   }
 });
 
-test("moderation-nav-visible-discovery-error: nav renders when discovery IPCs throw", async () => {
+test("relay-admin-nav-visible-discovery-error: nav renders when discovery IPCs throw", async () => {
   // Both origin lookup and discovery fail. Old code: "none" → hidden → RED.
   setIpcHandler("get_admin_origin", () =>
     Promise.reject(new Error("storage error")),
@@ -195,15 +195,15 @@ test("moderation-nav-visible-discovery-error: nav renders when discovery IPCs th
     await doRender();
     await settle();
     assert.ok(
-      container.querySelector("[data-testid='settings-nav-moderation']"),
-      "Moderation nav must render even when discovery errors",
+      container.querySelector("[data-testid='settings-nav-relay-admin']"),
+      "Relay admin nav must render even when discovery errors",
     );
   } finally {
     await unmount();
   }
 });
 
-test("moderation-nav-visible-pending: nav renders while discovery IPC never resolves", async () => {
+test("relay-admin-nav-visible-pending: nav renders while discovery IPC never resolves", async () => {
   // Hook stays undefined (disabled or pending). Old code: `moderationNav === undefined`
   // → false → nav hidden → RED. New code: nav is unconditional.
   setIpcHandler("get_admin_origin", () => new Promise(() => {}));
@@ -215,23 +215,23 @@ test("moderation-nav-visible-pending: nav renders while discovery IPC never reso
     await doRender();
     await settle();
     assert.ok(
-      container.querySelector("[data-testid='settings-nav-moderation']"),
-      "Moderation nav must render while discovery is pending",
+      container.querySelector("[data-testid='settings-nav-relay-admin']"),
+      "Relay admin nav must render while discovery is pending",
     );
   } finally {
     await unmount();
   }
 });
 
-test("moderation-section-not-redirected: section=moderation is not normalized away after discovery", async () => {
+test("relay-admin-section-not-redirected: section=relay-admin is not normalized away after discovery", async () => {
   // Old code deferred section normalization until moderationNav resolved, then
   // redirected to appearance when origin was none.
   stubNoOrigin();
   const redirectedTo = [];
   const { container, doRender, unmount } = mountSettingsView({
-    section: "moderation",
+    section: "relay-admin",
     onSectionChange: (s) => {
-      if (s !== "moderation") redirectedTo.push(s);
+      if (s !== "relay-admin") redirectedTo.push(s);
     },
   });
   try {
@@ -240,11 +240,11 @@ test("moderation-section-not-redirected: section=moderation is not normalized aw
     assert.deepEqual(
       redirectedTo,
       [],
-      `section=moderation must not be redirected; got redirects to: ${JSON.stringify(redirectedTo)}`,
+      `section=relay-admin must not be redirected; got redirects to: ${JSON.stringify(redirectedTo)}`,
     );
     assert.ok(
-      container.querySelector("[data-testid='settings-nav-moderation']"),
-      "Moderation nav must still be present after settling",
+      container.querySelector("[data-testid='settings-nav-relay-admin']"),
+      "Relay admin nav must still be present after settling",
     );
   } finally {
     await unmount();
@@ -252,7 +252,7 @@ test("moderation-section-not-redirected: section=moderation is not normalized aw
 });
 
 test("no-probe-before-save: admin_probe not called while rendering nav with no saved origin", async () => {
-  // SettingsView no longer calls useModerationNavResolution, so no probe hook
+  // SettingsView no longer calls the nav resolution hook, so no probe hook
   // runs during nav rendering. Any probe before explicit Save is a trust boundary
   // violation.
   stubNoOrigin();
@@ -276,11 +276,11 @@ test("no-probe-before-save: admin_probe not called while rendering nav with no s
   }
 });
 
-test("settings-nav-groups-contains-moderation: moderation is wired into Communities nav group", () => {
+test("settings-nav-groups-contains-relay-admin: relay-admin is wired into Communities nav group", () => {
   const communities = settingsNavGroups.find((g) => g.label === "Communities");
   assert.ok(communities, "Communities group must exist");
   assert.ok(
-    communities.sections.includes("moderation"),
-    `moderation must be in Communities; got: ${JSON.stringify(communities.sections)}`,
+    communities.sections.includes("relay-admin"),
+    `relay-admin must be in Communities; got: ${JSON.stringify(communities.sections)}`,
   );
 });

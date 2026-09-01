@@ -1,7 +1,7 @@
 /**
- * Unit tests for the Settings → Moderation nav visibility gate.
+ * Unit tests for the Settings → Relay admin nav visibility gate.
  *
- * The gate decides whether ordinary members ever see the Moderation entry.
+ * The gate decides whether ordinary members ever see the Relay admin entry.
  * Its load-bearing rule after the advertised-origin hardening: any resolved
  * origin — saved manual OR relay-advertised — shows the entry; only the
  * absence of any origin hides it. The advertised origin is deliberately NOT
@@ -13,18 +13,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { shouldShowModerationNav } from "./nav.ts";
+import { shouldShowRelayAdminNav } from "./nav.ts";
 
 test("no-origin-hides-entry: neither advertised nor saved → hidden", () => {
-  assert.equal(shouldShowModerationNav({ originSource: "none" }), false);
+  assert.equal(shouldShowRelayAdminNav({ originSource: "none" }), false);
 });
 
 test("saved-origin-shows-entry: a saved manual origin is always visible", () => {
-  assert.equal(shouldShowModerationNav({ originSource: "saved" }), true);
+  assert.equal(shouldShowRelayAdminNav({ originSource: "saved" }), true);
 });
 
 test("advertised-origin-shows-entry: an advertised origin is visible without probing", () => {
-  // The entry shows so the operator can open Moderation and confirm the
+  // The entry shows so the operator can open Relay admin and confirm the
   // pre-filled origin; nothing contacts the advertised origin until Save.
-  assert.equal(shouldShowModerationNav({ originSource: "advertised" }), true);
+  assert.equal(shouldShowRelayAdminNav({ originSource: "advertised" }), true);
 });

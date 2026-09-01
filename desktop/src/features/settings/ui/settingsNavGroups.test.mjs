@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { settingsNavGroups } from "./SettingsView.tsx";
 
-test("moderation is wired into the Communities nav group", () => {
+test("relay-admin is wired into the Communities nav group", () => {
   const communitiesGroup = settingsNavGroups.find(
     (g) => g.label === "Communities",
   );
@@ -12,12 +12,12 @@ test("moderation is wired into the Communities nav group", () => {
     "Communities group must exist in settingsNavGroups",
   );
   assert.ok(
-    communitiesGroup.sections.includes("moderation"),
-    `expected "moderation" in Communities group sections, got: ${JSON.stringify(communitiesGroup.sections)}`,
+    communitiesGroup.sections.includes("relay-admin"),
+    `expected "relay-admin" in Communities group sections, got: ${JSON.stringify(communitiesGroup.sections)}`,
   );
 });
 
-test("moderation follows community-members in the Communities nav group", () => {
+test("relay-admin follows community-members in the Communities nav group", () => {
   const communitiesGroup = settingsNavGroups.find(
     (g) => g.label === "Communities",
   );
@@ -26,11 +26,11 @@ test("moderation follows community-members in the Communities nav group", () => 
     "Communities group must exist in settingsNavGroups",
   );
   const membersIndex = communitiesGroup.sections.indexOf("community-members");
-  const moderationIndex = communitiesGroup.sections.indexOf("moderation");
+  const relayAdminIndex = communitiesGroup.sections.indexOf("relay-admin");
   assert.ok(membersIndex !== -1, "community-members must be present");
   assert.ok(
-    moderationIndex > membersIndex,
-    `expected "moderation" after "community-members", got: ${JSON.stringify(communitiesGroup.sections)}`,
+    relayAdminIndex > membersIndex,
+    `expected "relay-admin" after "community-members", got: ${JSON.stringify(communitiesGroup.sections)}`,
   );
 });
 

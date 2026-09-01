@@ -67,7 +67,7 @@ export const settingsNavGroups: Array<{
   },
   {
     label: "Communities",
-    sections: ["hosted-communities", "community-members", "moderation"],
+    sections: ["hosted-communities", "community-members", "relay-admin"],
   },
   {
     label: "App",
@@ -149,11 +149,11 @@ export function SettingsView({
       if (s.value === "community-members") {
         return canManageCommunityMembers(myMembershipQuery.data);
       }
-      // Moderation surfaces the relay admin console. Always reachable so an
+      // Relay admin surfaces the relay admin console. Always reachable so an
       // operator can enter a manual origin even when NIP-11 discovery is
       // absent, invalid, or pending — hiding the entry would lock them out of
       // the only place to configure one. Auth still gates the panel itself.
-      if (s.value === "moderation") {
+      if (s.value === "relay-admin") {
         return true;
       }
       return true;

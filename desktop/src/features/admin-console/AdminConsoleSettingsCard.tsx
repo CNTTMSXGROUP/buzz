@@ -217,8 +217,8 @@ export function AdminConsoleSettingsCard() {
       data-testid="settings-admin-console"
     >
       <SettingsSectionHeader
-        title="Moderation"
-        description="Triage moderation reports and product feedback across every community on your relay. Auto-detected from your relay when available — otherwise open Advanced to paste the value of BUZZ_ADMIN_HOST from your relay config."
+        title="Relay admin"
+        description="Manage your relay's platform layer: triage cross-community reports, review product feedback, and configure the relay operator roster. Auto-detected from your relay when available — otherwise open Advanced to paste the value of BUZZ_ADMIN_HOST from your relay config."
       />
       {pubkeyHex ? (
         <AdminConsoleSettingsSession key={pubkeyHex} pubkeyHex={pubkeyHex} />

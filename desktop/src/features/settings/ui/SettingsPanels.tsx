@@ -13,7 +13,7 @@ import {
   MessagesSquare,
   MonitorCog,
   Moon,
-  ShieldAlert,
+  ServerCog,
   Smartphone,
   Smile,
   Sun,
@@ -93,7 +93,7 @@ export type SettingsSection =
   | "shortcuts"
   | "hosted-communities"
   | "community-members"
-  | "moderation"
+  | "relay-admin"
   | "custom-emoji"
   | "local-archive"
   | "mobile"
@@ -113,7 +113,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "shortcuts",
   "hosted-communities",
   "community-members",
-  "moderation",
+  "relay-admin",
   "custom-emoji",
   "local-archive",
   "mobile",
@@ -209,9 +209,9 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     icon: Ticket,
   },
   {
-    value: "moderation",
-    label: "Moderation",
-    icon: ShieldAlert,
+    value: "relay-admin",
+    label: "Relay admin",
+    icon: ServerCog,
   },
   {
     value: "custom-emoji",
@@ -848,7 +848,7 @@ export function renderSettingsSection(
       return (
         <CommunityMembersSettingsCard currentPubkey={props.currentPubkey} />
       );
-    case "moderation":
+    case "relay-admin":
       return <AdminConsoleSettingsCard />;
     case "custom-emoji":
       return <CustomEmojiSettingsCard />;

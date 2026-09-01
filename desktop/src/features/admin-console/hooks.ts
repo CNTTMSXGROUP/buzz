@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { discoverAdminOrigin, getAdminOrigin } from "./api";
-import type { ModerationNavResolution } from "./nav";
+import type { RelayAdminNavResolution } from "./nav";
 
 export const moderationNavResolutionQueryKey = (
   pubkeyHex: string,
@@ -11,10 +11,10 @@ export const moderationNavResolutionQueryKey = (
 ) => ["moderationNavResolution", pubkeyHex, relayOrigin] as const;
 
 /**
- * Resolve the origin source that decides whether the Moderation nav entry is
+ * Resolve the origin source that decides whether the Relay admin nav entry is
  * visible. A saved manual origin wins outright; otherwise NIP-11 discovery is
  * attempted and, when it advertises an origin, the entry is shown so the
- * operator can open Moderation and confirm the pre-filled origin.
+ * operator can open Relay admin and confirm the pre-filled origin.
  *
  * The advertised origin is deliberately NOT probed here: it is untrusted
  * relay-advertised input, and probing it would send a signed NIP-98 credential
@@ -28,7 +28,7 @@ export const moderationNavResolutionQueryKey = (
  * known, so no verdict is computed against an unresolved relay.
  */
 export function useModerationNavResolution():
-  | ModerationNavResolution
+  | RelayAdminNavResolution
   | undefined {
   const { data: identity } = useIdentityQuery();
   const pubkeyHex = identity?.pubkey ?? "";
@@ -38,7 +38,7 @@ export function useModerationNavResolution():
     enabled: pubkeyHex.length > 0 && relayOrigin != null,
     queryKey: moderationNavResolutionQueryKey(pubkeyHex, relayOrigin),
     staleTime: 60_000,
-    queryFn: async (): Promise<ModerationNavResolution> => {
+    queryFn: async (): Promise<RelayAdminNavResolution> => {
       const saved = await getAdminOrigin(pubkeyHex);
       if (saved) {
         return { originSource: "saved" };

@@ -272,7 +272,11 @@ export function SetStatusDialog({
       baseline.customUntil !== null &&
       customUntil.getTime() !== baseline.customUntil.getTime());
   function expirationUnixSeconds(now = new Date()): number | undefined {
-    if (!durationTouched && baseline.hasExistingStatus) {
+    if (
+      !durationTouched &&
+      baseline.hasExistingStatus &&
+      baseline.expiresAt !== undefined
+    ) {
       return baseline.expiresAt;
     }
     const expiresAt = (() => {

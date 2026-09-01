@@ -279,6 +279,32 @@ test("can apply Today to an existing status without an expiration", async ({
   expect(Number(expiration)).toBeGreaterThan(nowSeconds);
 });
 
+test("applies Today when editing a legacy status without an expiration", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  await seedMockStatus(page, {
+    text: "Legacy indefinite status",
+    emoji: "♾️",
+    createdAt: nowSeconds,
+  });
+  await page.getByTestId("profile-popover-set-status").click();
+  const dialog = page.getByTestId("set-status-dialog");
+  await expect(page.getByTestId("set-status-duration")).toContainText("Today");
+  await dialog.getByTestId("set-status-input").fill("Legacy status edited");
+  await dialog.getByTestId("set-status-save").click();
+
+  const expiration = await page.evaluate(
+    () =>
+      window.__BUZZ_E2E_SIGNED_EVENTS__
+        ?.filter((event) => event.kind === 30315)
+        .at(-1)
+        ?.tags.find((tag) => tag[0] === "expiration")?.[1],
+  );
+  expect(Number(expiration)).toBeGreaterThan(nowSeconds);
+});
+
 test("preserves a minute-precision custom deadline when only text changes", async ({
   page,
 }) => {
@@ -402,13 +428,46 @@ test("shows status and huddle indicators beside chat names with tooltips", async
   await page.evaluate((pubkey) => {
     window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
       channelName: "alice-tyler",
-      content: JSON.stringify({ ephemeral_channel_id: "status-huddle" }),
+      content: JSON.stringify({
+        ephemeral_channel_id: "status-huddle",
+        generation: "status-generation",
+      }),
       id: "8".repeat(64),
       kind: 48100,
       pubkey,
     });
   }, MOCK_IDENTITY_PUBKEY);
   const huddleIndicator = row.getByTestId("user-huddle-indicator");
+  await expect(huddleIndicator).toHaveCount(0);
+
+  await waitForMockLiveSubscription(page, "alice-tyler", 48101);
+  await page.evaluate((relayPubkey) => {
+    const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+    emit?.({
+      channelName: "alice-tyler",
+      content: JSON.stringify({
+        admission_id: "status-admission",
+        ephemeral_channel_id: "status-huddle",
+        generation: "status-generation",
+        roster_revision: 1,
+      }),
+      extraTags: [["p", relayPubkey]],
+      id: "9".repeat(64),
+      kind: 48101,
+      pubkey: relayPubkey,
+    });
+    emit?.({
+      channelName: "alice-tyler",
+      content: JSON.stringify({
+        ephemeral_channel_id: "status-huddle",
+        generation: "status-generation",
+      }),
+      extraTags: [["d", "status-huddle"]],
+      id: "a".repeat(64),
+      kind: 48104,
+      pubkey: relayPubkey,
+    });
+  }, MOCK_IDENTITY_PUBKEY);
   await expect(huddleIndicator).toBeVisible();
   await expect(huddleIndicator).toHaveAttribute("aria-label", "🎧 In a huddle");
   await expect

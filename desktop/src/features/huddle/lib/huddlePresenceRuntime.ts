@@ -221,22 +221,26 @@ export function startHuddlePresenceRuntime(
       return;
     }
     const requestVersion = livenessRequestVersion;
+    const requestedSessionGenerations = new Map(activeSessionGenerations);
     try {
       const nextActiveSessionGenerations = await fetchActiveSessionIds([
-        ...activeSessionGenerations.keys(),
+        ...requestedSessionGenerations.keys(),
       ]);
       if (disposed) return;
       if (requestVersion !== livenessRequestVersion) {
-        const requestedGenerations = new Map(activeSessionGenerations);
+        const mergedGenerations = new Map(activeSessionGenerations);
         for (const [sessionId, generation] of nextActiveSessionGenerations) {
-          if (!requestedGenerations.has(sessionId)) continue;
-          requestedGenerations.set(sessionId, generation);
+          if (!requestedSessionGenerations.has(sessionId)) continue;
+          if (
+            activeSessionGenerations.get(sessionId) !==
+            requestedSessionGenerations.get(sessionId)
+          ) {
+            continue;
+          }
+          mergedGenerations.set(sessionId, generation);
         }
-        tracker.reconcileLiveness(
-          requestedGenerations,
-          activeSessionGenerations,
-        );
-        activeSessionGenerations = requestedGenerations;
+        tracker.reconcileLiveness(mergedGenerations, activeSessionGenerations);
+        activeSessionGenerations = mergedGenerations;
         dependencies.onPresence(
           tracker.snapshot(new Set(activeSessionGenerations.keys())),
         );

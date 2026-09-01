@@ -294,6 +294,48 @@ test("accepts lower revisions from a new relay room generation", () => {
   assert.equal(hydrated.has(CHARLIE), true);
 });
 
+test("rejects stale lifecycle events after liveness advances the generation", () => {
+  const tracker = new HuddlePresenceTracker(RELAY);
+  tracker.apply(event({ id: "1", kind: 48100 }));
+  tracker.apply(
+    participantEvent({
+      id: "2",
+      kind: 48101,
+      admissionId: "generation-1",
+      rosterRevision: 1,
+      generation: "generation-1",
+    }),
+  );
+  tracker.reconcileLiveness(
+    new Map([["room", "generation-2"]]),
+    new Map([["room", "generation-1"]]),
+  );
+  tracker.apply(
+    participantEvent({
+      id: "3",
+      kind: 48101,
+      admissionId: "generation-2",
+      rosterRevision: 1,
+      generation: "generation-2",
+      tags: [["p", CHARLIE]],
+    }),
+  );
+
+  assert.equal(
+    tracker.apply(
+      participantEvent({
+        id: "4",
+        kind: 48102,
+        admissionId: "generation-1",
+        rosterRevision: 2,
+        generation: "generation-1",
+      }),
+    ),
+    false,
+  );
+  assert.equal(tracker.snapshot().has(CHARLIE), true);
+});
+
 test("preserves distinct admissions that share one roster revision", () => {
   const events = [
     event({ id: "1", kind: 48100 }),

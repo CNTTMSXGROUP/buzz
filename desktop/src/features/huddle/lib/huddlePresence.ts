@@ -331,6 +331,9 @@ export class HuddlePresenceTracker {
       session.generation !== null &&
       generation !== session.generation
     ) {
+      if (event.kind === KIND_HUDDLE_PARTICIPANT_LEFT) return false;
+      // A relay-authenticated JOIN is affirmative proof of the current room
+      // generation. Teardown from an older socket must never roll it back.
       session.admissionsByParticipant.clear();
       session.legacyStateByParticipant.clear();
       session.departedAdmissions.clear();

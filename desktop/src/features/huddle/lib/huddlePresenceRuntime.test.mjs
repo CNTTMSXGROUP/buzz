@@ -447,6 +447,75 @@ test("keeps a live session added while an older liveness refresh is in flight", 
   dispose();
 });
 
+test("preserves a newer generation learned during an older liveness refresh", async () => {
+  let liveHandler;
+  let livenessTimer;
+  let resolveRefresh;
+  let livenessRequests = 0;
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) {
+        return [
+          event({ id: "start", kind: 48100, createdAt: 1 }),
+          participantEvent({
+            id: "old-join",
+            kind: 48101,
+            admissionId: "old-admission",
+            rosterRevision: 1,
+            generation: "generation-1",
+            createdAt: 2,
+          }),
+        ];
+      }
+      livenessRequests += 1;
+      if (livenessRequests === 1) {
+        return [livenessEvent("room", "generation-1")];
+      }
+      return new Promise((resolve) => {
+        resolveRefresh = resolve;
+      });
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => {
+      livenessTimer = callback;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
+  });
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), true);
+
+  livenessTimer();
+  await settle();
+  liveHandler(
+    participantEvent({
+      id: "new-join",
+      kind: 48101,
+      tags: [["p", CAROL]],
+      admissionId: "new-admission",
+      rosterRevision: 1,
+      generation: "generation-2",
+      createdAt: 3,
+    }),
+  );
+  assert.equal(snapshots.at(-1).has(CAROL), true);
+
+  resolveRefresh([livenessEvent("room", "generation-1")]);
+  await settle();
+  assert.equal(snapshots.at(-1).has(CAROL), true);
+  dispose();
+});
+
 test("retries a failed hydration and tears down every recovery path", async () => {
   let attempts = 0;
   let retry;

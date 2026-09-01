@@ -3078,7 +3078,17 @@ mod orchestrator_postgres_tests {
 
     /// Build a signed kind-9 event with an `h` channel tag.
     fn make_kind9_event(keys: &Keys, channel_id: Uuid) -> nostr::Event {
-        EventBuilder::new(Kind::from(9u16), "test message")
+        make_kind9_event_msg(keys, channel_id, "test message")
+    }
+
+    /// Build a signed kind-9 event with a specific content string and an `h` channel tag.
+    ///
+    /// Use distinct content strings for different calls within the same second: nostr
+    /// event IDs are deterministic over (pubkey, created_at, kind, tags, content), so two
+    /// calls with identical inputs in the same second produce the same event ID, which
+    /// triggers the step-3c `DuplicateEvent` precheck before the intended guard fires.
+    fn make_kind9_event_msg(keys: &Keys, channel_id: Uuid, content: &str) -> nostr::Event {
+        EventBuilder::new(Kind::from(9u16), content)
             .tag(Tag::custom(
                 nostr::TagKind::SingleLetter(nostr::SingleLetterTag {
                     character: nostr::Alphabet::H,
@@ -3145,7 +3155,7 @@ mod orchestrator_postgres_tests {
             .await
             .expect("orchestrator success path must not fail");
 
-        let (stored, _) = result;
+        let (stored, _, _) = result;
         // The returned event_id must match the submitted event.
         assert_eq!(
             stored.event.id, event.id,
@@ -3367,7 +3377,11 @@ mod orchestrator_postgres_tests {
                 let fx_channel_id = fx.channel_id;
                 let actor_clone = actor;
                 let deadline_clone = deadline;
-                let event = make_kind9_event(&keys, fx_channel_id);
+                let event = make_kind9_event_msg(
+                    &keys,
+                    fx_channel_id,
+                    &format!("concurrent-enrollment-msg-{i}"),
+                );
                 let assertion = make_assertion(deadline_clone);
                 let proof_event_id = [0x30u8 + i; 32]; // distinct proof per task
                 tokio::spawn(async move {
@@ -3613,7 +3627,10 @@ mod orchestrator_postgres_tests {
         // Second call: same actor, different proof_event_id.
         // The lifecycle_revision mismatch must be caught at authorize_protected_use_in_tx.
         let orch2 = make_orchestrator(db);
-        let event2 = make_kind9_event(&keys, fx.channel_id);
+        // Distinct content ensures a different event ID from event1 — same keys+channel
+        // within the same second would produce the same nostr event ID, firing step-3c
+        // DuplicateEvent before the lifecycle guard.
+        let event2 = make_kind9_event_msg(&keys, fx.channel_id, "lifecycle-advance-second-msg");
         let proof_event_id_2 = [0x41u8; 32];
         let result = orch2
             .commit_kind9_atomic(crate::nip_fi::Kind9Params {
@@ -3702,7 +3719,10 @@ mod orchestrator_postgres_tests {
         // proves the epoch UPDATE predicate matches every time.
         let orch2 = make_orchestrator(db);
         let proof_event_id_2 = [0x51u8; 32];
-        let event2 = make_kind9_event(&keys, fx.channel_id);
+        // Distinct content ensures a different event ID from event1 — same keys+channel
+        // within the same second would produce the same nostr event ID, firing step-3c
+        // DuplicateEvent before the epoch guard.
+        let event2 = make_kind9_event_msg(&keys, fx.channel_id, "epoch-guard-second-msg");
         let result = orch2
             .commit_kind9_atomic(crate::nip_fi::Kind9Params {
                 community_id: fx.community_id,
@@ -3779,7 +3799,9 @@ mod orchestrator_postgres_tests {
 
         // Second call: same proof_event_id — must fail with ProofReplayed.
         let orch2 = make_orchestrator(db);
-        let event2 = make_kind9_event(&keys, fx.channel_id);
+        // Distinct content ensures a different nostr event ID from event1: the proof-replay
+        // uniqueness guard (step 3d) must fire, not the step-3c DuplicateEvent precheck.
+        let event2 = make_kind9_event_msg(&keys, fx.channel_id, "proof-replay-second-msg");
         let result = orch2
             .commit_kind9_atomic(crate::nip_fi::Kind9Params {
                 community_id: fx.community_id,
@@ -4781,7 +4803,7 @@ mod orchestrator_postgres_tests {
 
         // Build a single signed event.
         let event = make_kind9_event(&keys, fx.channel_id);
-        let signed_event_id: [u8; 32] = event.id.to_bytes();
+        let _signed_event_id: [u8; 32] = event.id.to_bytes();
 
         // ── Invariant 1: deterministic_admission_op_id is stable ─────────────
         // Same inputs → same UUID, always.  This is the property UUID-v4 breaks.

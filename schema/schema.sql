@@ -3793,6 +3793,10 @@ CREATE TABLE project_state_heads (
     project_owner BYTEA NOT NULL CHECK (octet_length(project_owner) = 32),
     project_d_tag TEXT NOT NULL CHECK (project_d_tag <> ''),
     revision BIGINT NOT NULL CHECK (revision > 0),
+    projected_revision BIGINT NOT NULL DEFAULT 0
+        CHECK (projected_revision >= 0 AND projected_revision <= revision),
+    projection_pubkey BYTEA
+        CHECK (projection_pubkey IS NULL OR octet_length(projection_pubkey) = 32),
     deleted BOOLEAN NOT NULL DEFAULT FALSE,
     identity_event_id BYTEA NOT NULL CHECK (octet_length(identity_event_id) = 32),
     last_event_id BYTEA NOT NULL CHECK (octet_length(last_event_id) = 32),

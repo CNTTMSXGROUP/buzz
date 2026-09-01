@@ -2,14 +2,19 @@
 
 use std::collections::BTreeSet;
 
-use buzz_core::kind::{event_kind_u32, KIND_PROJECT, KIND_PROJECT_CHANGE};
+use buzz_core::kind::{event_kind_u32, KIND_PROJECT, KIND_PROJECT_CHANGE, KIND_PROJECT_STATE};
+use buzz_core::project_state::{
+    project_state_template, ProjectStateProjectionInput, ProjectStateTemplate,
+};
 use buzz_core::CommunityId;
-use nostr::Event;
+use nostr::{Event, EventId};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::event::insert_event_in_transaction;
-use crate::replaceable::event_replacement_lock_key;
+use crate::replaceable::{
+    event_replacement_lock_key, ParameterizedReplacePrecondition, ParameterizedReplaceStatus,
+};
 use crate::{Db, DbError, Result};
 
 const RELATED_CHANNEL_CAP: usize = 64;
@@ -67,6 +72,51 @@ pub enum ProjectChangeApplyResult {
     InvalidMutation(String),
     /// The current owner identity cannot be materialized as canonical v1 state.
     InvalidBase(String),
+}
+
+/// Coherent Project state awaiting a relay-signed kind:30623 projection.
+#[derive(Clone, Debug)]
+pub struct ProjectStateProjectionCandidate {
+    community_id: CommunityId,
+    template: ProjectStateTemplate,
+    previous_created_at: Option<u64>,
+    project_owner: Vec<u8>,
+    project_d_tag: String,
+    revision: i64,
+    identity_event_id: Vec<u8>,
+    change_event_id: Vec<u8>,
+    observed_projected_revision: i64,
+    observed_projection_pubkey: Option<Vec<u8>>,
+    projection_pubkey: Vec<u8>,
+}
+
+impl ProjectStateProjectionCandidate {
+    /// Community containing the Project.
+    #[must_use]
+    pub const fn community_id(&self) -> CommunityId {
+        self.community_id
+    }
+
+    /// Unsigned canonical fields the relay must timestamp and sign.
+    #[must_use]
+    pub const fn template(&self) -> &ProjectStateTemplate {
+        &self.template
+    }
+
+    /// Timestamp of the current live projection for this relay key, if any.
+    #[must_use]
+    pub const fn previous_created_at(&self) -> Option<u64> {
+        self.previous_created_at
+    }
+}
+
+/// Outcome of committing a relay-signed Project State projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectStateProjectionCommitResult {
+    /// The projection and durable retry marker committed atomically.
+    Committed,
+    /// Project state or projection ownership changed after the candidate loaded.
+    Stale,
 }
 
 fn tag_parts(tag: &serde_json::Value) -> Option<Vec<&str>> {
@@ -397,17 +447,336 @@ impl Db {
         tx.commit().await?;
         Ok(ProjectChangeApplyResult::Applied(snapshot))
     }
+
+    /// Load coherent Project states that require publication by `projection_pubkey`.
+    ///
+    /// A Project is pending when its relational revision has not been projected,
+    /// or when a relay-key rotation requires the same revision to be republished.
+    /// Every returned candidate is assembled while holding the Project coordinate
+    /// lock; [`Self::commit_project_state_projection`] rejects it if state changes
+    /// after this method returns.
+    pub async fn load_pending_project_state_projections(
+        &self,
+        projection_pubkey: &[u8],
+        limit: i64,
+    ) -> Result<Vec<ProjectStateProjectionCandidate>> {
+        if projection_pubkey.len() != 32 {
+            return Err(DbError::InvalidData(
+                "Project projection pubkey must be 32 bytes".into(),
+            ));
+        }
+        if !(1..=1_000).contains(&limit) {
+            return Err(DbError::InvalidData(
+                "Project projection candidate limit must be between 1 and 1000".into(),
+            ));
+        }
+        let coordinates = sqlx::query(
+            "SELECT head.community_id, head.project_owner, head.project_d_tag \
+             FROM project_state_heads head JOIN communities community ON community.id=head.community_id \
+             WHERE community.deletion_state='active' AND community.deleted_at IS NULL \
+               AND (head.projected_revision < head.revision \
+                    OR head.projection_pubkey IS DISTINCT FROM $1) \
+             ORDER BY head.updated_at, head.community_id, head.project_owner, head.project_d_tag \
+             LIMIT $2",
+        )
+        .bind(projection_pubkey)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut candidates = Vec::with_capacity(coordinates.len());
+        for coordinate in coordinates {
+            let community_id = CommunityId::from_uuid(coordinate.try_get("community_id")?);
+            let project_owner: Vec<u8> = coordinate.try_get("project_owner")?;
+            let project_d_tag: String = coordinate.try_get("project_d_tag")?;
+            if let Some(candidate) = self
+                .load_project_state_projection_candidate(
+                    community_id,
+                    &project_owner,
+                    &project_d_tag,
+                    projection_pubkey,
+                )
+                .await?
+            {
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
+    }
+
+    async fn load_project_state_projection_candidate(
+        &self,
+        community_id: CommunityId,
+        project_owner: &[u8],
+        project_d_tag: &str,
+        projection_pubkey: &[u8],
+    ) -> Result<Option<ProjectStateProjectionCandidate>> {
+        let mut tx = self.begin_transaction().await?;
+        let coordinate_lock = event_replacement_lock_key(
+            community_id,
+            KIND_PROJECT as i32,
+            project_owner,
+            Some(project_d_tag.as_bytes()),
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(coordinate_lock)
+            .execute(&mut *tx)
+            .await?;
+        let head = sqlx::query(
+            "SELECT revision, projected_revision, projection_pubkey, deleted, \
+                    identity_event_id, last_event_id \
+             FROM project_state_heads WHERE community_id=$1 AND project_owner=$2 \
+               AND project_d_tag=$3 FOR SHARE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(project_owner)
+        .bind(project_d_tag)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(head) = head else {
+            return Ok(None);
+        };
+        let revision: i64 = head.try_get("revision")?;
+        let projected_revision: i64 = head.try_get("projected_revision")?;
+        let observed_projection_pubkey: Option<Vec<u8>> = head.try_get("projection_pubkey")?;
+        if projected_revision == revision
+            && observed_projection_pubkey.as_deref() == Some(projection_pubkey)
+        {
+            return Ok(None);
+        }
+        let identity_event_id: Vec<u8> = head.try_get("identity_event_id")?;
+        let change_event_id: Vec<u8> = head.try_get("last_event_id")?;
+        let deleted: bool = head.try_get("deleted")?;
+        let identity_row = sqlx::query(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id \
+             FROM events WHERE community_id=$1 AND id=$2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&identity_event_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let identity_event = match identity_row {
+            Some(row) => {
+                crate::event::row_to_stored_event(row)?
+                    .ok_or_else(|| DbError::InvalidData("invalid Project identity event".into()))?
+                    .event
+            }
+            None => {
+                return Err(DbError::InvalidData(
+                    "Project state references a missing identity event".into(),
+                ))
+            }
+        };
+        let related_channels = sqlx::query_scalar::<_, Uuid>(
+            "SELECT channel_id FROM project_related_channels WHERE community_id=$1 \
+               AND project_owner=$2 AND project_d_tag=$3 ORDER BY channel_id",
+        )
+        .bind(community_id.as_uuid())
+        .bind(project_owner)
+        .bind(project_d_tag)
+        .fetch_all(&mut *tx)
+        .await?;
+        let change_id = EventId::from_hex(&hex::encode(&change_event_id))
+            .map_err(|error| DbError::InvalidData(format!("invalid Project change id: {error}")))?;
+        let coordinate = format!("30621:{}:{project_d_tag}", hex::encode(project_owner));
+        let template = project_state_template(ProjectStateProjectionInput {
+            coordinate: &coordinate,
+            revision,
+            identity_event: &identity_event,
+            change_event_id: &change_id,
+            deleted,
+            related_channels: &related_channels,
+        })
+        .map_err(|error| DbError::InvalidData(error.to_string()))?;
+        let projection_d_tag = projection_d_tag(&template)?;
+        let previous_created_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT created_at FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+               AND d_tag=$4 AND deleted_at IS NULL ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(KIND_PROJECT_STATE as i32)
+        .bind(projection_pubkey)
+        .bind(projection_d_tag)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let previous_created_at = previous_created_at
+            .map(|value| {
+                u64::try_from(value.timestamp()).map_err(|_| {
+                    DbError::InvalidData("Project projection has a negative timestamp".into())
+                })
+            })
+            .transpose()?;
+        tx.commit().await?;
+        Ok(Some(ProjectStateProjectionCandidate {
+            community_id,
+            template,
+            previous_created_at,
+            project_owner: project_owner.to_vec(),
+            project_d_tag: project_d_tag.to_owned(),
+            revision,
+            identity_event_id,
+            change_event_id,
+            observed_projected_revision: projected_revision,
+            observed_projection_pubkey,
+            projection_pubkey: projection_pubkey.to_vec(),
+        }))
+    }
+
+    /// Atomically publish a relay-signed projection and advance its retry marker.
+    ///
+    /// The candidate must be passed back unchanged. The Project coordinate is
+    /// locked before the projection replacement coordinate, and every observed
+    /// head field is revalidated before the event is stored.
+    pub async fn commit_project_state_projection(
+        &self,
+        candidate: &ProjectStateProjectionCandidate,
+        event: &Event,
+    ) -> Result<ProjectStateProjectionCommitResult> {
+        event.verify().map_err(|error| {
+            DbError::InvalidData(format!("invalid signed Project projection: {error}"))
+        })?;
+        if event_kind_u32(event) != KIND_PROJECT_STATE
+            || event.pubkey.to_bytes().as_slice() != candidate.projection_pubkey
+            || event.tags.as_slice() != candidate.template.tags
+            || event.content != candidate.template.content
+        {
+            return Err(DbError::InvalidData(
+                "signed Project projection does not match its candidate".into(),
+            ));
+        }
+        if candidate
+            .previous_created_at
+            .is_some_and(|previous| event.created_at.as_secs() <= previous)
+        {
+            return Err(DbError::InvalidData(
+                "Project projection timestamp must advance the live projection".into(),
+            ));
+        }
+        let projection_d_tag = projection_d_tag(&candidate.template)?;
+        let mut tx = self.begin_transaction().await?;
+        self.deletion_store()
+            .guard_transaction(&mut tx, candidate.community_id)
+            .await?;
+        let coordinate_lock = event_replacement_lock_key(
+            candidate.community_id,
+            KIND_PROJECT as i32,
+            &candidate.project_owner,
+            Some(candidate.project_d_tag.as_bytes()),
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(coordinate_lock)
+            .execute(&mut *tx)
+            .await?;
+        let head = sqlx::query(
+            "SELECT revision, projected_revision, projection_pubkey, identity_event_id, \
+                    last_event_id FROM project_state_heads WHERE community_id=$1 \
+               AND project_owner=$2 AND project_d_tag=$3 FOR UPDATE",
+        )
+        .bind(candidate.community_id.as_uuid())
+        .bind(&candidate.project_owner)
+        .bind(&candidate.project_d_tag)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(head) = head else {
+            return Ok(ProjectStateProjectionCommitResult::Stale);
+        };
+        let projection_pubkey: Option<Vec<u8>> = head.try_get("projection_pubkey")?;
+        let matches_candidate = head.try_get::<i64, _>("revision")? == candidate.revision
+            && head.try_get::<i64, _>("projected_revision")?
+                == candidate.observed_projected_revision
+            && projection_pubkey == candidate.observed_projection_pubkey
+            && head.try_get::<Vec<u8>, _>("identity_event_id")? == candidate.identity_event_id
+            && head.try_get::<Vec<u8>, _>("last_event_id")? == candidate.change_event_id;
+        if !matches_candidate {
+            return Ok(ProjectStateProjectionCommitResult::Stale);
+        }
+        let replaced = self
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                candidate.community_id,
+                event,
+                projection_d_tag,
+                None,
+                ParameterizedReplacePrecondition::Unconditional,
+            )
+            .await?;
+        if replaced.status != ParameterizedReplaceStatus::Inserted {
+            tx.rollback().await?;
+            return Ok(ProjectStateProjectionCommitResult::Stale);
+        }
+        sqlx::query(
+            "UPDATE project_state_heads SET projected_revision=$4, projection_pubkey=$5, \
+               updated_at=transaction_timestamp() WHERE community_id=$1 AND project_owner=$2 \
+               AND project_d_tag=$3",
+        )
+        .bind(candidate.community_id.as_uuid())
+        .bind(&candidate.project_owner)
+        .bind(&candidate.project_d_tag)
+        .bind(candidate.revision)
+        .bind(&candidate.projection_pubkey)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ProjectStateProjectionCommitResult::Committed)
+    }
+}
+
+fn projection_d_tag(template: &ProjectStateTemplate) -> Result<&str> {
+    template
+        .tags
+        .iter()
+        .find_map(|tag| match tag.as_slice() {
+            [name, value] if name == "d" => Some(value.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| DbError::InvalidData("Project projection template has no d tag".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use buzz_core::channel::{ChannelType, ChannelVisibility};
-    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
 
     use super::*;
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
+
+    async fn scratch_db(prefix: &str) -> (PgPool, PgPool, String) {
+        let database_url =
+            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let admin = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect admin database");
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .execute(&admin)
+            .await
+            .expect("create scratch database");
+        let slash = database_url.rfind('/').expect("database URL path");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&format!("{}/{name}", &database_url[..slash]))
+            .await
+            .expect("connect scratch database");
+        crate::migration::run_migrations(&pool)
+            .await
+            .expect("migrate scratch database");
+        (admin, pool, name)
+    }
+
+    async fn drop_scratch_db(admin: PgPool, pool: PgPool, name: &str) {
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop scratch database");
+    }
 
     fn command(
         actor: &Keys,
@@ -435,19 +804,25 @@ mod tests {
             .expect("sign command")
     }
 
+    fn projection(
+        candidate: &ProjectStateProjectionCandidate,
+        relay: &Keys,
+        created_at: u64,
+    ) -> Event {
+        EventBuilder::new(
+            candidate.template().kind,
+            candidate.template().content.clone(),
+        )
+        .tags(candidate.template().tags.clone())
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(relay)
+        .expect("sign projection")
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn transaction_enforces_authority_cas_replay_and_atomic_attribution() {
-        let database_url =
-            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&database_url)
-            .await
-            .expect("connect test database");
-        crate::migration::run_migrations(&pool)
-            .await
-            .expect("run migrations");
+        let (admin_pool, pool, scratch_name) = scratch_db("project_state").await;
         let db = Db::from_pool(pool.clone());
         let community = CommunityId::from_uuid(Uuid::new_v4());
         sqlx::query("INSERT INTO communities (id, host) VALUES ($1,$2)")
@@ -609,5 +984,115 @@ mod tests {
                 current_revision: 3
             }
         );
+
+        let relay_a = Keys::generate();
+        let relay_a_bytes = relay_a.public_key().to_bytes();
+        let candidates = db
+            .load_pending_project_state_projections(relay_a_bytes.as_slice(), 10)
+            .await
+            .expect("load initial pending projection");
+        assert_eq!(candidates.len(), 1);
+        let initial = candidates[0].clone();
+        assert_eq!(initial.previous_created_at(), None);
+        let initial_timestamp = Timestamp::now().as_secs();
+        let initial_event = projection(&initial, &relay_a, initial_timestamp);
+        assert_eq!(
+            db.commit_project_state_projection(&initial, &initial_event)
+                .await
+                .expect("commit initial projection"),
+            ProjectStateProjectionCommitResult::Committed
+        );
+        let marker: (i64, Vec<u8>) = sqlx::query_as(
+            "SELECT projected_revision, projection_pubkey FROM project_state_heads \
+             WHERE community_id=$1 AND project_owner=$2 AND project_d_tag='shared'",
+        )
+        .bind(community.as_uuid())
+        .bind(owner_bytes.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("read committed projection marker");
+        assert_eq!(marker, (3, relay_a_bytes.to_vec()));
+        assert!(db
+            .load_pending_project_state_projections(relay_a_bytes.as_slice(), 10)
+            .await
+            .expect("check settled projection")
+            .is_empty());
+
+        let relay_b = Keys::generate();
+        let relay_b_bytes = relay_b.public_key().to_bytes();
+        let rotation_candidate = db
+            .load_pending_project_state_projections(relay_b_bytes.as_slice(), 10)
+            .await
+            .expect("load key rotation projection")
+            .pop()
+            .expect("key rotation is pending");
+        assert_eq!(rotation_candidate.previous_created_at(), None);
+
+        let newest = Uuid::new_v4();
+        let next = command(&owner, &owner, "shared", 3, &[newest], &[]);
+        assert!(matches!(
+            db.apply_project_related_channel_change(
+                community,
+                &next,
+                ProjectRelatedChannelChange {
+                    project_owner: owner_bytes.as_slice(),
+                    project_d_tag: "shared",
+                    expected_revision: 3,
+                    add: &[newest],
+                    remove: &[],
+                },
+            )
+            .await
+            .expect("advance Project after candidate load"),
+            ProjectChangeApplyResult::Applied(ProjectStateSnapshot { revision: 4, .. })
+        ));
+        let stale_event = projection(&rotation_candidate, &relay_b, initial_timestamp + 1);
+        assert_eq!(
+            db.commit_project_state_projection(&rotation_candidate, &stale_event)
+                .await
+                .expect("reject stale projection"),
+            ProjectStateProjectionCommitResult::Stale
+        );
+        let pending = db
+            .load_pending_project_state_projections(relay_a_bytes.as_slice(), 10)
+            .await
+            .expect("reload advanced projection")
+            .pop()
+            .expect("advanced revision is pending");
+        assert_eq!(pending.previous_created_at(), Some(initial_timestamp));
+        let advanced_event = projection(&pending, &relay_a, initial_timestamp + 1);
+        assert_eq!(
+            db.commit_project_state_projection(&pending, &advanced_event)
+                .await
+                .expect("commit monotonic projection"),
+            ProjectStateProjectionCommitResult::Committed
+        );
+
+        let rotated = db
+            .load_pending_project_state_projections(relay_b_bytes.as_slice(), 10)
+            .await
+            .expect("reload key rotation")
+            .pop()
+            .expect("rotation remains pending");
+        let rotated_event = projection(&rotated, &relay_b, initial_timestamp + 2);
+        assert_eq!(
+            db.commit_project_state_projection(&rotated, &rotated_event)
+                .await
+                .expect("commit key rotation"),
+            ProjectStateProjectionCommitResult::Committed
+        );
+        let live_projection_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE community_id=$1 AND kind=$2 \
+               AND pubkey=$3 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(KIND_PROJECT_STATE as i32)
+        .bind(relay_b_bytes.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count rotated projection");
+        assert_eq!(live_projection_count, 1);
+
+        drop_scratch_db(admin_pool, pool, &scratch_name).await;
     }
 }

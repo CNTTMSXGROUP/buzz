@@ -54,7 +54,8 @@ pub use community::{
 pub use error::{DbError, Result};
 pub use event::{EventQuery, DEFAULT_MAX_PAGE_LIMIT};
 pub use project_state::{
-    ProjectChangeApplyResult, ProjectRelatedChannelChange, ProjectStateSnapshot,
+    ProjectChangeApplyResult, ProjectRelatedChannelChange, ProjectStateProjectionCandidate,
+    ProjectStateProjectionCommitResult, ProjectStateSnapshot,
 };
 pub use reaction::ReactionEventInsertOutcome;
 pub use reminder::DueReminder;

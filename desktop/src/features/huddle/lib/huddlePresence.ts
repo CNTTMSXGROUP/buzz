@@ -286,13 +286,14 @@ export class HuddlePresenceTracker {
     if (
       content.rosterRevision !== null &&
       session.latestRosterRevision !== null &&
-      content.rosterRevision <= session.latestRosterRevision &&
+      content.rosterRevision < session.latestRosterRevision &&
       isAfterLatestRosterEvent
     ) {
-      // Relay roster revisions are process-local and strictly increase for
-      // every mutation inside one room generation. A lower or repeated
-      // revision arriving after the latest authenticated roster event must
-      // therefore belong to a new generation, so prior admissions are dead.
+      // Relay roster revisions are process-local. A strictly lower revision
+      // arriving after the latest authenticated roster event starts a new room
+      // generation, so admissions from the previous relay process are dead.
+      // Equal revisions are valid: a remote join publishes a post-admission
+      // snapshot revision that can match a concurrent local mutation.
       session.admissionsByParticipant.clear();
       session.legacyStateByParticipant.clear();
       session.creatorPresent = false;

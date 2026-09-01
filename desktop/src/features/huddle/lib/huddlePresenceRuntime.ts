@@ -1,5 +1,6 @@
 import {
   applyHuddleLifecycleHistory,
+  compareHuddleLifecycleEvents,
   fetchHuddleLifecycleHistory,
   huddleSessionId,
   HuddlePresenceTracker,
@@ -254,6 +255,7 @@ export function startHuddlePresenceRuntime(
       const nextTracker = new HuddlePresenceTracker(
         dependencies.relaySelfPubkey,
       );
+      applyHuddleLifecycleHistory(nextTracker, history);
       if (pendingOverflowed) {
         pendingOverflowed = false;
         pendingLiveEvents = [];
@@ -262,11 +264,13 @@ export function startHuddlePresenceRuntime(
         reconcileAgain = true;
         return;
       }
-      applyHuddleLifecycleHistory(nextTracker, [
-        ...history,
-        ...pendingLiveEvents,
-      ]);
-      for (const event of pendingLiveEvents) {
+      // The liveness snapshot is authoritative for which persisted sessions are
+      // current. Replaying buffered events against a fresh tracker still gates
+      // each active-set mutation on the tracker's signer/session validation.
+      for (const event of [...pendingLiveEvents].sort(
+        compareHuddleLifecycleEvents,
+      )) {
+        if (!nextTracker.apply(event)) continue;
         const sessionId = huddleSessionId(event);
         if (!sessionId) continue;
         if (event.kind === KIND_HUDDLE_ENDED) {

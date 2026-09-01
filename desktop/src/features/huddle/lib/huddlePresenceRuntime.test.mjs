@@ -359,6 +359,57 @@ test("retries a failed hydration and tears down every recovery path", async () =
   assert.equal(attempts, 2);
 });
 
+test("does not let rejected lifecycle events reopen a dead room", async () => {
+  let liveHandler;
+  let resolveHistory;
+  const snapshots = [];
+  const history = [
+    event({ id: "1", kind: 48100 }),
+    participantEvent({
+      id: "2",
+      kind: 48101,
+      admissionId: "old",
+      rosterRevision: 1,
+    }),
+  ];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async (filter) => {
+      if (filter.kinds?.includes(48104)) return [];
+      return new Promise((resolve) => {
+        resolveHistory = resolve;
+      });
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => callback,
+    clearLivenessTimer: () => {},
+  });
+  await settle();
+
+  const forgedJoin = event({
+    id: "3",
+    kind: 48101,
+    pubkey: ALICE,
+    tags: [["p", BOB]],
+    admissionId: "forged",
+    rosterRevision: 2,
+  });
+  liveHandler(forgedJoin);
+  resolveHistory(history);
+  await settle();
+  assert.deepEqual([...snapshots.at(-1)], []);
+
+  liveHandler(forgedJoin);
+  assert.deepEqual([...snapshots.at(-1)], []);
+  dispose();
+});
+
 test("fails closed when persisted lifecycle has no authoritative live room", async () => {
   const snapshots = [];
   const dispose = startHuddlePresenceRuntime({

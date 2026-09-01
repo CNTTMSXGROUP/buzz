@@ -292,7 +292,37 @@ test("accepts lower revisions from a new relay room generation", () => {
   assert.equal(hydrated.has(CHARLIE), true);
 });
 
-test("retires old admissions when a restarted room repeats revision one", () => {
+test("preserves distinct admissions that share one roster revision", () => {
+  const events = [
+    event({ id: "1", kind: 48100 }),
+    participantEvent({
+      id: "2",
+      kind: 48101,
+      admissionId: "charlie-local",
+      rosterRevision: 3,
+      tags: [["p", CHARLIE]],
+    }),
+    participantEvent({
+      id: "3",
+      kind: 48101,
+      admissionId: "bob-remote",
+      rosterRevision: 3,
+    }),
+  ];
+
+  const tracker = new HuddlePresenceTracker(RELAY);
+  for (const item of events) tracker.apply(item);
+  assert.equal(tracker.snapshot().has(ALICE), true);
+  assert.equal(tracker.snapshot().has(BOB), true);
+  assert.equal(tracker.snapshot().has(CHARLIE), true);
+
+  const hydrated = reconstructHuddlePresence(events, RELAY);
+  assert.equal(hydrated.has(ALICE), true);
+  assert.equal(hydrated.has(BOB), true);
+  assert.equal(hydrated.has(CHARLIE), true);
+});
+
+test("does not infer a room restart from a repeated roster revision", () => {
   const events = [
     event({ id: "1", kind: 48100 }),
     participantEvent({
@@ -324,11 +354,11 @@ test("retires old admissions when a restarted room repeats revision one", () => 
 
   const tracker = new HuddlePresenceTracker(RELAY);
   for (const item of events) tracker.apply(item);
-  assert.equal(tracker.snapshot().has(BOB), false);
+  assert.equal(tracker.snapshot().has(BOB), true);
   assert.equal(tracker.snapshot().has(CHARLIE), true);
 
   const hydrated = reconstructHuddlePresence(events, RELAY);
-  assert.equal(hydrated.has(BOB), false);
+  assert.equal(hydrated.has(BOB), true);
   assert.equal(hydrated.has(CHARLIE), true);
 });
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { ProjectRevisionPublicationError } from "./projectRelatedChannelRevision.ts";
 import { addProjectChannel } from "./useAddProjectChannel.ts";
 
 const OWNER = "a".repeat(64);
@@ -16,6 +17,7 @@ function makeProject(overrides = {}) {
     createdAt: 100,
     projectChannelId: "11111111-1111-4111-8111-111111111111",
     relatedChannelIds: [],
+    baseRevisionId: "f".repeat(64),
     effectiveRevisionId: "f".repeat(64),
     status: "active",
     projectAddress: `30621:${OWNER}:platform`,
@@ -142,6 +144,111 @@ test("addProjectChannel removes its channel when project publication fails", asy
 
   assert.equal(fetchCalls, 2);
   assert.deepEqual(deleted, [CREATED_CHANNEL]);
+});
+
+test("addProjectChannel keeps the channel when a lost acknowledgement is reconciled", async () => {
+  const liveHead = makeLiveHead(100);
+  const revision = {
+    id: "e".repeat(64),
+    kind: 47001,
+    pubkey: "b".repeat(64),
+    created_at: 101,
+    content: "",
+    tags: [],
+  };
+  const deleted = [];
+  let liveFetches = 0;
+
+  const result = await addProjectChannel(input(), {
+    applyAgents: async () => {},
+    applyCanvas: async () => {},
+    createChannel: async () => ({ id: CREATED_CHANNEL }),
+    deleteChannel: async (channelId) => deleted.push(channelId),
+    fetchEvents: async () => {
+      liveFetches += 1;
+      return [liveHead];
+    },
+    fetchRevisionHeads: async () => [revision],
+    publishRevision: async () => {
+      throw new ProjectRevisionPublicationError(
+        revision,
+        new Error("confirmation timed out"),
+      );
+    },
+  });
+
+  assert.equal(liveFetches, 2);
+  assert.deepEqual(deleted, []);
+  assert.deepEqual(result.project.relatedChannelIds, [CREATED_CHANNEL]);
+  assert.equal(result.project.effectiveRevisionId, revision.id);
+});
+
+test("addProjectChannel cleans up when reconciliation confirms rejection", async () => {
+  const liveHead = makeLiveHead(100);
+  const revision = {
+    id: "e".repeat(64),
+    kind: 47001,
+    pubkey: "b".repeat(64),
+    created_at: 101,
+    content: "",
+    tags: [],
+  };
+  const deleted = [];
+
+  await assert.rejects(
+    addProjectChannel(input(), {
+      applyAgents: async () => {},
+      applyCanvas: async () => {},
+      createChannel: async () => ({ id: CREATED_CHANNEL }),
+      deleteChannel: async (channelId) => deleted.push(channelId),
+      fetchEvents: async () => [liveHead],
+      fetchRevisionHeads: async () => [],
+      publishRevision: async () => {
+        throw new ProjectRevisionPublicationError(
+          revision,
+          new Error("relay rejected revision"),
+        );
+      },
+    }),
+    /relay rejected revision/,
+  );
+
+  assert.deepEqual(deleted, [CREATED_CHANNEL]);
+});
+
+test("addProjectChannel preserves the channel when reconciliation is unavailable", async () => {
+  const liveHead = makeLiveHead(100);
+  const revision = {
+    id: "e".repeat(64),
+    kind: 47001,
+    pubkey: "b".repeat(64),
+    created_at: 101,
+    content: "",
+    tags: [],
+  };
+  const deleted = [];
+
+  await assert.rejects(
+    addProjectChannel(input(), {
+      applyAgents: async () => {},
+      applyCanvas: async () => {},
+      createChannel: async () => ({ id: CREATED_CHANNEL }),
+      deleteChannel: async (channelId) => deleted.push(channelId),
+      fetchEvents: async () => [liveHead],
+      fetchRevisionHeads: async () => {
+        throw new Error("relay unavailable");
+      },
+      publishRevision: async () => {
+        throw new ProjectRevisionPublicationError(
+          revision,
+          new Error("confirmation timed out"),
+        );
+      },
+    }),
+    /new channel was kept/,
+  );
+
+  assert.deepEqual(deleted, []);
 });
 
 test("addProjectChannel publishes an actor-signed revision and advances the local CAS head", async () => {

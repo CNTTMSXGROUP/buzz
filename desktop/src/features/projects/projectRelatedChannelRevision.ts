@@ -11,6 +11,23 @@ export type ProjectRelatedChannelOperation =
   | "add-related-channel"
   | "remove-related-channel";
 
+/** A signed revision whose relay publication outcome must be reconciled. */
+export class ProjectRevisionPublicationError extends Error {
+  readonly event: RelayEvent;
+  readonly publicationError: unknown;
+
+  constructor(event: RelayEvent, publicationError: unknown) {
+    super(
+      publicationError instanceof Error
+        ? publicationError.message
+        : "Could not publish the Project channel change.",
+    );
+    this.name = "ProjectRevisionPublicationError";
+    this.event = event;
+    this.publicationError = publicationError;
+  }
+}
+
 export function buildProjectRelatedChannelRevisionTemplate(
   project: Pick<
     Project,
@@ -117,11 +134,15 @@ export async function publishProjectRelatedChannelRevision(
     return result.event;
   }
   const event = await (deps?.signEvent ?? signRelayEvent)(template);
-  await (deps?.publishEvent ?? relayClient.publishEvent.bind(relayClient))(
-    event,
-    "Could not confirm the Project channel change. Refresh before retrying.",
-    "Could not change the Project's related channels.",
-  );
+  try {
+    await (deps?.publishEvent ?? relayClient.publishEvent.bind(relayClient))(
+      event,
+      "Could not confirm the Project channel change. Refresh before retrying.",
+      "Could not change the Project's related channels.",
+    );
+  } catch (error) {
+    throw new ProjectRevisionPublicationError(event, error);
+  }
   return event;
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertProjectRepositoryWriteCurrent,
   buildRepositoryChannelBindingTemplate,
   buildProjectPatchTemplate,
   buildAddedRepositoryEventTemplatesFromHead,
@@ -9,6 +10,64 @@ import {
 import { validateProjectEventEnvelope } from "./projectModels.ts";
 
 const OWNER = "a".repeat(64);
+
+function currentProject(overrides = {}) {
+  return {
+    baseRevisionId: "e".repeat(64),
+    effectiveRevisionId: "e".repeat(64),
+    projectAddress: `30621:${OWNER}:platform`,
+    ...overrides,
+  };
+}
+
+function currentProjectHead(overrides = {}) {
+  return {
+    id: "e".repeat(64),
+    kind: 30621,
+    pubkey: OWNER,
+    created_at: 100,
+    content: "",
+    tags: [["d", "platform"]],
+    sig: "0".repeat(128),
+    ...overrides,
+  };
+}
+
+test("repository writes reject a changed live base even at the same timestamp", () => {
+  assert.throws(
+    () =>
+      assertProjectRepositoryWriteCurrent({
+        liveHead: currentProjectHead({ id: "d".repeat(64) }),
+        project: currentProject(),
+        revisionHeads: [],
+      }),
+    /updated by another session/,
+  );
+});
+
+test("repository writes reject a concurrently advanced collaborative head", () => {
+  const revision = {
+    id: "c".repeat(64),
+    kind: 47_001,
+    pubkey: "b".repeat(64),
+    created_at: 101,
+    content: "",
+    tags: [
+      ["a", `30621:${OWNER}:platform`],
+      ["base", "e".repeat(64)],
+    ],
+    sig: "0".repeat(128),
+  };
+  assert.throws(
+    () =>
+      assertProjectRepositoryWriteCurrent({
+        liveHead: currentProjectHead(),
+        project: currentProject(),
+        revisionHeads: [revision],
+      }),
+    /channels were updated by another session/,
+  );
+});
 
 test("buildRepositoryChannelBindingTemplate preserves repository metadata", () => {
   const repository = {

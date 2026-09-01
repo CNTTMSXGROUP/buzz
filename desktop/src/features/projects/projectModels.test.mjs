@@ -332,6 +332,7 @@ test("addRepositoryToProject promotes a legacy repository route to a project coo
   assert.equal(updated.id, `30621:${PROJECT_OWNER}:sprout`);
   assert.equal(updated.legacy, false);
   assert.equal(updated.repositories.length, 2);
+  assert.equal(updated.baseRevisionId, "f".repeat(64));
   assert.equal(updated.effectiveRevisionId, "f".repeat(64));
 });
 

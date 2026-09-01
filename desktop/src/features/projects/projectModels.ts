@@ -615,8 +615,9 @@ export function addRepositoryToProject(
   project: Project,
   repository: Repository,
   createdAt: number,
-  effectiveRevisionId = project.effectiveRevisionId,
+  replacementEventId: string,
 ): Project {
+  const normalizedReplacementEventId = replacementEventId.toLowerCase();
   const projectAddress = `${KIND_PROJECT_ANNOUNCEMENT}:${project.owner}:${project.dtag}`;
   const repositoryAddresses = [
     ...new Set([...project.repositoryAddresses, repository.repoAddress]),
@@ -632,7 +633,8 @@ export function addRepositoryToProject(
     ...project,
     id: projectAddress,
     createdAt,
-    effectiveRevisionId,
+    baseRevisionId: normalizedReplacementEventId,
+    effectiveRevisionId: normalizedReplacementEventId,
     legacy: false,
     projectAddress,
     primaryRepositoryAddress:

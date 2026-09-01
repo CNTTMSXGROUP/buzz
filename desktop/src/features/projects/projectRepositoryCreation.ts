@@ -1,5 +1,5 @@
 import type { RelayEvent } from "@/shared/api/types";
-import type { Repository } from "@/features/projects/hooks";
+import type { Project, Repository } from "@/features/projects/hooks";
 import {
   isValidProjectChannelId,
   MAX_PROJECT_MEMBERS,
@@ -9,6 +9,7 @@ import {
 } from "@/features/projects/projectModels";
 import {
   KIND_PROJECT_ANNOUNCEMENT,
+  KIND_PROJECT_REVISION,
   KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
 import type { ProjectEventTemplate } from "./projectCreation";
@@ -124,6 +125,52 @@ function buildProjectPatchTemplate({
 }
 
 export { buildProjectPatchTemplate };
+
+/** Reject owner replacements built from a stale base or collaborative head. */
+export function assertProjectRepositoryWriteCurrent({
+  project,
+  liveHead,
+  revisionHeads,
+}: {
+  project: Pick<
+    Project,
+    "baseRevisionId" | "effectiveRevisionId" | "projectAddress"
+  >;
+  liveHead: RelayEvent;
+  revisionHeads: RelayEvent[];
+}): void {
+  const baseRevisionId = project.baseRevisionId?.toLowerCase();
+  const effectiveRevisionId = project.effectiveRevisionId?.toLowerCase();
+  const liveBaseId = liveHead.id.toLowerCase();
+  if (!baseRevisionId || liveBaseId !== baseRevisionId) {
+    throw new Error(
+      "This project was updated by another session while you were working. Refresh and try again.",
+    );
+  }
+  if (revisionHeads.length > 1) {
+    throw new Error("The relay returned multiple current Project revisions.");
+  }
+  const revisionHead = revisionHeads[0];
+  if (revisionHead) {
+    const coordinate = revisionHead.tags.find((tag) => tag[0] === "a")?.[1];
+    const signedBase = revisionHead.tags.find((tag) => tag[0] === "base")?.[1];
+    if (
+      revisionHead.kind !== KIND_PROJECT_REVISION ||
+      coordinate !== project.projectAddress ||
+      signedBase?.toLowerCase() !== liveBaseId
+    ) {
+      throw new Error(
+        "The relay returned an invalid current Project revision.",
+      );
+    }
+  }
+  const liveEffectiveId = (revisionHead?.id ?? liveHead.id).toLowerCase();
+  if (!effectiveRevisionId || liveEffectiveId !== effectiveRevisionId) {
+    throw new Error(
+      "This project's channels were updated by another session. Refresh and try again.",
+    );
+  }
+}
 
 export function buildRepositoryChannelBindingTemplate({
   channelId,

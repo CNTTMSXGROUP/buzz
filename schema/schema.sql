@@ -3803,3 +3803,22 @@ CREATE TABLE project_revision_heads (
 );
 
 SELECT attach_community_write_fence('project_revision_heads');
+
+-- Actor-signed Project revisions are an immutable audit trail. Enforce this
+-- below the relay process so older pods cannot soft-delete kind 47001 during a
+-- rolling deployment.
+CREATE FUNCTION guard_project_revision_soft_delete() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'kind 47001 Project revisions are immutable'
+        USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_guard_project_revision_soft_delete
+    BEFORE UPDATE OF deleted_at ON events
+    FOR EACH ROW
+    WHEN (
+        OLD.kind = 47001
+        AND OLD.deleted_at IS DISTINCT FROM NEW.deleted_at
+    )
+    EXECUTE FUNCTION guard_project_revision_soft_delete();

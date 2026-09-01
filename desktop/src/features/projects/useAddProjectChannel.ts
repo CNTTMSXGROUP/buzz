@@ -9,8 +9,12 @@ import { useApplyTemplate } from "@/features/channel-templates/useApplyTemplate"
 import { type Project, projectsQueryKey } from "@/features/projects/hooks";
 import { isUnsupportedProjectKindError } from "@/features/projects/projectCreation";
 import { addRelatedChannelToProject } from "@/features/projects/projectModels";
-import { publishProjectRelatedChannelRevision } from "@/features/projects/projectRelatedChannelRevision";
+import {
+  ProjectRevisionPublicationError,
+  publishProjectRelatedChannelRevision,
+} from "@/features/projects/projectRelatedChannelRevision";
 import { markProjectDataAuthoritative } from "@/features/projects/projectSnapshot";
+import { getProjectRevisionHeads } from "@/shared/api/projectRevisions";
 import { relayClient } from "@/shared/api/relayClient";
 import { deleteChannel as deleteChannelApi } from "@/shared/api/tauriChannels";
 import type {
@@ -46,6 +50,7 @@ export async function addProjectChannel(
     createChannel: ReturnType<typeof useCreateChannelMutation>["mutateAsync"];
     deleteChannel?: typeof deleteChannelApi;
     fetchEvents?: typeof relayClient.fetchEvents;
+    fetchRevisionHeads?: typeof getProjectRevisionHeads;
     publishRevision?: typeof publishProjectRelatedChannelRevision;
   },
 ): Promise<{ channel: Channel; project: Project }> {
@@ -55,6 +60,7 @@ export async function addProjectChannel(
     createChannel,
     deleteChannel = deleteChannelApi,
     fetchEvents = relayClient.fetchEvents.bind(relayClient),
+    fetchRevisionHeads = getProjectRevisionHeads,
     publishRevision = publishProjectRelatedChannelRevision,
   } = deps;
   const targetOwner = input.project.owner.toLowerCase();
@@ -131,17 +137,57 @@ export async function addProjectChannel(
         controlledSigner,
       )
     : publishRevision(input.project, channel.id, "add-related-channel");
-  const revision: RelayEvent = await revisionPromise.catch((error: unknown) =>
-    removeCreatedChannelAndThrow(
-      isUnsupportedProjectKindError(error)
-        ? new Error(
-            "This relay does not support collaborative Project channels yet, so the channel could not be linked.",
-          )
-        : error instanceof Error
-          ? error
-          : new Error("Could not link the channel to this project."),
-    ),
-  );
+  let revision: RelayEvent | undefined;
+  try {
+    revision = await revisionPromise;
+  } catch (error) {
+    if (error instanceof ProjectRevisionPublicationError) {
+      let storedRevision: RelayEvent | undefined;
+      try {
+        [storedRevision] = await fetchRevisionHeads([
+          input.project.projectAddress,
+        ]);
+      } catch (reconciliationError) {
+        throw new AggregateError(
+          [error, reconciliationError],
+          "Buzz could not confirm whether the Project channel change was accepted. The new channel was kept; refresh the Project before retrying.",
+        );
+      }
+      const currentHeadIncludesChannel = storedRevision?.tags.some(
+        (tag) =>
+          tag[0] === "buzz-related-channel" &&
+          tag[1]?.toLowerCase() === channel.id.toLowerCase(),
+      );
+      if (
+        storedRevision &&
+        (storedRevision.id.toLowerCase() === error.event.id.toLowerCase() ||
+          currentHeadIncludesChannel)
+      ) {
+        revision = storedRevision;
+      } else {
+        await removeCreatedChannelAndThrow(
+          isUnsupportedProjectKindError(error)
+            ? new Error(
+                "This relay does not support collaborative Project channels yet, so the channel could not be linked.",
+              )
+            : error,
+        );
+      }
+    } else {
+      await removeCreatedChannelAndThrow(
+        isUnsupportedProjectKindError(error)
+          ? new Error(
+              "This relay does not support collaborative Project channels yet, so the channel could not be linked.",
+            )
+          : error instanceof Error
+            ? error
+            : new Error("Could not link the channel to this project."),
+      );
+    }
+  }
+  if (!revision) {
+    throw new Error("Could not reconcile the Project channel change.");
+  }
 
   await applyCanvas(input.templateId, channel.id, input.name);
   void applyAgents(input.templateId, channel.id);

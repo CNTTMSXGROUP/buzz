@@ -13,7 +13,10 @@ import * as React from "react";
 import { presentContextCount } from "@/features/projects/lib/projectHomeSummary";
 import type { ProjectHomeWorkspaceSheetTab } from "@/features/projects/lib/projectHomeWorkspaceSheet";
 import { resolveProjectDefaultBranch } from "@/features/projects/lib/projectBranches";
-import { listProjectBoundChannels } from "@/features/projects/lib/projectRelatedChannels";
+import {
+  isExplicitProjectRelatedChannel,
+  listProjectBoundChannels,
+} from "@/features/projects/lib/projectRelatedChannels";
 import {
   useProjectActivitySummariesQuery,
   useProjectRepoSnapshotQuery,
@@ -368,7 +371,8 @@ export function ProjectHomeContextPanel({
                     : () => onOpenChannel(binding.channel.id)
                 }
                 onRemove={
-                  !isHome && channelManagementAccess.canManage
+                  isExplicitProjectRelatedChannel(binding) &&
+                  channelManagementAccess.canManage
                     ? () =>
                         removeProjectChannelMutation.mutate({
                           channelId: binding.channel.id,

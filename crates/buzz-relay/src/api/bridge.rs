@@ -1452,7 +1452,7 @@ async fn query_events_authed(
     // skips and the `before_id` BAD_REQUEST are decided here, before any DB
     // work is issued (validation errors are deterministic client mistakes, so
     // surfacing them ahead of transient DB errors is strictly more predictable).
-    let mut catchall_queries: Vec<(usize, buzz_db::EventQuery)> = Vec::new();
+    let mut catchall_queries: Vec<(usize, buzz_db::EventQuery, bool)> = Vec::new();
     for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
         if handled.contains(&idx) {
             continue;
@@ -1471,13 +1471,13 @@ async fn query_events_authed(
             tenant.community(),
         )
         .await;
-        if let Some(projects) = extract_project_revision_head_projects(raw)
-            .map_err(|message| api_error(StatusCode::BAD_REQUEST, message))?
-        {
+        let project_revision_head_projects = extract_project_revision_head_projects(raw)
+            .map_err(|message| api_error(StatusCode::BAD_REQUEST, message))?;
+        if let Some(projects) = &project_revision_head_projects {
             query.ids = Some(
                 state
                     .db
-                    .project_revision_head_event_ids(tenant.community(), &projects)
+                    .project_revision_head_event_ids(tenant.community(), projects)
                     .await
                     .map_err(|error| {
                         internal_error(&format!("Project revision head lookup: {error}"))
@@ -1531,7 +1531,7 @@ async fn query_events_authed(
             query.offset = Some(offset);
         }
 
-        catchall_queries.push((idx, query));
+        catchall_queries.push((idx, query, project_revision_head_projects.is_some()));
     }
 
     // Phase 2 — DB reads, bounded-concurrent, order-preserving (`buffered`).
@@ -1539,10 +1539,19 @@ async fn query_events_authed(
     // and error semantics match the previous serial loop.
     use futures_util::stream::{self, StreamExt};
     let db = state.db.clone();
-    let mut catchall_results = stream::iter(catchall_queries.into_iter().map(|(idx, query)| {
-        let db = db.clone();
-        async move { (idx, db.query_events_routed("bridge_query", &query).await) }
-    }))
+    let mut catchall_results = stream::iter(catchall_queries.into_iter().map(
+        |(idx, query, writer_only)| {
+            let db = db.clone();
+            async move {
+                let result = if writer_only {
+                    db.query_events(&query).await
+                } else {
+                    db.query_events_routed("bridge_query", &query).await
+                };
+                (idx, result)
+            }
+        },
+    ))
     .buffered(crate::handlers::req::FILTER_QUERY_CONCURRENCY);
 
     // Phase 3 — post-processing, strictly in filter order.

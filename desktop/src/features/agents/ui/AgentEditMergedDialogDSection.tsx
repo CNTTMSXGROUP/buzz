@@ -33,6 +33,7 @@ import { PersonaModelCombobox } from "./PersonaModelCombobox";
 import { PersonaProviderApiKeyField } from "./PersonaProviderApiKeyField";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
 import { EnvVarsEditor, type EnvVarsValue } from "./EnvVarsEditor";
+import { AgentIdentityFields } from "./AgentDescriptionField";
 import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 import {
   BuzzAgentModelTuningFields,
@@ -66,6 +67,8 @@ export type AgentEditMergedDSectionProps = {
   // Identity
   displayName: string;
   onDisplayNameChange: (value: string) => void;
+  description: string;
+  onDescriptionChange: (value: string) => void;
   // Behavior
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
@@ -128,6 +131,8 @@ export function AgentEditMergedDSection({
   isSaving,
   displayName,
   onDisplayNameChange,
+  description,
+  onDescriptionChange,
   systemPrompt,
   onSystemPromptChange,
   namePoolText,
@@ -229,34 +234,16 @@ export function AgentEditMergedDSection({
 
   return (
     <>
-      {/* Agent name — definition (shared across all linked instances) */}
-      <div className="space-y-1.5">
-        <label
-          className="text-sm font-medium text-foreground"
-          htmlFor="edit-agent-display-name"
-        >
-          Agent name (shared definition)
-        </label>
-        <div
-          className={cn(
-            "flex min-h-11 items-center px-3",
-            PERSONA_FIELD_SHELL_CLASS,
-          )}
-        >
-          <Input
-            autoCorrect="off"
-            className={cn(
-              "h-8 px-0 py-0 leading-6",
-              PERSONA_FIELD_CONTROL_CLASS,
-            )}
-            disabled={isSaving || !fieldEditable("displayName")}
-            id="edit-agent-display-name"
-            onChange={(e) => onDisplayNameChange(e.target.value)}
-            placeholder="Agent name"
-            value={displayName}
-          />
-        </div>
-      </div>
+      {/* Identity: agent name + public description (definition-shared D-fields).
+           Uses AgentIdentityFields to match the create dialog's clamp/counter
+           semantics — see AgentDescriptionField.tsx and #7126. */}
+      <AgentIdentityFields
+        description={description}
+        disabled={isSaving || !fieldEditable("displayName")}
+        displayName={displayName}
+        onDescriptionChange={onDescriptionChange}
+        onDisplayNameChange={onDisplayNameChange}
+      />
 
       {/* System prompt */}
       <div className="space-y-1.5">

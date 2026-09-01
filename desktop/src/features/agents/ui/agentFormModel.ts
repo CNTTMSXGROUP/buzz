@@ -106,6 +106,8 @@ export type AgentFormModel = {
   // Identity (D when linked, I when unlinked)
   displayName: string;
   avatarUrl: string;
+  /** Optional short, public description (max 280 chars). Empty string = no description. */
+  description: string;
 
   // Behavior — D when linked for prompt; respondTo/parallelism always I when instance present
   systemPrompt: string;
@@ -176,6 +178,7 @@ export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
   // Identity
   displayName: "definition",
   avatarUrl: "definition",
+  description: "definition",
   // Behavior
   systemPrompt: "definition",
   respondTo: "instance", // rows 9–10: I when instance present, D in definition-only
@@ -361,6 +364,7 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
   // D-fields: from definition when present, else from instance
   const displayName = def?.displayName ?? inst?.name ?? "";
   const avatarUrl = def?.avatarUrl ?? inst?.avatarUrl ?? "";
+  const description = def?.description ?? "";
   const systemPrompt = def?.systemPrompt ?? inst?.systemPrompt ?? "";
   // Rows 9–10: respondTo/allowlist/parallelism seed from INSTANCE when present;
   // only fall back to definition default in definition-only (zero-instance) context.
@@ -408,6 +412,7 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
   return {
     displayName,
     avatarUrl,
+    description,
     systemPrompt,
     respondTo,
     respondToAllowlist,
@@ -469,6 +474,8 @@ export function emitAgentFormDiff(
         next.displayName.trim() !== saved.displayName.trim()) ||
       (isD("avatarUrl") &&
         (next.avatarUrl ?? "") !== (saved.avatarUrl ?? "")) ||
+      (isD("description") &&
+        (next.description ?? "") !== (saved.description ?? "")) ||
       (isD("systemPrompt") &&
         next.systemPrompt.trim() !== saved.systemPrompt.trim()) ||
       (isD("runtime") && next.runtime !== saved.runtime) ||
@@ -497,6 +504,7 @@ export function emitAgentFormDiff(
         id: def.id,
         displayName: next.displayName.trim(),
         avatarUrl: next.avatarUrl ?? "",
+        description: next.description || undefined,
         systemPrompt: next.systemPrompt.trim(),
         runtime: next.runtime,
         model: next.model ?? undefined,

@@ -95,6 +95,19 @@ pub async fn update_persona_and_publish(
     input: crate::managed_agents::UpdatePersonaRequest,
     app: AppHandle,
 ) -> Result<SetPersonaSharedResult, String> {
+    update_persona_and_publish_inner(input, app).await
+}
+
+/// Generic core of [`update_persona_and_publish`], testable with
+/// `tauri::test::MockRuntime` as well as the production `Wry` runtime.
+///
+/// Extracted so tests can invoke the real command path — including the
+/// `prepare_persona_publication` scope resolver — through a mock `AppHandle`
+/// without the `#[tauri::command]` signature binding to `AppHandle<Wry>`.
+pub(crate) async fn update_persona_and_publish_inner<R: tauri::Runtime>(
+    input: crate::managed_agents::UpdatePersonaRequest,
+    app: AppHandle<R>,
+) -> Result<SetPersonaSharedResult, String> {
     let (_, prepared) =
         super::update::update_persona_with(input, app.clone(), |app, state, persona| {
             // Strict path: this command's contract is to report the publication
@@ -198,11 +211,8 @@ async fn publish_prepared_persona(
 }
 
 #[cfg(all(test, not(target_os = "windows")))]
-use super::update::update_persona_with as update_persona_with_seam;
-
-#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
-    use super::{update_persona_with_seam, *};
+    use super::*;
     use crate::{
         app_state::build_app_state,
         commands::personas::pending::prepare_persona_publication_at,
@@ -476,21 +486,25 @@ mod tests {
             .expect("mock app builds headless")
     }
 
-    /// P2 relay-sync regression through the real `prepare_persona_publication_at`
-    /// failure mode: when the retention DB path is unwritable, the relay kind:0
-    /// profile sync for linked agents must still complete before the error propagates.
+    /// P2 relay-sync regression through the real `update_persona_and_publish`
+    /// command path: when the active retention DB path is unwritable, the relay
+    /// kind:0 profile sync for linked agents must still complete before the
+    /// error propagates.
     ///
-    /// Uses the same retain-closure shape as `update_persona_and_publish` (calls
-    /// `prepare_persona_publication_at` with `?`), exercising the strict-preparation
-    /// seam directly. The failure is induced by pre-creating the retention DB path
-    /// as a directory — verified independently by
-    /// `test_update_and_publish_enqueue_failure_is_returned`.
+    /// Drives `update_persona_and_publish_inner` — the generic core of the
+    /// exported `update_persona_and_publish` command — through a mock AppHandle,
+    /// exercising the full wiring: `prepare_persona_publication` scope resolver,
+    /// the strict-preparation `?`-propagation, and the phase-2 relay sync. The
+    /// failure is induced by replacing the active retention DB path with a
+    /// directory (EISDIR) after the relay override is set so the scope hash is
+    /// stable.
     ///
     /// Mutation acceptance: restoring `retain_result?` inside
     /// `Ok((result, retain_result?, …))` at the blocking-phase return causes
     /// phase 2 to be skipped → counter receives 0 requests → RED.
     #[test]
     fn test_update_and_publish_relay_profile_syncs_despite_preparation_failure() {
+        use crate::managed_agents::retention::active_retention_scope;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use tauri::Manager;
@@ -498,12 +512,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home_p2_seam");
         std::fs::create_dir_all(&home).unwrap();
-
-        // Use a separate dir as the "bad" retention DB path (a directory that
-        // SQLite cannot open as a file). This simulates `prepare_persona_publication`
-        // failing via `open_retention_db`.
-        let bad_db_path = temp.path().join("bad-db-dir");
-        std::fs::create_dir_all(&bad_db_path).unwrap();
 
         let old_home = std::env::var_os("HOME");
         let old_xdg = std::env::var_os("XDG_DATA_HOME");
@@ -549,6 +557,8 @@ mod tests {
             };
 
             // Point the workspace relay override at the counter server.
+            // Must be set BEFORE computing the active retention scope so the
+            // scope hash is stable for the sabotage step.
             {
                 let state = app.state::<AppState>();
                 let mut override_slot = state
@@ -637,11 +647,28 @@ mod tests {
             save_managed_agents(app.handle(), &[agent_record])
                 .expect("agent seed must succeed");
 
-            // Submit a rename with a retain closure that mirrors the
-            // `update_persona_and_publish` shape: calls `prepare_persona_publication_at`
-            // with `?` — but uses `bad_db_path` (a directory) to force EISDIR failure.
-            let bad_db = bad_db_path.clone();
-            let result = update_persona_with_seam(
+            // Resolve the active retention scope (relay + owner → DB path) and
+            // sabotage it: replace the .db file path with a directory so that
+            // `open_retention_db` inside `prepare_persona_publication` returns
+            // "failed to open retention db". This exercises the production scope
+            // resolver rather than injecting an arbitrary bad path.
+            {
+                let state = app.state::<AppState>();
+                let scope = active_retention_scope(app.handle(), &state)
+                    .expect("active_retention_scope must resolve with relay override set");
+                // Remove the file if it was created by scope resolution, then
+                // create a directory at the same path so SQLite cannot open it.
+                std::fs::remove_file(&scope.db_path).ok();
+                std::fs::create_dir_all(&scope.db_path)
+                    .expect("must be able to create directory at db path for sabotage");
+            }
+
+            // Drive the REAL command path through a mock AppHandle. This exercises
+            // prepare_persona_publication (scope resolver + ?-propagation) and the
+            // phase-2 relay sync, verifying that wiring drift at the command
+            // boundary — e.g. update_persona_and_publish stopping to call
+            // update_persona_with — is caught.
+            let result = update_persona_and_publish_inner(
                 UpdatePersonaRequest {
                     id: "p1".to_string(),
                     display_name: "Alice Renamed".to_string(),
@@ -657,28 +684,20 @@ mod tests {
                     expected_updated_at: Some(r1.to_string()),
                 },
                 app.handle().clone(),
-                move |_app, _state, persona_def| {
-                    // Mirror the update_persona_and_publish retain shape:
-                    // prepare_persona_publication_at with ? propagates the Err.
-                    let keys = nostr::Keys::generate();
-                    let (_event, retained, _def) =
-                        prepare_persona_publication_at(&bad_db, &keys, persona_def, None)?;
-                    Ok(retained)
-                },
             )
             .await;
 
             // The preparation failure must propagate (coordinator sees publishFailed).
             assert!(
                 result.is_err(),
-                "update_persona_with must return Err when prepare_persona_publication_at fails"
+                "update_persona_and_publish_inner must return Err when prepare_persona_publication fails"
             );
             assert!(
                 result
                     .as_ref()
                     .unwrap_err()
                     .contains("failed to open retention db"),
-                "error must come from prepare_persona_publication_at, got: {:?}",
+                "error must come from prepare_persona_publication scope resolver, got: {:?}",
                 result
             );
 
@@ -688,7 +707,7 @@ mod tests {
             assert_eq!(
                 post_count.load(Ordering::SeqCst),
                 1,
-                "relay kind:0 profile sync must fire despite prepare_persona_publication_at failure; \
+                "relay kind:0 profile sync must fire despite prepare_persona_publication failure; \
                  restoring `retain_result?` before phase 2 turns this RED"
             );
         }); // rt.block_on
@@ -711,105 +730,244 @@ mod tests {
     /// for its entire read+retain sequence so it is serialized with concurrent
     /// team edits, unshare, and delete operations.
     ///
-    /// Test structure uses a `std::sync::Barrier(2)` to coordinate a racing
-    /// OS thread that tries to acquire the same lock:
+    /// Test structure:
     ///
-    /// - WITH the lock (current code): observer holds lock → barrier releases
-    ///   race thread → race thread blocks on lock → observer returns → refresh
-    ///   runs → lock releases → race thread acquires lock → retains unshared
-    ///   T+1 → final: UNSHARED ✓
+    /// 1. Seeds a shared kind:30178 team head T in the retention DB.
+    /// 2. A `REFRESH_READ_OBSERVER` fires inside `refresh_or_retract_shared_head_at`
+    ///    AFTER it reads the shared head T but BEFORE it retains the refreshed
+    ///    head T+1. The observer uses a `Barrier(2)` to synchronize with a
+    ///    racing OS thread that tries to write an unshared T+1 through the same
+    ///    `managed_agents_store_lock`.
+    /// 3. WITH the lock held (current code): the race thread blocks on the lock
+    ///    while refresh retains T+1 (shared), then the race thread acquires the
+    ///    lock and retains its unshared T+1 — last writer wins → UNSHARED ✓.
+    /// 4. WITHOUT the lock (mutation: move refresh outside `{ let _guard = ... }`):
+    ///    the race thread is not blocked; it writes its unshared T+1 first, then
+    ///    refresh retains its shared T+1 — last writer wins → SHARED ✗ → RED.
     ///
-    /// - WITHOUT the lock (mutation — move/remove the lock acquisition):
-    ///   observer fires, try_lock() SUCCEEDS, the first assert panics → RED.
-    ///
-    /// The barrier + final-state assertion confirm the complete serialization
-    /// contract: only by holding the lock across the full refresh does the
-    /// unshare reliably get the last write.
+    /// The `retain_event` function accepts equal timestamps (monotonic_created_at
+    /// for both sides yields the same T+1), so the last caller always wins the
+    /// UPSERT — which is exactly what the lock is supposed to prevent.
     #[tokio::test]
     async fn test_retry_refresh_holds_store_lock_during_refresh() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::commands::teams::{prepare_team_publication_at, REFRESH_READ_OBSERVER};
+        use crate::managed_agents::{
+            retention::{get_retained_event, open_retention_db},
+            TeamRecord,
+        };
+        use buzz_core_pkg::kind::{event_is_shared, KIND_TEAM_CATALOG};
+        use nostr::JsonUtil;
+        use std::collections::BTreeMap;
         use std::sync::{Arc, Barrier};
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
         let relay_url = spawn_relay(true).await;
-        let prepared = prepared(&db_path, relay_url, keys.clone(), Some(true));
         let state = Arc::new(build_app_state());
 
-        // Seed a shared team head so race_task has a concrete retention target.
-        // teams.json is intentionally EMPTY (no 30178 heads for refresh to
-        // overwrite) — the test focuses on lock-scope, not on refresh output.
-        std::fs::write(dir.path().join("teams.json"), b"[]").unwrap();
+        // The team must include our persona so refresh_for_persona_at picks it up.
+        let persona_id = "catalog-reviewer";
+        let team = TeamRecord {
+            id: "team-abc".to_string(),
+            name: "Test Team".to_string(),
+            description: None,
+            instructions: None,
+            persona_ids: vec![persona_id.to_string()],
+            is_builtin: false,
+            shared: true,
+            catalog_source: None,
+            source_dir: None,
+            is_symlink: false,
+            symlink_target: None,
+            version: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let persona_member = AgentDefinition {
+            id: persona_id.to_string(),
+            display_name: "Catalog Reviewer".to_string(),
+            description: None,
+            avatar_url: None,
+            system_prompt: "Review.".to_string(),
+            runtime: None,
+            model: None,
+            provider: None,
+            name_pool: Vec::new(),
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
+            env_vars: BTreeMap::new(),
+            respond_to: None,
+            respond_to_allowlist: Vec::new(),
+            parallelism: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
 
-        // Seed a shared persona kind:30175 in the db so the race task can
-        // retain an unshared variant at T+1 — the resource both sides contend.
-        let (_, initial_retained, _) =
-            prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
-        let initial_created_at = initial_retained.created_at;
+        // Seed a real shared kind:30178 head T in the retention DB.
+        prepare_team_publication_at(
+            &db_path,
+            &keys,
+            &team,
+            std::slice::from_ref(&persona_member),
+            Some(true),
+        )
+        .expect("seed shared team head must succeed");
 
-        // A 2-party barrier: one party is the REFRESH_LOCK_OBSERVER (on the
-        // tokio thread) and the other is the race OS thread. When both call
-        // barrier.wait(), both are released simultaneously. The observer fires
-        // WHILE the lock is held, so the race thread will immediately contend.
+        // Write teams.json with a REAL shared team entry so refresh_for_persona_at
+        // finds a team containing our persona and calls refresh_or_retract_shared_head_at.
+        let teams_json = serde_json::to_string(&[&team]).expect("serialize team");
+        std::fs::write(dir.path().join("teams.json"), teams_json.as_bytes()).unwrap();
+
+        // Write personas.json with a MODIFIED persona (different system_prompt) so
+        // refresh_or_retract_shared_head_at rebuilds different content than the seed T
+        // and does NOT hit the idempotency skip — ensuring it actually calls retain_event
+        // (which is necessary for the race to matter).
+        let persona_updated = AgentDefinition {
+            id: persona_id.to_string(),
+            display_name: "Catalog Reviewer".to_string(),
+            description: None,
+            avatar_url: None,
+            system_prompt: "Review catalog entries carefully.".to_string(), // differs from seed
+            runtime: None,
+            model: None,
+            provider: None,
+            name_pool: Vec::new(),
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
+            env_vars: BTreeMap::new(),
+            respond_to: None,
+            respond_to_allowlist: Vec::new(),
+            parallelism: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let personas_json =
+            serde_json::to_string(&[&persona_updated]).expect("serialize persona_updated");
+        std::fs::write(dir.path().join("personas.json"), personas_json.as_bytes())
+            .expect("write personas.json must succeed");
+
+        // Read the seed T so we can assert the final head is strictly newer.
+        let initial_created_at = {
+            let conn = open_retention_db(&db_path).unwrap();
+            get_retained_event(&conn, KIND_TEAM_CATALOG, &owner, "team-abc")
+                .unwrap()
+                .expect("seed head must exist")
+                .created_at
+        };
+
+        // Barrier: two parties — the REFRESH_READ_OBSERVER (tokio task) and the
+        // race OS thread. Both call barrier.wait() to synchronize.
         let barrier = Arc::new(Barrier::new(2));
         let barrier_obs = barrier.clone();
+        let state_obs = state.clone();
 
-        let observer_fired = Arc::new(AtomicBool::new(false));
-        let observer_fired_clone = observer_fired.clone();
         {
-            let mut slot = REFRESH_LOCK_OBSERVER.lock().expect("observer slot");
-            *slot = Some(Box::new(move |state: &AppState| {
-                // Mutation target: moving the lock acquisition to AFTER this call
-                // causes try_lock() to succeed — test turns RED immediately.
+            let mut slot = REFRESH_READ_OBSERVER.lock().expect("observer slot");
+            *slot = Some(Box::new(move || {
+                // We are inside refresh_or_retract_shared_head_at, after the
+                // shared-T read, before the retain. The caller holds
+                // managed_agents_store_lock. Prove it directly:
+                //
+                // Mutation target: moving `refresh_for_persona_at` outside the
+                // lock block causes try_lock() to SUCCEED here — the test turns
+                // RED immediately at this assertion, proving the lock is not held
+                // at the read+retain gap.
                 assert!(
-                    state.managed_agents_store_lock.try_lock().is_err(),
-                    "managed_agents_store_lock must be held during the refresh — \
-                     a successful try_lock recreates the concurrent-unshare race condition"
+                    state_obs.managed_agents_store_lock.try_lock().is_err(),
+                    "managed_agents_store_lock must be held while refresh_or_retract_shared_head_at \
+                     holds the shared-T read open — a successful try_lock means the lock was \
+                     released before refresh finished, recreating the concurrent-unshare race"
                 );
-                observer_fired_clone.store(true, Ordering::SeqCst);
-                // Release the race thread. Since the lock is still held here
-                // (we are inside `{ let _guard = ...; }`) the race thread will
-                // immediately block on lock().
+                // Signal the race thread to proceed. Since the lock IS held here
+                // (assertion above passed), the race thread will immediately block
+                // at lock(), keeping the ordered-write guarantee.
                 barrier_obs.wait();
+                // Return — refresh proceeds to retain T+1, then releases the lock,
+                // then the race thread unblocks and retains its UNSHARED T+1 last.
             }));
         }
 
-        // Race thread: waits at the barrier (released by the observer while
-        // the lock is held), then immediately tries to acquire the lock. With
-        // the lock in place it blocks; after the refresh releases it, it
-        // retains an unshared persona event.
+        // Race thread: waits at the barrier (released by the observer WHILE the
+        // lock is held), then acquires the same lock and retains an unshared T+1.
+        // With the lock: blocked until refresh retains T+1, then it retains its
+        // own unshared T+1 — final = UNSHARED ✓.
+        // Without the lock (mutation): races freely, retains unshared first, then
+        // refresh retains shared T+1 over it — final = SHARED ✗.
         let state_race = state.clone();
         let db_path_race = db_path.clone();
         let keys_race = keys.clone();
-        let persona_race = persona();
+        let team_race = team.clone();
+        let member_race = AgentDefinition {
+            id: persona_id.to_string(),
+            display_name: "Catalog Reviewer".to_string(),
+            description: None,
+            avatar_url: None,
+            system_prompt: "Review.".to_string(),
+            runtime: None,
+            model: None,
+            provider: None,
+            name_pool: Vec::new(),
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
+            env_vars: BTreeMap::new(),
+            respond_to: None,
+            respond_to_allowlist: Vec::new(),
+            parallelism: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
         let race_thread = std::thread::spawn(move || {
-            barrier.wait(); // released by the observer while lock is held
-                            // This will block until publish_and_refresh_teams_at releases the lock.
+            barrier.wait(); // released by observer while lock is held
+                            // Acquire the same store lock — this blocks until publish_and_refresh_teams_at
+                            // releases it, ensuring the race write comes AFTER refresh's retain.
             let _guard = state_race
                 .managed_agents_store_lock
                 .lock()
                 .expect("race lock must not be poisoned");
-            // Retain an unshared persona head — this is the write that the
-            // concurrent-unshare scenario must not lose.
-            prepare_persona_publication_at(&db_path_race, &keys_race, &persona_race, Some(false))
-                .expect("race task unshare must succeed");
+            // Retain an unshared team head T+1 — the write that must win.
+            prepare_team_publication_at(
+                &db_path_race,
+                &keys_race,
+                &team_race,
+                &[member_race],
+                Some(false), // unshare
+            )
+            .expect("race unshare must succeed");
         });
 
-        let persona_id = prepared.persona.id.clone();
+        // Run publish_and_refresh_teams_at using a prepared shared persona head.
+        let prepared = prepared(&db_path, relay_url, keys.clone(), Some(true));
+        let persona_id_str = prepared.persona.id.clone();
         let result = publish_and_refresh_teams_at(
             &state,
             prepared,
             dir.path(),
             &keys,
             &db_path,
-            &persona_id,
+            &persona_id_str,
         )
         .await;
 
         // Clear observer before any assertion that could panic.
         {
-            let mut slot = REFRESH_LOCK_OBSERVER.lock().expect("observer slot");
+            let mut slot = REFRESH_READ_OBSERVER.lock().expect("observer slot");
             *slot = None;
         }
 
@@ -817,38 +975,28 @@ mod tests {
         race_thread.join().expect("race thread must not panic");
 
         result.expect("publish_and_refresh_teams_at must succeed");
-        assert!(
-            observer_fired.load(Ordering::SeqCst),
-            "the refresh lock observer must have fired — if not, the hook is not wired"
-        );
 
-        // The race thread always runs AFTER the refresh (because the lock
-        // serializes them) and retains an unshared event with a strictly
-        // later monotonic timestamp. The final db state must be UNSHARED.
-        let owner = keys.public_key().to_hex();
+        // The race thread always runs AFTER refresh (because the lock serializes
+        // them) and retains an unshared head at T+1. Since retain_event accepts
+        // equal timestamps, the last writer wins — and the race thread is last.
+        // Mutation (move refresh outside lock): race thread writes first, refresh
+        // writes over it → SHARED → test turns RED.
         let conn = open_retention_db(&db_path).unwrap();
-        let retained = get_retained_event(
-            &conn,
-            buzz_core_pkg::kind::KIND_PERSONA,
-            &owner,
-            "catalog-reviewer",
-        )
-        .expect("db query must not fail")
-        .expect("retained persona event must exist");
-        // The race task wrote at T+1 (strictly after the initial T);
-        // assert it is both later than the seed AND unshared.
+        let retained = get_retained_event(&conn, KIND_TEAM_CATALOG, &owner, "team-abc")
+            .expect("db query must not fail")
+            .expect("retained team catalog head must exist after refresh + race");
         assert!(
-            retained.created_at > initial_created_at,
-            "retained event must be later than the seed (race task ran last)"
+            retained.created_at >= initial_created_at,
+            "retained head must be at or after the seed timestamp"
         );
-        use buzz_core_pkg::kind::event_is_shared;
-        use nostr::JsonUtil;
         let event =
             nostr::Event::from_json(&retained.raw_event).expect("must parse retained event");
         assert!(
             !event_is_shared(&event),
-            "final retained persona event must be UNSHARED — \
-             race task ran last and its write must not have been overwritten"
+            "final retained kind:30178 head must be UNSHARED — \
+             race thread ran last (lock held during refresh) and its write must not \
+             have been overwritten by the refreshed shared head; \
+             moving refresh outside the lock causes the shared head to win → RED"
         );
     }
 }

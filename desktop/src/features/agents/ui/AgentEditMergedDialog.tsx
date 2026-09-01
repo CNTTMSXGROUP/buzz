@@ -188,6 +188,7 @@ export function AgentEditMergedDialog({
   // D-fields
   const [displayName, setDisplayName] = React.useState("");
   const [avatarUrl, setAvatarUrl] = React.useState("");
+  const [description, setDescription] = React.useState("");
   const [systemPrompt, setSystemPrompt] = React.useState("");
   const [namePoolText, setNamePoolText] = React.useState("");
   // Definition runtime (D-field) — separate from instance harness pin (I-field)
@@ -286,6 +287,7 @@ export function AgentEditMergedDialog({
     const seed = seedAgentFormModel(ctx);
     setDisplayName(seed.displayName);
     setAvatarUrl(seed.avatarUrl);
+    setDescription(seed.description);
     setSystemPrompt(seed.systemPrompt);
     setNamePoolText(formatPersonaNamePoolText(seed.namePool ?? []));
     // D-section model/provider — seed from definition (or instance for I-only)
@@ -504,6 +506,7 @@ export function AgentEditMergedDialog({
     ctx,
     displayName,
     avatarUrl,
+    description,
     systemPrompt,
     namePoolText,
     model: showDef ? dModel : iModel,
@@ -793,6 +796,8 @@ export function AgentEditMergedDialog({
                 isSaving={isSaving}
                 displayName={displayName}
                 onDisplayNameChange={setDisplayName}
+                description={description}
+                onDescriptionChange={setDescription}
                 systemPrompt={systemPrompt}
                 onSystemPromptChange={setSystemPrompt}
                 namePoolText={namePoolText}
@@ -977,16 +982,13 @@ export function AgentEditMergedDialog({
               </div>
             ) : null}
 
-            {/* Save error */}
             {saveError ? (
               <p className="text-sm text-destructive">{saveError.message}</p>
             ) : null}
           </div>
         </div>
       </ChooserDialogContent>
-
-      {/* AddCustomHarnessDialog at dialog level so it renders in all contexts,
-          including definition-only edit where the instance section is absent. */}
+      {/* AddCustomHarnessDialog: rendered at dialog level so it works in definition-only context. */}
       <AddCustomHarnessDialog
         onOpenChange={setIsAddHarnessOpen}
         onSaved={selectSavedHarness}

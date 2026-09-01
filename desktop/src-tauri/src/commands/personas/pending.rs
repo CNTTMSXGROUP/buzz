@@ -64,8 +64,8 @@ pub(in crate::commands) fn retain_persona_pending_at(
 /// exact share tag. The explicit share toggle passes `Some(shared)`. Returning
 /// the retained event lets that command immediately await relay acceptance
 /// without rebuilding or re-signing a different NIP-33 head.
-pub(super) fn prepare_persona_publication(
-    app: &AppHandle,
+pub(super) fn prepare_persona_publication<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     persona: &AgentDefinition,
     shared_override: Option<bool>,

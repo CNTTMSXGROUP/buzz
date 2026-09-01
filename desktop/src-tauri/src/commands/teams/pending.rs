@@ -20,6 +20,22 @@ use crate::managed_agents::{
 
 use buzz_core_pkg::kind::KIND_TEAM_CATALOG;
 
+/// Test-only observer called inside `refresh_or_retract_shared_head_at` after
+/// it reads the existing shared kind:30178 head (the authoritative T) but
+/// before it retains the refreshed head (T+1). Tests use this to inject a
+/// racing write — simulating a concurrent unshare — between the read and the
+/// write, and to assert that the `managed_agents_store_lock` held by
+/// `publish_and_refresh_teams_at` serializes the two operations correctly.
+///
+/// Moving `refresh_for_persona_at` outside the lock (mutation target) causes
+/// the racing unshare to win the UPSERT after `retain_event`, so the final
+/// retained head is SHARED rather than UNSHARED — the prescribed RED signal.
+#[cfg(test)]
+type RefreshReadObserver = Box<dyn Fn() + Send>;
+#[cfg(test)]
+pub(crate) static REFRESH_READ_OBSERVER: std::sync::Mutex<Option<RefreshReadObserver>> =
+    std::sync::Mutex::new(None);
+
 /// A signed catalog head, retained and awaiting relay acceptance.
 ///
 /// Only the retained-row coordinate is carried, not the signed event itself:
@@ -145,7 +161,7 @@ pub(super) fn prepare_team_publication(
     })
 }
 
-pub(super) fn prepare_team_publication_at(
+pub(crate) fn prepare_team_publication_at(
     db_path: &std::path::Path,
     keys: &nostr::Keys,
     team: &TeamRecord,
@@ -329,6 +345,19 @@ pub(super) fn refresh_or_retract_shared_head_at(
         .map_err(|e| format!("failed to parse retained head: {e}"))?;
     if !event_is_shared(&head_event) {
         return Ok(RefreshOrRetractOutcome::Noop);
+    }
+
+    // Fire the test-only read observer BEFORE retaining the refreshed head.
+    // Tests use this to race a concurrent unshare between the authoritative
+    // shared-T read above and the retain below — proving that the caller's
+    // `managed_agents_store_lock` must span this entire read+retain sequence.
+    #[cfg(test)]
+    {
+        if let Ok(obs) = REFRESH_READ_OBSERVER.lock() {
+            if let Some(ref f) = *obs {
+                f();
+            }
+        }
     }
 
     // Rebuild; on failure, purge + tombstone immediately so the stale shared

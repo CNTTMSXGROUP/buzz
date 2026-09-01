@@ -41,6 +41,7 @@ export type AgentEditSubmitState = {
   ctx: AgentEditContext;
   displayName: string;
   avatarUrl: string;
+  description: string;
   systemPrompt: string;
   namePoolText: string;
   model: string;
@@ -136,6 +137,7 @@ export function buildNextAgentFormModel(
     ...seed,
     displayName: s.displayName.trim(),
     avatarUrl: s.avatarUrl.trim(),
+    description: s.description,
     systemPrompt: s.systemPrompt.trim(),
     respondTo: s.respondTo as typeof seed.respondTo,
     respondToAllowlist: s.respondToAllowlist,

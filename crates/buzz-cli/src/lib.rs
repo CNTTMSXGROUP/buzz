@@ -1316,6 +1316,15 @@ pub enum ProjectsCmd {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Read the relay-authoritative collaborative Project state
+    State {
+        /// Project slug
+        slug: String,
+        /// Project owner pubkey (64-char hex). Defaults to the current identity
+        /// or its NIP-OA owner when configured.
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// List projects
     List {
         /// Owner pubkey (64-char hex). Defaults to the current identity.
@@ -1355,6 +1364,25 @@ pub enum ProjectsCmd {
         /// Optional Desktop channel-template name
         #[arg(long)]
         template: Option<String>,
+    },
+    /// Atomically add or remove related channels at the current revision
+    #[command(
+        name = "change-related-channels",
+        group = clap::ArgGroup::new("related-channel-mutation").required(true).multiple(true)
+    )]
+    ChangeRelatedChannels {
+        /// Project slug
+        slug: String,
+        /// Project owner pubkey (64-char hex). Defaults to the current identity
+        /// or its NIP-OA owner when configured.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Related channel UUID to add (repeatable)
+        #[arg(long = "add", group = "related-channel-mutation")]
+        add: Vec<Uuid>,
+        /// Related channel UUID to remove (repeatable)
+        #[arg(long = "remove", group = "related-channel-mutation")]
+        remove: Vec<Uuid>,
     },
     /// Remove one or more member repositories from a project
     #[command(name = "remove-repo")]
@@ -2087,7 +2115,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
-        Cmd::Projects(sub) => commands::projects::dispatch(sub, &client).await,
+        Cmd::Projects(sub) => commands::projects::dispatch(sub, &client, &cli.format).await,
         Cmd::Patches(sub) => commands::patches::dispatch(sub, &client).await,
         Cmd::Issues(sub) => commands::issues::dispatch(sub, &client).await,
         Cmd::Pr(sub) => commands::pr::dispatch(sub, &client).await,
@@ -2399,11 +2427,13 @@ mod tests {
             vec![
                 "add-channel",
                 "add-repo",
+                "change-related-channels",
                 "create",
                 "delete",
                 "get",
                 "list",
                 "remove-repo",
+                "state",
                 "update"
             ]
         );
@@ -2444,7 +2474,7 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
-            ("projects", 8),
+            ("projects", 10),
             ("reactions", 3),
             ("repos", 5),
             ("social", 7),
@@ -2532,6 +2562,30 @@ mod tests {
             "Release team",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn projects_collaborative_state_commands_parse() {
+        let owner = "a".repeat(64);
+        assert!(
+            Cli::try_parse_from(["buzz", "projects", "state", "platform", "--owner", &owner,])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "projects",
+            "change-related-channels",
+            "platform",
+            "--add",
+            "11111111-1111-4111-8111-111111111111",
+            "--remove",
+            "22222222-2222-4222-8222-222222222222",
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["buzz", "projects", "change-related-channels", "platform",])
+                .is_err()
+        );
     }
 
     /// Multiple independent fields must be accepted in the same invocation.

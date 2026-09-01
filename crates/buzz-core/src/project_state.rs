@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 
-use nostr::{Event, EventId, Kind, Tag};
-use serde::Serialize;
+use nostr::{Event, EventId, Kind, PublicKey, Tag};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -125,11 +125,230 @@ pub fn project_state_template(
     })
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectionBody {
     v: u8,
     deleted: bool,
     project_tags: Vec<Vec<String>>,
+}
+
+/// Validate a relay-authored Project State event and return its CAS revision.
+///
+/// This checks the event signature and relay author, the exact canonical
+/// envelope and compact JSON encoding, and the canonical ordering and shape of
+/// all known effective Project tags. Unknown Project extension tags remain
+/// valid, but may appear only after the known tag groups.
+pub fn validate_project_state_projection(
+    event: &Event,
+    relay_pubkey: &PublicKey,
+    coordinate: &str,
+) -> Result<u64, ProjectStateError> {
+    let (_, project_d) = parse_project_coordinate(coordinate)?;
+    event
+        .verify()
+        .map_err(|error| ProjectStateError::State(format!("invalid event signature: {error}")))?;
+    if event.kind.as_u16() as u32 != KIND_PROJECT_STATE || &event.pubkey != relay_pubkey {
+        return Err(ProjectStateError::State(
+            "event is not a Project State signed by the relay".into(),
+        ));
+    }
+
+    let raw_tags: Vec<&[String]> = event.tags.iter().map(Tag::as_slice).collect();
+    if raw_tags.len() != 5 {
+        return Err(ProjectStateError::State(
+            "projection must have exactly five tags".into(),
+        ));
+    }
+    let projection_d = hex::encode(Sha256::digest(coordinate.as_bytes()));
+    if raw_tags[0] != ["d", projection_d.as_str()]
+        || raw_tags[1] != ["a", coordinate]
+        || raw_tags[2].len() != 2
+        || raw_tags[2][0] != "rev"
+        || !canonical_positive_i64(&raw_tags[2][1])
+        || !canonical_event_reference(raw_tags[3], "identity")
+        || !canonical_event_reference(raw_tags[4], "change")
+    {
+        return Err(ProjectStateError::State(
+            "projection envelope is not canonical".into(),
+        ));
+    }
+    let revision = raw_tags[2][1]
+        .parse::<u64>()
+        .map_err(|error| ProjectStateError::State(format!("invalid revision: {error}")))?;
+
+    let body: ProjectionBody = serde_json::from_str(&event.content)
+        .map_err(|error| ProjectStateError::State(format!("invalid projection JSON: {error}")))?;
+    let canonical = serde_json::to_string(&body)
+        .map_err(|error| ProjectStateError::Encoding(error.to_string()))?;
+    if body.v != 1 || canonical != event.content {
+        return Err(ProjectStateError::State(
+            "projection JSON is not supported canonical version 1".into(),
+        ));
+    }
+    if body.deleted {
+        if !body.project_tags.is_empty() {
+            return Err(ProjectStateError::State(
+                "deleted projection must have no Project tags".into(),
+            ));
+        }
+    } else {
+        validate_canonical_live_projection_tags(&body.project_tags, project_d)?;
+    }
+    Ok(revision)
+}
+
+fn canonical_positive_i64(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<i64>().is_ok_and(|value| value > 0)
+}
+
+fn canonical_event_reference(tag: &[String], marker: &str) -> bool {
+    matches!(tag, [name, id, relay, tag_marker]
+        if name == "e"
+            && relay.is_empty()
+            && tag_marker == marker
+            && is_lower_hex64(id)
+            && EventId::parse(id).is_ok())
+}
+
+fn is_lower_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_canonical_live_projection_tags(
+    tags: &[Vec<String>],
+    project_d: &str,
+) -> Result<(), ProjectStateError> {
+    if !matches!(tags.first().map(Vec::as_slice), Some([name, value]) if name == "d" && value == project_d)
+    {
+        return Err(ProjectStateError::State(
+            "live projection must begin with its matching Project d tag".into(),
+        ));
+    }
+
+    let mut name = None;
+    let mut description = None;
+    let mut members = Vec::new();
+    let mut home_channel = None;
+    let mut related = Vec::new();
+    let mut visibility = None;
+    let mut extensions = Vec::new();
+    let mut seen_member_coordinates = HashSet::new();
+
+    for tag in &tags[1..] {
+        let tag_name = tag.first().map(String::as_str);
+        match tag_name {
+            Some("d" | "auth") => {
+                return Err(ProjectStateError::State(format!(
+                    "{tag_name:?} is not valid in this projection position"
+                )))
+            }
+            Some("name") => {
+                validate_projection_singleton(tag, &name, 256)?;
+                name = Some(tag.clone());
+            }
+            Some("description") => {
+                validate_projection_singleton(tag, &description, 2048)?;
+                description = Some(tag.clone());
+            }
+            Some("a") => {
+                if !(2..=3).contains(&tag.len()) {
+                    return Err(ProjectStateError::State(
+                        "member a tag has invalid shape".into(),
+                    ));
+                }
+                validate_member_coordinate(&tag[1])?;
+                if !seen_member_coordinates.insert(tag[1].as_str()) {
+                    return Err(ProjectStateError::State(
+                        "member repository coordinate is duplicated".into(),
+                    ));
+                }
+                members.push(tag.clone());
+            }
+            Some("buzz-channel") => {
+                validate_projection_singleton(tag, &home_channel, 256)?;
+                home_channel = Some(tag.clone());
+            }
+            Some("buzz-related-channel") => {
+                let canonical_uuid = tag
+                    .get(1)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .is_some_and(|uuid| uuid.to_string() == tag[1]);
+                if tag.len() != 2 || !canonical_uuid {
+                    return Err(ProjectStateError::State(
+                        "related-channel tag is not a canonical UUID".into(),
+                    ));
+                }
+                related.push(tag.clone());
+            }
+            Some("buzz-visibility") => {
+                validate_projection_singleton(tag, &visibility, 256)?;
+                visibility = Some(tag.clone());
+            }
+            _ => extensions.push(tag.clone()),
+        }
+    }
+    if members.len() > MEMBER_CAP || related.len() > MEMBER_CAP {
+        return Err(ProjectStateError::State(
+            "projection collection exceeds the 64-member cap".into(),
+        ));
+    }
+    let mut sorted_members = members.clone();
+    sorted_members.sort_unstable();
+    let mut sorted_related = related.clone();
+    sorted_related.sort_unstable();
+    sorted_related.dedup();
+    if members != sorted_members || related != sorted_related {
+        return Err(ProjectStateError::State(
+            "projection collections are not in canonical order".into(),
+        ));
+    }
+    if let Some(home) = home_channel.as_ref().and_then(|tag| tag.get(1)) {
+        let canonical_home = Uuid::parse_str(home).ok().map(|uuid| uuid.to_string());
+        if canonical_home
+            .as_ref()
+            .is_some_and(|home| related.iter().any(|tag| tag.get(1) == Some(home)))
+        {
+            return Err(ProjectStateError::State(
+                "home channel cannot also be a related channel".into(),
+            ));
+        }
+    }
+
+    let mut canonical = vec![vec!["d".into(), project_d.into()]];
+    canonical.extend(name);
+    canonical.extend(description);
+    canonical.extend(members);
+    canonical.extend(home_channel);
+    canonical.extend(related);
+    canonical.extend(visibility);
+    canonical.extend(extensions);
+    if canonical != tags {
+        return Err(ProjectStateError::State(
+            "Project tags are not in canonical group order".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_singleton(
+    tag: &[String],
+    prior: &Option<Vec<String>>,
+    max_len: usize,
+) -> Result<(), ProjectStateError> {
+    if prior.is_some() || tag.len() != 2 || tag[1].len() > max_len {
+        return Err(ProjectStateError::State(format!(
+            "{} tag has invalid shape, length, or cardinality",
+            tag.first().map_or("metadata", String::as_str)
+        )));
+    }
+    Ok(())
 }
 
 fn parse_project_coordinate(coordinate: &str) -> Result<(&str, &str), ProjectStateError> {
@@ -330,6 +549,13 @@ mod tests {
         (keys, event)
     }
 
+    fn signed_projection(relay: &Keys, template: &ProjectStateTemplate) -> Event {
+        EventBuilder::new(template.kind, &template.content)
+            .tags(template.tags.clone())
+            .sign_with_keys(relay)
+            .expect("sign test projection")
+    }
+
     #[test]
     fn emits_exact_canonical_live_projection() {
         let repo_b = format!("30617:{}:b", "b".repeat(64));
@@ -492,5 +718,96 @@ mod tests {
             }),
             Err(ProjectStateError::State(_))
         ));
+    }
+
+    #[test]
+    fn validates_canonical_projection_and_rejects_noncanonical_envelope_or_json() {
+        let (owner, identity) = fixture(vec![tag(&["d", "project"])]);
+        let relay = Keys::generate();
+        let coordinate = format!("30621:{}:project", owner.public_key().to_hex());
+        let template = project_state_template(ProjectStateProjectionInput {
+            coordinate: &coordinate,
+            revision: 7,
+            identity_event: &identity,
+            change_event_id: &identity.id,
+            deleted: false,
+            related_channels: &[],
+        })
+        .unwrap();
+        let event = signed_projection(&relay, &template);
+        assert_eq!(
+            validate_project_state_projection(&event, &relay.public_key(), &coordinate),
+            Ok(7)
+        );
+
+        let mut reordered = template.clone();
+        reordered.tags.swap(0, 1);
+        assert!(validate_project_state_projection(
+            &signed_projection(&relay, &reordered),
+            &relay.public_key(),
+            &coordinate,
+        )
+        .is_err());
+
+        let mut spaced_json = template;
+        spaced_json.content.insert(0, ' ');
+        assert!(validate_project_state_projection(
+            &signed_projection(&relay, &spaced_json),
+            &relay.public_key(),
+            &coordinate,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_noncanonical_live_project_tags() {
+        let (owner, identity) = fixture(vec![tag(&["d", "project"])]);
+        let relay = Keys::generate();
+        let coordinate = format!("30621:{}:project", owner.public_key().to_hex());
+        let template = project_state_template(ProjectStateProjectionInput {
+            coordinate: &coordinate,
+            revision: 1,
+            identity_event: &identity,
+            change_event_id: &identity.id,
+            deleted: false,
+            related_channels: &[],
+        })
+        .unwrap();
+        let invalid_tag_sets = [
+            vec![vec!["d".into(), "other".into()]],
+            vec![
+                vec!["d".into(), "project".into()],
+                vec!["d".into(), "project".into()],
+            ],
+            vec![
+                vec!["d".into(), "project".into()],
+                vec!["buzz-related-channel".into(), "not-a-uuid".into()],
+            ],
+            vec![
+                vec!["d".into(), "project".into()],
+                vec!["name".into(), "Name".into(), "extra".into()],
+            ],
+            vec![
+                vec!["d".into(), "project".into()],
+                vec!["description".into(), "Desc".into()],
+                vec!["name".into(), "Name".into()],
+            ],
+        ];
+
+        for project_tags in invalid_tag_sets {
+            let mut invalid = template.clone();
+            invalid.content = serde_json::to_string(&ProjectionBody {
+                v: 1,
+                deleted: false,
+                project_tags,
+            })
+            .unwrap();
+            assert!(validate_project_state_projection(
+                &signed_projection(&relay, &invalid),
+                &relay.public_key(),
+                &coordinate,
+            )
+            .is_err());
+        }
     }
 }

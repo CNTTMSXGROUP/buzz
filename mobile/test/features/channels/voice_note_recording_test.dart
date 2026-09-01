@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:buzz/features/channels/voice_note_recording.dart';
 
@@ -48,6 +49,17 @@ class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
     if (stopCalled && !stopCompleted) terminalOverlap = true;
     disposeCalled = true;
     await amplitudes.close();
+  }
+}
+
+class _DelayedHttpClient extends http.BaseClient {
+  final sent = Completer<http.BaseRequest>();
+  final response = Completer<http.StreamedResponse>();
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    sent.complete(request);
+    return response.future;
   }
 }
 
@@ -116,6 +128,8 @@ class _CoordinatedPlayer extends VoiceNotePlayerController {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   test('cancellation fences delayed permission before native start', () async {
     final backend = _DelayedRecorderBackend();
     final directory = await Directory.systemTemp.createTemp('voice-note-test');
@@ -195,6 +209,45 @@ void main() {
       expect(backend.cancelCalled, isFalse);
       expect(backend.disposeCalled, isTrue);
       expect(backend.terminalOverlap, isFalse);
+    },
+  );
+
+  test(
+    'authenticated iOS playback waits for play and aborts on disposal',
+    () async {
+      final client = _DelayedHttpClient();
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-playback-test',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: VoiceNotePlaybackCoordinator(),
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+      );
+
+      await player.loadRemote(
+        'https://example.com/voice-note.mp4',
+        headers: const {'Authorization': 'Nostr signed-event'},
+        fallbackDuration: const Duration(seconds: 7),
+      );
+      expect(player.state.isLoading, isFalse);
+      expect(player.state.duration, const Duration(seconds: 7));
+      expect(client.sent.isCompleted, isFalse);
+
+      final playback = player.toggle();
+      final request = await client.sent.future;
+      expect(request, isA<http.AbortableStreamedRequest>());
+      expect(request.headers['Authorization'], 'Nostr signed-event');
+
+      final abortable = request as http.AbortableStreamedRequest;
+      player.dispose();
+      await abortable.abortTrigger;
+      client.response.completeError(http.RequestAbortedException(request.url));
+      await playback;
+
+      expect(directory.listSync().whereType<File>(), isEmpty);
     },
   );
 

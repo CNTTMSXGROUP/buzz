@@ -332,6 +332,9 @@ class VoiceNotePlaybackCoordinator {
     return identical(_active, controller);
   }
 
+  bool ownsPlayback(VoiceNotePlayerController controller) =>
+      identical(_active, controller);
+
   void release(VoiceNotePlayerController controller) {
     if (identical(_active, controller)) _active = null;
   }
@@ -356,9 +359,12 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     required VoiceNotePlaybackCoordinator coordinator,
     required http.Client client,
     Future<Directory> Function()? temporaryDirectory,
+    bool? requiresAuthenticatedLocalFile,
   }) : _coordinator = coordinator,
        _client = client,
        _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory,
+       _requiresAuthenticatedLocalFile =
+           requiresAuthenticatedLocalFile ?? Platform.isIOS,
        _player = audio.AudioPlayer(useProxyForRequestHeaders: false) {
     _subscriptions.add(
       _player.positionStream.listen((position) {
@@ -400,8 +406,13 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   final http.Client _client;
   final Future<Directory> Function() _temporaryDirectory;
   final audio.AudioPlayer _player;
+  final bool _requiresAuthenticatedLocalFile;
   final List<StreamSubscription<Object?>> _subscriptions = [];
   VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
+  ({String url, Map<String, String> headers, Duration fallbackDuration})?
+  _pendingRemote;
+  Completer<void>? _downloadAbort;
+  File? _downloadingRemoteFile;
   File? _remoteFile;
   bool _disposed = false;
 
@@ -425,32 +436,69 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     String url, {
     required Map<String, String> headers,
     required Duration fallbackDuration,
-  }) => _load(() async {
-    if (!Platform.isIOS || headers.isEmpty) {
-      return _player.setUrl(url, headers: headers);
-    }
-    final response = await _client.get(Uri.parse(url), headers: headers);
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw HttpException(
-        'Voice note download failed (${response.statusCode})',
-        uri: Uri.parse(url),
+  }) {
+    if (!_requiresAuthenticatedLocalFile || headers.isEmpty) {
+      _pendingRemote = null;
+      return _load(
+        () => _player.setUrl(url, headers: headers),
+        fallbackDuration: fallbackDuration,
       );
     }
-    final directory = await _temporaryDirectory();
-    if (_disposed) return null;
-    final file = File(
-      '${directory.path}${Platform.pathSeparator}'
-      'buzz-voice-note-${DateTime.now().microsecondsSinceEpoch}.mp4',
+    _pendingRemote = (
+      url: url,
+      headers: Map.unmodifiable(headers),
+      fallbackDuration: fallbackDuration,
     );
-    await file.writeAsBytes(response.bodyBytes, flush: true);
-    if (_disposed) {
-      await _deleteRemoteFile(file);
+    _update(VoiceNotePlaybackState(duration: fallbackDuration));
+    return Future.value();
+  }
+
+  Future<Duration?> _loadPendingRemote() async {
+    final remote = _pendingRemote;
+    if (remote == null) return null;
+    final uri = Uri.parse(remote.url);
+    final requestAbort = Completer<void>();
+    _downloadAbort = requestAbort;
+    File? file;
+    try {
+      final request = http.AbortableStreamedRequest(
+        'GET',
+        uri,
+        abortTrigger: requestAbort.future,
+      )..headers.addAll(remote.headers);
+      final response = await _client.send(request);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        await response.stream.drain<void>();
+        throw HttpException(
+          'Voice note download failed (${response.statusCode})',
+          uri: uri,
+        );
+      }
+      final directory = await _temporaryDirectory();
+      file = File(
+        '${directory.path}${Platform.pathSeparator}'
+        'buzz-voice-note-${DateTime.now().microsecondsSinceEpoch}.mp4',
+      );
+      _downloadingRemoteFile = file;
+      await response.stream.pipe(file.openWrite());
+      if (_disposed || !_coordinator.ownsPlayback(this)) return null;
+      await _deleteRemoteFile(_remoteFile);
+      _remoteFile = file;
+      _downloadingRemoteFile = null;
+      _pendingRemote = null;
+      return _player.setFilePath(file.path);
+    } on http.RequestAbortedException {
       return null;
+    } finally {
+      if (identical(_downloadAbort, requestAbort)) _downloadAbort = null;
+      if (identical(_downloadingRemoteFile, file)) {
+        _downloadingRemoteFile = null;
+      }
+      if (file != null && !identical(_remoteFile, file)) {
+        await _deleteRemoteFile(file);
+      }
     }
-    await _deleteRemoteFile(_remoteFile);
-    _remoteFile = file;
-    return _player.setFilePath(file.path);
-  }, fallbackDuration: fallbackDuration);
+  }
 
   Future<void> _deleteRemoteFile(File? file) async {
     if (file == null) return;
@@ -490,12 +538,29 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
       await pause();
     } else {
       final ownsPlayback = await _coordinator.activate(this);
-      if (ownsPlayback && !_disposed) await _player.play();
+      if (!ownsPlayback || _disposed) return;
+      final remote = _pendingRemote;
+      if (remote != null) {
+        await _load(
+          _loadPendingRemote,
+          fallbackDuration: remote.fallbackDuration,
+        );
+        if (_pendingRemote != null) return;
+      }
+      if (_coordinator.ownsPlayback(this) && !_disposed && !_state.hasError) {
+        await _player.play();
+      }
     }
   }
 
   @override
-  Future<void> pause() => _player.pause();
+  Future<void> pause() async {
+    final activeDownloadAbort = _downloadAbort;
+    if (activeDownloadAbort != null && !activeDownloadAbort.isCompleted) {
+      activeDownloadAbort.complete();
+    }
+    await _player.pause();
+  }
 
   @override
   Future<void> seek(Duration position) => _player.seek(position);
@@ -513,6 +578,10 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   void dispose() {
     _disposed = true;
     _coordinator.release(this);
+    final activeDownloadAbort = _downloadAbort;
+    if (activeDownloadAbort != null && !activeDownloadAbort.isCompleted) {
+      activeDownloadAbort.complete();
+    }
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }

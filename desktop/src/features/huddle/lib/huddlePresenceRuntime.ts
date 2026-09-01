@@ -5,9 +5,11 @@ import {
   huddleSessionId,
   HuddlePresenceTracker,
   HUDDLE_LIFECYCLE_PAGE_LIMIT,
+  compareHuddleGenerations,
 } from "@/features/huddle/lib/huddlePresence";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { MAX_EXPLICIT_CHANNEL_VALUES } from "@/shared/api/relayClientShared";
 import {
   KIND_HUDDLE_ENDED,
@@ -85,6 +87,7 @@ export function startHuddlePresenceRuntime(
   let livenessHandle: unknown = null;
   let retryDelayMs = INITIAL_RETRY_DELAY_MS;
   let livenessRequestVersion = 0;
+  const pendingOpaqueJoins = new Map<string, RelayEvent>();
 
   const channelChunks: string[][] = [];
   const normalizedChannelIds = [...new Set(dependencies.channelIds)].sort();
@@ -125,6 +128,100 @@ export function startHuddlePresenceRuntime(
     }, delay);
   };
 
+  const pendingOpaqueJoinMatches = (
+    sessionId: string,
+    generation: string | undefined,
+  ) => {
+    for (const event of pendingOpaqueJoins.values()) {
+      if (
+        huddleSessionId(event) === sessionId &&
+        huddleLifecycleGeneration(event) === generation
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const sessionHasPendingOpaqueJoin = (sessionId: string) => {
+    for (const event of pendingOpaqueJoins.values()) {
+      if (huddleSessionId(event) === sessionId) return true;
+    }
+    return false;
+  };
+
+  const clearPendingOpaqueJoinsForSession = (sessionId: string) => {
+    for (const [eventId, event] of pendingOpaqueJoins) {
+      if (huddleSessionId(event) === sessionId) {
+        pendingOpaqueJoins.delete(eventId);
+      }
+    }
+  };
+
+  const deferOpaqueJoin = (event: RelayEvent): boolean => {
+    if (
+      event.kind !== KIND_HUDDLE_PARTICIPANT_JOINED ||
+      normalizePubkey(event.pubkey) !==
+        normalizePubkey(dependencies.relaySelfPubkey)
+    ) {
+      return false;
+    }
+    const sessionId = huddleSessionId(event);
+    const generation = huddleLifecycleGeneration(event);
+    const currentGeneration = sessionId
+      ? activeSessionGenerations.get(sessionId)
+      : undefined;
+    if (
+      !sessionId ||
+      !generation ||
+      !currentGeneration ||
+      generation === currentGeneration ||
+      compareHuddleGenerations(generation, currentGeneration) !== null
+    ) {
+      return false;
+    }
+
+    pendingOpaqueJoins.delete(event.id);
+    pendingOpaqueJoins.set(event.id, event);
+    while (pendingOpaqueJoins.size > MAX_PENDING_LIVE_EVENTS) {
+      const oldestEventId = pendingOpaqueJoins.keys().next().value as
+        | string
+        | undefined;
+      if (!oldestEventId) break;
+      pendingOpaqueJoins.delete(oldestEventId);
+    }
+    // The rejected JOIN still changes reconciliation state: an in-flight
+    // snapshot may be the authority that establishes its opaque generation.
+    livenessRequestVersion += 1;
+    return true;
+  };
+
+  const replayAuthoritativeOpaqueJoins = (
+    generations: ReadonlyMap<string, string>,
+    discardMismatches: boolean,
+  ) => {
+    for (const event of [...pendingOpaqueJoins.values()].sort(
+      compareHuddleLifecycleEvents,
+    )) {
+      const sessionId = huddleSessionId(event);
+      if (!sessionId) {
+        pendingOpaqueJoins.delete(event.id);
+        continue;
+      }
+      const liveGeneration = generations.get(sessionId);
+      if (liveGeneration === undefined) {
+        pendingOpaqueJoins.delete(event.id);
+        continue;
+      }
+      if (huddleLifecycleGeneration(event) !== liveGeneration) {
+        if (discardMismatches) pendingOpaqueJoins.delete(event.id);
+        continue;
+      }
+      tracker.apply(event);
+      pendingOpaqueJoins.delete(event.id);
+    }
+  };
+
   const applyLiveEvent = (event: RelayEvent) => {
     if (disposed) return;
     if (!hydrated || reconciling) {
@@ -139,12 +236,16 @@ export function startHuddlePresenceRuntime(
       return;
     }
     const changed = tracker.apply(event);
-    if (!changed) return;
+    if (!changed) {
+      deferOpaqueJoin(event);
+      return;
+    }
 
     const sessionId = huddleSessionId(event);
     if (sessionId) {
       if (event.kind === KIND_HUDDLE_ENDED) {
         activeSessionGenerations.delete(sessionId);
+        clearPendingOpaqueJoinsForSession(sessionId);
       } else if (event.kind === KIND_HUDDLE_PARTICIPANT_JOINED) {
         // A START is published before audio admission and is not proof of a live
         // room. An authenticated relay JOIN may activate it immediately.
@@ -234,6 +335,18 @@ export function startHuddlePresenceRuntime(
           requestedGeneration,
         ] of requestedSessionGenerations) {
           if (activeSessionGenerations.get(sessionId) !== requestedGeneration) {
+            const liveGeneration = nextActiveSessionGenerations.get(sessionId);
+            if (
+              pendingOpaqueJoinMatches(sessionId, liveGeneration) ||
+              (liveGeneration === undefined &&
+                !sessionHasPendingOpaqueJoin(sessionId))
+            ) {
+              if (liveGeneration === undefined) {
+                mergedGenerations.delete(sessionId);
+              } else {
+                mergedGenerations.set(sessionId, liveGeneration);
+              }
+            }
             continue;
           }
           const liveGeneration = nextActiveSessionGenerations.get(sessionId);
@@ -247,6 +360,7 @@ export function startHuddlePresenceRuntime(
           }
         }
         tracker.reconcileLiveness(mergedGenerations, activeSessionGenerations);
+        replayAuthoritativeOpaqueJoins(mergedGenerations, false);
         activeSessionGenerations = mergedGenerations;
         dependencies.onPresence(
           tracker.snapshot(new Set(activeSessionGenerations.keys())),
@@ -258,6 +372,7 @@ export function startHuddlePresenceRuntime(
         nextActiveSessionGenerations,
         activeSessionGenerations,
       );
+      replayAuthoritativeOpaqueJoins(nextActiveSessionGenerations, true);
       activeSessionGenerations = nextActiveSessionGenerations;
       dependencies.onPresence(
         tracker.snapshot(new Set(activeSessionGenerations.keys())),
@@ -346,6 +461,7 @@ export function startHuddlePresenceRuntime(
       pendingLiveEvents = [];
       nextTracker.reconcileLiveness(nextActiveSessionGenerations);
       tracker = nextTracker;
+      pendingOpaqueJoins.clear();
       activeSessionGenerations = nextActiveSessionGenerations;
       hydrated = true;
       retryDelayMs = INITIAL_RETRY_DELAY_MS;
@@ -433,6 +549,7 @@ export function startHuddlePresenceRuntime(
     if (liveDispose) void liveDispose();
     liveDispose = null;
     pendingLiveEvents = [];
+    pendingOpaqueJoins.clear();
     pendingOverflowed = false;
     activeSessionGenerations.clear();
   };

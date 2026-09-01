@@ -42,7 +42,8 @@ type LifecycleContent = {
   generation: string | null;
 };
 
-function compareHuddleGenerations(
+/** Compare monotonic decimal mesh generations; opaque epochs are unordered. */
+export function compareHuddleGenerations(
   candidate: LivenessGeneration,
   current: LivenessGeneration,
 ): number | null {

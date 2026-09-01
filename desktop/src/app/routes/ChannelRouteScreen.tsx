@@ -25,6 +25,8 @@ import {
   shouldUseScopedProjectHomeLookup,
 } from "@/features/projects/projectSnapshot";
 import { ProjectChannelHome } from "@/features/projects/ui/ProjectChannelHome";
+import { useMarketAnnouncement } from "@/features/market/lib/useMarketChannels";
+import { MarketChannelHome } from "@/features/market/ui/MarketChannelHome";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { getEventById } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
@@ -159,6 +161,7 @@ export function ChannelRouteScreen({
   );
   const projectHome =
     enumeratedProjectHome ?? projectHomeLookupQuery.data ?? null;
+  const marketAnnouncement = useMarketAnnouncement(channelId);
   const [targetMessageEvents, setTargetMessageEvents] = React.useState<
     RelayEvent[]
   >(() => {
@@ -304,6 +307,30 @@ export function ChannelRouteScreen({
         projects={projectsQuery.data ?? [projectHome]}
         targetMessageEvents={targetMessageEvents}
         targetMessageId={targetMessageId}
+      />
+    );
+  }
+
+  if (activeChannel && marketAnnouncement && !isHuddleTranscript) {
+    return (
+      <MarketChannelHome
+        activeChannel={activeChannel}
+        announcement={marketAnnouncement}
+        autoSendDraftKey={autoSendDraftKey}
+        currentIdentity={identityQuery.data}
+        currentProfile={profileQuery.data}
+        onCloseForumPost={() => {
+          void closeForumPost(channelId);
+        }}
+        onSelectForumPost={(postId) => {
+          void goForumPost(channelId, postId);
+        }}
+        selectedForumPostId={selectedPostId}
+        targetForumReplyId={targetReplyId}
+        targetMessageEvents={targetMessageEvents}
+        targetMessageId={targetMessageId}
+        targetSearchMessageId={activeSearchHighlight?.messageId}
+        targetSearchQuery={activeSearchHighlight?.query}
       />
     );
   }

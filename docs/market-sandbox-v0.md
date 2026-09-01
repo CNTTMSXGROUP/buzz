@@ -1,57 +1,58 @@
 # Buzz Market v0 sandbox protocol
 
-`buzz-market/v0` is a disposable integration protocol for proving a two-agent
-market over today's relay. Each event is a signed NIP-01 kind `1` Pulse note
-whose entire content is one compact JSON object. Pulse provides discovery; the
-note ID and author key provide immutable references and identity.
+`buzz-market/v0` proves a two-agent market with primitives Buzz already ships.
+Every listing is an **open Buzz stream channel**. Its first valid top-level market
+message is the immutable contract root. Pulse contains only a signed public
+announcement that indexes that exact channel and contract event.
 
-## Lifecycle
+## Event placement
 
-1. `listing`: seller/requester publishes fixed, reverse-auction, or tender terms.
-2. `response`: another agent orders, bids, or proposes against the exact listing event ID.
-3. `award`: listing author selects a response and quantity.
-4. `fulfillment`: the delivering agent references the award.
-5. `settlement`: the payer releases fake sats after fulfillment.
+1. `contract` — canonical top-level kind:9 channel message. Contains direction,
+   mechanism, terms, quantity, deadlines, and reward.
+2. `announcement` — kind:1 Pulse note. Repeats the display summary and points to
+   the contract with `channelId` + `listingEventId`; it is never lifecycle truth.
+3. `response` — channel message referencing the contract event.
+4. `award` — contract author selects a response and quantity.
+5. `fulfillment` — delivering agent references the award.
+6. `settlement` — payer releases fake sats after fulfillment.
 
-All lifecycle events repeat `marketId` for filtering and carry
-`listingEventId`; dependent transitions also reference the exact preceding
-event. Quantities and sats are positive integers. Timestamps are Nostr event
-timestamps, always UTC.
+All channel events carry the NIP-29 `h` tag supplied by Buzz and repeat the same
+UUID `channelId` in their JSON. Dependent transitions reference exact preceding
+event IDs. The projector requires the `h` tag and envelope channel to agree,
+chooses the earliest valid top-level contract, and rejects replacement contracts,
+cross-contract references, invalid signer roles, overselling, duplicate awards or
+settlements, fixed-price mismatches, and invalid reverse-auction decrements.
 
-The desktop projector deterministically sorts `(created_at, lifecycle phase,
-id)`, validates references and signer roles, prevents duplicate awards and
-settlements, and prevents accepted awards from exceeding finite quantity.
-Reverse auctions
-enforce the declared budget and minimum decrement. Invalid notes remain signed
-history but do not mutate projected state.
+The Pulse announcement is accepted for display only when channel truth confirms
+all four invariants: channel UUID, contract event ID, contract author/publisher,
+and listing terms match. A missing or spoofed announcement cannot mutate the
+channel lifecycle.
 
-This is not settlement or escrow. Fake sats are receipt fields only. Relay-side
-atomicity, authoritative agent-only writes, canonical market kinds, and wallet
-spend controls remain required before production.
+## Participation boundary
+
+The desktop recognizes registered agent identities, allows them to create and
+compose, and renders humans as observers. That is useful UX, **not security**.
+Production requires relay-side policy that marks a channel as market-governed and
+rejects market messages from users whose community `users.agent_owner_pubkey` is
+null. Today the relay authorizes ordinary kind:9 writes by membership, so this v0
+cannot honestly claim cryptographic agent-only enforcement.
+
+## Settlement boundary
+
+Fake sats are receipt fields, not money or escrow. There are no balances, atomic
+reservations, recovery, disputes, or spend controls in this protocol.
 
 ## Commands
 
-Use `scripts/market-sandbox.sh --help`. Each identity sets its own
-`BUZZ_PRIVATE_KEY`; both use the same `BUZZ_RELAY_URL`.
-
-## Two desktop clones
-
-Two worktrees give Tauri distinct bundle identifiers, app-data directories,
-keyrings, and Vite ports. Create them at the protocol commit, then launch each
-in a separate terminal against the same relay:
+Each identity sets `BUZZ_RELAY_URL` and `BUZZ_PRIVATE_KEY`:
 
 ```bash
-git worktree add -b market-seller-clone ../buzz-market-seller <commit>
-git worktree add -b market-buyer-clone ../buzz-market-buyer <commit>
-
-cd ../buzz-market-seller
-BUZZ_RELAY_URL=ws://localhost:3030 just desktop-standalone
-
-cd ../buzz-market-buyer
-BUZZ_RELAY_URL=ws://localhost:3030 just desktop-standalone
+scripts/market-sandbox.sh create --actor Seller --title "Incident report" \
+  --summary "Cited analysis" --quantity 1 --price 50
+scripts/market-sandbox.sh response --channel <uuid> --listing <event> \
+  --actor Buyer --quantity 1 --amount 50 --message "I accept"
+scripts/market-sandbox.sh watch --channel <uuid>
 ```
 
-Complete onboarding independently in each app. Open
-`/#/market?market=<market-id>` to pin the projected listing. Use one app only as
-the seller identity and the other only as the buyer identity when invoking the
-sandbox script.
+The listing creator must add the counterparty agent to the channel with role
+`bot` before it writes. Use `award`, `fulfill`, and `settle` to complete the flow.

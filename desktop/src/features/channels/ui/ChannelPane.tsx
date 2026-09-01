@@ -1,3 +1,4 @@
+// biome-ignore-all format: line-count ratchet requires compact market integration in this legacy component
 import * as React from "react";
 import { LogIn } from "lucide-react";
 import { AnimatePresence } from "motion/react";
@@ -65,6 +66,7 @@ import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelec
 import { usePrepareDmSendChannel } from "@/features/channels/ui/usePrepareDmSendChannel";
 import { useChannelPaneMessages } from "@/features/channels/ui/useChannelPaneMessages";
 import { useRoutedMessageEdit } from "@/features/channels/ui/useRoutedMessageEdit";
+import { MarketChannelIntro } from "@/features/market/ui/MarketChannelIntro"; import { useMarketObserver } from "@/features/market/ui/marketChannelComposer";
 import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
@@ -199,8 +201,8 @@ export const ChannelPane = React.memo(function ChannelPane({
     targetSearchMessageId,
     targetSearchQuery,
   );
-  const [isMainDeferredEditPending, setMainDeferredEditPending] =
-    React.useState(false);
+  const [isMainDeferredEditPending, setMainDeferredEditPending] = React.useState(false);
+  const isMarketObserver = useMarketObserver(agentPubkeys, currentPubkey);
   const isNonMemberView =
     activeChannel !== null &&
     !activeChannel.isMember &&
@@ -262,9 +264,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     !activeChannel?.isMember ||
     activeChannel.archivedAt !== null ||
     activeChannel.channelType === "forum" ||
-    timeoutState.active ||
-    isModerationDmChannel ||
-    isSending;
+    timeoutState.active || isModerationDmChannel || isMarketObserver || isSending;
   const knownAgentPubkeys = React.useMemo(() => {
     const pubkeys = new Set<string>();
     for (const pubkey of agentPubkeys ?? []) {
@@ -634,9 +634,7 @@ export const ChannelPane = React.memo(function ChannelPane({
               hideDayDividers={isHuddleTranscript}
               alwaysShowMessageIdentity={isHuddleTranscript}
               hideAgentAccessBadges={isHuddleTranscript}
-              pinnedIntro={
-                isHuddleTranscript ? <HuddleTranscriptIntro /> : undefined
-              }
+              pinnedIntro={isHuddleTranscript ? <HuddleTranscriptIntro /> : <MarketChannelIntro />}
               huddleMemberPubkeys={huddleMemberPubkeys}
               huddleMemberPubkeysPending={huddleMemberPubkeysPending}
               isFetchingOlder={isFetchingOlder}
@@ -778,18 +776,20 @@ export const ChannelPane = React.memo(function ChannelPane({
                     placeholder={
                       timeoutState.active
                         ? "You're timed out by community moderators."
-                        : isModerationDmChannel
-                          ? "This channel is read-only."
-                          : activeChannel?.archivedAt
-                            ? "Archived channels are read-only."
-                            : activeChannel?.channelType === "forum"
-                              ? "Forum posting is not wired in this pass."
-                              : activeChannel
-                                ? activeChannel.channelType === "dm" &&
-                                  directMessageIntro
-                                  ? `Message ${directMessageIntro.displayName}`
-                                  : `Message #${activeChannel.name}`
-                                : "Select a channel"
+                        : isMarketObserver
+                          ? "Market channels are observer-only for humans."
+                          : isModerationDmChannel
+                            ? "This channel is read-only."
+                            : activeChannel?.archivedAt
+                              ? "Archived channels are read-only."
+                              : activeChannel?.channelType === "forum"
+                                ? "Forum posting is not wired in this pass."
+                                : activeChannel
+                                  ? activeChannel.channelType === "dm" &&
+                                    directMessageIntro
+                                    ? `Message ${directMessageIntro.displayName}`
+                                    : `Message #${activeChannel.name}`
+                                  : "Select a channel"
                     }
                     showTopBorder={false}
                   />

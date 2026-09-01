@@ -11,19 +11,19 @@ import { truncatePubkey } from "@/shared/lib/pubkey";
 export const MARKET_PROTOCOL = "buzz-market/v0" as const;
 
 const EventId = z.string().regex(/^[0-9a-f]{64}$/);
-const MarketId = z.string().min(1).max(120);
+const ChannelId = z.string().uuid();
 const ActorName = z.string().min(1).max(80);
 const PositiveInteger = z.number().int().positive();
-const NonnegativeInteger = z.number().int().nonnegative();
 
 const BaseEnvelope = z.object({
   protocol: z.literal(MARKET_PROTOCOL),
-  marketId: MarketId,
+  channelId: ChannelId,
 });
 
-const ListingEnvelope = BaseEnvelope.extend({
-  type: z.literal("listing"),
+const AnnouncementEnvelope = BaseEnvelope.extend({
+  type: z.literal("announcement"),
   version: z.literal(1),
+  listingEventId: EventId,
   listing: z.object({
     actorName: ActorName,
     direction: z.enum(["offer", "request"]),
@@ -33,10 +33,16 @@ const ListingEnvelope = BaseEnvelope.extend({
     quantity: z.union([PositiveInteger, z.literal("unlimited")]),
     priceSats: PositiveInteger.optional(),
     maxBudgetSats: PositiveInteger.optional(),
-    closesAt: NonnegativeInteger.optional(),
+    closesAt: PositiveInteger.optional(),
     deliveryMinutes: PositiveInteger.optional(),
     minimumDecrementSats: PositiveInteger.optional(),
   }),
+});
+
+const ContractEnvelope = BaseEnvelope.extend({
+  type: z.literal("contract"),
+  version: z.literal(1),
+  listing: AnnouncementEnvelope.shape.listing,
 });
 
 const ResponseEnvelope = BaseEnvelope.extend({
@@ -75,7 +81,8 @@ const SettlementEnvelope = BaseEnvelope.extend({
 });
 
 export const MarketEnvelopeSchema = z.discriminatedUnion("type", [
-  ListingEnvelope,
+  AnnouncementEnvelope,
+  ContractEnvelope,
   ResponseEnvelope,
   AwardEnvelope,
   FulfillmentEnvelope,
@@ -83,9 +90,14 @@ export const MarketEnvelopeSchema = z.discriminatedUnion("type", [
 ]);
 
 export type MarketEnvelope = z.infer<typeof MarketEnvelopeSchema>;
-export type MarketListingEnvelope = z.infer<typeof ListingEnvelope>;
+export type MarketAnnouncementEnvelope = z.infer<typeof AnnouncementEnvelope>;
+export type MarketContractEnvelope = z.infer<typeof ContractEnvelope>;
+export type MarketListing = MarketContractEnvelope["listing"];
 
 export type MarketProjection = {
+  channelId: string;
+  contract: MarketContractEnvelope;
+  contractAuthorPubkey: string;
   listingEventId: string;
   scenario: MarketScenario;
   rejected: Array<{ eventId: string; reason: string }>;
@@ -103,7 +115,7 @@ export function parseMarketEnvelope(content: string): MarketEnvelope | null {
 }
 
 function scenarioIdForListing(
-  listing: MarketListingEnvelope["listing"],
+  listing: MarketListing,
   settled: boolean,
 ): MarketScenarioId {
   if (settled) return "awarded";
@@ -125,7 +137,7 @@ function actorDetail(pubkey: string): string {
   return `agent · ${truncatePubkey(pubkey)}`;
 }
 
-function listingPrice(listing: MarketListingEnvelope["listing"]): string {
+function listingPrice(listing: MarketListing): string {
   if (listing.mechanism === "fixed") {
     return `${listing.priceSats ?? 0} sats per unit`;
   }
@@ -137,20 +149,34 @@ function listingPrice(listing: MarketListingEnvelope["listing"]): string {
     : "Judged on published criteria";
 }
 
-function validateListing(
-  listing: MarketListingEnvelope["listing"],
-): string | null {
+function validateListing(listing: MarketListing): string | null {
   if (listing.mechanism === "fixed" && !listing.priceSats) {
     return "fixed listing requires priceSats";
   }
+  if (listing.mechanism === "fixed" && listing.maxBudgetSats) {
+    return "fixed listing cannot declare maxBudgetSats";
+  }
+  if (listing.mechanism !== "reverse-auction" && listing.minimumDecrementSats) {
+    return "minimumDecrementSats is only valid for reverse auctions";
+  }
   if (listing.mechanism === "reverse-auction" && !listing.maxBudgetSats) {
     return "reverse auction requires maxBudgetSats";
+  }
+  if (listing.mechanism === "reverse-auction" && listing.priceSats) {
+    return "reverse auction cannot declare priceSats";
+  }
+  if (
+    listing.mechanism === "reverse-auction" &&
+    listing.minimumDecrementSats &&
+    listing.minimumDecrementSats > (listing.maxBudgetSats ?? 0)
+  ) {
+    return "minimum decrement exceeds maximum budget";
   }
   return null;
 }
 
 function responseIsValid(
-  listing: MarketListingEnvelope["listing"],
+  listing: MarketListing,
   response: Extract<MarketEnvelope, { type: "response" }>,
   bestAuctionBid: number | null,
 ): string | null {
@@ -185,7 +211,9 @@ function responseIsValid(
 
 function envelopePhase(envelope: MarketEnvelope): number {
   switch (envelope.type) {
-    case "listing":
+    case "announcement":
+      return -1;
+    case "contract":
       return 0;
     case "response":
       return 1;
@@ -198,16 +226,28 @@ function envelopePhase(envelope: MarketEnvelope): number {
   }
 }
 
-export function projectMarketNotes(
-  notes: UserNote[],
-  marketId?: string,
+function hasChannelTag(note: UserNote, channelId: string): boolean {
+  return note.tags.some(
+    (tag) =>
+      tag[0] === "h" && tag[1]?.toLowerCase() === channelId.toLowerCase(),
+  );
+}
+
+function isTopLevelChannelEvent(note: UserNote): boolean {
+  return !note.tags.some((tag) => tag[0] === "e");
+}
+
+export function projectMarketChannel(
+  events: UserNote[],
+  channelId: string,
 ): MarketProjection | null {
-  const parsed = notes
+  const parsed = events
     .map((note) => ({ note, envelope: parseMarketEnvelope(note.content) }))
     .filter(
       (entry): entry is { note: UserNote; envelope: MarketEnvelope } =>
         entry.envelope !== null &&
-        (marketId === undefined || entry.envelope.marketId === marketId),
+        entry.envelope.channelId.toLowerCase() === channelId.toLowerCase() &&
+        hasChannelTag(entry.note, channelId),
     )
     .sort(
       (left, right) =>
@@ -217,18 +257,26 @@ export function projectMarketNotes(
     );
   const listingEntry = parsed.find(
     (entry) =>
-      entry.envelope.type === "listing" &&
+      entry.envelope.type === "contract" &&
+      isTopLevelChannelEvent(entry.note) &&
       validateListing(entry.envelope.listing) === null,
   );
-  if (listingEntry?.envelope.type !== "listing") return null;
+  if (listingEntry?.envelope.type !== "contract") return null;
 
   const listingEventId = listingEntry.note.id;
   const listing = listingEntry.envelope;
   const marketEvents = parsed.filter(
     (entry) =>
-      entry.envelope.marketId === listing.marketId &&
+      (entry.envelope.type === "contract" ||
+        entry.envelope.type === "response" ||
+        entry.envelope.type === "award" ||
+        entry.envelope.type === "fulfillment" ||
+        entry.envelope.type === "settlement") &&
       entry.note.createdAt >= listingEntry.note.createdAt,
-  );
+  ) as Array<{
+    note: UserNote;
+    envelope: Exclude<MarketEnvelope, { type: "announcement" }>;
+  }>;
   const responses = new Map<
     string,
     { note: UserNote; envelope: Extract<MarketEnvelope, { type: "response" }> }
@@ -245,24 +293,39 @@ export function projectMarketNotes(
     }
   >();
   const settlements = new Map<string, UserNote>();
+  const acceptedEventIds = new Set<string>();
   const rejected: MarketProjection["rejected"] = [];
   let awardedQuantity = 0;
   let bestAuctionBid: number | null = null;
 
   for (const entry of marketEvents) {
     const { envelope, note } = entry;
-    if (envelope.type === "listing") continue;
+    if (envelope.type === "contract") {
+      if (note.id !== listingEventId) {
+        rejected.push({
+          eventId: note.id,
+          reason: "channel already has a canonical contract",
+        });
+      } else {
+        acceptedEventIds.add(note.id);
+      }
+      continue;
+    }
     if (envelope.listingEventId !== listingEventId) {
       rejected.push({
         eventId: note.id,
-        reason: "listingEventId does not target current listing",
+        reason: "listingEventId does not target channel contract",
       });
       continue;
     }
-    if (listing.listing.closesAt && note.createdAt > listing.listing.closesAt) {
+    if (
+      envelope.type === "response" &&
+      listing.listing.closesAt &&
+      note.createdAt > listing.listing.closesAt
+    ) {
       rejected.push({
         eventId: note.id,
-        reason: "event arrived after listing close",
+        reason: "response arrived after listing close",
       });
       continue;
     }
@@ -274,6 +337,7 @@ export function projectMarketNotes(
         continue;
       }
       responses.set(note.id, { note, envelope });
+      acceptedEventIds.add(note.id);
       if (listing.listing.mechanism === "reverse-auction") {
         bestAuctionBid = envelope.amountSats ?? bestAuctionBid;
       }
@@ -306,6 +370,7 @@ export function projectMarketNotes(
         continue;
       }
       awards.set(envelope.responseEventId, { note, envelope });
+      acceptedEventIds.add(note.id);
       awardedQuantity += envelope.quantity;
       continue;
     }
@@ -333,6 +398,7 @@ export function projectMarketNotes(
         continue;
       }
       fulfillments.set(envelope.awardEventId, { note, envelope });
+      acceptedEventIds.add(note.id);
       continue;
     }
 
@@ -365,20 +431,21 @@ export function projectMarketNotes(
       continue;
     }
     settlements.set(envelope.awardEventId, note);
+    acceptedEventIds.add(note.id);
   }
 
   const accepted = marketEvents.filter((entry) => {
-    if (entry.envelope.type === "listing")
-      return entry.note.id === listingEventId;
-    return !rejected.some((item) => item.eventId === entry.note.id);
+    if (!acceptedEventIds.has(entry.note.id)) return false;
+    acceptedEventIds.delete(entry.note.id);
+    return true;
   });
   const activities: MarketActivity[] = accepted
     .map(({ note, envelope }): MarketActivity => {
-      if (envelope.type === "listing") {
+      if (envelope.type === "contract") {
         return {
           actor: envelope.listing.actorName,
           at: formatAt(note.createdAt),
-          detail: `Contract v${envelope.version} is signed and open on Pulse.`,
+          detail: `Contract v${envelope.version} is signed in this Buzz channel and announced on Pulse.`,
           state: "accepted",
           title: "Market opened",
         };
@@ -445,6 +512,9 @@ export function projectMarketNotes(
       : "Open";
 
   return {
+    channelId,
+    contract: listing,
+    contractAuthorPubkey: listingEntry.note.pubkey,
     listingEventId,
     rejected,
     scenario: {
@@ -463,9 +533,9 @@ export function projectMarketNotes(
             ? "Reverse auction"
             : "Qualitative tender",
       status,
-      statusDetail: `Pulse state ${accepted.at(-1)?.note.id.slice(0, 8) ?? listingEventId.slice(0, 8)} · ${formatAt(accepted.at(-1)?.note.createdAt ?? listingEntry.note.createdAt)}`,
+      statusDetail: `Channel state ${accepted.at(-1)?.note.id.slice(0, 8) ?? listingEventId.slice(0, 8)} · ${formatAt(accepted.at(-1)?.note.createdAt ?? listingEntry.note.createdAt)}`,
       closeAt,
-      contractId: `${MARKET_PROTOCOL}:${listing.marketId}:v${listing.version}`,
+      contractId: `${MARKET_PROTOCOL}:${channelId}:v${listing.version}`,
       primaryAction:
         listing.listing.mechanism === "reverse-auction"
           ? `Bid below ${bestAuctionBid ?? listing.listing.maxBudgetSats ?? 0} sats`
@@ -509,3 +579,71 @@ export function projectMarketNotes(
     },
   };
 }
+
+export function projectMarketAnnouncements(
+  notes: UserNote[],
+): MarketAnnouncement[] {
+  const announcements = notes.flatMap((note) => {
+    const envelope = parseMarketEnvelope(note.content);
+    if (envelope?.type !== "announcement") return [];
+    const listingReason = validateListing(envelope.listing);
+    if (listingReason) return [];
+    return [{ note, envelope }];
+  });
+  const seenChannels = new Set<string>();
+  return announcements
+    .sort(
+      (left, right) =>
+        left.note.createdAt - right.note.createdAt ||
+        left.note.id.localeCompare(right.note.id),
+    )
+    .flatMap(({ note, envelope }) => {
+      const channelKey = envelope.channelId.toLowerCase();
+      if (seenChannels.has(channelKey)) return [];
+      seenChannels.add(channelKey);
+      return [
+        {
+          announcementEventId: note.id,
+          channelId: envelope.channelId,
+          createdAt: note.createdAt,
+          listingEventId: envelope.listingEventId,
+          listing: envelope.listing,
+          publisherPubkey: note.pubkey,
+        },
+      ];
+    })
+    .sort(
+      (left, right) =>
+        right.createdAt - left.createdAt ||
+        right.announcementEventId.localeCompare(left.announcementEventId),
+    );
+}
+
+export function marketAnnouncementMatchesProjection(
+  announcement: MarketAnnouncement,
+  projection: MarketProjection,
+): boolean {
+  return (
+    announcement.channelId.toLowerCase() ===
+      projection.channelId.toLowerCase() &&
+    announcement.listingEventId === projection.listingEventId &&
+    announcement.publisherPubkey.toLowerCase() ===
+      projection.contractAuthorPubkey.toLowerCase() &&
+    listingsMatch(announcement.listing, projection.contract.listing)
+  );
+}
+
+function listingsMatch(left: MarketListing, right: MarketListing): boolean {
+  return AnnouncementEnvelope.shape.listing
+    .keyof()
+    .options.every((key) => left[key] === right[key]);
+}
+
+export type MarketAnnouncement = {
+  announcementEventId: string;
+  channelId: string;
+  createdAt: number;
+  listingEventId: string;
+  listing: MarketAnnouncementEnvelope["listing"];
+  publisherPubkey: string;
+};

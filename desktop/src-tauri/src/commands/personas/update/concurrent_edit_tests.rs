@@ -180,8 +180,8 @@ fn update_request(id: &str, display_name: &str, expected: Option<&str>) -> Updat
 /// Moving the lock acquisition to after the comparison (the TOCTOU shape)
 /// means `try_lock()` succeeds and the assertion panics — turning this test
 /// **RED**.
-#[tokio::test]
-async fn command_path_and_lock_scope_regressions() {
+#[test]
+fn command_path_and_lock_scope_regressions() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -191,104 +191,112 @@ async fn command_path_and_lock_scope_regressions() {
 
     let old_home = std::env::var_os("HOME");
     let old_xdg = std::env::var_os("XDG_DATA_HOME");
-    {
-        // Hold the path mutex only during the synchronous setup phase so that
-        // clippy does not flag a MutexGuard held across an await point.
-        let _path_guard = crate::managed_agents::lock_path_mutex();
-        std::env::set_var("HOME", &home);
-        std::env::set_var("XDG_DATA_HOME", &home);
-    }
+    // Hold the path mutex for the entire test so concurrent tests that also
+    // mutate HOME cannot race against our store reads/writes.
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_DATA_HOME", &home);
 
-    let app = mock_app();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime");
 
-    // ── Layer 3: lock-scope assertion ─────────────────────────────────────
-    // Install the observer BEFORE seeding so it fires on the first real write.
-    let observer_fired = Arc::new(AtomicBool::new(false));
-    let observer_fired_clone = observer_fired.clone();
-    {
-        let mut slot = PRE_GUARD_OBSERVER.lock().expect("observer slot");
-        *slot = Some(Box::new(move |state: &crate::app_state::AppState| {
-            assert!(
-                state.managed_agents_store_lock.try_lock().is_err(),
-                "managed_agents_store_lock must already be held when find_persona_for_update \
+    rt.block_on(async {
+        let app = mock_app();
+
+        // ── Layer 3: lock-scope assertion ─────────────────────────────────────
+        // Install the observer BEFORE seeding so it fires on the first real write.
+        let observer_fired = Arc::new(AtomicBool::new(false));
+        let observer_fired_clone = observer_fired.clone();
+        {
+            let mut slot = PRE_GUARD_OBSERVER.lock().expect("observer slot");
+            *slot = Some(Box::new(move |state: &crate::app_state::AppState| {
+                assert!(
+                    state.managed_agents_store_lock.try_lock().is_err(),
+                    "managed_agents_store_lock must already be held when find_persona_for_update \
                  runs — a successful try_lock means the comparison happens outside the lock, \
                  which recreates the TOCTOU race"
-            );
-            observer_fired_clone.store(true, Ordering::SeqCst);
-        }));
-    }
+                );
+                observer_fired_clone.store(true, Ordering::SeqCst);
+            }));
+        }
 
-    // Seed: one persona at R1 in the persisted store.
-    save_personas(app.handle(), &[persona("p1", "Alice", R1)]).expect("seed write must succeed");
+        // Seed: one persona at R1 in the persisted store.
+        save_personas(app.handle(), &[persona("p1", "Alice", R1)])
+            .expect("seed write must succeed");
 
-    // Layer 3 probe: a successful write fires the observer while the lock is held.
-    let probe_result = update_persona_with(
-        update_request("p1", "Alice probe", Some(R1)),
-        app.handle().clone(),
-        |_app, _state, _persona| Ok(()),
-    )
-    .await;
+        // Layer 3 probe: a successful write fires the observer while the lock is held.
+        let probe_result = update_persona_with(
+            update_request("p1", "Alice probe", Some(R1)),
+            app.handle().clone(),
+            |_app, _state, _persona| Ok(()),
+        )
+        .await;
 
-    // Clear the observer immediately — must happen before any assertion that
-    // could panic, so it is never left installed for subsequent invocations.
-    {
-        let mut slot = PRE_GUARD_OBSERVER.lock().expect("observer slot");
-        *slot = None;
-    }
+        // Clear the observer immediately — must happen before any assertion that
+        // could panic, so it is never left installed for subsequent invocations.
+        {
+            let mut slot = PRE_GUARD_OBSERVER.lock().expect("observer slot");
+            *slot = None;
+        }
 
-    probe_result.expect("probe write must succeed — revision matches the seed");
-    assert!(
-        observer_fired.load(Ordering::SeqCst),
-        "the pre-guard observer must have fired — if it did not, the hook is not wired"
-    );
+        probe_result.expect("probe write must succeed — revision matches the seed");
+        assert!(
+            observer_fired.load(Ordering::SeqCst),
+            "the pre-guard observer must have fired — if it did not, the hook is not wired"
+        );
 
-    // ── Layer 2: command-path wiring ──────────────────────────────────────
-    // Writer A: now at the probe's updated_at (R2). Capture it so B can use
-    // the original R1 as a stale seed.
-    //
-    // Re-seed at R1 so the two-writer scenario starts from a known revision.
-    save_personas(app.handle(), &[persona("p1", "Alice", R1)]).expect("re-seed write must succeed");
+        // ── Layer 2: command-path wiring ──────────────────────────────────────
+        // Writer A: now at the probe's updated_at (R2). Capture it so B can use
+        // the original R1 as a stale seed.
+        //
+        // Re-seed at R1 so the two-writer scenario starts from a known revision.
+        save_personas(app.handle(), &[persona("p1", "Alice", R1)])
+            .expect("re-seed write must succeed");
 
-    let a_result = update_persona_with(
-        update_request("p1", "Alice A", Some(R1)),
-        app.handle().clone(),
-        |_app, _state, _persona| Ok(()),
-    )
-    .await;
-    let (a_persona, ()) = a_result.expect("writer A must succeed — revision matches the seed");
-    let r2 = a_persona.updated_at.clone();
-    assert_ne!(r2, R1, "the commit must advance the revision past R1");
+        let a_result = update_persona_with(
+            update_request("p1", "Alice A", Some(R1)),
+            app.handle().clone(),
+            |_app, _state, _persona| Ok(()),
+        )
+        .await;
+        let (a_persona, ()) = a_result.expect("writer A must succeed — revision matches the seed");
+        let r2 = a_persona.updated_at.clone();
+        assert_ne!(r2, R1, "the commit must advance the revision past R1");
 
-    // Writer B: seeded at R1, submits after A has committed R2.
-    let b_result = update_persona_with(
-        update_request("p1", "Alice B (must not land)", Some(R1)),
-        app.handle().clone(),
-        |_app, _state, _persona| Ok(()),
-    )
-    .await;
-    let b_err = b_result.expect_err("writer B must be rejected — its seed revision R1 is stale");
+        // Writer B: seeded at R1, submits after A has committed R2.
+        let b_result = update_persona_with(
+            update_request("p1", "Alice B (must not land)", Some(R1)),
+            app.handle().clone(),
+            |_app, _state, _persona| Ok(()),
+        )
+        .await;
+        let b_err =
+            b_result.expect_err("writer B must be rejected — its seed revision R1 is stale");
 
-    assert!(
-        b_err.starts_with(PERSONA_REVISION_CONFLICT),
-        "rejection must carry the conflict marker; got: {b_err}"
-    );
+        assert!(
+            b_err.starts_with(PERSONA_REVISION_CONFLICT),
+            "rejection must carry the conflict marker; got: {b_err}"
+        );
 
-    // Reload from the persisted store and confirm A's R2 survived B's attempt.
-    let persisted =
-        crate::managed_agents::load_personas(app.handle()).expect("reload must succeed");
-    let stored = persisted
-        .iter()
-        .find(|p| p.id == "p1")
-        .expect("persona must still exist after B's rejection");
+        // Reload from the persisted store and confirm A's R2 survived B's attempt.
+        let persisted =
+            crate::managed_agents::load_personas(app.handle()).expect("reload must succeed");
+        let stored = persisted
+            .iter()
+            .find(|p| p.id == "p1")
+            .expect("persona must still exist after B's rejection");
 
-    assert_eq!(
-        stored.updated_at, r2,
-        "A's committed revision must survive B's stale write attempt"
-    );
-    assert_eq!(
-        stored.display_name, "Alice A",
-        "A's committed display_name must survive B's stale write attempt"
-    );
+        assert_eq!(
+            stored.updated_at, r2,
+            "A's committed revision must survive B's stale write attempt"
+        );
+        assert_eq!(
+            stored.display_name, "Alice A",
+            "A's committed display_name must survive B's stale write attempt"
+        );
+    }); // rt.block_on
 
     // ── Cleanup ───────────────────────────────────────────────────────────
     std::env::remove_var("HOME");
@@ -313,64 +321,70 @@ async fn command_path_and_lock_scope_regressions() {
 /// and refuse to close the dialog as full success. If the retain error were
 /// swallowed — e.g. the callback's `?` were removed and it returned `Ok(())` —
 /// this test would become GREEN on a broken code path and catch it.
-#[tokio::test]
-async fn retain_failure_after_persist_is_returned_not_swallowed() {
+#[test]
+fn retain_failure_after_persist_is_returned_not_swallowed() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
     let old_home = std::env::var_os("HOME");
     let old_xdg = std::env::var_os("XDG_DATA_HOME");
-    {
-        let _path_guard = crate::managed_agents::lock_path_mutex();
-        std::env::set_var("HOME", &home);
-        std::env::set_var("XDG_DATA_HOME", &home);
-    }
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_DATA_HOME", &home);
 
-    let app = mock_app();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime");
 
-    // Seed one persona at R1 in the persisted store.
-    save_personas(app.handle(), &[persona("p1", "Alice", R1)]).expect("seed write must succeed");
+    rt.block_on(async {
+        let app = mock_app();
 
-    // Submit via update_persona_with with a retain callback that always fails.
-    // The persona save runs first (line ~210 in update.rs: `save_personas`),
-    // then the retain callback is called. If the retain error propagates, we
-    // get Err; if it is silently discarded, we get Ok — the test catches both.
-    let result = update_persona_with(
-        update_request("p1", "Alice retain-fail", Some(R1)),
-        app.handle().clone(),
-        |_app, _state, _persona| -> Result<(), String> {
-            Err("simulated retain / publish failure after persona persisted".to_string())
-        },
-    )
-    .await;
+        // Seed one persona at R1 in the persisted store.
+        save_personas(app.handle(), &[persona("p1", "Alice", R1)])
+            .expect("seed write must succeed");
 
-    assert!(
-        result.is_err(),
-        "update_persona_with must return Err when the retain callback fails — \
+        // Submit via update_persona_with with a retain callback that always fails.
+        // The persona save runs first (line ~210 in update.rs: `save_personas`),
+        // then the retain callback is called. If the retain error propagates, we
+        // get Err; if it is silently discarded, we get Ok — the test catches both.
+        let result = update_persona_with(
+            update_request("p1", "Alice retain-fail", Some(R1)),
+            app.handle().clone(),
+            |_app, _state, _persona| -> Result<(), String> {
+                Err("simulated retain / publish failure after persona persisted".to_string())
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "update_persona_with must return Err when the retain callback fails — \
          the save coordinator must see this error, not a silent success; \
          got: {:?}",
-        result.ok()
-    );
+            result.ok()
+        );
 
-    let err = result.unwrap_err();
-    assert!(
-        err.contains("simulated retain"),
-        "the error text must propagate from the retain callback; got: {err}"
-    );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("simulated retain"),
+            "the error text must propagate from the retain callback; got: {err}"
+        );
 
-    // Verify the persona DID persist (save_personas ran before retain) so we
-    // confirm the test scenario actually exercises the post-persist failure path.
-    let persisted =
-        crate::managed_agents::load_personas(app.handle()).expect("reload must succeed");
-    let stored = persisted
-        .iter()
-        .find(|p| p.id == "p1")
-        .expect("persona must exist");
-    assert_eq!(
-        stored.display_name, "Alice retain-fail",
-        "persona fields must have persisted before retain was called"
-    );
+        // Verify the persona DID persist (save_personas ran before retain) so we
+        // confirm the test scenario actually exercises the post-persist failure path.
+        let persisted =
+            crate::managed_agents::load_personas(app.handle()).expect("reload must succeed");
+        let stored = persisted
+            .iter()
+            .find(|p| p.id == "p1")
+            .expect("persona must exist");
+        assert_eq!(
+            stored.display_name, "Alice retain-fail",
+            "persona fields must have persisted before retain was called"
+        );
+    }); // rt.block_on
 
     // Cleanup
     std::env::remove_var("HOME");
@@ -399,133 +413,140 @@ async fn retain_failure_after_persist_is_returned_not_swallowed() {
 /// Mutation acceptance: restoring `retain(&app, &state, &result)?` before
 /// the avatar/name propagation block causes `save_managed_agents` to never run
 /// and the assertion on the stored agent name turns RED.
-#[tokio::test]
-async fn linked_instance_rename_completes_before_retain_error_propagates() {
+#[test]
+fn linked_instance_rename_completes_before_retain_error_propagates() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home2");
     std::fs::create_dir_all(&home).unwrap();
 
     let old_home = std::env::var_os("HOME");
     let old_xdg = std::env::var_os("XDG_DATA_HOME");
-    {
-        let _path_guard = crate::managed_agents::lock_path_mutex();
-        std::env::set_var("HOME", &home);
-        std::env::set_var("XDG_DATA_HOME", &home);
-    }
+    // Hold the path mutex for the entire test so concurrent tests that also
+    // mutate HOME cannot race against our store reads/writes.
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_DATA_HOME", &home);
 
-    let app = mock_app();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime");
 
-    // Seed persona "Alice" at R1.
-    save_personas(app.handle(), &[persona("p1", "Alice", R1)]).expect("seed must succeed");
+    rt.block_on(async {
+        let app = mock_app();
 
-    // Seed a linked agent whose name matches the persona's display_name.
-    let agent_record = crate::managed_agents::ManagedAgentRecord {
-        pubkey: "pk-alice-p2".to_string(),
-        name: "Alice".to_string(),
-        persona_id: Some("p1".to_string()),
-        private_key_nsec: String::new(),
-        auth_tag: None,
-        relay_url: String::new(),
-        avatar_url: None,
-        acp_command: String::new(),
-        agent_command: String::new(),
-        agent_command_override: None,
-        agent_args: vec![],
-        mcp_command: String::new(),
-        turn_timeout_seconds: 0,
-        idle_timeout_seconds: None,
-        max_turn_duration_seconds: None,
-        parallelism: 1,
-        system_prompt: None,
-        model: None,
-        provider: None,
-        persona_source_version: None,
-        env_vars: std::collections::BTreeMap::new(),
-        start_on_app_launch: false,
-        auto_restart_on_config_change: false,
-        runtime_pid: None,
-        backend: Default::default(),
-        backend_agent_id: None,
-        provider_policy_pending: false,
-        provider_binary_path: None,
-        team_id: None,
-        persona_team_dir: None,
-        persona_name_in_team: None,
-        created_at: String::new(),
-        updated_at: String::new(),
-        last_started_at: None,
-        last_stopped_at: None,
-        last_exit_code: None,
-        last_error: None,
-        last_error_code: None,
-        respond_to: Default::default(),
-        respond_to_allowlist: vec![],
-        display_name: Some("Alice".to_string()),
-        description: None,
-        slug: None,
-        runtime: None,
-        name_pool: vec![],
-        is_builtin: false,
-        is_active: true,
-        shared: false,
-        source_team: None,
-        source_team_persona_slug: None,
-        catalog_source: None,
-        team_catalog_source: None,
-        definition_respond_to: None,
-        definition_respond_to_allowlist: vec![],
-        definition_parallelism: None,
-        relay_mesh: None,
-        effort_level: None,
-    };
-    crate::managed_agents::save_managed_agents(app.handle(), &[agent_record])
-        .expect("agent seed must succeed");
+        // Seed persona "Alice" at R1.
+        save_personas(app.handle(), &[persona("p1", "Alice", R1)]).expect("seed must succeed");
 
-    // Submit a rename with a retain callback that always fails — simulates a
-    // strict publication/enqueue failure AFTER save_personas ran.
-    let result = update_persona_with(
-        UpdatePersonaRequest {
-            id: "p1".to_string(),
-            display_name: "Alice Renamed".to_string(),
+        // Seed a linked agent whose name matches the persona's display_name.
+        let agent_record = crate::managed_agents::ManagedAgentRecord {
+            pubkey: "pk-alice-p2".to_string(),
+            name: "Alice".to_string(),
+            persona_id: Some("p1".to_string()),
+            private_key_nsec: String::new(),
+            auth_tag: None,
+            relay_url: String::new(),
             avatar_url: None,
-            description: None,
-            system_prompt: "Do the work.".to_string(),
-            runtime: None,
+            acp_command: String::new(),
+            agent_command: String::new(),
+            agent_command_override: None,
+            agent_args: vec![],
+            mcp_command: String::new(),
+            turn_timeout_seconds: 0,
+            idle_timeout_seconds: None,
+            max_turn_duration_seconds: None,
+            parallelism: 1,
+            system_prompt: None,
             model: None,
             provider: None,
-            name_pool: Vec::new(),
-            env_vars: None,
-            behavior: None,
-            expected_updated_at: Some(R1.to_string()),
-        },
-        app.handle().clone(),
-        |_app, _state, _persona| -> Result<(), String> {
-            Err("simulated publish failure after persona persisted".to_string())
-        },
-    )
-    .await;
+            persona_source_version: None,
+            env_vars: std::collections::BTreeMap::new(),
+            start_on_app_launch: false,
+            auto_restart_on_config_change: false,
+            runtime_pid: None,
+            backend: Default::default(),
+            backend_agent_id: None,
+            provider_policy_pending: false,
+            provider_binary_path: None,
+            team_id: None,
+            persona_team_dir: None,
+            persona_name_in_team: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_started_at: None,
+            last_stopped_at: None,
+            last_exit_code: None,
+            last_error: None,
+            last_error_code: None,
+            respond_to: Default::default(),
+            respond_to_allowlist: vec![],
+            display_name: Some("Alice".to_string()),
+            description: None,
+            slug: None,
+            runtime: None,
+            name_pool: vec![],
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
+            definition_respond_to: None,
+            definition_respond_to_allowlist: vec![],
+            definition_parallelism: None,
+            relay_mesh: None,
+            effort_level: None,
+        };
+        crate::managed_agents::save_managed_agents(app.handle(), &[agent_record])
+            .expect("agent seed must succeed");
 
-    // The retain error must propagate so the coordinator sees publishFailed.
-    assert!(
-        result.is_err(),
-        "update_persona_with must return Err when retain fails; \
+        // Submit a rename with a retain callback that always fails — simulates a
+        // strict publication/enqueue failure AFTER save_personas ran.
+        let result = update_persona_with(
+            UpdatePersonaRequest {
+                id: "p1".to_string(),
+                display_name: "Alice Renamed".to_string(),
+                avatar_url: None,
+                description: None,
+                system_prompt: "Do the work.".to_string(),
+                runtime: None,
+                model: None,
+                provider: None,
+                name_pool: Vec::new(),
+                env_vars: None,
+                behavior: None,
+                expected_updated_at: Some(R1.to_string()),
+            },
+            app.handle().clone(),
+            |_app, _state, _persona| -> Result<(), String> {
+                Err("simulated publish failure after persona persisted".to_string())
+            },
+        )
+        .await;
+
+        // The retain error must propagate so the coordinator sees publishFailed.
+        assert!(
+            result.is_err(),
+            "update_persona_with must return Err when retain fails; \
          if this is Ok the retain error was swallowed"
-    );
+        );
 
-    // The linked agent must have been renamed BEFORE the error propagated.
-    // If save_managed_agents was skipped (the pre-fix path), the name is still "Alice".
-    let agents = crate::managed_agents::load_managed_agents(app.handle())
-        .expect("agent reload must succeed");
-    let stored_agent = agents
-        .iter()
-        .find(|a| a.pubkey == "pk-alice-p2")
-        .expect("linked agent must still exist");
+        // The linked agent must have been renamed BEFORE the error propagated.
+        // If save_managed_agents was skipped (the pre-fix path), the name is still "Alice".
+        let agents = crate::managed_agents::load_managed_agents(app.handle())
+            .expect("agent reload must succeed");
+        let stored_agent = agents
+            .iter()
+            .find(|a| a.pubkey == "pk-alice-p2")
+            .expect("linked agent must still exist");
 
-    assert_eq!(
-        stored_agent.name, "Alice Renamed",
-        "linked instance name must be propagated before the retain error is returned; \
+        assert_eq!(
+            stored_agent.name, "Alice Renamed",
+            "linked instance name must be propagated before the retain error is returned; \
          restoring `retain()?` before the propagation block turns this RED"
-    );
+        );
+    }); // rt.block_on
 
     // Cleanup
     std::env::remove_var("HOME");

@@ -171,8 +171,16 @@ export function AppShell() {
   });
   // Settings lives in history so back returns to the previous app entry.
   const settingsOpen = location.pathname === "/settings";
-  const locationSearchSection = (location.search as { section?: unknown })
+  const rawLocationSearchSection = (location.search as { section?: unknown })
     .section;
+  // Migrate legacy URL tokens: "moderation" → "relay-admin" (renamed section
+  // id), "doctor" → "agents" (alias also handled in validateSettingsSearch).
+  // useLocation().search is the raw URL query, bypassing route validation, so
+  // the alias must be applied here too.
+  const locationSearchSection =
+    rawLocationSearchSection === "moderation"
+      ? "relay-admin"
+      : rawLocationSearchSection;
   const settingsSection: SettingsSection = isSettingsSection(
     locationSearchSection,
   )

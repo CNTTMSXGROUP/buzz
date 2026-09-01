@@ -13131,19 +13131,6 @@ mod tests {
         let short_idle = std::time::Duration::from_millis(100);
         let ten_s = std::time::Duration::from_secs(10);
 
-        let applied_count = |o: &crate::observer::ObserverHandle| {
-            o.snapshot()
-                .into_iter()
-                .filter(|e| {
-                    e.kind == "acp_write"
-                        && e.authorization
-                            .as_ref()
-                            .map(|a| a.reason.as_deref() == Some("applied"))
-                            .unwrap_or(false)
-                })
-                .count()
-        };
-
         // ── reject_once resolves the entry ────────────────────────────────────
         {
             let (tx, rx) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
@@ -13166,11 +13153,31 @@ mod tests {
             "entry must be resolved after reject_once decision; \
              mutation: accepts() drops reject → entry stays pending → this fires"
         );
+
+        // Collect the applied writes and assert exactly one, carrying the reject option ID.
+        let events = obs.snapshot();
+        let applied_writes: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.kind == "acp_write"
+                    && e.authorization
+                        .as_ref()
+                        .map(|a| a.reason.as_deref() == Some("applied"))
+                        .unwrap_or(false)
+            })
+            .collect();
         assert_eq!(
-            applied_count(&obs),
+            applied_writes.len(),
             1,
             "exactly one applied ACP write must be emitted for reject_once; \
-             mutation: accepts() drops reject → zero writes → this fires"
+             mutation: accepts() drops reject → zero writes → this fires; got: {applied_writes:?}"
+        );
+        let payload = &applied_writes[0].payload;
+        assert_eq!(
+            payload["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-reject-once"),
+            "applied write must carry the reject option ID; \
+             mutation: response helper emits wrong optionId → this fires; got: {payload}"
         );
     }
 }

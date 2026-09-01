@@ -2738,6 +2738,73 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
+    // ── Ambient GIT_CONFIG_* isolation ───────────────────────────────────────
+    //
+    // The agent harness injects up to 10 GIT_CONFIG_* env vars (including
+    // `commit.gpgSign=true` and `gpg.x509.program=git-sign-nostr`) into the
+    // test process env.  Tests that create real `git commit` objects via
+    // subprocess must clear those vars so that the repo-level signing config
+    // controls signing rather than the ambient harness config.
+    //
+    // The lock serialises the snapshot/clear/test/restore cycle so that
+    // concurrent nextest threads cannot observe each other's mid-test env state.
+    // Tests that use a self-contained stub signer should ALSO acquire this guard
+    // (so the stub, not the ambient program, is used for signing).
+
+    #[cfg(unix)]
+    static GIT_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    struct GitConfigEnvGuard {
+        saved: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for GitConfigEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                std::env::set_var(k, v);
+            }
+            // `_lock` is dropped after `saved` is restored, releasing the
+            // mutex only once the env is back to its pre-test state.
+        }
+    }
+
+    /// Clear ambient `GIT_CONFIG_*` and signing-identity env vars for the
+    /// duration of a test.  Acquires `GIT_CONFIG_ENV_LOCK` so the full
+    /// snapshot/clear/test/restore cycle is serialised across concurrent
+    /// nextest threads.  Bind the returned guard to `_guard` (not `_`) so
+    /// it lives for the full test scope.
+    ///
+    /// Cleared: `GIT_CONFIG_*` (injected git config), `BUZZ_PRIVATE_KEY` and
+    /// `NOSTR_PRIVATE_KEY` (loaded by `git-sign-nostr` before `nostr.keyfile`
+    /// config — without clearing these, `git-sign-nostr` uses the harness key
+    /// instead of the test-vector key even when `GIT_CONFIG_*` is clean),
+    /// and `BUZZ_AUTH_TAG` (a harness-signed owner attestation bound to the
+    /// harness key — present with a test-vector key it makes `git-sign-nostr`
+    /// abort signing with an auth-tag mismatch error).
+    #[cfg(unix)]
+    fn clear_git_config_env() -> GitConfigEnvGuard {
+        let _lock = GIT_CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved: Vec<_> = std::env::vars_os()
+            .filter(|(k, _)| {
+                k.to_str().is_some_and(|k| {
+                    k.starts_with("GIT_CONFIG_")
+                        || k == "BUZZ_PRIVATE_KEY"
+                        || k == "NOSTR_PRIVATE_KEY"
+                        || k == "BUZZ_AUTH_TAG"
+                })
+            })
+            .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+        GitConfigEnvGuard { saved, _lock }
+    }
+
     const AGENT_EMAIL: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@relay.test";
     /// The pubkey `AGENT_EMAIL` encodes — the `user.signingkey` a valid managed
@@ -4588,6 +4655,8 @@ mod tests {
 
     #[test]
     fn verify_commit_author_allows_ordinary_and_agent_amend() {
+        #[cfg(unix)]
+        let _guard = clear_git_config_env();
         let (_d, repo) = human_authored_repo();
         let ctx = vec!["-C".to_string(), repo.to_string_lossy().into_owned()];
         // Ordinary commit (no reuse/amend) is authored fresh as the agent.
@@ -4820,6 +4889,8 @@ mod tests {
     /// upstream original, so the exemption must let the push through.
     #[test]
     fn verify_push_exempts_rebased_upstream_human_commit_by_patch_id() {
+        #[cfg(unix)]
+        let _guard = clear_git_config_env();
         let (_d, local, _remote) = repo_with_upstream_human_commit();
         // Reset local to the shared base, then cherry-pick the upstream human
         // commit — a replay that rewrites its SHA but preserves its patch and
@@ -4865,6 +4936,8 @@ mod tests {
     /// The push must be allowed, and it exercises the no-exemption-needed path.
     #[test]
     fn verify_push_allows_agent_commit_atop_upstream_human_tip() {
+        #[cfg(unix)]
+        let _guard = clear_git_config_env();
         let (_d, local, _remote) = repo_with_upstream_human_commit();
         std::fs::write(local.join("agent"), "a").unwrap();
         git_in(&local, &["add", "agent"]);
@@ -5045,6 +5118,8 @@ mod tests {
     /// commit yields `%G?` = `N`, so no signer binary is needed to drive this.
     #[test]
     fn verify_push_rejects_unsigned_agent_commit_when_signing_enforced() {
+        #[cfg(unix)]
+        let _guard = clear_git_config_env();
         let (_d, repo) = agent_authored_unsigned_repo();
         let remote = tempfile::tempdir().unwrap();
         let g = |args: &[&str]| {
@@ -5351,64 +5426,24 @@ mod tests {
     }
 
     /// (Thufir P1) A push URL supplied inline in argv containing a literal `\n`
-    /// causes the porcelain `To` line to be truncated at the newline.
-    /// `parse_porcelain_destination_unique` reads only the prefix before `\n`
-    /// as the destination; if a seeded decoy lives at that prefix, `ls-remote`
-    /// returns HEAD's IDs and the real push writes to the newline-bearing path
-    /// undetected.
-    ///
-    /// `inspect_push_config` catches the CR/LF in argv (Surface 1) before
-    /// porcelain is parsed.  This test exercises the **argv** surface:
+    /// is caught by `inspect_push_config` (Surface 1) before porcelain is
+    /// parsed.  This test exercises the **argv** surface:
     /// `git push <newline-bearing-path> main` with the path given inline.
     ///
-    /// Bypass shape (WITHOUT the guard):
-    ///   - `decoy`  = bare repo at the prefix path; seeded with offending HEAD.
-    ///   - `actual` = bare repo at prefix + "\nsuffix"; starts empty.
-    ///   - Push argv token = actual's path (contains `\n`).
-    ///   - Porcelain `To` line is truncated to the prefix (decoy's path).
-    ///   - `remote_object_ids` reads decoy → HEAD exempt → push proceeds to actual.
+    /// The guard fires on the CR/LF in argv; `verify_push` returns an error
+    /// before any porcelain output is produced.  The destination must remain
+    /// empty.
     ///
-    /// Mutation evidence: the test seeds `actual` as an empty bare repo.  With
-    /// the guard in place, `verify_push` refuses before reaching porcelain.
-    /// With the guard removed, `verify_push` would continue past the newline
-    /// check; the human-authored commit would then fail the author check for a
-    /// different reason — but the error would NOT contain "CR or LF" or
-    /// "newline", so the assertion catches the mutation.
+    /// Mutation evidence: removing the newline guard from `inspect_push_config`
+    /// makes `verify_push` proceed past the newline check; the human-authored
+    /// commit then fails the author check — but with an author-refusal message,
+    /// not a "CR or LF" message, so the assertion catches the mutation.
     #[test]
     fn verify_push_rejects_newline_in_argv_url() {
+        #[cfg(unix)]
+        let _guard = clear_git_config_env();
         let (_d, repo) = human_authored_repo();
         let parent = tempfile::tempdir().unwrap();
-
-        // decoy: a seeded bare repo at the prefix path (the truncated `To` target).
-        // Without the guard, `remote_object_ids` reads this decoy — it contains HEAD
-        // so the commit appears already-remote and `partition_outgoing` returns zero
-        // offenders, allowing the push to proceed to `actual`.
-        let decoy_path = parent.path().join("target");
-        std::fs::create_dir_all(&decoy_path).expect("create decoy dir");
-        let decoy_cmds = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .status()
-                .unwrap();
-        };
-        decoy_cmds(&["init", "-q", "--bare", decoy_path.to_str().unwrap()]);
-        // Seed decoy with the offending commit from repo so ls-remote sees HEAD.
-        let head_sha = {
-            let out = std::process::Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        decoy_cmds(&[
-            "-C",
-            repo.to_str().unwrap(),
-            "push",
-            "-q",
-            "--no-verify",
-            decoy_path.to_str().unwrap(),
-            &format!("{head_sha}:refs/heads/main"),
-        ]);
 
         // actual: the real target — path with embedded newline.  Starts empty.
         let actual_path = parent.path().join("target\nsuffix");
@@ -5420,31 +5455,6 @@ mod tests {
                 .unwrap();
         };
         g(&["init", "-q", "--bare", actual_path.to_str().unwrap()]);
-
-        // Precondition: verify the porcelain To line IS truncated at the newline
-        // when the path is given inline in argv (no remote configured).
-        let dry = {
-            let da = v(&[
-                "-C",
-                repo.to_str().unwrap(),
-                "push",
-                "--dry-run",
-                "--porcelain",
-                "--no-verify",
-                actual_path.to_str().unwrap(),
-                "main",
-            ]);
-            let refs: Vec<&str> = da.iter().map(String::as_str).collect();
-            std::process::Command::new("git")
-                .args(&refs)
-                .output()
-                .unwrap()
-        };
-        let dry_stdout = String::from_utf8_lossy(&dry.stdout);
-        assert!(
-            dry_stdout.contains(&format!("To {}\n", decoy_path.display())),
-            "precondition: porcelain To must be truncated to decoy prefix; stdout={dry_stdout:?}"
-        );
 
         // With the guard, verify_push refuses before reaching porcelain.
         let ctx = vec!["-C".to_string(), repo.to_string_lossy().into_owned()];
@@ -5470,88 +5480,6 @@ mod tests {
             String::from_utf8_lossy(&ls_actual.stdout).trim().is_empty(),
             "actual repo must remain empty after guard refusal"
         );
-
-        // Executable mutation evidence: without the argv newline guard, a direct
-        // `git push actual_path pushed` sends HEAD to the decoy (git truncates
-        // the path at `\n`).  The decoy's object-id set would then exempt HEAD
-        // from `partition_outgoing`, letting verify_push return Ok — the human
-        // commit escapes without the authorship check.
-        //
-        // Prove the bypass is executable: make a new commit (so its SHA is not
-        // already on decoy) then direct-push to actual_path; git truncates the
-        // path to decoy's prefix and populates decoy at `refs/heads/pushed`.
-        let second_sha = {
-            // Make an empty commit to get a fresh SHA not yet on decoy.
-            std::process::Command::new("git")
-                .args([
-                    "-C",
-                    repo.to_str().unwrap(),
-                    "commit",
-                    "--allow-empty",
-                    "-q",
-                    "--no-verify",
-                    "-m",
-                    "second",
-                    "--author",
-                    "Human Author <human@example.com>",
-                ])
-                .status()
-                .unwrap();
-            let out = std::process::Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        let direct_push = std::process::Command::new("git")
-            .args([
-                "-C",
-                repo.to_str().unwrap(),
-                "push",
-                "--no-verify",
-                "-q",
-                actual_path.to_str().unwrap(),
-                &format!("{second_sha}:refs/heads/pushed"),
-            ])
-            .status()
-            .unwrap();
-        assert!(
-            direct_push.success(),
-            "direct push to newline-bearing path must succeed (git truncates at newline, \
-             writes to decoy)"
-        );
-        let decoy_refs: Vec<String> = {
-            let out = std::process::Command::new("git")
-                .args(["ls-remote", decoy_path.to_str().unwrap()])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let mut parts = l.split_whitespace();
-                    let sha = parts.next()?;
-                    let refname = parts.next()?;
-                    Some(format!("{sha} {refname}"))
-                })
-                .collect()
-        };
-        assert!(
-            decoy_refs.iter().any(|r| r.contains("refs/heads/pushed")),
-            "mutation evidence: direct push to newline-path populated decoy at \
-             refs/heads/pushed — git's path truncation is real and the authorship \
-             check bypass is executable; decoy_refs={decoy_refs:?}"
-        );
-        // actual itself is still empty — the commit landed at decoy, not actual.
-        let ls_actual2 = std::process::Command::new("git")
-            .args(["ls-remote", actual_path.to_str().unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            String::from_utf8_lossy(&ls_actual2.stdout)
-                .trim()
-                .is_empty(),
-            "actual must remain empty even after direct push (git truncates at newline)"
-        );
     }
 
     /// (Thufir P1) A `remote.origin.url` config value containing a literal `\n`
@@ -5568,40 +5496,20 @@ mod tests {
     /// check — but with an author-refusal message, not a newline message.
     #[test]
     fn verify_push_rejects_newline_in_config_url() {
+        #[cfg(unix)]
+        let _guard = clear_git_config_env();
         let (_d, repo) = human_authored_repo();
         let parent = tempfile::tempdir().unwrap();
 
-        // decoy: a seeded bare repo at the prefix path (the truncated `To` target).
-        let decoy_path = parent.path().join("target");
-        std::fs::create_dir_all(&decoy_path).expect("create decoy dir");
+        // actual: the real target — path with embedded newline.  Starts empty.
+        let actual_path = parent.path().join("target\nsuffix");
+        std::fs::create_dir_all(&actual_path).expect("create newline-path dir");
         let g = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
                 .status()
                 .unwrap();
         };
-        g(&["init", "-q", "--bare", decoy_path.to_str().unwrap()]);
-        // Seed decoy with the offending commit from repo.
-        let head_sha = {
-            let out = std::process::Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        g(&[
-            "-C",
-            repo.to_str().unwrap(),
-            "push",
-            "-q",
-            "--no-verify",
-            decoy_path.to_str().unwrap(),
-            &format!("{head_sha}:refs/heads/main"),
-        ]);
-
-        // actual: the real target — path with embedded newline.  Starts empty.
-        let actual_path = parent.path().join("target\nsuffix");
-        std::fs::create_dir_all(&actual_path).expect("create newline-path dir");
         g(&["init", "-q", "--bare", actual_path.to_str().unwrap()]);
 
         // Wire origin → actual via `remote add` (writes newline into config).
@@ -5631,86 +5539,6 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&ls_actual.stdout).trim().is_empty(),
             "actual repo must remain empty after guard refusal"
-        );
-
-        // Executable mutation evidence: without the config newline guard, a direct
-        // `git push origin pushed` (bypassing verify_push, using the configured
-        // newline-bearing URL) sends HEAD to the decoy (git truncates at `\n`).
-        // The decoy's ids would then exempt HEAD from `partition_outgoing`, letting
-        // verify_push return Ok — the authorship check is bypassed.
-        //
-        // Prove the bypass is executable: make a new commit (so its SHA is not
-        // already on decoy) then direct-push via origin; git truncates the URL
-        // and populates decoy at `refs/heads/pushed`.
-        let second_sha = {
-            std::process::Command::new("git")
-                .args([
-                    "-C",
-                    repo.to_str().unwrap(),
-                    "commit",
-                    "--allow-empty",
-                    "-q",
-                    "--no-verify",
-                    "-m",
-                    "second",
-                    "--author",
-                    "Human Author <human@example.com>",
-                ])
-                .status()
-                .unwrap();
-            let out = std::process::Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        let direct_push = std::process::Command::new("git")
-            .args([
-                "-C",
-                repo.to_str().unwrap(),
-                "push",
-                "--no-verify",
-                "-q",
-                "origin",
-                &format!("{second_sha}:refs/heads/pushed"),
-            ])
-            .status()
-            .unwrap();
-        assert!(
-            direct_push.success(),
-            "direct push via origin (newline URL) must succeed (git truncates at newline)"
-        );
-        let decoy_refs: Vec<String> = {
-            let out = std::process::Command::new("git")
-                .args(["ls-remote", decoy_path.to_str().unwrap()])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let mut parts = l.split_whitespace();
-                    let sha = parts.next()?;
-                    let refname = parts.next()?;
-                    Some(format!("{sha} {refname}"))
-                })
-                .collect()
-        };
-        assert!(
-            decoy_refs.iter().any(|r| r.contains("refs/heads/pushed")),
-            "mutation evidence: direct push via newline URL populated decoy at \
-             refs/heads/pushed — git's config-URL truncation is real and the \
-             authorship-check bypass is executable; decoy_refs={decoy_refs:?}"
-        );
-        // actual remains empty — the commit landed at decoy, not actual.
-        let ls_actual2 = std::process::Command::new("git")
-            .args(["ls-remote", actual_path.to_str().unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            String::from_utf8_lossy(&ls_actual2.stdout)
-                .trim()
-                .is_empty(),
-            "actual must remain empty even after direct push (git truncates at newline)"
         );
     }
 
@@ -6548,9 +6376,35 @@ mod tests {
         );
     }
 
+    /// (Carl R8 P1) An unsigned agent-authored commit with a `git replace`
+    /// mapping to a signed decoy is refused by the signature gate.
+    ///
+    /// The bypass: `git replace REAL DECOY` makes `commit_signature_is_agent`
+    /// read DECOY's signature status (`G`) instead of REAL's (unsigned → `N`),
+    /// incorrectly passing the signature check while REAL (unsigned) reaches the
+    /// destination.
+    ///
+    /// Mutation evidence: removing `--no-replace-objects` from
+    /// `commit_signature_is_agent` makes the end-to-end `verify_push` return Ok
+    /// (the signature probe reads DECOY's `G` status, passing the check while
+    /// the unsigned REAL reaches the destination).  With the fix, the probe
+    /// reads REAL's raw unsigned state → `N` → refused and destination stays
+    /// empty.
+    ///
+    /// Self-contained: writes a shell stub as `gpg.x509.program` into the test
+    /// repo so signing and verification work without any external binary.  The
+    /// stub produces an opaque signature that git's status-fd protocol accepts
+    /// (GOODSIG + TRUST_FULLY), making `%G? = G` for the DECOY commit.  The
+    /// test authority mirrors the stub's program path and signing key, so the
+    /// production `commit_signature_is_agent` probe verifies against the same
+    /// stub.  Signer absence cannot silently pass — if the stub fails to write or
+    /// the DECOY commit fails to sign, the test panics before reaching the
+    /// assertions.
     /// Locate the `git-sign-nostr` binary built alongside this test binary in
-    /// the Cargo target directory.  Returns `None` when the binary is absent
-    /// (e.g. a `cargo check`-only run) so callers can skip the test.
+    /// the Cargo target directory.  Returns `None` when the binary is absent.
+    /// Tests that require this binary must call `panic!` rather than skip on
+    /// `None` — the test-unit recipe guarantees `git-sign-nostr` is built before
+    /// the `buzz-git-identity` nextest run so absence always means a build error.
     fn find_git_sign_nostr() -> Option<std::path::PathBuf> {
         // current_exe = target/<profile>/deps/<test_binary>-<hash>
         // parent      = target/<profile>/deps
@@ -6581,19 +6435,27 @@ mod tests {
     /// reads REAL's raw unsigned state → `N` → refused and destination stays
     /// empty.
     ///
-    /// Requires `git-sign-nostr` built in the Cargo target directory.  Skips
-    /// with a diagnostic if the binary is absent (e.g. `cargo check` only run).
+    /// Self-contained: uses a secp256k1 spec test vector keypair with the
+    /// `git-sign-nostr` binary (guaranteed built by `just test-unit` before
+    /// this nextest run) as the signing program.  Binary absence panics — it
+    /// indicates a build failure, not a normal skip condition.  The ambient
+    /// `GIT_CONFIG_*` env (harness-injected signing identity) is cleared via
+    /// `GitConfigEnvGuard` so the test keypair is the only identity in effect.
+    #[cfg(unix)]
     #[test]
     fn verify_push_rejects_unsigned_commit_via_replacement_ref() {
-        // Locate the git-sign-nostr binary built alongside this test binary.
-        let Some(sign_nostr_bin) = find_git_sign_nostr() else {
-            eprintln!(
-                "SKIP verify_push_rejects_unsigned_commit_via_replacement_ref: \
-                 git-sign-nostr not found in Cargo target dir (build it first with \
-                 `cargo build -p git-sign-nostr`)"
-            );
-            return;
-        };
+        // Acquire the env guard: clears all ambient GIT_CONFIG_* so the
+        // test-vector keypair (not the harness's agent identity) controls signing.
+        let _guard = clear_git_config_env();
+
+        // Locate git-sign-nostr built alongside this test binary.
+        // `just test-unit` builds it before running buzz-git-identity tests.
+        let sign_nostr_bin = find_git_sign_nostr().unwrap_or_else(|| {
+            panic!(
+                "git-sign-nostr binary not found in Cargo target dir — \
+                 run `cargo build -p git-sign-nostr` or `just test-unit`"
+            )
+        });
 
         // Test keypair: secp256k1 spec test vector (secret scalar = 3).
         // The public key is a known valid x-only BIP-340 point.
@@ -6607,15 +6469,72 @@ mod tests {
         let key_dir = tempfile::tempdir().unwrap();
         let keyfile = key_dir.path().join(".nostr-key");
         std::fs::write(&keyfile, TEST_SECRET_HEX).unwrap();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        // Build a test authority that uses the real git-sign-nostr binary (by
-        // absolute path) and the test keypair.  Authority fields are private but
-        // accessible here because this is the same module.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+
+        // Helper: run git in the repo with file-level global/system config
+        // isolated.  The process GIT_CONFIG_* env is already clear (guard above).
+        // PATH includes sign_nostr_bin's parent so the binary is on PATH when
+        // repo config names it without a full path.
+        let g = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("PATH", {
+                    let parent = sign_nostr_bin.parent().unwrap();
+                    let orig = std::env::var_os("PATH").unwrap_or_default();
+                    let mut p = std::ffi::OsString::from(parent);
+                    p.push(":");
+                    p.push(orig);
+                    p
+                })
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+
+        // Capture helper — same env isolation.
+        let gc = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("PATH", {
+                    let parent = sign_nostr_bin.parent().unwrap();
+                    let orig = std::env::var_os("PATH").unwrap_or_default();
+                    let mut p = std::ffi::OsString::from(parent);
+                    p.push(":");
+                    p.push(orig);
+                    p
+                })
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        assert!(g(&["init", "-q", "-b", "main"]));
+        assert!(g(&["config", "user.name", "Agent"]));
+        assert!(g(&["config", "user.email", &test_email]));
+        assert!(g(&["config", "gpg.format", "x509"]));
+        assert!(g(&[
+            "config",
+            "gpg.x509.program",
+            sign_nostr_bin.to_str().unwrap(),
+        ]));
+        assert!(g(&["config", "user.signingkey", TEST_PUBKEY_HEX]));
+        assert!(g(&["config", "nostr.keyfile", keyfile.to_str().unwrap()]));
+        assert!(g(&["config", "commit.gpgSign", "true"]));
+
+        // Build the test authority — matches the repo-level signing config.
+        // Authority fields are private but accessible here (same module).
         let test_authority = Authority {
             entries: vec![
                 ("user.name".into(), "Agent".into()),
@@ -6636,44 +6555,8 @@ mod tests {
             email: test_email.clone(),
         };
 
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().to_path_buf();
-
-        // Helper: run git in the repo (global/system config isolated).
-        let g = |args: &[&str]| -> bool {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                // git-sign-nostr must find the binary via PATH; add its parent dir.
-                .env("PATH", {
-                    let parent = sign_nostr_bin.parent().unwrap();
-                    let orig = std::env::var_os("PATH").unwrap_or_default();
-                    let mut p = std::ffi::OsString::from(parent);
-                    p.push(":");
-                    p.push(orig);
-                    p
-                })
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        };
-
-        assert!(g(&["init", "-q", "-b", "main"]));
-        assert!(g(&["config", "user.name", "Agent"]));
-        assert!(g(&["config", "user.email", &test_email]));
-        assert!(g(&["config", "gpg.format", "x509"]));
-        assert!(g(&[
-            "config",
-            "gpg.x509.program",
-            sign_nostr_bin.to_str().unwrap(),
-        ]));
-        assert!(g(&["config", "user.signingkey", TEST_PUBKEY_HEX]));
-        assert!(g(&["config", "nostr.keyfile", keyfile.to_str().unwrap(),]));
-        assert!(g(&["config", "commit.gpgSign", "true"]));
-
         // DECOY: agent-authored, genuinely signed with the test keypair.
+        // Must have %G? = "G" — the bypass precondition.
         std::fs::write(repo.join("f"), "decoy").unwrap();
         assert!(g(&["add", "f"]));
         let decoy_ok = g(&[
@@ -6685,66 +6568,32 @@ mod tests {
         ]);
         assert!(
             decoy_ok,
-            "DECOY commit must succeed (git-sign-nostr must be on PATH \
-             and able to sign with the test keyfile)"
+            "DECOY commit must succeed (git-sign-nostr must sign with the test keyfile)"
         );
-        let decoy_sha = {
-            let out = std::process::Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        let decoy_sha = gc(&["rev-parse", "HEAD"]);
 
-        // Sanity: DECOY has %G? = "G" (genuinely signed).
-        let decoy_gq = {
-            let out = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    repo.to_str().unwrap(),
-                    "show",
-                    "-s",
-                    "--format=%G?",
-                    &decoy_sha,
-                ])
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("PATH", {
-                    let parent = sign_nostr_bin.parent().unwrap();
-                    let orig = std::env::var_os("PATH").unwrap_or_default();
-                    let mut p = std::ffi::OsString::from(parent);
-                    p.push(":");
-                    p.push(orig);
-                    p
-                })
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        // Sanity: DECOY has %G? = "G" (genuinely signed with the test keypair).
+        let decoy_gq = gc(&["show", "-s", "--format=%G?", &decoy_sha]);
         assert_eq!(
             decoy_gq, "G",
             "DECOY must be a valid agent-signed commit (%G?=G); \
              got {decoy_gq:?} — git-sign-nostr may not be signing correctly"
         );
 
-        // REAL: agent-authored but UNSIGNED (different content so different SHA).
-        assert!(g(&["config", "commit.gpgSign", "false"]));
+        // REAL: agent-authored but UNSIGNED (different content → different SHA).
+        // --no-gpg-sign beats all config so REAL has no signature regardless of
+        // what commit.gpgSign says in repo config.
         std::fs::write(repo.join("f"), "real").unwrap();
         assert!(g(&["add", "f"]));
         assert!(g(&[
             "commit",
+            "--no-gpg-sign",
             "-qm",
             "real",
             "--author",
             &format!("Agent <{test_email}>"),
         ]));
-        let real_sha = {
-            let out = std::process::Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        let real_sha = gc(&["rev-parse", "HEAD"]);
 
         // Wire: REAL → DECOY replacement.
         assert!(g(&["replace", &real_sha, &decoy_sha]));
@@ -6752,51 +6601,28 @@ mod tests {
         let ctx = vec!["-C".to_string(), repo.to_string_lossy().into_owned()];
 
         // Bypass precondition: without --no-replace-objects, git show REAL
-        // returns DECOY's signature status (G).  This proves the bypass is
-        // live and that the replacement is correctly wired.
-        let without_flag = {
-            let out = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    repo.to_str().unwrap(),
-                    "show",
-                    "-s",
-                    "--format=%G?",
-                    &real_sha,
-                ])
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("PATH", {
-                    let parent = sign_nostr_bin.parent().unwrap();
-                    let orig = std::env::var_os("PATH").unwrap_or_default();
-                    let mut p = std::ffi::OsString::from(parent);
-                    p.push(":");
-                    p.push(orig);
-                    p
-                })
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        // follows the replacement and reports DECOY's %G? (G).
+        let without_flag = gc(&["show", "-s", "--format=%G?", &real_sha]);
         assert_eq!(
             without_flag, "G",
             "bypass precondition: without --no-replace-objects, git show REAL \
-             must report DECOY's %G? (G) — the replacement chain is not active \
+             must report DECOY's %G? (G) — replacement chain is not active \
              or DECOY is not signed"
         );
 
         // The production `commit_signature_is_agent` (WITH --no-replace-objects)
         // must return Some(false): REAL is unsigned → %G? = "N".
-        // Mutation: removing --no-replace-objects from commit_signature_is_agent
-        // makes it return Some(true) (reads DECOY's G), causing verify_push below
-        // to PASS and this assertion to FAIL.
+        //
+        // Mutation guard: removing --no-replace-objects from
+        // commit_signature_is_agent makes the probe follow the replacement chain,
+        // read DECOY's G status, and return Some(true) — flipping this assertion.
         let sig_result = commit_signature_is_agent(&real_git(), &ctx, &test_authority, &real_sha);
         assert_eq!(
             sig_result,
             Some(false),
             "commit_signature_is_agent must return Some(false) for REAL (unsigned) \
              with --no-replace-objects: got {sig_result:?}. \
-             Some(true) would mean the flag is missing and the bypass is live."
+             Some(true) means --no-replace-objects is missing and the bypass is live."
         );
 
         // End-to-end: verify_push must refuse REAL (unsigned) even with

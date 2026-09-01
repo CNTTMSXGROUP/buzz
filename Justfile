@@ -428,6 +428,14 @@ test-unit:
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.
         cargo nextest run -p buzz-acp --lib
+        # buzz-git-identity git wrapper unit tests: the push/commit author and
+        # signature guards that prevent identity bypass via git-replace,
+        # newline injection, config URL injection, and SSH-command hijack.
+        # `verify_push_rejects_unsigned_commit_via_replacement_ref` requires
+        # the `git-sign-nostr` binary to create a genuinely signed test commit;
+        # build it first so the test panics (not silently skips) on absence.
+        cargo build -p git-sign-nostr
+        cargo nextest run -p buzz-git-identity --lib
     else
         ./scripts/run-tests.sh unit
     fi

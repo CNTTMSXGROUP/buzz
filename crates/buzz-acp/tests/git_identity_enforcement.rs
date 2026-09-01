@@ -1251,3 +1251,160 @@ fn wrapper_refuses_alias_with_abbreviated_receive_pack_flag() {
         String::from_utf8_lossy(&refs.stdout),
     );
 }
+
+/// R9 real-wrapper regression: `alias.push = status` (a builtin-shadowing alias
+/// git silently ignores) must NOT suppress push verification.
+///
+/// **Bypass shape (without the fix):**
+/// `verify_alias_safety` previously performed an unconditional alias lookup on
+/// every command word, including builtins.  With `alias.push=status` set it
+/// expanded `push` → `status` and returned `effective_argv` with subcommand
+/// `status` → `is_push_command` returned `NotPush` → `verify_push` was skipped
+/// → `exec_real_git` ran the original `push` argv → git ignored the alias (it
+/// is a builtin) → real push succeeded with the human-authored HEAD.
+///
+/// **Mutation evidence:**
+/// Removing the `!builtins.is_empty() && builtins.contains(name.as_str())` break
+/// from `verify_alias_safety` recreates the bypass: the alias expands, the
+/// subcommand reads `status`, verification is skipped, and the remote receives
+/// the commit.  The `for-each-ref` assertion below would then fire.
+#[test]
+fn wrapper_refuses_push_via_builtin_shadowing_alias() {
+    let (_shim, path, _email, _keydir) = signed_shim_env();
+    let repo = human_repo();
+    let remote = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q", "--bare", remote.path().to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    wrapper(
+        &path,
+        repo.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    // Set alias.push=status — a builtin-shadowing alias git silently ignores.
+    // The wrapper must honour git's builtin-first precedence and refuse the
+    // human-authored commit exactly as it would without this alias.
+    wrapper(&path, repo.path(), &["config", "alias.push", "status"]);
+
+    let out = wrapper(&path, repo.path(), &["push", "origin", "main"]);
+    assert!(
+        !out.status.success(),
+        "push with alias.push=status must be refused (builtin-shadowing alias must not \
+         suppress verification); stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not authored by your agent identity"),
+        "expected the push-gate rejection (not an alias safety error or status output); \
+         stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // Destination must be empty — the push was refused before anything was sent.
+    let refs = Command::new("git")
+        .args(["-C", remote.path().to_str().unwrap(), "for-each-ref"])
+        .output()
+        .unwrap();
+    assert!(
+        refs.stdout.is_empty(),
+        "remote must be empty after refused push; refs={}",
+        String::from_utf8_lossy(&refs.stdout),
+    );
+}
+
+/// R9 real-wrapper regression: `alias.whatchanged = push origin main` must be
+/// expanded and held to policy on Git 2.52+ where deprecated builtins are
+/// alias-first.
+///
+/// **Bypass shape (without the fix):**
+/// `git_builtin_commands` on 2.52+ includes `whatchanged`; the prior code broke
+/// out of the alias expansion loop when it saw a builtin name, classifying the
+/// command as `NotPush` without looking at the alias definition.  Real git on
+/// 2.52+ calls `handle_alias()` before `handle_builtin()` for deprecated
+/// commands, so it DID expand the alias and executed `push origin main`.
+/// The wrapper skipped verification; the human-authored commit reached the
+/// remote.
+///
+/// **Fix:** `git_deprecated_commands(real_git)` queries `--list-cmds=deprecated`
+/// for the same binary.  The short-circuit now requires `builtin AND NOT
+/// deprecated`: deprecated-builtin names stay in the alias expansion path.
+///
+/// **Mutation evidence:**
+/// Removing the `!deprecated.contains(name.as_str())` qualifier from the
+/// builtin short-circuit in `verify_alias_safety` recreates the bypass for
+/// `whatchanged` on 2.52+: expansion is skipped, the command is classified
+/// `NotPush`, verification is omitted, and the remote receives the commit.
+/// The `for-each-ref` assertion below would fire.
+///
+/// Self-gate: this test is only meaningful on a Git binary that supports
+/// `--list-cmds=deprecated` (introduced in 2.52) and lists `whatchanged` as
+/// deprecated.  On older binaries the test skips rather than asserting an
+/// incorrect result.
+#[test]
+fn wrapper_refuses_push_via_deprecated_builtin_alias() {
+    // Probe whether the PATH git supports --list-cmds=deprecated and actually
+    // lists whatchanged.  Skip on pre-2.52 binaries where the deprecated-builtin
+    // alias-first path does not exist.
+    let probe = Command::new("git")
+        .args(["--list-cmds=deprecated"])
+        .output()
+        .unwrap();
+    if !probe.status.success() {
+        eprintln!("skip: git --list-cmds=deprecated unsupported (pre-2.52 binary)");
+        return;
+    }
+    let deprecated_list = String::from_utf8_lossy(&probe.stdout);
+    if !deprecated_list.lines().any(|l| l.trim() == "whatchanged") {
+        eprintln!("skip: `whatchanged` not in --list-cmds=deprecated output on this binary");
+        return;
+    }
+
+    let (_shim, path, _email, _keydir) = signed_shim_env();
+    let repo = human_repo();
+    let remote = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q", "--bare", remote.path().to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    wrapper(
+        &path,
+        repo.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    // Set alias.whatchanged=push — on 2.52+ git expands this alias because
+    // deprecated builtins are alias-first.  The alias body is just `push`; the
+    // remote and refspec come from the caller's trailing argv so that
+    // `resolve_push_sources` can replay the dry-run via the alias name
+    // (git expands `whatchanged --dry-run --porcelain --no-verify origin main`
+    // the same way as `push --dry-run --porcelain --no-verify origin main`).
+    wrapper(&path, repo.path(), &["config", "alias.whatchanged", "push"]);
+
+    // Invoke via the deprecated builtin name `whatchanged` — not `push`.
+    // Pass `origin main` so the dry-run probe can replay via the alias name:
+    // git expands `whatchanged --dry-run … origin main` to
+    // `push --dry-run … origin main`, which resolves the `origin` remote.
+    let out = wrapper(&path, repo.path(), &["whatchanged", "origin", "main"]);
+    assert!(
+        !out.status.success(),
+        "alias.whatchanged=push must be expanded and refused (deprecated builtin is \
+         alias-first on 2.52+); stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not authored by your agent identity"),
+        "expected the push-gate rejection via whatchanged alias; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // Destination must be empty — no commit should have reached the remote.
+    let refs = Command::new("git")
+        .args(["-C", remote.path().to_str().unwrap(), "for-each-ref"])
+        .output()
+        .unwrap();
+    assert!(
+        refs.stdout.is_empty(),
+        "remote must be empty after refused push via whatchanged alias; refs={}",
+        String::from_utf8_lossy(&refs.stdout),
+    );
+}

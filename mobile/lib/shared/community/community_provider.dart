@@ -181,10 +181,29 @@ class _CommunitySnapshotSync {
   _CommunitySnapshotSync(this._writer);
 
   final CommunitySnapshotWriter _writer;
+  final Set<Future<void>> _writesInFlight = {};
   String? _lastSuccessfulSnapshot;
+  bool _ageRestricted = false;
 
-  Future<void> write(List<Community> communities) async {
-    final fingerprint = communities
+  Future<void> write(
+    List<Community> communities, {
+    bool enforceAgeRestriction = false,
+  }) async {
+    if (enforceAgeRestriction) {
+      _ageRestricted = true;
+      final olderWrites = [..._writesInFlight];
+      await Future.wait(
+        olderWrites.map(
+          (write) =>
+              write.then<void>((_) {}, onError: (Object _, StackTrace _) {}),
+        ),
+      );
+    }
+
+    final effectiveCommunities = _ageRestricted
+        ? const <Community>[]
+        : communities;
+    final fingerprint = effectiveCommunities
         .map(
           (community) => [
             community.id,
@@ -201,8 +220,17 @@ class _CommunitySnapshotSync {
         .join('\u0001');
     if (fingerprint == _lastSuccessfulSnapshot) return;
 
-    await _writer(communities);
-    _lastSuccessfulSnapshot = fingerprint;
+    late final Future<void> writeFuture;
+    writeFuture = _writer(
+      effectiveCommunities,
+    ).whenComplete(() => _writesInFlight.remove(writeFuture));
+    _writesInFlight.add(writeFuture);
+    await writeFuture;
+    if (_ageRestricted && effectiveCommunities.isNotEmpty) {
+      await write(const <Community>[], enforceAgeRestriction: true);
+    } else {
+      _lastSuccessfulSnapshot = fingerprint;
+    }
   }
 }
 
@@ -218,6 +246,17 @@ Future<void> syncCommunitySnapshot(Ref ref, List<Community> communities) async {
 Future<void> syncStoredCommunitySnapshot(Ref ref) async {
   final communities = await ref.read(communityStorageProvider).loadAll();
   await syncCommunitySnapshot(ref, communities);
+}
+
+Future<void> _enforceAgeRestrictedCommunitySnapshot(Ref ref) async {
+  try {
+    await ref
+        .read(_communitySnapshotSyncProvider)
+        .write(const [], enforceAgeRestriction: true);
+    pushCommunitySnapshotError.value = null;
+  } catch (error, stackTrace) {
+    reportPushCommunitySnapshotError(error, stackTrace);
+  }
 }
 
 class CommunityListNotifier extends AsyncNotifier<List<Community>> {
@@ -482,6 +521,9 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
   /// Disables every stored push lease after the platform age gate restricts
   /// access, and retries journals left pending by an earlier launch.
   Future<void> enforceAgeRestrictionOnPush() async {
+    // Fence every older or later authenticated export before touching storage.
+    // The final empty write wins even if a stale export is already in I/O.
+    await _enforceAgeRestrictedCommunitySnapshot(ref);
     final attempts = <({String id, bool advanceGeneration})>[];
     await _serializePushMutation(() async {
       final storage = ref.read(communityStorageProvider);

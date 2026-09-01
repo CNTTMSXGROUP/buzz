@@ -94,13 +94,13 @@ import os.log
       name: "buzz/age_signal",
       binaryMessenger: messenger
     )
-    let ageSignalViewController = engineBridge.pluginRegistry.registrar(
+    let ageSignalRegistrar = engineBridge.pluginRegistry.registrar(
       forPlugin: "BuzzAgeSignal"
-    )?.viewController
-    ageSignalChannel?.setMethodCallHandler { [weak ageSignalViewController] call, result in
+    )
+    ageSignalChannel?.setMethodCallHandler { call, result in
       Self.handleAgeSignalMethodCall(
         call,
-        viewController: ageSignalViewController,
+        viewController: ageSignalRegistrar?.viewController,
         result: result
       )
     }
@@ -250,8 +250,18 @@ import os.log
       result(FlutterMethodNotImplemented)
       return
     }
-    guard #available(iOS 26.0, *), let viewController else {
+    guard #available(iOS 26.0, *) else {
       result(Self.noAgeSignalResponse)
+      return
+    }
+    guard let viewController else {
+      result(
+        FlutterError(
+          code: "age_signal_unavailable",
+          message: "The age signal presenter is unavailable.",
+          details: nil
+        )
+      )
       return
     }
 

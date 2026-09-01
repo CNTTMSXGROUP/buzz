@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:buzz/shared/auth/auth_provider.dart';
 import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/community/community_provider.dart';
 import 'package:buzz/shared/community/community_storage.dart';
@@ -426,6 +427,54 @@ void main() {
         );
         expect(deactivatedCommunityIds, [active.id, pending.id, pending.id]);
         expect(deactivationGenerations, [5, 8, 9]);
+      },
+    );
+
+    test(
+      'age restriction fences a stale authenticated snapshot export',
+      () async {
+        final staleWriteStarted = Completer<void>();
+        final releaseStaleWrite = Completer<void>();
+        final completedSnapshots = <List<Community>>[];
+        final community = Community.create(
+          name: 'Restricted',
+          relayUrl: 'https://restricted.example.com',
+          nsec: nostr.Keys.generate().nsec,
+        ).copyWith(pushNotificationsEnabled: true);
+        await communityStorage.save(community);
+        await communityStorage.saveActiveId(community.id);
+
+        container = ProviderContainer(
+          overrides: [
+            communityStorageProvider.overrideWithValue(communityStorage),
+            communitySnapshotWriterProvider.overrideWithValue((
+              communities,
+            ) async {
+              final captured = List.of(communities);
+              if (captured.isNotEmpty && !staleWriteStarted.isCompleted) {
+                staleWriteStarted.complete();
+                await releaseStaleWrite.future;
+              }
+              completedSnapshots.add(captured);
+            }),
+          ],
+        );
+
+        final staleAuthBuild = container.read(authProvider.future);
+        await staleWriteStarted.future;
+        final restriction = container
+            .read(communityListProvider.notifier)
+            .enforceAgeRestrictionOnPush();
+
+        releaseStaleWrite.complete();
+        await staleAuthBuild;
+        await restriction;
+
+        expect(
+          completedSnapshots.any((snapshot) => snapshot.isNotEmpty),
+          isTrue,
+        );
+        expect(completedSnapshots.last, isEmpty);
       },
     );
 

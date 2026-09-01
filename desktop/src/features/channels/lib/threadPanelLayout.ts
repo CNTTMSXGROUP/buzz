@@ -1,10 +1,7 @@
 import type * as React from "react";
 
-import { THREAD_FOCUS_COLUMN_MAX_WIDTH_PX } from "@/features/channels/lib/threadFocusLayout";
-
 export type ThreadPanelLayoutProps = {
   canResetWidth?: boolean;
-  columnMaxWidthPx?: number;
   enterMotion?: boolean;
   headerLeading?: React.ReactNode;
   /** Replaces the default "Thread" label. Channel threads leave this unset. */
@@ -38,7 +35,6 @@ export function getThreadPanelLayout({
 }: ThreadPanelLayoutOptions): ThreadPanelLayoutProps {
   return isFocusDrawer
     ? {
-        columnMaxWidthPx: THREAD_FOCUS_COLUMN_MAX_WIDTH_PX,
         headerLeading,
         isFocusMode: true,
         isSinglePanelView: true,
@@ -46,7 +42,6 @@ export function getThreadPanelLayout({
         transparentChrome: false,
       }
     : {
-        columnMaxWidthPx: undefined,
         headerLeading,
         isFocusMode: false,
         isSinglePanelView: useSplitAuxiliaryPane ? false : isSinglePanelView,

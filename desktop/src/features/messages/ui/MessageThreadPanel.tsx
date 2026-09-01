@@ -26,7 +26,6 @@ import { cn } from "@/shared/lib/cn";
 import { AuxiliaryPanel } from "@/shared/layout/AuxiliaryPanel";
 import { AuxiliaryPanelBody } from "@/shared/layout/AuxiliaryPanel";
 import {
-  THREAD_PANEL_COLUMN_CLASS,
   THREAD_PANEL_COMPOSER_GUTTER_CLASS,
   THREAD_PANEL_MESSAGE_GUTTER_CLASS,
 } from "@/features/messages/lib/messageThreadPanelLayout";
@@ -145,7 +144,6 @@ export function MessageThreadPanel({
   channel,
   channelId,
   channelName,
-  columnMaxWidthPx,
   currentPubkey,
   disabled = false,
   firstUnreadReplyId,
@@ -226,7 +224,6 @@ export function MessageThreadPanel({
     onClose,
     !isHuddleTranscript && (isOverlay || isSinglePanelView || isFocusMode),
   );
-  const hasConstrainedColumn = columnMaxWidthPx != null;
   // Whether the composer dock trades its quiet-state spacer for the
   // conditional activity accessory (agent working and/or someone typing).
   const hasComposerBottomActivity =
@@ -515,14 +512,7 @@ export function MessageThreadPanel({
       {/* The gallery is intentionally DOM-scoped: only media currently rendered
           in this open thread participates. Collapsed or unloaded descendants
           join only after the thread UI renders them. */}
-      <div
-        className={cn(hasConstrainedColumn && THREAD_PANEL_COLUMN_CLASS)}
-        data-image-gallery-scope="thread"
-        ref={threadContentRef}
-        style={
-          hasConstrainedColumn ? { maxWidth: columnMaxWidthPx } : undefined
-        }
-      >
+      <div data-image-gallery-scope="thread" ref={threadContentRef}>
         {isHuddleTranscript ? (
           <div className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-2 pt-4")}>
             <HuddleTranscriptIntro />
@@ -816,12 +806,7 @@ export function MessageThreadPanel({
         data-testid="thread-composer-overlay"
         ref={threadComposerWrapperRef}
       >
-        <div
-          className={cn(hasConstrainedColumn && THREAD_PANEL_COLUMN_CLASS)}
-          style={
-            hasConstrainedColumn ? { maxWidth: columnMaxWidthPx } : undefined
-          }
-        >
+        <div>
           <div
             className={cn(
               "composer-dock composer-overlay-corner-masks relative pointer-events-auto",

@@ -1,7 +1,6 @@
 import type * as React from "react";
 import type { ThreadPanelLayoutProps } from "@/features/channels/lib/threadPanelLayout";
 import {
-  THREAD_PANEL_COLUMN_CLASS,
   THREAD_PANEL_COMPOSER_GUTTER_CLASS,
   THREAD_PANEL_MESSAGE_GUTTER_CLASS,
 } from "@/features/messages/lib/messageThreadPanelLayout";
@@ -105,24 +104,10 @@ export function ThreadMessageSkeleton({
   );
 }
 
-function ThreadComposerSkeleton({
-  columnMaxWidthPx,
-}: {
-  columnMaxWidthPx?: number;
-}) {
-  const hasConstrainedColumn = columnMaxWidthPx != null;
-
+function ThreadComposerSkeleton() {
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10">
-      <div
-        className={cn(
-          "pointer-events-auto",
-          hasConstrainedColumn && THREAD_PANEL_COLUMN_CLASS,
-        )}
-        style={
-          hasConstrainedColumn ? { maxWidth: columnMaxWidthPx } : undefined
-        }
-      >
+      <div className="pointer-events-auto">
         <div
           className={cn(
             "relative z-10 shrink-0 bg-transparent pb-2 pt-0",
@@ -152,7 +137,6 @@ function ThreadComposerSkeleton({
 /** Loading state for the thread panel, in every layout the real panel supports. */
 export function MessageThreadPanelSkeleton({
   canResetWidth,
-  columnMaxWidthPx,
   enterMotion,
   headerLeading,
   headerTitle,
@@ -171,7 +155,6 @@ export function MessageThreadPanelSkeleton({
   transparentChrome = false,
 }: MessageThreadPanelSkeletonProps) {
   const isOverlay = useIsThreadPanelOverlay();
-  const hasConstrainedColumn = columnMaxWidthPx != null;
   useEscapeKey(onClose, isOverlay || isSinglePanelView || isFocusMode);
 
   const threadBody = (
@@ -179,12 +162,7 @@ export function MessageThreadPanelSkeleton({
       className="overflow-y-auto overflow-x-hidden overscroll-contain pb-24"
       data-testid="message-thread-loading"
     >
-      <div
-        className={cn(hasConstrainedColumn && THREAD_PANEL_COLUMN_CLASS)}
-        style={
-          hasConstrainedColumn ? { maxWidth: columnMaxWidthPx } : undefined
-        }
-      >
+      <div>
         <div
           className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-1 pt-0")}
           data-testid="message-thread-head-loading"
@@ -214,7 +192,7 @@ export function MessageThreadPanelSkeleton({
       canResetWidth={canResetWidth}
       className="relative"
       enterMotion={enterMotion ?? !isFocusMode}
-      footer={<ThreadComposerSkeleton columnMaxWidthPx={columnMaxWidthPx} />}
+      footer={<ThreadComposerSkeleton />}
       header={
         <MessageThreadPanelHeader
           headerLeading={headerLeading}

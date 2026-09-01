@@ -173,10 +173,11 @@ export function AppShell() {
   const settingsOpen = location.pathname === "/settings";
   const rawLocationSearchSection = (location.search as { section?: unknown })
     .section;
-  // Migrate legacy URL tokens: "moderation" → "relay-admin" (renamed section
-  // id), "doctor" → "agents" (alias also handled in validateSettingsSearch).
-  // useLocation().search is the raw URL query, bypassing route validation, so
-  // the alias must be applied here too.
+  // Migrate the legacy "moderation" token to "relay-admin" (renamed section
+  // id). useLocation().search is the raw URL query, bypassing route validation,
+  // so the alias must be applied here too. The "doctor" alias is NOT needed on
+  // this path: AppShell never carried it on main, and it lives only in
+  // validateSettingsSearch where route validation rewrites it before rendering.
   const locationSearchSection =
     rawLocationSearchSection === "moderation"
       ? "relay-admin"

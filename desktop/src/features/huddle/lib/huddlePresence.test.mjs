@@ -376,6 +376,46 @@ test("accepts a new generation join before liveness establishes authority", () =
   assert.equal(tracker.snapshot().has(CHARLIE), true);
 });
 
+test("waits for liveness before accepting a new opaque generation", () => {
+  const generation1 = "11111111-1111-4111-8111-111111111111";
+  const generation2 = "22222222-2222-4222-8222-222222222222";
+  const tracker = new HuddlePresenceTracker(RELAY);
+  tracker.apply(event({ id: "start", kind: 48100 }));
+  tracker.apply(
+    participantEvent({
+      id: "old",
+      kind: 48101,
+      admissionId: "old-admission",
+      rosterRevision: 1,
+      generation: generation1,
+    }),
+  );
+  tracker.reconcileLiveness(
+    new Map([["room", generation1]]),
+    new Map([["room", generation1]]),
+  );
+  const newJoin = participantEvent({
+    id: "new",
+    kind: 48101,
+    admissionId: "new-admission",
+    rosterRevision: 1,
+    generation: generation2,
+    tags: [["p", CHARLIE]],
+  });
+
+  assert.equal(tracker.apply(newJoin), false);
+  assert.equal(tracker.snapshot().has(BOB), true);
+  assert.equal(tracker.snapshot().has(CHARLIE), false);
+
+  tracker.reconcileLiveness(
+    new Map([["room", generation2]]),
+    new Map([["room", generation1]]),
+  );
+  assert.equal(tracker.apply(newJoin), true);
+  assert.equal(tracker.snapshot().has(BOB), false);
+  assert.equal(tracker.snapshot().has(CHARLIE), true);
+});
+
 test("preserves distinct admissions that share one roster revision", () => {
   const events = [
     event({ id: "1", kind: 48100 }),

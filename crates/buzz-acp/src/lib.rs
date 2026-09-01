@@ -2035,23 +2035,55 @@ fn handle_permission_decision_control(
         }
     };
 
-    // Record the nonce as soon as at least one task received the decision.
+    // Record the nonce and summarise into a single observer status.
+    //
+    // Correctness requirement (fan-out false-ack): a `permission_decision` is
+    // fanned out to all same-channel loops; each loop uses the nonce to select
+    // its own entry. The dispatcher cannot identify which task owns the nonce,
+    // so it must not report `sent` — stopping Desktop's retransmit loop — unless
+    // every loop that has a permission tx accepted the message. If any tx-equipped
+    // loop's queue returned `Full` or `Closed` (owner-queue saturated while a
+    // sibling accepted), the nonce-owning loop may not have received the decision,
+    // so we return a retryable status and leave Desktop's retry loop running.
     let any_sent = deliveries.iter().any(|d| matches!(d, Delivery::Sent));
-    if any_sent {
+    let any_full = deliveries.iter().any(|d| matches!(d, Delivery::Full));
+    // All tx-equipped loops accepted: no Full and no Closed among the deliveries.
+    let all_tx_accepted =
+        any_sent && !any_full && !deliveries.iter().any(|d| matches!(d, Delivery::Closed));
+
+    // Only suppress retransmits (record nonce) when every tx-equipped loop
+    // received the decision — a partial fan-out is not a confirmed delivery.
+    if all_tx_accepted {
         pool.record_permission_decision(request_nonce);
     }
 
-    // Summarise into a single status for the observer frame. Priority:
-    // Sent > Full > Closed > NoChannel > NoTask.
-    let status = if deliveries.iter().any(|d| matches!(d, Delivery::Sent)) {
+    // Summarise into a single status for the observer frame.
+    // all_tx_accepted → "sent" (Desktop retransmit stops, decision confirmed).
+    // any_sent + any_full → "channel_full" (retryable: Desktop re-enables buttons,
+    //   owner can retry once the queue drains; the owning loop's dedup tolerates
+    //   duplicate deliveries from later retransmits).
+    // No Sent → fall through to the existing priority ladder.
+    let status = if all_tx_accepted {
         tracing::info!(
             channel = %channel_id,
             nonce = %request_nonce,
             option_id = %option_id,
             tasks_fanned = deliveries.len(),
-            "permission_decision delivered to read loop(s)"
+            "permission_decision delivered to all read loop(s)"
         );
         "sent"
+    } else if any_sent && any_full {
+        // Mixed: at least one sibling accepted but the owner queue was full.
+        // Reporting "sent" here would stop Desktop's retransmit loop while the
+        // nonce-owning read loop never received the decision. Return "channel_full"
+        // so Desktop keeps retrying until the queue drains.
+        tracing::warn!(
+            channel = %channel_id,
+            nonce = %request_nonce,
+            "permission_decision: some loops sent, owner loop full — \
+             reporting channel_full to keep Desktop retransmitting"
+        );
+        "channel_full"
     } else if deliveries.iter().any(|d| matches!(d, Delivery::Full)) {
         tracing::warn!(
             channel = %channel_id,
@@ -11269,6 +11301,121 @@ mod permission_decision_control_tests {
             "Thread B must receive its own decision after Thread A's was handled: {received_b_2:?}"
         );
         assert_eq!(received_b_2.unwrap().request_nonce, nonce_b);
+    }
+
+    /// Fan-out false-ack: mixed-result (owner-Full + sibling-Sent) must NOT
+    /// report `sent` or record the nonce.
+    ///
+    /// Scenario (Carl's verbatim requirement):
+    ///   1. Two tasks share a channel — owner (rx_owner, capacity 4) and
+    ///      sibling (rx_sibling, capacity 4).  Owner's queue is saturated with
+    ///      4 unread messages; sibling's queue is kept clear.
+    ///   2. A permission decision for nonce N is fanned out: sibling receives
+    ///      it (`Sent`), owner queue returns `Full`.
+    ///   3. Expected: status == `channel_full` (Desktop keeps retransmitting),
+    ///      nonce N is NOT in `was_recently_decided` (no suppression yet).
+    ///   4. Owner queue is drained; decision is retransmitted.
+    ///      Expected: status == `sent`, nonce N recorded, owner receives it.
+    ///
+    /// **Mutation proof:** reverting the `all_tx_accepted` gate to the prior
+    /// `any_sent` semantics makes step 3 return `"sent"` and records the nonce,
+    /// causing the assertion `assert_ne!(status_mixed, "sent")` to fail.
+    #[tokio::test]
+    async fn mixed_result_owner_full_sibling_sent_reports_channel_full_not_sent() {
+        let observer = ObserverHandle::in_process();
+        let mut rx_obs = observer.subscribe();
+        let channel_id = Uuid::new_v4();
+        let nonce = "nonce-mixed-full";
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        // Install sibling first — fan-out visits it before the owner.
+        // Keep the sibling receiver so we can drain it between fill rounds.
+        let mut rx_sibling = install_task(&mut pool, channel_id);
+        let mut rx_owner = install_task(&mut pool, channel_id);
+
+        // Saturate the owner's queue (capacity 4) with four fill decisions.
+        // After each send we drain the sibling's queue so it never fills.
+        let fill_nonce = "nonce-fill";
+        for _ in 0..4 {
+            handle_permission_decision_control(
+                &decision_payload(channel_id, fill_nonce),
+                &mut pool,
+                Some(&observer),
+            );
+            // Observer drain — keeps it responsive.
+            let _ = control_result_status(&mut rx_obs);
+            // Drain sibling so its queue stays open for the critical decision.
+            while rx_sibling.try_recv().is_ok() {}
+        }
+        // Precondition: owner queue is full (4/4 unread), sibling queue is empty.
+        assert!(
+            rx_owner.try_recv().is_ok(),
+            "precondition: owner queue must have unread messages (fill worked)"
+        );
+        // We just popped one — push it back conceptually: re-fill the slot we
+        // accidentally drained by sending one more fill decision.
+        handle_permission_decision_control(
+            &decision_payload(channel_id, fill_nonce),
+            &mut pool,
+            Some(&observer),
+        );
+        let _ = control_result_status(&mut rx_obs);
+        while rx_sibling.try_recv().is_ok() {}
+        // Owner queue: 4/4 full again (we drained 1 then immediately refilled).
+
+        // Deliver the critical decision.
+        // Owner queue: Full.  Sibling queue: Sent.  → any_sent=true, any_full=true.
+        handle_permission_decision_control(
+            &decision_payload(channel_id, nonce),
+            &mut pool,
+            Some(&observer),
+        );
+        let status_mixed = control_result_status(&mut rx_obs);
+
+        assert_ne!(
+            status_mixed, "sent",
+            "mixed-result (owner Full, sibling Sent) must NOT report 'sent'"
+        );
+        assert_eq!(
+            status_mixed, "channel_full",
+            "mixed-result must report 'channel_full' to keep Desktop retransmitting"
+        );
+        assert!(
+            !pool.was_recently_decided(nonce),
+            "nonce must NOT be recorded when owner queue was Full — \
+             retransmit suppression must not activate"
+        );
+
+        // Drain the owner queue fully — makes room for the retransmit.
+        while rx_owner.try_recv().is_ok() {}
+        // Also drain the sibling's copy of the critical nonce so it won't be
+        // counted as full on the retransmit path either.
+        while rx_sibling.try_recv().is_ok() {}
+
+        // Retransmit.  Now both queues have capacity: all tx-equipped loops
+        // accept → must report `sent` and record the nonce.
+        handle_permission_decision_control(
+            &decision_payload(channel_id, nonce),
+            &mut pool,
+            Some(&observer),
+        );
+        let status_retry = control_result_status(&mut rx_obs);
+
+        assert_eq!(
+            status_retry, "sent",
+            "after drain, retransmitted decision must reach owner and report 'sent'"
+        );
+        assert!(
+            pool.was_recently_decided(nonce),
+            "nonce must be recorded after all-loops-accepted retransmit"
+        );
+        // Confirm the owner's queue actually received the retransmit.
+        let received = rx_owner.try_recv();
+        assert!(
+            received.is_ok(),
+            "owner loop must receive the retransmitted decision after drain: {received:?}"
+        );
+        assert_eq!(received.unwrap().request_nonce, nonce);
     }
 
     /// F4 outer signed-control path: `handle_relay_observer_control_event`

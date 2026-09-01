@@ -293,6 +293,76 @@ export function retireAllLivePermissionCards(
 }
 
 /**
+ * Retire live permission cards scoped to a specific turn, identified by
+ * `turnId`. Cards whose `turnId` matches are retired (actionable → false)
+ * and their nonce indexes removed.
+ *
+ * With concurrent thread-scoped turns, a channel-wide retirement on
+ * `turn_completed` / `turn_error` would retire pending cards belonging to
+ * still-running sibling threads. This function scopes the backstop to the
+ * single terminating turn so siblings remain actionable.
+ *
+ * Falls back to `retireAllLivePermissionCards` when `turnId` is absent —
+ * kept as a backstop for events (e.g. legacy archive frames) that carry no
+ * turn identity.
+ */
+export function retireLivePermissionCardsForTurn(
+  d: PermissionDraftSlice,
+  channelId: string,
+  turnId: string | null | undefined,
+): void {
+  if (!turnId) {
+    // No turn identity available — fall back to channel-wide backstop.
+    retireAllLivePermissionCards(d, channelId);
+    return;
+  }
+  const prefix = `permission:${channelId}:`;
+  let retired = false;
+  for (const [id, item] of d.itemsById) {
+    if (
+      id.startsWith(prefix) &&
+      item.type === "lifecycle" &&
+      item.renderClass === "permission" &&
+      item.actionable &&
+      item.turnId === turnId
+    ) {
+      if (!retired) {
+        d.items = [...d.items];
+        d.itemsById = new Map(d.itemsById);
+        retired = true;
+        d.changed = true;
+      }
+      const updated = { ...item, actionable: false };
+      d.itemsById.set(id, updated);
+      const idx = d.items.findIndex((i) => i.id === id);
+      if (idx !== -1) d.items[idx] = updated;
+      // Clean up nonce index if present.
+      if (item.requestNonce) {
+        d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
+        d.pendingPermissionsByNonce.delete(item.requestNonce);
+      }
+    }
+  }
+  // `pendingPermissions` keys use the format `ch:session:turn:id`; retire only
+  // entries belonging to this channel-turn combination.
+  const turnPrefix = `${channelId}:`;
+  let permsMutated = false;
+  for (const key of d.pendingPermissions.keys()) {
+    if (key.startsWith(turnPrefix)) {
+      // Parse `ch:session:turn:id` — the turn segment is index 2.
+      const parts = key.split(":");
+      if (parts[2] === turnId) {
+        if (!permsMutated) {
+          d.pendingPermissions = new Map(d.pendingPermissions);
+          permsMutated = true;
+        }
+        d.pendingPermissions.delete(key);
+      }
+    }
+  }
+}
+
+/**
  * Handle an observer-only `permission_terminal` event.
  * Emitted for uncertain outcomes (process poison, cancel-during-write) where
  * no confirmed ACP wire response is available.

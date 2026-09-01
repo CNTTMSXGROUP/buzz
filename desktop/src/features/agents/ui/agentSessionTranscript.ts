@@ -30,7 +30,7 @@ import {
 import { friendlyTurnErrorCopy } from "../lib/friendlyAgentLastError";
 import {
   describePermissionRequest,
-  retireAllLivePermissionCards,
+  retireLivePermissionCardsForTurn,
   handlePermissionTerminal,
   handlePermissionWrite,
   handlePermissionDecisionResult,
@@ -724,17 +724,21 @@ export function processTranscriptEvent(
       ctx,
       event.kind,
     );
-    // Backstop: retire any still-live permission cards for this channel so
+    // Backstop: retire permission cards belonging to this terminating turn so
     // missing telemetry and archive replay never reconstruct live controls
-    // after a terminal turn/process state.
-    retireAllLivePermissionCards(d, ch);
+    // after a terminal turn/process state.  Scoped to `event.turnId` so that
+    // sibling threads' pending cards are not retired — each concurrent turn owns
+    // its own cards.  Falls back to channel-wide retirement only when no turn
+    // identity is present (legacy archive frames).
+    retireLivePermissionCardsForTurn(d, ch, event.turnId);
   } else if (event.kind === "turn_completed") {
-    // Backstop: retire any still-live permission cards for this channel.
+    // Backstop: retire permission cards belonging to this completing turn.
     // Applied/timed-out/cancelled cards should already be retired via their
     // nonce-correlated acp_write frames, but uncertain (process-poison) cards
     // may only receive a turn_completed — this ensures they are not left
-    // actionable in live state or archive replay.
-    retireAllLivePermissionCards(d, ch);
+    // actionable in live state or archive replay.  Scoped to `event.turnId`;
+    // channel-wide backstop kept only when no turn identity exists on the event.
+    retireLivePermissionCardsForTurn(d, ch, event.turnId);
   } else if (event.kind === "permission_terminal") {
     handlePermissionTerminal(d, event.authorization, event.payload, ch, ctx);
   } else if (event.kind === "acp_read" || event.kind === "acp_write") {

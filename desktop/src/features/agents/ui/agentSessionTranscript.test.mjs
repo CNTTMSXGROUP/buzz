@@ -2905,3 +2905,171 @@ test("buildTranscript_sync_denial_write_with_mismatched_nonce_leaves_card_live",
     "nonce index must still contain the read card when write nonce does not match",
   );
 });
+
+// ─── P2: turn-scoped retirement — sibling thread cards survive their turn ─────
+
+test("buildTranscript_turn_scoped_retirement_does_not_retire_sibling_thread_cards", () => {
+  // Regression guard for P2: with concurrent thread-scoped turns, a
+  // turn_completed event for Thread B must NOT retire Thread A's still-pending
+  // permission cards.  Only cards whose turnId matches the terminating turn are
+  // retired.
+  //
+  // Sequence:
+  //   1. Thread A (turnId="turn-A") raises a permission request — card is live.
+  //   2. Thread B (turnId="turn-B") raises a permission request — card is live.
+  //   3. Thread B completes (turn_completed, turnId="turn-B").
+  //   4. Thread A's card must still be actionable.
+  //   5. Thread A's decision arrives — card is resolved correctly.
+  //   6. Archive replay of the same sequence produces the same final state
+  //      (turn-scoped retirement holds for both live and replay paths).
+  const CH = "ch-2";
+  const events = [
+    // Thread A permission request.
+    makePermissionRequestWithAuth(1, "req-A", "nonce-A", {
+      turnId: "turn-A",
+      channelId: CH,
+    }),
+    // Thread B permission request.
+    makePermissionRequestWithAuth(2, "req-B", "nonce-B", {
+      turnId: "turn-B",
+      channelId: CH,
+    }),
+    // Thread B completes — must NOT retire Thread A's card.
+    makeTurnCompleted(3, { channelId: CH, turnId: "turn-B" }),
+    // Thread A's decision is applied.
+    makePermissionWriteWithNonce(
+      4,
+      "req-A",
+      "nonce-A",
+      "selected",
+      "allow_once",
+      {
+        channelId: CH,
+        turnId: "turn-A",
+      },
+    ),
+  ];
+
+  // ── Live path ──────────────────────────────────────────────────────────────
+
+  // Step 3: after turn-B completes, A must still be actionable.
+  const stateAfterBComplete = buildTranscriptState(events.slice(0, 3));
+  const cardA_live = stateAfterBComplete.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === "nonce-A",
+  );
+  const cardB_live = stateAfterBComplete.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === "nonce-B",
+  );
+  assert.ok(cardA_live, "Thread A card must exist after Thread B completes");
+  assert.equal(
+    cardA_live.actionable,
+    true,
+    "Thread A card must still be actionable after Thread B completes",
+  );
+  assert.ok(cardB_live, "Thread B card must exist");
+  assert.equal(
+    cardB_live.actionable,
+    false,
+    "Thread B card must be retired by its own turn_completed",
+  );
+
+  // Step 4: A's decision resolves it correctly.
+  const stateAfterADecision = buildTranscriptState(events);
+  const cardA_resolved = stateAfterADecision.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === "nonce-A",
+  );
+  assert.ok(cardA_resolved, "Thread A card must still exist after A decision");
+  assert.equal(
+    cardA_resolved.actionable,
+    false,
+    "Thread A card must be retired after its own decision",
+  );
+  assert.ok(
+    cardA_resolved.outcome,
+    "Thread A card must have an outcome after its own decision",
+  );
+  assert.ok(
+    !stateAfterADecision.pendingPermissionsByNonce.has("nonce-A"),
+    "nonce-A must be cleared from the index after Thread A's decision",
+  );
+  assert.ok(
+    !stateAfterADecision.pendingPermissionsByNonce.has("nonce-B"),
+    "nonce-B must be cleared from the index after Thread B's turn_completed",
+  );
+
+  // ── Archive replay: same sequence produces the same final state ────────────
+
+  const replay = buildTranscriptState(events);
+  const cardA_replay = replay.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === "nonce-A",
+  );
+  assert.ok(cardA_replay, "Thread A card must survive replay");
+  assert.equal(
+    cardA_replay.actionable,
+    false,
+    "Thread A card must be resolved in replay",
+  );
+  assert.ok(
+    cardA_replay.outcome,
+    "Thread A card must have an outcome in replay",
+  );
+});
+
+test("buildTranscript_turn_error_scoped_retirement_does_not_retire_sibling_thread_cards", () => {
+  // Same as the turn_completed variant but using turn_error so the same
+  // scoping invariant is verified for the error-terminal path.
+  //
+  // Mutation guard: replacing retireLivePermissionCardsForTurn with
+  // retireAllLivePermissionCards in the turn_error handler makes this test fail
+  // because Thread A's card is retired by Thread B's error event.
+  const CH = "ch-3";
+  const events = [
+    makePermissionRequestWithAuth(1, "req-EA", "nonce-EA", {
+      turnId: "turn-EA",
+      channelId: CH,
+    }),
+    makePermissionRequestWithAuth(2, "req-EB", "nonce-EB", {
+      turnId: "turn-EB",
+      channelId: CH,
+    }),
+    // Thread B errors — must NOT retire Thread A's card.
+    makeTurnError(3, { channelId: CH, turnId: "turn-EB" }),
+    // Thread A's decision applies.
+    makePermissionWriteWithNonce(
+      4,
+      "req-EA",
+      "nonce-EA",
+      "selected",
+      "allow_once",
+      {
+        channelId: CH,
+        turnId: "turn-EA",
+      },
+    ),
+  ];
+
+  const stateAfterBError = buildTranscriptState(events.slice(0, 3));
+  const cardA = stateAfterBError.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === "nonce-EA",
+  );
+  assert.ok(cardA, "Thread A card must exist after Thread B errors");
+  assert.equal(
+    cardA.actionable,
+    true,
+    "Thread A card must still be actionable after Thread B errors",
+  );
+
+  const stateAfterADecision = buildTranscriptState(events);
+  const cardA_resolved = stateAfterADecision.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === "nonce-EA",
+  );
+  assert.ok(
+    cardA_resolved?.outcome,
+    "Thread A card must have an outcome after its own decision",
+  );
+  assert.equal(
+    cardA_resolved?.actionable,
+    false,
+    "Thread A card must be retired after its own decision",
+  );
+});

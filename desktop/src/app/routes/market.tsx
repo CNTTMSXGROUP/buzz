@@ -8,11 +8,16 @@ import {
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
 type MarketRouteSearch = {
+  market?: string;
   scenario?: MarketScenarioId;
 };
 
 export const Route = createFileRoute("/market")({
   validateSearch: (search: Record<string, unknown>): MarketRouteSearch => ({
+    market:
+      typeof search.market === "string" && search.market.length <= 120
+        ? search.market
+        : undefined,
     scenario: isMarketScenarioId(search.scenario) ? search.scenario : undefined,
   }),
   component: MarketRouteComponent,
@@ -29,7 +34,10 @@ function MarketRouteComponent() {
     <React.Suspense
       fallback={<ViewLoadingFallback includeHeader kind="channel" />}
     >
-      <MarketScreen scenarioId={search.scenario ?? "finite"} />
+      <MarketScreen
+        marketId={search.market}
+        scenarioId={search.scenario ?? "finite"}
+      />
     </React.Suspense>
   );
 }

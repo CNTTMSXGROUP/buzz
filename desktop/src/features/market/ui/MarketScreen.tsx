@@ -10,6 +10,7 @@ import * as React from "react";
 
 import { ChatHeader } from "@/features/chat/ui/ChatHeader";
 import { AgentWalletPanel } from "@/features/market/ui/AgentWalletPanel";
+import { useLiveMarketScenario } from "@/features/market/lib/useLiveMarketScenario";
 import {
   MARKET_SCENARIOS,
   type MarketActivity,
@@ -74,8 +75,18 @@ const ACTIVITY_STYLE: Record<
   },
 };
 
-export function MarketScreen({ scenarioId }: { scenarioId: MarketScenarioId }) {
-  const scenario = MARKET_SCENARIOS[scenarioId];
+export function MarketScreen({
+  marketId,
+  scenarioId,
+}: {
+  marketId?: string;
+  scenarioId: MarketScenarioId;
+}) {
+  const fallbackScenario = MARKET_SCENARIOS[scenarioId];
+  const { scenario, live, isLoading } = useLiveMarketScenario(
+    fallbackScenario,
+    marketId,
+  );
   const sidebar = useOptionalSidebar();
   const [createOpen, setCreateOpen] = React.useState(false);
   const [walletOpen, setWalletOpen] = React.useState(true);
@@ -139,7 +150,11 @@ export function MarketScreen({ scenarioId }: { scenarioId: MarketScenarioId }) {
                   </p>
                 </div>
                 <Badge variant="secondary">
-                  {scenario.activity.length} messages
+                  {isLoading
+                    ? "Checking Pulse…"
+                    : live
+                      ? "Live · Pulse"
+                      : `${scenario.activity.length} messages`}
                 </Badge>
               </div>
               <div>

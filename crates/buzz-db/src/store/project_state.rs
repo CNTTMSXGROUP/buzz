@@ -2,11 +2,14 @@
 
 use std::collections::BTreeSet;
 
-use buzz_core::kind::{event_kind_u32, KIND_PROJECT, KIND_PROJECT_CHANGE, KIND_PROJECT_STATE};
+use buzz_core::kind::{
+    event_kind_u32, KIND_DELETION, KIND_PROJECT, KIND_PROJECT_CHANGE, KIND_PROJECT_STATE,
+};
 use buzz_core::project_state::{
     project_state_template, ProjectStateProjectionInput, ProjectStateTemplate,
 };
-use buzz_core::CommunityId;
+use buzz_core::{CommunityId, StoredEvent};
+use chrono::{DateTime, Utc};
 use nostr::{Event, EventId};
 use sqlx::Row;
 use uuid::Uuid;
@@ -119,6 +122,40 @@ pub enum ProjectStateProjectionCommitResult {
     Stale,
 }
 
+/// Result category for an owner identity or deletion lifecycle event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectLifecycleStatus {
+    /// The event changed authoritative Project state.
+    Applied,
+    /// The event was newly stored but had no effect on the current Project head.
+    NoEffect,
+    /// The exact event was already stored.
+    Duplicate,
+    /// A newer owner identity already dominates the submitted identity.
+    Superseded,
+}
+
+/// Atomic persistence result for a Project lifecycle event.
+#[derive(Clone, Debug)]
+pub struct ProjectLifecycleApplyResult {
+    /// Stored representation used by relay dispatch when the event was inserted.
+    pub event: StoredEvent,
+    /// Whether and how authoritative Project state changed.
+    pub status: ProjectLifecycleStatus,
+    /// Canonical state after an applied lifecycle mutation.
+    pub snapshot: Option<ProjectStateSnapshot>,
+}
+
+impl ProjectLifecycleApplyResult {
+    /// Whether this call newly persisted the submitted event.
+    #[must_use]
+    pub fn was_inserted(&self) -> bool {
+        matches!(
+            self.status,
+            ProjectLifecycleStatus::Applied | ProjectLifecycleStatus::NoEffect
+        )
+    }
+}
 fn tag_parts(tag: &serde_json::Value) -> Option<Vec<&str>> {
     tag.as_array()?
         .iter()
@@ -193,7 +230,341 @@ fn validate_patch(change: ProjectRelatedChannelChange<'_>) -> Option<String> {
     None
 }
 
+async fn replace_related_channels(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    owner: &[u8],
+    d_tag: &str,
+    related: &BTreeSet<Uuid>,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM project_related_channels WHERE community_id=$1 \
+         AND project_owner=$2 AND project_d_tag=$3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(owner)
+    .bind(d_tag)
+    .execute(&mut **tx)
+    .await?;
+    for channel in related {
+        sqlx::query(
+            "INSERT INTO project_related_channels \
+             (community_id, project_owner, project_d_tag, channel_id) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner)
+        .bind(d_tag)
+        .bind(channel)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 impl Db {
+    /// Atomically accept an owner-signed Project identity and materialize it.
+    ///
+    /// A newer identity is a full recovery snapshot. Existing relational
+    /// revisions advance rather than resetting, including recreation after a
+    /// deletion. Duplicate and superseded identities leave state unchanged.
+    pub async fn apply_project_identity_event(
+        &self,
+        community_id: CommunityId,
+        event: &Event,
+    ) -> Result<ProjectLifecycleApplyResult> {
+        if event_kind_u32(event) != KIND_PROJECT {
+            return Err(DbError::InvalidData(
+                "Project identity persistence requires kind 30621".into(),
+            ));
+        }
+        let d_tag = crate::event::extract_d_tag(event).unwrap_or_default();
+        if d_tag.is_empty() || d_tag.len() > crate::event::D_TAG_MAX_LEN {
+            return Err(DbError::InvalidData("invalid Project d tag".into()));
+        }
+        let tags = serde_json::to_value(&event.tags)?;
+        let (_, related) = parse_base_state(&tags).map_err(DbError::InvalidData)?;
+        let owner = event.pubkey.to_bytes();
+
+        let mut tx = self.begin_transaction().await?;
+        self.deletion_store()
+            .guard_transaction(&mut tx, community_id)
+            .await?;
+        let coordinate_lock = event_replacement_lock_key(
+            community_id,
+            KIND_PROJECT as i32,
+            owner.as_slice(),
+            Some(d_tag.as_bytes()),
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(coordinate_lock)
+            .execute(&mut *tx)
+            .await?;
+        let current_head = sqlx::query(
+            "SELECT revision, deleted, last_event_id FROM project_state_heads \
+             WHERE community_id=$1 AND project_owner=$2 AND project_d_tag=$3 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.as_slice())
+        .bind(&d_tag)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(head) = current_head
+            .as_ref()
+            .filter(|head| head.get::<bool, _>("deleted"))
+        {
+            let tombstone_event_id: Vec<u8> = head.try_get("last_event_id")?;
+            let tombstone_created_at: DateTime<Utc> =
+                sqlx::query_scalar("SELECT created_at FROM events WHERE community_id=$1 AND id=$2")
+                    .bind(community_id.as_uuid())
+                    .bind(tombstone_event_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or_else(|| {
+                        DbError::InvalidData(
+                            "Project tombstone event is missing from history".into(),
+                        )
+                    })?;
+            let identity_created_at =
+                DateTime::<Utc>::from_timestamp(event.created_at.as_secs() as i64, 0)
+                    .ok_or_else(|| DbError::InvalidTimestamp(event.created_at.as_secs() as i64))?;
+            // A tombstone dominates every identity in its second. Recreating a
+            // Project requires an unambiguously later owner event.
+            if identity_created_at <= tombstone_created_at {
+                tx.rollback().await?;
+                return Ok(ProjectLifecycleApplyResult {
+                    event: StoredEvent::new(event.clone(), None),
+                    status: ProjectLifecycleStatus::Superseded,
+                    snapshot: None,
+                });
+            }
+        }
+        let had_unmaterialized_identity: bool = if current_head.is_none() {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE community_id=$1 AND kind=$2 \
+                 AND pubkey=$3 AND d_tag=$4 AND deleted_at IS NULL)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(KIND_PROJECT as i32)
+            .bind(owner.as_slice())
+            .bind(&d_tag)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            false
+        };
+        let persisted = self
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                community_id,
+                event,
+                &d_tag,
+                None,
+                ParameterizedReplacePrecondition::Unconditional,
+            )
+            .await?;
+        if persisted.status != ParameterizedReplaceStatus::Inserted {
+            tx.rollback().await?;
+            let status = match persisted.status {
+                ParameterizedReplaceStatus::Duplicate => ProjectLifecycleStatus::Duplicate,
+                _ => ProjectLifecycleStatus::Superseded,
+            };
+            return Ok(ProjectLifecycleApplyResult {
+                event: persisted.event,
+                status,
+                snapshot: None,
+            });
+        }
+
+        let revision = match current_head {
+            None if had_unmaterialized_identity => 2,
+            None => 1,
+            Some(head) => head
+                .try_get::<i64, _>("revision")?
+                .checked_add(1)
+                .ok_or_else(|| DbError::InvalidData("Project revision overflow".into()))?,
+        };
+        sqlx::query(
+            "INSERT INTO project_state_heads \
+               (community_id, project_owner, project_d_tag, revision, deleted, identity_event_id, last_event_id) \
+             VALUES ($1,$2,$3,$4,FALSE,$5,$5) \
+             ON CONFLICT (community_id, project_owner, project_d_tag) DO UPDATE SET \
+               revision=EXCLUDED.revision, deleted=FALSE, identity_event_id=EXCLUDED.identity_event_id, \
+               last_event_id=EXCLUDED.last_event_id, updated_at=transaction_timestamp()",
+        )
+        .bind(community_id.as_uuid())
+        .bind(owner.as_slice())
+        .bind(&d_tag)
+        .bind(revision)
+        .bind(event.id.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await?;
+        replace_related_channels(&mut tx, community_id, owner.as_slice(), &d_tag, &related).await?;
+
+        let snapshot = ProjectStateSnapshot {
+            revision,
+            identity_event_id: event.id.as_bytes().to_vec(),
+            change_event_id: event.id.as_bytes().to_vec(),
+            related_channels: related.into_iter().collect(),
+        };
+        tx.commit().await?;
+        Ok(ProjectLifecycleApplyResult {
+            event: persisted.event,
+            status: ProjectLifecycleStatus::Applied,
+            snapshot: Some(snapshot),
+        })
+    }
+
+    /// Atomically store an owner-authorized NIP-09 coordinate deletion and,
+    /// when it covers the live identity, advance Project state to a tombstone.
+    pub async fn apply_project_deletion_event(
+        &self,
+        community_id: CommunityId,
+        event: &Event,
+        project_owner: &[u8],
+        project_d_tag: &str,
+        expected_identity_event_id: Option<&[u8]>,
+    ) -> Result<ProjectLifecycleApplyResult> {
+        if event_kind_u32(event) != KIND_DELETION
+            || project_owner.len() != 32
+            || project_d_tag.is_empty()
+            || project_d_tag.len() > crate::event::D_TAG_MAX_LEN
+            || expected_identity_event_id.is_some_and(|event_id| event_id.len() != 32)
+        {
+            return Err(DbError::InvalidData("invalid Project deletion".into()));
+        }
+        let deletion_created_at =
+            DateTime::<Utc>::from_timestamp(event.created_at.as_secs() as i64, 0)
+                .ok_or_else(|| DbError::InvalidTimestamp(event.created_at.as_secs() as i64))?;
+        let mut tx = self.begin_transaction().await?;
+        self.deletion_store()
+            .guard_transaction(&mut tx, community_id)
+            .await?;
+        let lock = event_replacement_lock_key(
+            community_id,
+            KIND_PROJECT as i32,
+            project_owner,
+            Some(project_d_tag.as_bytes()),
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock)
+            .execute(&mut *tx)
+            .await?;
+        let (stored_event, inserted) =
+            insert_event_in_transaction(&mut tx, community_id, event, None).await?;
+        if !inserted {
+            tx.rollback().await?;
+            return Ok(ProjectLifecycleApplyResult {
+                event: stored_event,
+                status: ProjectLifecycleStatus::Duplicate,
+                snapshot: None,
+            });
+        }
+
+        let live = sqlx::query(
+            "SELECT id, created_at FROM events WHERE community_id=$1 AND kind=$2 \
+             AND pubkey=$3 AND d_tag=$4 AND deleted_at IS NULL \
+             ORDER BY created_at DESC, id ASC LIMIT 1 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(KIND_PROJECT as i32)
+        .bind(project_owner)
+        .bind(project_d_tag)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(live) = live else {
+            tx.commit().await?;
+            return Ok(ProjectLifecycleApplyResult {
+                event: stored_event,
+                status: ProjectLifecycleStatus::NoEffect,
+                snapshot: None,
+            });
+        };
+        let identity_event_id: Vec<u8> = live.try_get("id")?;
+        let identity_created_at: DateTime<Utc> = live.try_get("created_at")?;
+        if identity_created_at > deletion_created_at
+            || expected_identity_event_id
+                .is_some_and(|expected| expected != identity_event_id.as_slice())
+        {
+            tx.commit().await?;
+            return Ok(ProjectLifecycleApplyResult {
+                event: stored_event,
+                status: ProjectLifecycleStatus::NoEffect,
+                snapshot: None,
+            });
+        }
+
+        let head = sqlx::query(
+            "SELECT revision, deleted, identity_event_id FROM project_state_heads \
+             WHERE community_id=$1 AND project_owner=$2 AND project_d_tag=$3 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(project_owner)
+        .bind(project_d_tag)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let revision = if let Some(head) = head {
+            let materialized: Vec<u8> = head.try_get("identity_event_id")?;
+            if head.try_get::<bool, _>("deleted")? || materialized != identity_event_id {
+                return Err(DbError::InvalidData(
+                    "Project lifecycle state does not match live identity".into(),
+                ));
+            }
+            head.try_get::<i64, _>("revision")?
+                .checked_add(1)
+                .ok_or_else(|| DbError::InvalidData("Project revision overflow".into()))?
+        } else {
+            // Materialize the pre-existing identity at revision 1 before applying
+            // its first relational lifecycle event.
+            2
+        };
+
+        sqlx::query(
+            "UPDATE events SET deleted_at=transaction_timestamp() WHERE community_id=$1 \
+             AND id=$2 AND deleted_at IS NULL AND created_at <= $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(&identity_event_id)
+        .bind(deletion_created_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO project_state_heads \
+               (community_id, project_owner, project_d_tag, revision, deleted, identity_event_id, last_event_id) \
+             VALUES ($1,$2,$3,$4,TRUE,$5,$6) \
+             ON CONFLICT (community_id, project_owner, project_d_tag) DO UPDATE SET \
+               revision=EXCLUDED.revision, deleted=TRUE, last_event_id=EXCLUDED.last_event_id, \
+               updated_at=transaction_timestamp()",
+        )
+        .bind(community_id.as_uuid())
+        .bind(project_owner)
+        .bind(project_d_tag)
+        .bind(revision)
+        .bind(&identity_event_id)
+        .bind(event.id.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await?;
+        replace_related_channels(
+            &mut tx,
+            community_id,
+            project_owner,
+            project_d_tag,
+            &BTreeSet::new(),
+        )
+        .await?;
+        let snapshot = ProjectStateSnapshot {
+            revision,
+            identity_event_id,
+            change_event_id: event.id.as_bytes().to_vec(),
+            related_channels: Vec::new(),
+        };
+        tx.commit().await?;
+        Ok(ProjectLifecycleApplyResult {
+            event: stored_event,
+            status: ProjectLifecycleStatus::Applied,
+            snapshot: Some(snapshot),
+        })
+    }
+
     /// Authorize and atomically apply one v1 Project related-channel command.
     ///
     /// Lock order is community deletion fence, Project coordinate, then current
@@ -870,17 +1241,25 @@ mod tests {
             .expect("insert member");
         }
         let seeded = Uuid::new_v4();
+        let identity_time = Utc::now().timestamp() as u64 - 100;
         let base = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "")
             .tags([
                 Tag::parse(["d", "shared"]).expect("d tag"),
                 Tag::parse(["buzz-channel", &home.to_string()]).expect("home tag"),
                 Tag::parse(["buzz-related-channel", &seeded.to_string()]).expect("related tag"),
             ])
+            .custom_created_at(Timestamp::from(identity_time))
             .sign_with_keys(&owner)
             .expect("sign Project");
-        db.insert_event(community, &base, None)
+        let initial = db
+            .apply_project_identity_event(community, &base)
             .await
-            .expect("insert Project");
+            .expect("insert Project identity");
+        assert_eq!(initial.status, ProjectLifecycleStatus::Applied);
+        assert_eq!(
+            initial.snapshot.as_ref().map(|state| state.revision),
+            Some(1)
+        );
 
         let added = Uuid::new_v4();
         let first = command(&admin, &owner, "shared", 1, &[added], &[]);
@@ -990,7 +1369,6 @@ mod tests {
                 current_revision: 3
             }
         );
-
         let relay_a = Keys::generate();
         let relay_a_bytes = relay_a.public_key().to_bytes();
         let candidates = db
@@ -1098,6 +1476,145 @@ mod tests {
         .await
         .expect("count rotated projection");
         assert_eq!(live_projection_count, 1);
+
+        let recovered = Uuid::new_v4();
+        let recovery = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "")
+            .tags([
+                Tag::parse(["d", "shared"]).expect("d tag"),
+                Tag::parse(["buzz-channel", &home.to_string()]).expect("home tag"),
+                Tag::parse(["buzz-related-channel", &recovered.to_string()]).expect("related tag"),
+            ])
+            .custom_created_at(Timestamp::from(identity_time + 1))
+            .sign_with_keys(&owner)
+            .expect("sign recovery");
+        let recovery_result = db
+            .apply_project_identity_event(community, &recovery)
+            .await
+            .expect("apply recovery");
+        assert_eq!(recovery_result.status, ProjectLifecycleStatus::Applied);
+        let recovery_state = recovery_result.snapshot.expect("recovery state");
+        assert_eq!(recovery_state.revision, 5);
+        assert_eq!(recovery_state.related_channels, vec![recovered]);
+        assert_eq!(
+            db.apply_project_identity_event(community, &recovery)
+                .await
+                .expect("duplicate recovery")
+                .status,
+            ProjectLifecycleStatus::Duplicate
+        );
+
+        let stale_identity_deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tag(Tag::event(base.id))
+            .custom_created_at(Timestamp::from(identity_time + 2))
+            .sign_with_keys(&owner)
+            .expect("sign stale identity deletion");
+        assert_eq!(
+            db.apply_project_deletion_event(
+                community,
+                &stale_identity_deletion,
+                owner_bytes.as_slice(),
+                "shared",
+                Some(base.id.as_bytes()),
+            )
+            .await
+            .expect("ignore stale identity deletion")
+            .status,
+            ProjectLifecycleStatus::NoEffect
+        );
+        assert!(db
+            .get_event_by_id(community, recovery.id.as_bytes())
+            .await
+            .expect("load recovered identity")
+            .is_some());
+
+        let coordinate = format!("30621:{}:shared", owner.public_key().to_hex());
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tag(Tag::parse(["a", &coordinate]).expect("coordinate tag"))
+            .custom_created_at(Timestamp::from(identity_time + 2))
+            .sign_with_keys(&owner)
+            .expect("sign deletion");
+        let deleted = db
+            .apply_project_deletion_event(
+                community,
+                &deletion,
+                owner_bytes.as_slice(),
+                "shared",
+                None,
+            )
+            .await
+            .expect("delete Project");
+        assert_eq!(deleted.status, ProjectLifecycleStatus::Applied);
+        assert_eq!(
+            deleted.snapshot.as_ref().map(|state| state.revision),
+            Some(6)
+        );
+        assert_eq!(
+            db.apply_project_deletion_event(
+                community,
+                &deletion,
+                owner_bytes.as_slice(),
+                "shared",
+                None,
+            )
+            .await
+            .expect("duplicate deletion")
+            .status,
+            ProjectLifecycleStatus::Duplicate
+        );
+
+        let same_second_recreation = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "stale")
+            .tags([Tag::parse(["d", "shared"]).expect("d tag")])
+            .custom_created_at(Timestamp::from(identity_time + 2))
+            .sign_with_keys(&owner)
+            .expect("sign same-second recreation");
+        assert_eq!(
+            db.apply_project_identity_event(community, &same_second_recreation)
+                .await
+                .expect("reject same-second recreation")
+                .status,
+            ProjectLifecycleStatus::Superseded
+        );
+        assert!(db
+            .get_event_by_id(community, same_second_recreation.id.as_bytes())
+            .await
+            .expect("check same-second recreation")
+            .is_none());
+
+        let recreation = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "")
+            .tags([Tag::parse(["d", "shared"]).expect("d tag")])
+            .custom_created_at(Timestamp::from(identity_time + 3))
+            .sign_with_keys(&owner)
+            .expect("sign recreation");
+        let recreated = db
+            .apply_project_identity_event(community, &recreation)
+            .await
+            .expect("recreate Project");
+        assert_eq!(recreated.status, ProjectLifecycleStatus::Applied);
+        assert_eq!(
+            recreated.snapshot.as_ref().map(|state| state.revision),
+            Some(7)
+        );
+
+        let live_identity_deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tag(Tag::event(recreation.id))
+            .custom_created_at(Timestamp::from(identity_time + 4))
+            .sign_with_keys(&owner)
+            .expect("sign live identity deletion");
+        let deleted_by_id = db
+            .apply_project_deletion_event(
+                community,
+                &live_identity_deletion,
+                owner_bytes.as_slice(),
+                "shared",
+                Some(recreation.id.as_bytes()),
+            )
+            .await
+            .expect("delete live identity by id");
+        assert_eq!(deleted_by_id.status, ProjectLifecycleStatus::Applied);
+        assert_eq!(
+            deleted_by_id.snapshot.as_ref().map(|state| state.revision),
+            Some(8)
+        );
 
         drop_scratch_db(admin_pool, pool, &scratch_name).await;
     }

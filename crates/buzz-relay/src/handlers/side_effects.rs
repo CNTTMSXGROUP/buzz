@@ -2185,6 +2185,14 @@ async fn handle_a_tag_deletion(
     let actor_bytes = effective_message_author(event, &state.relay_keypair.public_key());
 
     match kind_num {
+        // Project deletion is handled atomically with its relational state in
+        // ingest. Reaching this generic post-storage side effect would split
+        // the event acceptance from the authoritative tombstone.
+        buzz_core::kind::KIND_PROJECT => {
+            return Err(anyhow::anyhow!(
+                "Project deletion bypassed the atomic lifecycle handler"
+            ));
+        }
         // kind:30350 revocation is exclusively a higher-generation inactive replacement.
         super::push_lease::KIND_PUSH_LEASE => {
             tracing::debug!(d_tag, "NIP-09 deletion ignored for push lease");

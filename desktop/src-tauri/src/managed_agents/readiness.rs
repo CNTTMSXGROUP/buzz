@@ -112,8 +112,8 @@ pub(crate) struct EffectiveHarnessDescriptor {
 /// Returns `Err("DANGLING_HARNESS_ID:<id>")` when the record (or its linked
 /// persona) references a runtime id that no longer exists in the registry —
 /// the same typed error produced by `try_record_agent_command`. Callers that
-/// cannot continue with a dangling id (e.g. `spawn_agent_child`) propagate the
-/// error; callers that degrade gracefully may use `.unwrap_or_else(|_| …)`.
+/// cannot continue with a dangling id propagate the error; callers that degrade
+/// gracefully may use `.unwrap_or_else(|_| …)`.
 ///
 /// Does NOT require an `AppHandle` so it is fully unit-testable.
 ///
@@ -394,9 +394,8 @@ impl AgentReadiness {
 ///   credential store — NOT `OPENAI_API_KEY`).
 /// * **unknown / custom command**: always `Ready` (no requirements known).
 ///
-/// Databricks note: `DATABRICKS_TOKEN` is `.unwrap_or_default()` in
-/// `buzz-agent/src/config.rs:143` — an escape hatch for static tokens, but
-/// the normal path is OAuth PKCE, so we do NOT mark the token as required.
+/// Databricks note: `DATABRICKS_TOKEN` is `.unwrap_or_default()` (escape hatch
+/// for static tokens); normal path is OAuth PKCE, so token is not required.
 pub(crate) fn agent_readiness(effective: &EffectiveAgentEnv) -> AgentReadiness {
     let runtime = known_acp_runtime(&effective.effective_command);
     let missing = collect_missing_requirements(effective, runtime);

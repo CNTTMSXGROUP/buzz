@@ -392,6 +392,10 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
       );
 
   VoiceNoteRecording? uploadedRecording;
+  XFile? file;
+
+  @override
+  Future<XFile?> pickAttachmentFile() async => file;
 
   @override
   Future<BlobDescriptor> uploadVoiceNote(
@@ -464,7 +468,7 @@ class _DelayedVoiceNoteRecorder extends _FakeVoiceNoteRecorder {
   @override
   Future<void> start() async {
     await startup.future;
-    await super.start();
+    if (!cancelled) await super.start();
   }
 
   @override
@@ -4840,13 +4844,92 @@ void main() {
       );
     });
 
+    testWidgets(
+      'permission startup survives transient inactive and resumed states',
+      (tester) async {
+        final recorder = _DelayedVoiceNoteRecorder();
+        final lifecycle = _FakeAppLifecycleNotifier();
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: _FakeVoiceNoteUploadService(),
+            voiceNoteRecorderFactory: () => recorder,
+            appLifecycle: () => lifecycle,
+            onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+          ),
+        );
+        await _openAttachmentMenu(tester);
+        await tester.tap(find.text('Voice note'));
+        await tester.pumpAndSettle();
+
+        lifecycle.setLifecycle(AppLifecycleState.inactive);
+        lifecycle.setLifecycle(AppLifecycleState.resumed);
+        recorder.startup.complete();
+        await tester.pumpAndSettle();
+
+        expect(recorder.started, isTrue);
+        expect(recorder.cancelled, isFalse);
+        expect(
+          find.byKey(const ValueKey('voice-note-recorder')),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets('hidden remains a transient lifecycle state', (tester) async {
+      final recorder = _FakeVoiceNoteRecorder();
+      final lifecycle = _FakeAppLifecycleNotifier();
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: _FakeVoiceNoteUploadService(),
+          voiceNoteRecorderFactory: () => recorder,
+          appLifecycle: () => lifecycle,
+          onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+        ),
+      );
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Voice note'));
+      await tester.pumpAndSettle();
+
+      lifecycle.setLifecycle(AppLifecycleState.hidden);
+      await tester.pump();
+
+      expect(recorder.cancelled, isFalse);
+      expect(find.byKey(const ValueKey('voice-note-recorder')), findsOneWidget);
+    });
+
+    testWidgets(
+      'paused cancels startup without waiting for its permission result',
+      (tester) async {
+        final recorder = _DelayedVoiceNoteRecorder();
+        final lifecycle = _FakeAppLifecycleNotifier();
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: _FakeVoiceNoteUploadService(),
+            voiceNoteRecorderFactory: () => recorder,
+            appLifecycle: () => lifecycle,
+            onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+          ),
+        );
+        await _openAttachmentMenu(tester);
+        await tester.tap(find.text('Voice note'));
+        await tester.pumpAndSettle();
+
+        lifecycle.setLifecycle(AppLifecycleState.paused);
+
+        expect(recorder.cancelled, isTrue);
+        recorder.startup.complete();
+        await tester.pumpAndSettle();
+        expect(recorder.started, isFalse);
+        expect(recorder.disposed, isTrue);
+      },
+    );
+
     for (final lifecycleState in [
-      AppLifecycleState.inactive,
       AppLifecycleState.paused,
-      AppLifecycleState.hidden,
+      AppLifecycleState.detached,
     ]) {
       testWidgets(
-        'leaving the foreground for ${lifecycleState.name} cancels recording',
+        '${lifecycleState.name} starts cancellation without a rendered frame',
         (tester) async {
           final recorder = _FakeVoiceNoteRecorder();
           final lifecycle = _FakeAppLifecycleNotifier();
@@ -4863,9 +4946,9 @@ void main() {
           await tester.pumpAndSettle();
 
           lifecycle.setLifecycle(lifecycleState);
-          await tester.pumpAndSettle();
 
           expect(recorder.cancelled, isTrue);
+          await tester.pumpAndSettle();
           expect(recorder.disposed, isTrue);
           expect(
             find.byKey(const ValueKey('voice-note-recorder')),
@@ -4874,6 +4957,71 @@ void main() {
         },
       );
     }
+
+    testWidgets('voice note rejects an existing attachment like desktop', (
+      tester,
+    ) async {
+      final recorder = _FakeVoiceNoteRecorder();
+      final uploadService = _FakeVoiceNoteUploadService()
+        ..file = XFile('/tmp/extra.txt');
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: uploadService,
+          voiceNoteRecorderFactory: () => recorder,
+          onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+        ),
+      );
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Files'));
+      await tester.pumpAndSettle();
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Voice note'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('A voice note must be the only attachment.'),
+        findsOneWidget,
+      );
+      expect(find.text('extra.txt'), findsOneWidget);
+      expect(recorder.started, isFalse);
+      expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
+    });
+
+    testWidgets('voice note stays the only attachment like desktop', (
+      tester,
+    ) async {
+      final recorder = _FakeVoiceNoteRecorder();
+      final uploadService = _FakeVoiceNoteUploadService()
+        ..file = XFile('/tmp/extra.txt');
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: uploadService,
+          voiceNoteRecorderFactory: () => recorder,
+          onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+        ),
+      );
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Voice note'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      await tester.pumpAndSettle();
+
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Files'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('A voice note must be the only attachment.'),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(
+          const ValueKey('voice-note-attachment:/tmp/voice-note-test.m4a'),
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('extra.txt'), findsNothing);
+    });
 
     testWidgets('covering the route cancels its active voice-note recorder', (
       tester,

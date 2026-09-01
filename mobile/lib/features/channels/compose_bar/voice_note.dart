@@ -43,6 +43,10 @@ _ComposerVoiceNote _useComposerVoiceNote({
   }
 
   void start() {
+    if (attachments.value.isNotEmpty) {
+      uploadError.value = 'A voice note must be the only attachment.';
+      return;
+    }
     attachmentSurface.value = _AttachmentSurface.closed;
     showFormatting.value = false;
     isComposerExpanded.value = false;

@@ -1,5 +1,75 @@
 part of '../compose_bar.dart';
 
+bool _rejectsNonVoiceAttachment(
+  _ComposerVoiceNote voiceNote,
+  List<_PendingAttachment> attachments,
+  ValueNotifier<String?> uploadError,
+) {
+  if (!voiceNote.isPreparing &&
+      voiceNote.recorder == null &&
+      !attachments.any(
+        (attachment) => attachment.kind == _PendingAttachmentKind.voiceNote,
+      )) {
+    return false;
+  }
+  uploadError.value = voiceNote.recorder != null || voiceNote.isPreparing
+      ? 'Finish or discard the voice note before attaching a file.'
+      : 'A voice note must be the only attachment.';
+  return true;
+}
+
+bool _queueComposerAttachment(
+  XFile file,
+  _PendingAttachmentKind kind,
+  ObjectRef<_ComposerVoiceNote> voiceNote,
+  ValueNotifier<List<_PendingAttachment>> attachments,
+  ValueNotifier<String?> uploadError,
+  ObjectRef<int> draftRevision, {
+  bool deleteAfterUse = false,
+}) {
+  if (kind != _PendingAttachmentKind.voiceNote &&
+      _rejectsNonVoiceAttachment(
+        voiceNote.value,
+        attachments.value,
+        uploadError,
+      )) {
+    return false;
+  }
+  draftRevision.value += 1;
+  uploadError.value = null;
+  attachments.value = [
+    ...attachments.value,
+    _PendingAttachment(file: file, kind: kind, deleteAfterUse: deleteAfterUse),
+  ];
+  return true;
+}
+
+bool _queueComposerImages(
+  List<XFile> images,
+  _ComposerVoiceNote voiceNote,
+  ValueNotifier<List<_PendingAttachment>> attachments,
+  ValueNotifier<String?> uploadError,
+  ObjectRef<int> draftRevision,
+  bool deleteAfterUse,
+) {
+  if (images.isEmpty ||
+      _rejectsNonVoiceAttachment(voiceNote, attachments.value, uploadError)) {
+    return false;
+  }
+  draftRevision.value += 1;
+  uploadError.value = null;
+  attachments.value = [
+    ...attachments.value,
+    for (final image in images)
+      _PendingAttachment(
+        file: image,
+        kind: _PendingAttachmentKind.image,
+        deleteAfterUse: deleteAfterUse,
+      ),
+  ];
+  return true;
+}
+
 enum _AttachmentSurface { closed, menu, camera, photos }
 
 const _attachmentMenuWidth = 216.0;
@@ -336,16 +406,14 @@ void _removePendingAttachment(
 Future<void> _retainAndQueueImages(
   BuildContext context,
   List<XFile> images,
-  void Function(List<XFile>, {bool deleteAfterUse}) queueImages,
+  bool Function(List<XFile>, {bool deleteAfterUse}) queueImages,
 ) async {
   final retained = await retainTemporaryImages(images);
-  if (!context.mounted) {
+  if (!context.mounted || !queueImages(retained, deleteAfterUse: true)) {
     for (final image in retained) {
       await _deleteXFile(image);
     }
-    return;
   }
-  queueImages(retained, deleteAfterUse: true);
 }
 
 Future<BlobDescriptor> _uploadPendingAttachment(

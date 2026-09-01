@@ -39,7 +39,6 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     final error = useState<String?>(null);
     final isStarted = useState(false);
     final isStopping = useState(false);
-    final lifecycle = ref.watch(appLifecycleProvider);
     final startedAt = useRef<DateTime?>(null);
     final routeAware = useMemoized(
       () => _VoiceNoteRouteAware(() {
@@ -49,11 +48,19 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     );
 
     useEffect(() {
-      if (lifecycle != AppLifecycleState.resumed) {
-        WidgetsBinding.instance.addPostFrameCallback((_) => onCancel());
-      }
-      return null;
-    }, [lifecycle, onCancel]);
+      final subscription = ref.listenManual(appLifecycleProvider, (
+        previous,
+        next,
+      ) {
+        if (next != AppLifecycleState.paused &&
+            next != AppLifecycleState.detached) {
+          return;
+        }
+        unawaited(recorder.cancel());
+        if (context.mounted) onCancel();
+      });
+      return subscription.close;
+    }, [recorder, onCancel]);
 
     final route = ModalRoute.of(context);
     useEffect(() {

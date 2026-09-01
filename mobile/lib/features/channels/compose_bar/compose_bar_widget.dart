@@ -85,6 +85,7 @@ class ComposeBar extends HookConsumerWidget {
       draftRevision: draftRevision,
       attachments: attachments,
     );
+    final voiceNoteRef = useRef(voiceNote)..value = voiceNote;
     _useComposeDraftLifecycle(
       ref: ref,
       controller: controller,
@@ -612,23 +613,22 @@ class ComposeBar extends HookConsumerWidget {
       }
     }
 
-    final queueAttachment = useCallback((
-      XFile file,
-      _PendingAttachmentKind kind, {
-      bool deleteAfterUse = false,
-    }) {
-      draftRevision.value += 1;
-      uploadError.value = null;
-      attachments.value = [
-        ...attachments.value,
-        _PendingAttachment(
-          file: file,
-          kind: kind,
-          deleteAfterUse: deleteAfterUse,
-        ),
-      ];
-    }, [draftRevision, uploadError, attachments]);
-
+    final queueAttachment = useCallback(
+      (
+        XFile file,
+        _PendingAttachmentKind kind, {
+        bool deleteAfterUse = false,
+      }) => _queueComposerAttachment(
+        file,
+        kind,
+        voiceNoteRef,
+        attachments,
+        uploadError,
+        draftRevision,
+        deleteAfterUse: deleteAfterUse,
+      ),
+      [voiceNoteRef, draftRevision, uploadError, attachments],
+    );
     Future<void> pickThenQueue({
       required Future<XFile?> Function() pick,
       required _PendingAttachmentKind kind,
@@ -645,20 +645,15 @@ class ComposeBar extends HookConsumerWidget {
       }
     }
 
-    void queueImages(List<XFile> images, {bool deleteAfterUse = false}) {
-      if (images.isEmpty) return;
-      draftRevision.value += 1;
-      uploadError.value = null;
-      attachments.value = [
-        ...attachments.value,
-        for (final image in images)
-          _PendingAttachment(
-            file: image,
-            kind: _PendingAttachmentKind.image,
-            deleteAfterUse: deleteAfterUse,
-          ),
-      ];
-    }
+    bool queueImages(List<XFile> images, {bool deleteAfterUse = false}) =>
+        _queueComposerImages(
+          images,
+          voiceNote,
+          attachments,
+          uploadError,
+          draftRevision,
+          deleteAfterUse,
+        );
 
     Future<void> retainAndQueueImages(List<XFile> images) =>
         _retainAndQueueImages(context, images, queueImages);
@@ -765,13 +760,15 @@ class ComposeBar extends HookConsumerWidget {
     void chooseAttachment(
       Future<void> Function() choose, {
       String? errorMessage,
-    }) => _chooseComposerAttachment(
-      context,
-      attachmentSurface,
-      uploadError,
-      choose,
-      errorMessage: errorMessage,
-    );
+    }) => _rejectsNonVoiceAttachment(voiceNote, attachments.value, uploadError)
+        ? attachmentSurface.value = _AttachmentSurface.closed
+        : _chooseComposerAttachment(
+            context,
+            attachmentSurface,
+            uploadError,
+            choose,
+            errorMessage: errorMessage,
+          );
 
     void toggleAttachments() {
       attachmentSurface.value = switch (attachmentSurface.value) {

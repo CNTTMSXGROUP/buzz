@@ -245,7 +245,7 @@ enum VoiceNotePackager {
             switch exportSession.status {
             case .completed:
                 do {
-                    try Self.neutralizeSampleDependencyBoxes(at: outputURL)
+                    try MP4Canonicalizer.neutralizeSampleDependencyBoxes(at: outputURL)
                     result(outputURL.path)
                 } catch {
                     try? FileManager.default.removeItem(at: outputURL)

@@ -21,6 +21,7 @@ const MAX_PATCH_CHANNELS: usize = 64;
 #[derive(Debug)]
 struct ParsedChange {
     owner: Vec<u8>,
+    delegated_owner: Option<Vec<u8>>,
     d_tag: String,
     expected_revision: i64,
     add: Vec<Uuid>,
@@ -106,12 +107,44 @@ fn parse_channels(values: Vec<String>) -> Result<Vec<Uuid>, IngestError> {
         .collect()
 }
 
+fn verify_delegated_owner(event: &Event, auth_tag: &[String]) -> Result<Vec<u8>, IngestError> {
+    let auth_tag_json = serde_json::to_string(auth_tag)
+        .map_err(|error| invalid(format!("could not encode Project auth tag: {error}")))?;
+    let owner = buzz_sdk::nip_oa::verify_auth_tag(&auth_tag_json, &event.pubkey)
+        .map_err(|error| invalid(format!("invalid Project auth tag: {error}")))?;
+    let conditions = &auth_tag[2];
+    for clause in conditions.split('&').filter(|clause| !clause.is_empty()) {
+        let satisfied = if let Some(value) = clause.strip_prefix("kind=") {
+            value.parse::<u16>().ok() == Some(event.kind.as_u16())
+        } else if let Some(value) = clause.strip_prefix("created_at<") {
+            value
+                .parse::<u64>()
+                .is_ok_and(|bound| event.created_at.as_secs() < bound)
+        } else if let Some(value) = clause.strip_prefix("created_at>") {
+            value
+                .parse::<u64>()
+                .is_ok_and(|bound| event.created_at.as_secs() > bound)
+        } else {
+            false
+        };
+        if !satisfied {
+            return Err(invalid(format!(
+                "Project command does not satisfy auth condition {clause}"
+            )));
+        }
+    }
+    Ok(owner.to_bytes().to_vec())
+}
+
 fn parse(event: &Event) -> Result<ParsedChange, IngestError> {
-    if event.tags.len() != 2 {
-        return Err(invalid("Project change must contain exactly two tags"));
+    if !(2..=3).contains(&event.tags.len()) {
+        return Err(invalid(
+            "Project change must contain two required tags and at most one auth tag",
+        ));
     }
     let mut coordinate = None;
     let mut revision = None;
+    let mut auth_tag = None;
     for tag in event.tags.iter() {
         match tag.as_slice() {
             [name, value] if name == "a" && coordinate.is_none() => {
@@ -119,6 +152,9 @@ fn parse(event: &Event) -> Result<ParsedChange, IngestError> {
             }
             [name, value] if name == "expected-revision" && revision.is_none() => {
                 revision = Some(parse_revision(value)?);
+            }
+            [name, _, _, _] if name == "auth" && auth_tag.is_none() => {
+                auth_tag = Some(tag.as_slice().to_vec());
             }
             _ => return Err(invalid("Project change tags are malformed")),
         }
@@ -143,8 +179,13 @@ fn parse(event: &Event) -> Result<ParsedChange, IngestError> {
     if !add_set.is_disjoint(&remove_set) {
         return Err(invalid("Project change adds and removes the same channel"));
     }
+    let delegated_owner = auth_tag
+        .as_deref()
+        .map(|tag| verify_delegated_owner(event, tag))
+        .transpose()?;
     Ok(ParsedChange {
         owner,
+        delegated_owner,
         d_tag,
         expected_revision,
         add,
@@ -160,6 +201,7 @@ pub(crate) async fn handle(
     let parsed = parse(event)?;
     let change = ProjectRelatedChannelChange {
         project_owner: &parsed.owner,
+        delegated_owner: parsed.delegated_owner.as_deref(),
         project_d_tag: &parsed.d_tag,
         expected_revision: parsed.expected_revision,
         add: &parsed.add,
@@ -231,11 +273,34 @@ pub(crate) async fn handle(
 
 #[cfg(test)]
 mod tests {
-    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     use super::*;
 
     fn command(tags: Vec<Tag>, content: &str) -> Event {
+        command_with(&Keys::generate(), tags, content, None)
+    }
+
+    fn command_with(actor: &Keys, tags: Vec<Tag>, content: &str, created_at: Option<u64>) -> Event {
+        let builder = EventBuilder::new(Kind::Custom(47_010), content).tags(tags);
+        let builder = match created_at {
+            Some(timestamp) => builder.custom_created_at(Timestamp::from(timestamp)),
+            None => builder,
+        };
+        builder.sign_with_keys(actor).expect("sign test command")
+    }
+
+    fn auth_tag(owner: &Keys, actor: &Keys, conditions: &str) -> Tag {
+        let json = buzz_sdk::nip_oa::compute_auth_tag(owner, &actor.public_key(), conditions)
+            .expect("compute auth tag");
+        buzz_sdk::nip_oa::parse_auth_tag(&json).expect("parse auth tag")
+    }
+
+    fn valid_content() -> &'static str {
+        r#"{"v":1,"patch":{"related_channels":{"add":["11111111-1111-4111-8111-111111111111"],"remove":[]}}}"#
+    }
+
+    fn legacy_command(tags: Vec<Tag>, content: &str) -> Event {
         EventBuilder::new(Kind::Custom(47_010), content)
             .tags(tags)
             .sign_with_keys(&Keys::generate())
@@ -252,14 +317,44 @@ mod tests {
 
     #[test]
     fn parses_exact_v1_envelope() {
-        let event = command(
-            valid_tags(),
-            r#"{"v":1,"patch":{"related_channels":{"add":["11111111-1111-4111-8111-111111111111"],"remove":[]}}}"#,
-        );
+        let event = command(valid_tags(), valid_content());
         let parsed = parse(&event).expect("valid command");
         assert_eq!(parsed.expected_revision, 1);
         assert_eq!(parsed.d_tag, "project:x");
         assert_eq!(parsed.add.len(), 1);
+    }
+
+    #[test]
+    fn verifies_current_auth_tag_without_rewriting_actor() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let mut tags = valid_tags();
+        tags.push(auth_tag(&owner, &actor, "kind=47010&created_at>99"));
+        let event = command_with(&actor, tags, valid_content(), Some(100));
+
+        let parsed = parse(&event).expect("valid delegated command");
+        assert_eq!(event.pubkey, actor.public_key());
+        assert_eq!(
+            parsed.delegated_owner,
+            Some(owner.public_key().to_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn rejects_forged_and_stale_auth_tags() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let other_agent = Keys::generate();
+
+        let mut forged = valid_tags();
+        forged.push(auth_tag(&owner, &other_agent, "kind=47010"));
+        assert!(parse(&command_with(&actor, forged, valid_content(), None)).is_err());
+
+        for conditions in ["kind=1", "created_at<100"] {
+            let mut stale = valid_tags();
+            stale.push(auth_tag(&owner, &actor, conditions));
+            assert!(parse(&command_with(&actor, stale, valid_content(), Some(100))).is_err());
+        }
     }
 
     #[test]
@@ -279,15 +374,22 @@ mod tests {
             ),
         ];
         for (tags, content) in cases {
-            assert!(parse(&command(tags, content)).is_err());
+            assert!(parse(&legacy_command(tags, content)).is_err());
         }
 
         let mut bad_revision = valid_tags();
         bad_revision[1] = Tag::parse(["expected-revision", "01"]).expect("tag");
-        assert!(parse(&command(bad_revision, "{}")).is_err());
+        assert!(parse(&legacy_command(bad_revision, "{}")).is_err());
 
         let mut extra_tag = valid_tags();
         extra_tag.push(Tag::parse(["h", &Uuid::new_v4().to_string()]).expect("tag"));
-        assert!(parse(&command(extra_tag, "{}")).is_err());
+        assert!(parse(&legacy_command(extra_tag, "{}")).is_err());
+
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let mut duplicate_auth = valid_tags();
+        duplicate_auth.push(auth_tag(&owner, &actor, ""));
+        duplicate_auth.push(auth_tag(&owner, &actor, ""));
+        assert!(parse(&command_with(&actor, duplicate_auth, valid_content(), None)).is_err());
     }
 }

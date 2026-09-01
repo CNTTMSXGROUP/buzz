@@ -122,6 +122,8 @@ struct FleetUsageSchedule {
     next_activity: std::time::Instant,
     last_stock_success: Option<std::time::Instant>,
     last_activity_success: Option<std::time::Instant>,
+    stock_snapshot: Option<buzz_db::usage::FleetStockSnapshot>,
+    activity_snapshot: Option<buzz_db::usage::FleetActiveUsersSnapshot>,
     stock_interval: std::time::Duration,
     activity_interval: std::time::Duration,
     retry_interval: std::time::Duration,
@@ -148,6 +150,8 @@ impl FleetUsageSchedule {
             next_activity: now,
             last_stock_success: None,
             last_activity_success: None,
+            stock_snapshot: None,
+            activity_snapshot: None,
             stock_interval,
             activity_interval,
             retry_interval,
@@ -162,18 +166,28 @@ impl FleetUsageSchedule {
         now >= self.next_activity
     }
 
-    fn mark_stock_success(&mut self, now: std::time::Instant) {
+    fn mark_stock_success(
+        &mut self,
+        now: std::time::Instant,
+        snapshot: buzz_db::usage::FleetStockSnapshot,
+    ) {
         self.next_stock = now + self.stock_interval;
         self.last_stock_success = Some(now);
+        self.stock_snapshot = Some(snapshot);
     }
 
     fn mark_stock_failure(&mut self, now: std::time::Instant) {
         self.next_stock = now + self.retry_interval;
     }
 
-    fn mark_activity_success(&mut self, now: std::time::Instant) {
+    fn mark_activity_success(
+        &mut self,
+        now: std::time::Instant,
+        snapshot: buzz_db::usage::FleetActiveUsersSnapshot,
+    ) {
         self.next_activity = now + self.activity_interval;
         self.last_activity_success = Some(now);
+        self.activity_snapshot = Some(snapshot);
     }
 
     fn mark_activity_failure(&mut self, now: std::time::Instant) {
@@ -181,11 +195,20 @@ impl FleetUsageSchedule {
     }
 
     fn stock_available(&self) -> bool {
-        self.last_stock_success.is_some()
+        self.stock_snapshot.is_some()
     }
 
     fn activity_available(&self) -> bool {
-        self.last_activity_success.is_some()
+        self.activity_snapshot.is_some()
+    }
+
+    fn reset_after_demotion(&mut self, now: std::time::Instant) {
+        self.next_stock = now;
+        self.next_activity = now;
+        self.last_stock_success = None;
+        self.last_activity_success = None;
+        self.stock_snapshot = None;
+        self.activity_snapshot = None;
     }
 }
 
@@ -1193,8 +1216,9 @@ async fn main() -> anyhow::Result<()> {
     // are snapshotted from live in-memory state. Both avoid inc/dec drift.
     //
     // Multi-pod semantics:
-    //   DB-derived: all pods export the same value → dashboard uses max()
-    //   In-memory:  each pod exports its partition → dashboard uses sum()
+    //   DB/storage: leader-only; dashboards must filter by
+    //               buzz_usage_poller_is_leader == 1 before aggregating.
+    //   In-memory:  each pod exports its partition → dashboard uses sum().
     {
         let usage_state = Arc::clone(&state);
         let emission_scope = EmissionScope::from_env();
@@ -1720,6 +1744,7 @@ async fn run_usage_metrics_tick(
                 if leader.is_some() {
                     warn!("Usage metrics leader demoting: host map collection failed");
                     *leader = None;
+                    mark_usage_leader_demoted(fleet_schedule);
                 }
                 emit_in_memory_usage_metrics(state, emission_scope, None, emitted_in_memory);
                 return Err(error.into());
@@ -1740,6 +1765,7 @@ async fn run_usage_metrics_tick(
         if !leader_guard.is_live().await {
             warn!("Usage metrics leader lock connection failed liveness check; demoting");
             *leader = None;
+            mark_usage_leader_demoted(fleet_schedule);
             demoted = true;
         }
     }
@@ -1757,6 +1783,7 @@ async fn run_usage_metrics_tick(
             if let Err(error) = emit_db_usage_metrics(state, emission_scope, &host_map).await {
                 warn!("Usage metrics leader demoting: DB collection failed");
                 *leader = None;
+                mark_usage_leader_demoted(fleet_schedule);
                 return Err(error);
             }
         } else {
@@ -1782,13 +1809,19 @@ async fn run_usage_metrics_tick(
     Ok(())
 }
 
+fn mark_usage_leader_demoted(schedule: &mut FleetUsageSchedule) {
+    schedule.reset_after_demotion(std::time::Instant::now());
+    metrics::gauge!("buzz_usage_snapshot_available", "family" => "stock").set(0.0);
+    metrics::gauge!("buzz_usage_snapshot_available", "family" => "activity").set(0.0);
+    metrics::gauge!("buzz_storage_community_breakdown_available").set(0.0);
+}
+
 async fn emit_fleet_db_usage_metrics(state: &AppState, schedule: &mut FleetUsageSchedule) {
     let now = std::time::Instant::now();
     if schedule.stock_due(now) {
         match state.db.usage_fleet_stock_snapshot().await {
             Ok(Some(snapshot)) => {
-                emit_fleet_stock_metrics(snapshot);
-                schedule.mark_stock_success(now);
+                schedule.mark_stock_success(now, snapshot);
             }
             Ok(None) => {
                 schedule.mark_stock_failure(now);
@@ -1815,8 +1848,7 @@ async fn emit_fleet_db_usage_metrics(state: &AppState, schedule: &mut FleetUsage
     if schedule.activity_due(now) {
         match state.db.usage_fleet_active_users(chrono::Utc::now()).await {
             Ok(Some(snapshot)) => {
-                emit_fleet_active_user_metrics(snapshot);
-                schedule.mark_activity_success(now);
+                schedule.mark_activity_success(now, snapshot);
             }
             Ok(None) => {
                 schedule.mark_activity_failure(now);
@@ -1838,6 +1870,18 @@ async fn emit_fleet_db_usage_metrics(state: &AppState, schedule: &mut FleetUsage
                 .increment(1);
             }
         }
+    }
+
+    // Refresh cached fixed-cardinality gauges on every poller tick. The
+    // Prometheus recorder evicts gauges after several idle ticks, while the
+    // underlying stock and activity queries intentionally run hourly/daily.
+    // Re-emission preserves the query cadence without letting valid snapshots
+    // disappear between collections.
+    if let Some(snapshot) = schedule.stock_snapshot {
+        emit_fleet_stock_metrics(snapshot);
+    }
+    if let Some(snapshot) = schedule.activity_snapshot {
+        emit_fleet_active_user_metrics(snapshot);
     }
     metrics::gauge!("buzz_usage_snapshot_available", "family" => "stock")
         .set(if schedule.stock_available() { 1.0 } else { 0.0 });
@@ -2346,8 +2390,6 @@ mod tests {
         assert!(tick_count.load(std::sync::atomic::Ordering::Relaxed) <= 1);
     }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = connect_audit_pool(&DbConfig {
@@ -2405,6 +2447,14 @@ mod tests {
             .execute(&mut *holder)
             .await
             .expect("release audit advisory lock");
+    }
+
+    mod postgres_tests {
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
+            super::audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits().await;
+        }
     }
 
     #[test]
@@ -2475,8 +2525,19 @@ mod tests {
         assert!(schedule.activity_due(now));
 
         let stock_success = now + Duration::from_secs(10);
-        schedule.mark_stock_success(stock_success);
+        let stock_snapshot = buzz_db::usage::FleetStockSnapshot {
+            communities_estimated: 7,
+            ..Default::default()
+        };
+        schedule.mark_stock_success(stock_success, stock_snapshot);
         assert!(schedule.stock_available());
+        assert_eq!(
+            schedule
+                .stock_snapshot
+                .expect("cached stock snapshot")
+                .communities_estimated,
+            7
+        );
         assert!(!schedule.stock_due(stock_success + Duration::from_secs(59)));
         assert!(schedule.stock_due(stock_success + Duration::from_secs(60)));
 
@@ -2485,10 +2546,28 @@ mod tests {
         assert!(schedule.activity_due(now + Duration::from_secs(10)));
 
         let activity_success = now + Duration::from_secs(10);
-        schedule.mark_activity_success(activity_success);
+        let activity_snapshot = buzz_db::usage::FleetActiveUsersSnapshot {
+            human_1d: 3,
+            ..Default::default()
+        };
+        schedule.mark_activity_success(activity_success, activity_snapshot);
         assert!(schedule.activity_available());
+        assert_eq!(
+            schedule
+                .activity_snapshot
+                .expect("cached activity snapshot")
+                .human_1d,
+            3
+        );
         assert!(!schedule.activity_due(activity_success + Duration::from_secs(599)));
         assert!(schedule.activity_due(activity_success + Duration::from_secs(600)));
+
+        let demoted_at = activity_success + Duration::from_secs(20);
+        schedule.reset_after_demotion(demoted_at);
+        assert!(!schedule.stock_available());
+        assert!(!schedule.activity_available());
+        assert!(schedule.stock_due(demoted_at));
+        assert!(schedule.activity_due(demoted_at));
     }
 
     #[test]

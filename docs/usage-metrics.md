@@ -22,6 +22,12 @@ Dashboards and monitors must pair values with these fixed-cardinality gauges:
 - `buzz_usage_snapshot_available{family="activity"}`
 - `buzz_storage_community_breakdown_available`
 
+Database and storage gauges are leader-only. In a multi-pod deployment, first
+filter them to the pod where `buzz_usage_poller_is_leader == 1`; do not take an
+unfiltered maximum across pods. A demoted pod clears its snapshot availability,
+but previously exported value series remain scrape-visible until the recorder
+evicts them.
+
 A value of `0` means the corresponding snapshot was not collected. It must not
 be interpreted as all usage being zero. Failed stock or activity collections
 retry after 60 seconds; successful collections resume their normal hourly and
@@ -51,4 +57,6 @@ Every relay process attempts the same PostgreSQL session advisory lock. Exactly
 one live database session owns it and performs collection. If that process or
 session exits, PostgreSQL releases the lock and another relay acquires it. The
 lock only deduplicates collectors; it does not permit writer fallback for fleet
-queries.
+queries. A process that loses the lock clears its cached fleet snapshots, marks
+their availability as zero, and forces fresh collection if it later becomes the
+leader again.

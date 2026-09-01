@@ -1828,15 +1828,10 @@ mod postgres_tests {
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
         expected_fences.extend(
-            surface(
-                MIGRATOR
-                    .iter()
-                    .find(|item| item.version == 43)
-                    .expect("migration 0043")
-                    .sql
-                    .as_ref(),
-            )
-            .fence_attachments,
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version > 29)
+                .flat_map(|migration| surface(migration.sql.as_ref()).fence_attachments),
         );
         assert_eq!(
             expected_fences, schema.fence_attachments,

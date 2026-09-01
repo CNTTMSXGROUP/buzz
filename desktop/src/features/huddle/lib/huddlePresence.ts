@@ -11,9 +11,12 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 type AdmissionState = {
   present: boolean;
   rosterRevision: number | null;
+  generation: string | null;
   createdAt: number;
   eventId: string;
 };
+
+type LivenessGeneration = string;
 
 type HuddleSession = {
   creator: string;
@@ -26,12 +29,16 @@ type HuddleSession = {
   latestRosterRevision: number | null;
   latestRosterCreatedAt: number;
   latestRosterEventId: string;
+  generation: LivenessGeneration | null;
+  departedAdmissions: Map<string, AdmissionState>;
+  compactedRosterRevisionFloor: number | null;
 };
 
 type LifecycleContent = {
   ephemeralChannelId: string | null;
   rosterRevision: number | null;
   admissionId: string | null;
+  generation: string | null;
 };
 
 function lifecycleContent(event: RelayEvent): LifecycleContent {
@@ -40,6 +47,7 @@ function lifecycleContent(event: RelayEvent): LifecycleContent {
       ephemeral_channel_id?: unknown;
       roster_revision?: unknown;
       admission_id?: unknown;
+      generation?: unknown;
     };
     return {
       ephemeralChannelId:
@@ -57,18 +65,27 @@ function lifecycleContent(event: RelayEvent): LifecycleContent {
         typeof content.admission_id === "string" && content.admission_id
           ? content.admission_id
           : null,
+      generation:
+        typeof content.generation === "string" && content.generation
+          ? content.generation
+          : null,
     };
   } catch {
     return {
       ephemeralChannelId: null,
       rosterRevision: null,
       admissionId: null,
+      generation: null,
     };
   }
 }
 
 export function huddleSessionId(event: RelayEvent): string | null {
   return lifecycleContent(event).ephemeralChannelId;
+}
+
+export function huddleLifecycleGeneration(event: RelayEvent): string | null {
+  return lifecycleContent(event).generation;
 }
 
 function participantPubkey(event: RelayEvent): string | null {
@@ -124,7 +141,7 @@ function isNewerAdmissionState(
   return candidate.eventId > existing.eventId;
 }
 
-function participantIsPresent(
+function participantHasExplicitPresence(
   session: HuddleSession,
   participant: string,
 ): boolean {
@@ -132,9 +149,17 @@ function participantIsPresent(
   if (admissions?.size) {
     return [...admissions.values()].some((admission) => admission.present);
   }
-  const legacy = session.legacyStateByParticipant.get(participant);
-  if (legacy) return legacy.present;
-  return participant === session.creator && session.creatorPresent;
+  return session.legacyStateByParticipant.get(participant)?.present ?? false;
+}
+
+function participantIsPresent(
+  session: HuddleSession,
+  participant: string,
+): boolean {
+  return (
+    participantHasExplicitPresence(session, participant) ||
+    (participant === session.creator && session.creatorPresent)
+  );
 }
 
 function sessionParticipants(session: HuddleSession): Set<string> {
@@ -169,6 +194,7 @@ export async function fetchHuddleLifecycleHistory(
 ): Promise<RelayEvent[]> {
   const events = new Map<string, RelayEvent>();
   let until: number | undefined;
+  let beforeId: string | undefined;
 
   for (;;) {
     const page = await fetchEvents({
@@ -181,17 +207,26 @@ export async function fetchHuddleLifecycleHistory(
       ...(channelIds?.length ? { "#h": channelIds } : {}),
       ...(until === undefined ? {} : { until }),
       limit: HUDDLE_LIFECYCLE_PAGE_LIMIT,
+      ...(beforeId === undefined ? {} : { before_id: beforeId }),
     });
     for (const event of page) events.set(event.id, event);
     if (page.length < HUDDLE_LIFECYCLE_PAGE_LIMIT) break;
 
-    const oldest = Math.min(...page.map((event) => event.created_at));
-    if (until !== undefined && oldest >= until) {
+    const terminal = [...page]
+      .sort((left, right) =>
+        left.created_at !== right.created_at
+          ? right.created_at - left.created_at
+          : left.id.localeCompare(right.id),
+      )
+      .at(-1);
+    if (!terminal) break;
+    if (until === terminal.created_at && beforeId === terminal.id) {
       throw new Error(
-        "Could not load active huddles: a lifecycle timestamp exceeds one relay page.",
+        "Could not load active huddles: pagination cursor did not advance.",
       );
     }
-    until = oldest;
+    until = terminal.created_at;
+    beforeId = terminal.id;
   }
 
   return [...events.values()];
@@ -236,6 +271,9 @@ export class HuddlePresenceTracker {
         latestRosterRevision: null,
         latestRosterCreatedAt: 0,
         latestRosterEventId: "",
+        generation: null,
+        departedAdmissions: new Map(),
+        compactedRosterRevisionFloor: null,
       });
       return true;
     }
@@ -243,12 +281,26 @@ export class HuddlePresenceTracker {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
 
+    const generation = content.generation;
     if (event.kind === KIND_HUDDLE_ENDED) {
       const signer = normalizePubkey(event.pubkey);
       if (signer !== this.relaySelf && signer !== session.creator) return false;
+      if (
+        generation !== null &&
+        session.generation !== null &&
+        generation !== session.generation
+      ) {
+        session.admissionsByParticipant.clear();
+        session.legacyStateByParticipant.clear();
+        session.departedAdmissions.clear();
+        session.compactedRosterRevisionFloor = null;
+        session.creatorPresent = false;
+      }
+      if (generation !== null) session.generation = generation;
       const nextEnd: AdmissionState = {
         present: false,
         rosterRevision: null,
+        generation: content.generation,
         createdAt: event.created_at,
         eventId: event.id,
       };
@@ -258,6 +310,7 @@ export class HuddlePresenceTracker {
       session.endState = nextEnd;
       session.admissionsByParticipant.clear();
       session.legacyStateByParticipant.clear();
+      session.departedAdmissions.clear();
       return true;
     }
 
@@ -272,9 +325,24 @@ export class HuddlePresenceTracker {
 
     const participant = participantPubkey(event);
     if (!participant) return false;
+
+    if (
+      generation !== null &&
+      session.generation !== null &&
+      generation !== session.generation
+    ) {
+      session.admissionsByParticipant.clear();
+      session.legacyStateByParticipant.clear();
+      session.departedAdmissions.clear();
+      session.compactedRosterRevisionFloor = null;
+      session.creatorPresent = false;
+    }
+    if (generation !== null) session.generation = generation;
+
     const next: AdmissionState = {
       present: event.kind === KIND_HUDDLE_PARTICIPANT_JOINED,
       rosterRevision: content.rosterRevision,
+      generation: content.generation,
       createdAt: event.created_at,
       eventId: event.id,
     };
@@ -287,7 +355,9 @@ export class HuddlePresenceTracker {
       content.rosterRevision !== null &&
       session.latestRosterRevision !== null &&
       content.rosterRevision < session.latestRosterRevision &&
-      isAfterLatestRosterEvent
+      isAfterLatestRosterEvent &&
+      (session.compactedRosterRevisionFloor === null ||
+        content.rosterRevision > session.compactedRosterRevisionFloor)
     ) {
       // Relay roster revisions are process-local. A strictly lower revision
       // arriving after the latest authenticated roster event starts a new room
@@ -296,17 +366,60 @@ export class HuddlePresenceTracker {
       // snapshot revision that can match a concurrent local mutation.
       session.admissionsByParticipant.clear();
       session.legacyStateByParticipant.clear();
+      session.departedAdmissions.clear();
+      session.compactedRosterRevisionFloor = null;
       session.creatorPresent = false;
+    }
+
+    if (
+      !next.present &&
+      next.rosterRevision !== null &&
+      session.compactedRosterRevisionFloor !== null &&
+      next.rosterRevision <= session.compactedRosterRevisionFloor
+    ) {
+      return false;
     }
 
     if (content.admissionId) {
       const admissions =
         session.admissionsByParticipant.get(participant) ??
         new Map<string, AdmissionState>();
-      const existing = admissions.get(content.admissionId);
+      const departed = session.departedAdmissions.get(content.admissionId);
+      const existing = admissions.get(content.admissionId) ?? departed;
       if (!isNewerAdmissionState(next, existing)) return false;
-      admissions.set(content.admissionId, next);
-      session.admissionsByParticipant.set(participant, admissions);
+      if (
+        !existing &&
+        next.rosterRevision !== null &&
+        session.compactedRosterRevisionFloor !== null &&
+        next.rosterRevision <= session.compactedRosterRevisionFloor
+      ) {
+        return false;
+      }
+      if (next.present) {
+        session.departedAdmissions.delete(content.admissionId);
+        admissions.set(content.admissionId, next);
+        session.admissionsByParticipant.set(participant, admissions);
+      } else {
+        admissions.delete(content.admissionId);
+        if (admissions.size === 0) {
+          session.admissionsByParticipant.delete(participant);
+        }
+        session.departedAdmissions.delete(content.admissionId);
+        session.departedAdmissions.set(content.admissionId, next);
+        while (session.departedAdmissions.size > 1_000) {
+          const oldest = session.departedAdmissions.entries().next().value as
+            | [string, AdmissionState]
+            | undefined;
+          if (!oldest) break;
+          session.departedAdmissions.delete(oldest[0]);
+          if (oldest[1].rosterRevision !== null) {
+            session.compactedRosterRevisionFloor = Math.max(
+              session.compactedRosterRevisionFloor ?? -1,
+              oldest[1].rosterRevision,
+            );
+          }
+        }
+      }
     } else {
       const existing = session.legacyStateByParticipant.get(participant);
       if (!isNewerAdmissionState(next, existing)) return false;
@@ -320,11 +433,34 @@ export class HuddlePresenceTracker {
     if (
       participant === session.creator &&
       event.kind === KIND_HUDDLE_PARTICIPANT_LEFT &&
-      !participantIsPresent(session, participant)
+      !participantHasExplicitPresence(session, participant)
     ) {
       session.creatorPresent = false;
     }
     return true;
+  }
+
+  reconcileLiveness(
+    generations: ReadonlyMap<string, LivenessGeneration>,
+    previousGenerations: ReadonlyMap<string, LivenessGeneration> = new Map(),
+  ): void {
+    for (const [sessionId, session] of this.sessions) {
+      const generation = generations.get(sessionId);
+      if (generation === undefined) continue;
+      const previous = previousGenerations.get(sessionId) ?? session.generation;
+      if (
+        previous !== null &&
+        previous !== undefined &&
+        previous !== generation
+      ) {
+        session.admissionsByParticipant.clear();
+        session.legacyStateByParticipant.clear();
+        session.departedAdmissions.clear();
+        session.compactedRosterRevisionFloor = null;
+        session.creatorPresent = false;
+      }
+      session.generation = generation;
+    }
   }
 
   private compactEndedSessions(): void {

@@ -15,6 +15,7 @@ function event({
   tags = [],
   admissionId,
   rosterRevision,
+  generation,
   createdAt = Number(id),
   session = "room",
 }) {
@@ -26,6 +27,7 @@ function event({
       ephemeral_channel_id: session,
       admission_id: admissionId,
       roster_revision: rosterRevision,
+      generation,
     }),
     tags,
     created_at: createdAt,
@@ -37,12 +39,13 @@ function participantEvent(options) {
   return event({ pubkey: RELAY, tags: [["p", BOB]], ...options });
 }
 
-function livenessEvent(session = "room") {
+function livenessEvent(session = "room", generation = "generation-1") {
   return event({
     id: `live-${session}`,
     kind: 48104,
     createdAt: 1_000,
     session,
+    generation,
   });
 }
 
@@ -54,6 +57,7 @@ async function settle() {
 function runtimeHarness(initialHistory) {
   let history = initialHistory;
   let liveSessions = ["room"];
+  let liveGeneration = "generation-1";
   let reconnect;
   let liveHandler;
   let livenessTimer;
@@ -73,7 +77,9 @@ function runtimeHarness(initialHistory) {
       };
     },
     fetchEvents: async (filter) =>
-      filter.kinds?.includes(48104) ? liveSessions.map(livenessEvent) : history,
+      filter.kinds?.includes(48104)
+        ? liveSessions.map((session) => livenessEvent(session, liveGeneration))
+        : history,
     subscribeToReconnects: (listener) => {
       reconnect = listener;
       return () => {
@@ -103,6 +109,9 @@ function runtimeHarness(initialHistory) {
     },
     setLiveSessions: (next) => {
       liveSessions = next;
+    },
+    setLiveGeneration: (next) => {
+      liveGeneration = next;
     },
     snapshots,
     livenessDelay: () => livenessDelay,
@@ -242,6 +251,121 @@ test("clears stale presence on the lease-cadence liveness refresh", async () => 
   harness.dispose();
 });
 
+test("globally orders pending starts with persisted same-second joins", async () => {
+  let liveHandler;
+  let resolveHistory;
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async (filter) => {
+      if (filter.kinds?.includes(48104)) return [livenessEvent()];
+      return new Promise((resolve) => {
+        resolveHistory = resolve;
+      });
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => callback,
+    clearLivenessTimer: () => {},
+  });
+  await settle();
+
+  liveHandler(event({ id: "a", kind: 48100, createdAt: 10 }));
+  resolveHistory([
+    event({ id: "z", kind: 48100, createdAt: 10 }),
+    participantEvent({
+      id: "join",
+      kind: 48101,
+      admissionId: "desktop",
+      rosterRevision: 1,
+      createdAt: 10,
+    }),
+  ]);
+  await settle();
+
+  assert.equal(snapshots.at(-1).has(BOB), true);
+  dispose();
+});
+
+test("repeated same-generation liveness preserves admissions", async () => {
+  const harness = runtimeHarness([
+    event({ id: "1", kind: 48100 }),
+    participantEvent({
+      id: "2",
+      kind: 48101,
+      admissionId: "desktop",
+      rosterRevision: 1,
+    }),
+  ]);
+  await settle();
+
+  harness.refreshLiveness();
+  await settle();
+
+  assert.equal(harness.snapshots.at(-1).has(BOB), true);
+  harness.dispose();
+});
+
+test("changed liveness generation retires equal-revision admissions", async () => {
+  const harness = runtimeHarness([
+    event({ id: "1", kind: 48100 }),
+    participantEvent({
+      id: "2",
+      kind: 48101,
+      admissionId: "desktop",
+      rosterRevision: 1,
+    }),
+  ]);
+  await settle();
+
+  harness.setLiveGeneration("generation-2");
+  harness.refreshLiveness();
+  await settle();
+
+  assert.equal(harness.snapshots.at(-1).has(BOB), false);
+  harness.dispose();
+});
+
+test("live generation change retires stale admissions immediately", async () => {
+  const harness = runtimeHarness([
+    event({ id: "start", kind: 48100, generation: "generation-1" }),
+    participantEvent({
+      id: "old",
+      kind: 48101,
+      admissionId: "old-admission",
+      rosterRevision: 1,
+      generation: "generation-1",
+    }),
+  ]);
+  await settle();
+  assert.equal(harness.snapshots.at(-1).has(BOB), true);
+
+  harness.emit(
+    participantEvent({
+      id: "new",
+      kind: 48101,
+      admissionId: "new-admission",
+      rosterRevision: 1,
+      generation: "generation-2",
+      tags: [["p", CAROL]],
+    }),
+  );
+
+  assert.equal(harness.snapshots.at(-1).has(BOB), false);
+  assert.equal(harness.snapshots.at(-1).has(CAROL), true);
+
+  harness.setLiveSessions([]);
+  harness.refreshLiveness();
+  await settle();
+  assert.deepEqual([...harness.snapshots.at(-1)], []);
+  harness.dispose();
+});
+
 test("keeps a live session added while an older liveness refresh is in flight", async () => {
   let liveHandler;
   let livenessTimer;
@@ -268,7 +392,12 @@ test("keeps a live session added while an older liveness refresh is in flight", 
           resolveRefresh = resolve;
         });
       }
-      return filter["#d"].map(livenessEvent);
+      return filter["#d"].map((session) =>
+        livenessEvent(
+          session,
+          session === "new-room" ? "pending" : "generation-1",
+        ),
+      );
     },
     subscribeToReconnects: () => () => {},
     onPresence: (participants) => snapshots.push(new Set(participants)),
@@ -286,9 +415,21 @@ test("keeps a live session added while an older liveness refresh is in flight", 
   await settle();
   liveHandler(
     event({
-      id: "2",
+      id: "new-start",
       kind: 48100,
       pubkey: CAROL,
+      createdAt: 2,
+      session: "new-room",
+    }),
+  );
+  liveHandler(
+    participantEvent({
+      id: "new-join",
+      kind: 48101,
+      tags: [["p", CAROL]],
+      admissionId: "new-room-admission",
+      rosterRevision: 1,
+      createdAt: 3,
       session: "new-room",
     }),
   );
@@ -436,5 +577,80 @@ test("fails closed when persisted lifecycle has no authoritative live room", asy
 
   await settle();
   assert.deepEqual([...snapshots.at(-1)], []);
+  dispose();
+});
+
+test("does not activate a start until liveness or an authenticated join", async () => {
+  let liveHandler;
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async () => [],
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => callback,
+    clearLivenessTimer: () => {},
+  });
+  await settle();
+
+  liveHandler(event({ id: "start", kind: 48100, session: "new-room" }));
+  assert.equal(snapshots.at(-1).has(ALICE), false);
+  liveHandler(
+    participantEvent({
+      id: "join",
+      kind: 48101,
+      session: "new-room",
+      admissionId: "admission",
+      rosterRevision: 1,
+    }),
+  );
+  assert.equal(snapshots.at(-1).has(BOB), true);
+  dispose();
+});
+
+test("liveness refresh clears equal-revision admissions across generations", async () => {
+  let livenessTimer;
+  let generation = "generation-1";
+  const snapshots = [];
+  const history = [
+    event({ id: "start", kind: 48100, createdAt: 1 }),
+    participantEvent({
+      id: "old",
+      kind: 48101,
+      admissionId: "old-admission",
+      rosterRevision: 1,
+      createdAt: 2,
+    }),
+  ];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async () => () => {},
+    fetchEvents: async (filter) =>
+      filter.kinds?.includes(48104)
+        ? [livenessEvent("room", generation)]
+        : history,
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => {
+      livenessTimer = callback;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
+  });
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), true);
+
+  generation = "generation-2";
+  livenessTimer();
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), false);
   dispose();
 });

@@ -1,7 +1,7 @@
 import {
-  applyHuddleLifecycleHistory,
   compareHuddleLifecycleEvents,
   fetchHuddleLifecycleHistory,
+  huddleLifecycleGeneration,
   huddleSessionId,
   HuddlePresenceTracker,
   HUDDLE_LIFECYCLE_PAGE_LIMIT,
@@ -78,7 +78,7 @@ export function startHuddlePresenceRuntime(
   let reconcileAgain = false;
   let hydrated = false;
   let tracker = new HuddlePresenceTracker(dependencies.relaySelfPubkey);
-  let activeSessionIds = new Set<string>();
+  let activeSessionGenerations = new Map<string, string>();
   let pendingLiveEvents: RelayEvent[] = [];
   let pendingOverflowed = false;
   let retryHandle: unknown = null;
@@ -143,14 +143,26 @@ export function startHuddlePresenceRuntime(
 
     const sessionId = huddleSessionId(event);
     if (sessionId) {
-      if (event.kind === KIND_HUDDLE_ENDED) activeSessionIds.delete(sessionId);
-      else activeSessionIds.add(sessionId);
+      if (event.kind === KIND_HUDDLE_ENDED) {
+        activeSessionGenerations.delete(sessionId);
+      } else if (event.kind === KIND_HUDDLE_PARTICIPANT_JOINED) {
+        // A START is published before audio admission and is not proof of a live
+        // room. An authenticated relay JOIN may activate it immediately.
+        activeSessionGenerations.set(
+          sessionId,
+          huddleLifecycleGeneration(event) ??
+            activeSessionGenerations.get(sessionId) ??
+            "pending",
+        );
+      }
     }
     // Fence an in-flight authoritative snapshot against every accepted live
     // lifecycle mutation. A stale response queried the old session set and
     // must not replace newer live state.
     livenessRequestVersion += 1;
-    dependencies.onPresence(tracker.snapshot(activeSessionIds));
+    dependencies.onPresence(
+      tracker.snapshot(new Set(activeSessionGenerations.keys())),
+    );
   };
 
   const fetchActiveSessionIds = async (sessionIds: readonly string[]) => {
@@ -176,13 +188,23 @@ export function startHuddlePresenceRuntime(
         ),
       ),
     );
-    return new Set(
-      livenessPages
-        .flat()
-        .filter((event) => event.kind === KIND_HUDDLE_LIVENESS)
-        .map(huddleSessionId)
-        .filter((sessionId): sessionId is string => Boolean(sessionId)),
-    );
+    const generations = new Map<string, string>();
+    for (const event of livenessPages.flat()) {
+      if (event.kind !== KIND_HUDDLE_LIVENESS) continue;
+      const sessionId = huddleSessionId(event);
+      if (!sessionId) continue;
+      try {
+        const generation = (
+          JSON.parse(event.content) as { generation?: unknown }
+        ).generation;
+        if (typeof generation === "string" && generation.length > 0) {
+          generations.set(sessionId, generation);
+        }
+      } catch {
+        // A malformed synthetic response is not authoritative liveness.
+      }
+    }
+    return generations;
   };
 
   const scheduleLivenessRefresh = () => {
@@ -200,16 +222,35 @@ export function startHuddlePresenceRuntime(
     }
     const requestVersion = livenessRequestVersion;
     try {
-      const nextActiveSessionIds = await fetchActiveSessionIds([
-        ...activeSessionIds,
+      const nextActiveSessionGenerations = await fetchActiveSessionIds([
+        ...activeSessionGenerations.keys(),
       ]);
       if (disposed) return;
       if (requestVersion !== livenessRequestVersion) {
+        const requestedGenerations = new Map(activeSessionGenerations);
+        for (const [sessionId, generation] of nextActiveSessionGenerations) {
+          if (!requestedGenerations.has(sessionId)) continue;
+          requestedGenerations.set(sessionId, generation);
+        }
+        tracker.reconcileLiveness(
+          requestedGenerations,
+          activeSessionGenerations,
+        );
+        activeSessionGenerations = requestedGenerations;
+        dependencies.onPresence(
+          tracker.snapshot(new Set(activeSessionGenerations.keys())),
+        );
         scheduleLivenessRefresh();
         return;
       }
-      activeSessionIds = nextActiveSessionIds;
-      dependencies.onPresence(tracker.snapshot(activeSessionIds));
+      tracker.reconcileLiveness(
+        nextActiveSessionGenerations,
+        activeSessionGenerations,
+      );
+      activeSessionGenerations = nextActiveSessionGenerations;
+      dependencies.onPresence(
+        tracker.snapshot(new Set(activeSessionGenerations.keys())),
+      );
       scheduleLivenessRefresh();
     } catch (error) {
       if (disposed) return;
@@ -245,17 +286,17 @@ export function startHuddlePresenceRuntime(
       ];
       const sessionIds = [
         ...new Set(
-          history
+          [...history, ...pendingLiveEvents]
             .map(huddleSessionId)
             .filter((sessionId): sessionId is string => Boolean(sessionId)),
         ),
       ];
-      const nextActiveSessionIds = await fetchActiveSessionIds(sessionIds);
+      const nextActiveSessionGenerations =
+        await fetchActiveSessionIds(sessionIds);
       if (disposed) return;
       const nextTracker = new HuddlePresenceTracker(
         dependencies.relaySelfPubkey,
       );
-      applyHuddleLifecycleHistory(nextTracker, history);
       if (pendingOverflowed) {
         pendingOverflowed = false;
         pendingLiveEvents = [];
@@ -264,28 +305,43 @@ export function startHuddlePresenceRuntime(
         reconcileAgain = true;
         return;
       }
-      // The liveness snapshot is authoritative for which persisted sessions are
-      // current. Replaying buffered events against a fresh tracker still gates
-      // each active-set mutation on the tracker's signer/session validation.
-      for (const event of [...pendingLiveEvents].sort(
-        compareHuddleLifecycleEvents,
-      )) {
+      const bufferedEvents = pendingLiveEvents;
+      pendingLiveEvents = [];
+      const bufferedEventIds = new Set(bufferedEvents.map((event) => event.id));
+      const combinedEvents = [
+        ...new Map(
+          [...history, ...bufferedEvents].map((event) => [event.id, event]),
+        ).values(),
+      ].sort(compareHuddleLifecycleEvents);
+      // Globally order persisted history with the live overlap before applying
+      // either source. Accepted buffered events may activate or end sessions;
+      // rejected events cannot mutate the liveness gate.
+      for (const event of combinedEvents) {
         if (!nextTracker.apply(event)) continue;
+        if (!bufferedEventIds.has(event.id)) continue;
         const sessionId = huddleSessionId(event);
         if (!sessionId) continue;
         if (event.kind === KIND_HUDDLE_ENDED) {
-          nextActiveSessionIds.delete(sessionId);
-        } else {
-          nextActiveSessionIds.add(sessionId);
+          nextActiveSessionGenerations.delete(sessionId);
+        } else if (event.kind === KIND_HUDDLE_PARTICIPANT_JOINED) {
+          nextActiveSessionGenerations.set(
+            sessionId,
+            huddleLifecycleGeneration(event) ??
+              nextActiveSessionGenerations.get(sessionId) ??
+              "pending",
+          );
         }
       }
       pendingLiveEvents = [];
+      nextTracker.reconcileLiveness(nextActiveSessionGenerations);
       tracker = nextTracker;
-      activeSessionIds = nextActiveSessionIds;
+      activeSessionGenerations = nextActiveSessionGenerations;
       hydrated = true;
       retryDelayMs = INITIAL_RETRY_DELAY_MS;
       clearScheduledRetry();
-      dependencies.onPresence(tracker.snapshot(activeSessionIds));
+      dependencies.onPresence(
+        tracker.snapshot(new Set(activeSessionGenerations.keys())),
+      );
       clearScheduledLivenessRefresh();
       scheduleLivenessRefresh();
     } catch (error) {
@@ -367,6 +423,6 @@ export function startHuddlePresenceRuntime(
     liveDispose = null;
     pendingLiveEvents = [];
     pendingOverflowed = false;
-    activeSessionIds.clear();
+    activeSessionGenerations.clear();
   };
 }

@@ -58,7 +58,7 @@ export function UserStatusLookupProvider({
   const deferredPubkeysKey = deferredPubkeys.join(":");
   const queriedPubkeys =
     pubkeysKey === deferredPubkeysKey ? pubkeys : deferredPubkeys;
-  const statusQuery = useUserStatusQuery(queriedPubkeys);
+  const statusQuery = useUserStatusQuery(queriedPubkeys, true);
   const value = React.useMemo(
     () => ({
       lookup: statusQuery.data ?? EMPTY_USER_STATUS_LOOKUP,

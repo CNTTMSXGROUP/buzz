@@ -52,6 +52,7 @@ const _: () = assert!(FILTER_QUERY_CONCURRENCY >= 2 && FILTER_QUERY_CONCURRENCY 
 pub async fn handle_req(
     sub_id: String,
     filters: Vec<Filter>,
+    before_ids: Vec<Option<Vec<u8>>>,
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
@@ -355,6 +356,7 @@ pub async fn handle_req(
             };
             let mut params =
                 filter_to_query_params(filter, per_filter_channel, conn.tenant.community());
+            params.before_id = before_ids.get(idx).cloned().flatten();
             apply_channel_scope_to_query(
                 &mut params,
                 filter,
@@ -1191,48 +1193,21 @@ async fn handle_huddle_liveness_req(
         return;
     }
 
-    for session_id in huddle_liveness_session_ids(filters) {
-        let channel = match state
-            .db
-            .get_channel(conn.tenant.community(), session_id)
-            .await
-        {
-            Ok(channel) => channel,
-            Err(buzz_db::error::DbError::ChannelNotFound(_)) => continue,
-            Err(error) => {
-                warn!(session_id = %session_id, "Huddle liveness channel lookup failed: {error}");
-                conn.send(RelayMessage::closed(sub_id, "error: database error"));
-                return;
-            }
-        };
-        let mut linked_parent = None;
-        for parent_channel_id in parent_channel_ids {
-            match state
-                .db
-                .huddle_started_link_exists(
-                    conn.tenant.community(),
-                    *parent_channel_id,
-                    session_id,
-                    &channel.created_by,
-                )
-                .await
-            {
-                Ok(true) => {
-                    linked_parent = Some(*parent_channel_id);
-                    break;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    warn!(session_id = %session_id, "Huddle liveness linkage lookup failed: {error}");
-                    conn.send(RelayMessage::closed(sub_id, "error: database error"));
-                    return;
-                }
-            }
+    let session_ids = huddle_liveness_session_ids(filters);
+    let linked_sessions = match state
+        .db
+        .huddle_started_links(conn.tenant.community(), parent_channel_ids, &session_ids)
+        .await
+    {
+        Ok(links) => links,
+        Err(error) => {
+            warn!("Huddle liveness linkage batch failed: {error}");
+            conn.send(RelayMessage::closed(sub_id, "error: database error"));
+            return;
         }
-        let Some(parent_channel_id) = linked_parent else {
-            continue;
-        };
+    };
 
+    for (session_id, parent_channel_id, _creator) in linked_sessions {
         let generation = if let Some(mesh) = state.mesh() {
             match mesh
                 .directory
@@ -1240,23 +1215,22 @@ async fn handle_huddle_liveness_req(
                 .await
             {
                 Ok(Some(lease)) if lease.profile == buzz_relay_mesh::Profile::HuddleControl => {
-                    Some(lease.generation)
+                    lease.generation.to_string()
                 }
-                Ok(_) => None,
+                Ok(_) => continue,
                 Err(error) => {
                     warn!(session_id = %session_id, "Huddle liveness lease lookup failed: {error}");
                     conn.send(RelayMessage::closed(sub_id, "error: liveness unavailable"));
                     return;
                 }
             }
+        } else if state
+            .audio_rooms
+            .get(conn.tenant.community(), session_id)
+            .is_some_and(|room| !room.is_empty())
+        {
+            state.huddle_liveness_generation.to_string()
         } else {
-            state
-                .audio_rooms
-                .get(conn.tenant.community(), session_id)
-                .filter(|room| !room.is_empty())
-                .map(|_| 0)
-        };
-        let Some(generation) = generation else {
             continue;
         };
 

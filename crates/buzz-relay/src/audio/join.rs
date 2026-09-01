@@ -265,6 +265,15 @@ pub enum JoinOutcome {
 }
 
 impl JoinOutcome {
+    /// Fenced generation carried by both local- and remote-owner outcomes.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        match *self {
+            JoinOutcome::LocalOwner { generation }
+            | JoinOutcome::RemoteOwner { generation, .. } => generation,
+        }
+    }
+
     /// The fenced header for frames this join produces, given the huddle's
     /// session id (its channel id) and resolved owner. For a local-owner join
     /// the owner is this pod (`local_runtime_id`); for a remote-owner join it

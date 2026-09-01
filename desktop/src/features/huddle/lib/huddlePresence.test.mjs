@@ -22,6 +22,7 @@ function event({
   tags = [],
   admissionId,
   rosterRevision,
+  generation,
   createdAt = Number(id),
 }) {
   return {
@@ -32,6 +33,7 @@ function event({
       ephemeral_channel_id: session,
       admission_id: admissionId,
       roster_revision: rosterRevision,
+      generation,
     }),
     tags,
     created_at: createdAt,
@@ -463,15 +465,106 @@ test("pages complete lifecycle history without a fixed lifetime horizon", async 
   );
 });
 
-test("refuses to claim exhaustive history at a dense timestamp", async () => {
+test("advances dense lifecycle timestamps with the composite cursor", async () => {
   const page = Array.from({ length: HUDDLE_LIFECYCLE_PAGE_LIMIT }, (_, index) =>
-    event({ id: `dense-${index}`, kind: 48101, createdAt: 9_000 }),
+    event({
+      id: index.toString(16).padStart(64, "0"),
+      kind: 48101,
+      createdAt: 9_000,
+    }),
+  );
+  const filters = [];
+  const result = await fetchHuddleLifecycleHistory(async (filter) => {
+    filters.push(filter);
+    return filters.length === 1
+      ? page
+      : [event({ id: "older", kind: 48100, createdAt: 8_999 })];
+  });
+
+  assert.equal(filters[1].until, 9_000);
+  assert.equal(filters[1].before_id, page.at(-1).id);
+  assert.equal(result.length, HUDDLE_LIFECYCLE_PAGE_LIMIT + 1);
+});
+
+test("bounds departed admissions while rejecting compacted late joins", () => {
+  const tracker = new HuddlePresenceTracker(RELAY);
+  tracker.apply(event({ id: "start", kind: 48100, createdAt: 1 }));
+  for (let revision = 1; revision <= 1_002; revision += 1) {
+    tracker.apply(
+      participantEvent({
+        id: `leave-${revision}`,
+        kind: 48102,
+        admissionId: `admission-${revision}`,
+        rosterRevision: revision,
+        createdAt: revision + 1,
+      }),
+    );
+  }
+
+  assert.equal(
+    tracker.apply(
+      participantEvent({
+        id: "late-join",
+        kind: 48101,
+        admissionId: "admission-1",
+        rosterRevision: 1,
+        createdAt: 2_000,
+      }),
+    ),
+    false,
+  );
+  assert.equal(tracker.snapshot().has(BOB), false);
+});
+
+test("reconcileLiveness preserves admissions for the same generation", () => {
+  const tracker = new HuddlePresenceTracker(RELAY);
+  tracker.apply(event({ id: "start", kind: 48100, createdAt: 1 }));
+  tracker.apply(
+    participantEvent({
+      id: "old",
+      kind: 48101,
+      admissionId: "old-admission",
+      rosterRevision: 1,
+      createdAt: 2,
+    }),
   );
 
-  await assert.rejects(
-    fetchHuddleLifecycleHistory(async () => page),
-    /timestamp exceeds one relay page/,
+  tracker.reconcileLiveness(new Map([["room", "generation-1"]]));
+  tracker.reconcileLiveness(
+    new Map([["room", "generation-1"]]),
+    new Map([["room", "generation-1"]]),
   );
+
+  assert.equal(tracker.snapshot().has(BOB), true);
+});
+
+test("lifecycle generation change clears equal-revision stale admissions", () => {
+  const tracker = new HuddlePresenceTracker(RELAY);
+  tracker.apply(event({ id: "start", kind: 48100, createdAt: 1 }));
+  tracker.apply(
+    participantEvent({
+      id: "old",
+      kind: 48101,
+      admissionId: "old-admission",
+      rosterRevision: 1,
+      createdAt: 2,
+      generation: "generation-1",
+    }),
+  );
+  tracker.apply(
+    participantEvent({
+      id: "new",
+      kind: 48101,
+      admissionId: "new-admission",
+      rosterRevision: 1,
+      createdAt: 3,
+      generation: "generation-2",
+      tags: [["p", CHARLIE]],
+    }),
+  );
+
+  assert.equal(tracker.snapshot().has(BOB), false);
+  assert.equal(tracker.snapshot().has(CHARLIE), true);
 });
 
 test("incremental state retains an end tombstone and ignores late events", () => {

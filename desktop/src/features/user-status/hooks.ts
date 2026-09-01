@@ -177,7 +177,10 @@ export async function fetchUserStatusLookup(
   return lookup;
 }
 
-export function useUserStatusQuery(pubkeys: string[]) {
+export function useUserStatusQuery(
+  pubkeys: string[],
+  preservePreviousData = false,
+) {
   const refetchInterval = useFocusedRefetchInterval(
     USER_STATUS_REFETCH_INTERVAL_MS,
   );
@@ -188,6 +191,11 @@ export function useUserStatusQuery(pubkeys: string[]) {
     enabled,
     queryKey: userStatusQueryKey(normalizedPubkeys),
     queryFn: () => fetchUserStatusLookup(normalizedPubkeys),
+    ...(preservePreviousData
+      ? {
+          placeholderData: (previous: UserStatusLookup | undefined) => previous,
+        }
+      : {}),
     refetchInterval,
     ...userStatusFocusRefetchPolicy,
   });

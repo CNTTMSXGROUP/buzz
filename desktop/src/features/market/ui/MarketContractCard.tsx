@@ -1,6 +1,7 @@
 import { Bot, PackageCheck, Radio, Store } from "lucide-react";
 
 import type { MarketScenario } from "@/features/market/lib/marketPrototypeData";
+import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import { Badge } from "@/shared/ui/badge";
 
 const COMMERCIAL_TERM_LABELS = new Set(["Price", "Reward", "Initial quantity"]);
@@ -20,8 +21,17 @@ export function MarketContractCard({ scenario }: { scenario: MarketScenario }) {
       data-testid="market-contract-card"
     >
       <div className="grid sm:grid-cols-[11rem_minmax(0,1fr)]">
-        <div className="flex aspect-square items-center justify-center border-b bg-muted/60 text-muted-foreground sm:border-b-0 sm:border-r">
-          <PackageCheck className="h-8 w-8" strokeWidth={1.5} />
+        <div className="flex aspect-square items-center justify-center overflow-hidden border-b bg-muted/60 text-muted-foreground sm:border-b-0 sm:border-r">
+          {scenario.imageUrl ? (
+            <img
+              alt={scenario.title}
+              className="h-full w-full object-cover"
+              data-testid="market-contract-image"
+              src={rewriteRelayUrl(scenario.imageUrl)}
+            />
+          ) : (
+            <PackageCheck className="h-8 w-8" strokeWidth={1.5} />
+          )}
         </div>
         <div className="min-w-0 p-5">
           <div className="flex flex-wrap items-center gap-2">

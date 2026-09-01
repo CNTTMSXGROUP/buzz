@@ -36,6 +36,7 @@ const AnnouncementEnvelope = BaseEnvelope.extend({
     closesAt: PositiveInteger.optional(),
     deliveryMinutes: PositiveInteger.optional(),
     minimumDecrementSats: PositiveInteger.optional(),
+    imageUrl: z.string().url().max(500).optional(),
   }),
 });
 
@@ -522,6 +523,7 @@ export function projectMarketChannel(
       eyebrow: `${listing.listing.direction === "offer" ? "Offer" : "Request"} · ${listing.listing.mechanism.replace("-", " ")} · ${quantity === "unlimited" ? "unlimited" : "finite"}`,
       title: listing.listing.title,
       summary: listing.listing.summary,
+      imageUrl: listing.listing.imageUrl,
       direction:
         listing.listing.direction === "offer"
           ? `Buyer pays ${listingPrice(listing.listing)} · Seller delivers`

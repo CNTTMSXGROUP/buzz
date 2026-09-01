@@ -26,6 +26,7 @@ export type MarketScenario = {
   direction: string;
   eyebrow: string;
   id: MarketScenarioId;
+  imageUrl?: string;
   liveMetrics: MarketTerm[];
   mode: string;
   primaryAction: string;

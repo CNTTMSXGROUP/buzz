@@ -1,9 +1,6 @@
 // Compact mutes lane adapter contract.
-// Full merge-lane storage invariants are covered by mergeLaneStorage.shared.test.mjs.
-// This file proves only the mutes-specific wiring: correct value field name,
-// storage key prefix, id projection — catches copy/paste field miswiring —
-// PLUS the duplicated mutes algebra (mergeStores, boundMuteStore,
-// isMutesStoreSubsumedBy) that is NOT exercised by the stars-based shared suite.
+// Full merge-lane storage invariants are in mergeLaneStorage.shared.test.mjs.
+// This file proves mutes-specific wiring PLUS duplicated mutes algebra not in the stars-based shared suite.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -17,8 +14,6 @@ import {
   parseMutePayload,
   storageKey,
 } from "./channelMutesStorage.ts";
-
-// ─── Wire-contract: value field, key prefix, id projection ───────────────────
 
 test("mutes adapter: value field is 'muted', key prefix is buzz-channel-mutes.v1", () => {
   const raw = {
@@ -60,8 +55,6 @@ test("mutes adapter: wrong value field (starred) is rejected by parser", () => {
     "starred entry filtered as malformed",
   );
 });
-
-// ─── Duplicated mutes algebra: mergeStores order ─────────────────────────────
 // These laws hold in channelStarsStorage too (exercised by mergeLaneStorage.shared),
 // but the implementations are independent — a mute-specific copy-paste error
 // cannot be caught by the stars suite.
@@ -73,47 +66,37 @@ function muteEntry(muted, updatedAt, rev = 0) {
   return { muted, updatedAt, rev };
 }
 
-for (const { title, a, b, expected } of [
-  {
-    title: "later updatedAt wins regardless of muted value",
-    a: muteStore({ ch: muteEntry(true, 100, 0) }),
-    b: muteStore({ ch: muteEntry(false, 200, 0) }),
-    expected: { ch: muteEntry(false, 200, 0) },
-  },
-  {
-    title: "equal updatedAt: higher rev wins",
-    a: muteStore({ ch: muteEntry(true, 100, 1) }),
-    b: muteStore({ ch: muteEntry(false, 100, 2) }),
-    expected: { ch: muteEntry(false, 100, 2) },
-  },
-  {
-    title: "full tie (equal updatedAt and rev): muted=true wins",
-    a: muteStore({ ch: muteEntry(false, 100, 1) }),
-    b: muteStore({ ch: muteEntry(true, 100, 1) }),
-    expected: { ch: muteEntry(true, 100, 1) },
-  },
-  {
-    title: "old-build rev=0 loses to new-build rev=1 at same second",
-    a: muteStore({ ch: muteEntry(true, 100, 0) }),
-    b: muteStore({ ch: muteEntry(false, 100, 1) }),
-    expected: { ch: muteEntry(false, 100, 1) },
-  },
-  {
-    title: "mergeStores is commutative",
-    a: muteStore({ ch: muteEntry(true, 100, 3) }),
-    b: muteStore({ ch: muteEntry(false, 200, 1) }),
-    expected: { ch: muteEntry(false, 200, 1) },
-  },
-]) {
-  test(`mutes mergeStores: ${title}`, () => {
-    const ab = mergeStores(a, b);
-    const ba = mergeStores(b, a);
-    assert.deepEqual(ab.channels, expected, "a∪b");
-    assert.deepEqual(ba.channels, expected, "b∪a (commutative)");
-  });
-}
-
-// ─── Duplicated mutes algebra: boundMuteStore capacity + preserved key ───────
+test("mutes mergeStores: winner selection algebra (all cases also verify commutativity)", () => {
+  const check = (a, b, expected) => {
+    assert.deepEqual(mergeStores(a, b).channels, expected, "a∪b");
+    assert.deepEqual(mergeStores(b, a).channels, expected, "b∪a");
+  };
+  check(
+    muteStore({ ch: muteEntry(true, 100, 0) }),
+    muteStore({ ch: muteEntry(false, 200, 0) }),
+    { ch: muteEntry(false, 200, 0) },
+  );
+  check(
+    muteStore({ ch: muteEntry(true, 100, 1) }),
+    muteStore({ ch: muteEntry(false, 100, 2) }),
+    { ch: muteEntry(false, 100, 2) },
+  );
+  check(
+    muteStore({ ch: muteEntry(false, 100, 1) }),
+    muteStore({ ch: muteEntry(true, 100, 1) }),
+    { ch: muteEntry(true, 100, 1) },
+  );
+  check(
+    muteStore({ ch: muteEntry(true, 100, 0) }),
+    muteStore({ ch: muteEntry(false, 100, 1) }),
+    { ch: muteEntry(false, 100, 1) },
+  );
+  check(
+    muteStore({ ch: muteEntry(true, 100, 3) }),
+    muteStore({ ch: muteEntry(false, 200, 1) }),
+    { ch: muteEntry(false, 200, 1) },
+  );
+});
 
 test("mutes boundMuteStore: caps at MAX_CHANNEL_MUTE_ENTRIES, retains newest", () => {
   const channels = Object.fromEntries(
@@ -150,27 +133,24 @@ test("mutes boundMuteStore: preserved key survives even when oldest", () => {
   );
 });
 
-// ─── Duplicated mutes algebra: subsumption ───────────────────────────────────
-
-test("mutes isMutesStoreSubsumedBy: head subsumes candidate when it carries strictly newer state", () => {
+test("mutes isMutesStoreSubsumedBy: newer/identical head subsumes; older head does not", () => {
   const candidate = muteStore({ ch: muteEntry(true, 100, 1) });
-  const head = muteStore({ ch: muteEntry(false, 200, 2) });
   assert.ok(
-    isMutesStoreSubsumedBy(candidate, head),
+    isMutesStoreSubsumedBy(
+      candidate,
+      muteStore({ ch: muteEntry(false, 200, 2) }),
+    ),
     "head subsumes older candidate",
   );
-});
-
-test("mutes isMutesStoreSubsumedBy: head does NOT subsume candidate when candidate has newer state", () => {
-  const candidate = muteStore({ ch: muteEntry(true, 300, 5) });
-  const head = muteStore({ ch: muteEntry(false, 200, 2) });
   assert.ok(
-    !isMutesStoreSubsumedBy(candidate, head),
+    !isMutesStoreSubsumedBy(
+      muteStore({ ch: muteEntry(true, 300, 5) }),
+      muteStore({ ch: muteEntry(false, 200, 2) }),
+    ),
     "newer candidate not subsumed",
   );
-});
-
-test("mutes isMutesStoreSubsumedBy: head subsumes candidate when identical", () => {
-  const store = muteStore({ ch: muteEntry(true, 100, 1) });
-  assert.ok(isMutesStoreSubsumedBy(store, store), "identical is subsumed");
+  assert.ok(
+    isMutesStoreSubsumedBy(candidate, candidate),
+    "identical is subsumed",
+  );
 });

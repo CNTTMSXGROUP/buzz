@@ -1,8 +1,6 @@
 // Compact stars lane adapter contract.
-// Full merge-lane storage invariants (parsePayload, mergeStores algebra,
-// boundStore, storageKey, claimLegacy state machine) are covered by
-// mergeLaneStorage.shared.test.mjs. This file proves only the stars-specific
-// wiring: correct value field name, storage key prefix, and id projection.
+// Full merge-lane storage invariants are in mergeLaneStorage.shared.test.mjs.
+// This file proves only stars-specific wiring: value field name, storage key prefix, and id projection.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -14,7 +12,6 @@ import {
 } from "./channelStarsStorage.ts";
 
 test("stars adapter: value field is 'starred', key prefix is buzz-channel-stars.v1", () => {
-  // A round-trip through the parser confirms the field name and version gate.
   const raw = {
     version: 1,
     channels: { a: { starred: true, updatedAt: 100, rev: 1 } },
@@ -48,7 +45,6 @@ test("stars adapter: wrong value field (muted) is rejected by parser", () => {
     channels: { a: { muted: true, updatedAt: 100, rev: 1 } },
   };
   const result = parseStarPayload(mutePayload);
-  // muted field is filtered out as malformed (no 'starred' field), leaving empty channels.
   assert.deepEqual(
     result?.channels ?? {},
     {},

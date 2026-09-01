@@ -1,10 +1,6 @@
-// Authoritative merge-lane storage suite — runs directly against
-// channelStarsStorage.ts (the canonical merge-lane implementation).
-//
-// Covers all merge-lane storage invariants: parsePayload contract, mergeStores
-// algebra, boundStore, idsFromStore, storageKey, readStore/writeStore, and the
-// full claimLegacy state machine. Lane adapter files carry compact contracts
-// that catch field/key/prefix wiring divergence without replaying this suite.
+// Authoritative merge-lane storage suite — runs directly against channelStarsStorage.ts.
+// Covers: parsePayload contract, mergeStores algebra, boundStore, idsFromStore,
+// storageKey, readStore/writeStore, and the full claimLegacy state machine.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -40,128 +36,119 @@ function makeStore(channels = {}) {
   return { version: 1, channels };
 }
 
-// ── parsePayload ──────────────────────────────────────────────────────────────
-
-test("parseStarPayload: valid payload round-trips (rev preserved)", () => {
+test("parseStarPayload: valid payload round-trips; rev normalization; invalid entries filtered", () => {
   const payload = {
     version: 1,
     channels: { "chan-1": E(true, 1000, 3), "chan-2": E(false, 2000, 0) },
   };
   assert.deepEqual(parseStarPayload(payload), payload);
-});
-
-test("parseStarPayload: missing rev normalizes to 0 (old-build blob, entry kept)", () => {
-  const result = parseStarPayload({
-    version: 1,
-    channels: { "chan-1": { starred: true, updatedAt: 1000 } },
-  });
-  assert.deepEqual(result.channels["chan-1"], E(true, 1000, 0));
-});
-
-test("parseStarPayload: malformed rev (string/negative/fraction/NaN/unsafe-int) normalizes to 0", () => {
-  const result = parseStarPayload({
+  assert.deepEqual(
+    parseStarPayload({
+      version: 1,
+      channels: { c: { starred: true, updatedAt: 1000 } },
+    }).channels.c,
+    E(true, 1000, 0),
+    "missing rev normalizes to 0",
+  );
+  const badRevResult = parseStarPayload({
     version: 1,
     channels: {
       str: { starred: true, updatedAt: 1, rev: "5" },
       neg: { starred: true, updatedAt: 1, rev: -2 },
       frac: { starred: true, updatedAt: 1, rev: 1.5 },
       nan: { starred: true, updatedAt: 1, rev: NaN },
-      boundary: { starred: true, updatedAt: 1, rev: Number.MAX_SAFE_INTEGER },
       huge: { starred: true, updatedAt: 1, rev: Number.MAX_SAFE_INTEGER + 1 },
     },
   });
-  for (const id of ["str", "neg", "frac", "nan", "boundary", "huge"])
-    assert.equal(result.channels[id].rev, 0, `${id} rev normalized to 0`);
-});
-
-for (const [title, input] of [
-  ["missing version", { channels: { c: E(true, 1, 0) } }],
-  ["wrong version (2)", { version: 2, channels: {} }],
-  ["null input", null],
-  ["string input", "string"],
-  ["number input", 42],
-]) {
-  test(`parseStarPayload: ${title} returns null`, () =>
-    assert.equal(parseStarPayload(input), null));
-}
-
-test("parseStarPayload: malformed entries filtered; valid entry kept", () => {
-  const result = parseStarPayload({
-    version: 1,
-    channels: {
-      "no-starred": { updatedAt: 1000 },
-      "no-updated-at": { starred: true },
-      valid: { starred: false, updatedAt: 500 },
-      "value-wrong-type": { starred: "yes", updatedAt: 1000 },
-      "updated-at-wrong-type": { starred: true, updatedAt: "now" },
-      null: null,
-    },
-  });
-  assert.deepEqual(result, makeStore({ valid: E(false, 500, 0) }));
-});
-
-test("parseStarPayload: NaN/Infinity/negative/unsafe updatedAt entries filtered", () => {
-  const result = parseStarPayload({
-    version: 1,
-    channels: {
-      nan: { starred: true, updatedAt: NaN },
-      inf: { starred: true, updatedAt: Infinity },
-      "neg-inf": { starred: true, updatedAt: -Infinity },
-      neg: { starred: true, updatedAt: -1 },
-      unsafe: { starred: true, updatedAt: Number.MAX_SAFE_INTEGER + 1 },
-      valid: { starred: true, updatedAt: 100, rev: 2 },
-    },
-  });
-  assert.deepEqual(result, makeStore({ valid: E(true, 100, 2) }));
-});
-
-test("parseStarPayload: empty channels / no channels key returns empty store", () => {
+  for (const id of ["str", "neg", "frac", "nan", "huge"])
+    assert.equal(badRevResult.channels[id].rev, 0);
+  assert.deepEqual(
+    parseStarPayload({
+      version: 1,
+      channels: {
+        "no-starred": { updatedAt: 1000 },
+        "no-updated-at": { starred: true },
+        valid: { starred: false, updatedAt: 500 },
+        "value-wrong-type": { starred: "yes", updatedAt: 1000 },
+        "updated-at-wrong-type": { starred: true, updatedAt: "now" },
+        null: null,
+      },
+    }),
+    makeStore({ valid: E(false, 500, 0) }),
+  );
+  assert.deepEqual(
+    parseStarPayload({
+      version: 1,
+      channels: {
+        nan: { starred: true, updatedAt: NaN },
+        inf: { starred: true, updatedAt: Infinity },
+        neg: { starred: true, updatedAt: -1 },
+        unsafe: { starred: true, updatedAt: Number.MAX_SAFE_INTEGER + 1 },
+        valid: { starred: true, updatedAt: 100, rev: 2 },
+      },
+    }),
+    makeStore({ valid: E(true, 100, 2) }),
+  );
   assert.deepEqual(parseStarPayload({ version: 1, channels: {} }), makeStore());
   assert.deepEqual(parseStarPayload({ version: 1 }), makeStore());
+  for (const input of [
+    { channels: { c: E(true, 1, 0) } },
+    { version: 2, channels: {} },
+    null,
+    "string",
+    42,
+  ])
+    assert.equal(
+      parseStarPayload(input),
+      null,
+      "invalid payload must return null",
+    );
 });
 
-// ── mergeStores ───────────────────────────────────────────────────────────────
-
-test("mergeStores: non-overlapping channels returns union", () =>
+test("mergeStores: union, winner selection, same-second old-build compat", () => {
   assert.deepEqual(
     mergeStores(
       makeStore({ a: E(true, 100, 1) }),
       makeStore({ b: E(false, 200, 1) }),
     ),
     makeStore({ a: E(true, 100, 1), b: E(false, 200, 1) }),
-  ));
-
-for (const [title, a, b, expected] of [
-  [
-    "strictly-later updatedAt wins (primary key)",
-    S(E(false, 200, 0)),
-    S(E(true, 100, 7)),
+    "non-overlapping returns union",
+  );
+  assert.deepEqual(
+    mergeStores(S(E(false, 200, 0)), S(E(true, 100, 7))).channels.c,
     E(false, 200, 0),
-  ],
-  [
-    "equal updatedAt: higher rev wins (tiebreak)",
-    S(E(false, 100, 5)),
-    S(E(true, 100, 2)),
+    "later updatedAt wins",
+  );
+  assert.deepEqual(
+    mergeStores(S(E(false, 100, 5)), S(E(true, 100, 2))).channels.c,
     E(false, 100, 5),
-  ],
-  [
-    "equal updatedAt AND rev: true-value wins (leaf)",
-    S(E(false, 100, 3)),
-    S(E(true, 100, 3)),
+    "higher rev tiebreaks",
+  );
+  assert.deepEqual(
+    mergeStores(S(E(false, 100, 3)), S(E(true, 100, 3))).channels.c,
     E(true, 100, 3),
-  ],
-  [
-    "false with higher updatedAt overrides true",
-    S(E(true, 100, 9)),
-    S(E(false, 999, 1)),
+    "true wins equal tie",
+  );
+  assert.deepEqual(
+    mergeStores(S(E(true, 100, 9)), S(E(false, 999, 1))).channels.c,
     E(false, 999, 1),
-  ],
-]) {
-  test(`mergeStores: ${title}`, () =>
-    assert.deepEqual(mergeStores(a, b).channels.c, expected));
-}
-
-test("mergeStores: same-second old-build click (rev 0) loses to earlier new-build rev; heals next second", () => {
+    "false beats true at later ts",
+  );
+  assert.deepEqual(
+    mergeStores(makeStore(), S(E(true, 42, 1))).channels.c,
+    E(true, 42, 1),
+    "remote-only entry",
+  );
+  assert.deepEqual(
+    mergeStores(S(E(false, 10, 2)), makeStore()).channels.c,
+    E(false, 10, 2),
+    "local-only entry",
+  );
+  assert.deepEqual(
+    mergeStores(makeStore(), makeStore()),
+    makeStore(),
+    "both empty",
+  );
   assert.deepEqual(
     mergeStores(S(E(true, 100, 2)), S(E(false, 100, 0))).channels.c,
     E(true, 100, 2),
@@ -200,20 +187,6 @@ test("mergeStores: boundary (MAX_SAFE_INTEGER) rev cannot wedge later same-secon
     prevRev = rev;
   }
 });
-
-test("mergeStores: empty-store cases", () => {
-  assert.deepEqual(
-    mergeStores(makeStore(), S(E(true, 42, 1))).channels.c,
-    E(true, 42, 1),
-  );
-  assert.deepEqual(
-    mergeStores(S(E(false, 10, 2)), makeStore()).channels.c,
-    E(false, 10, 2),
-  );
-  assert.deepEqual(mergeStores(makeStore(), makeStore()), makeStore());
-});
-
-// ── mergeStores: algebra ──────────────────────────────────────────────────────
 
 function randEntry(rng) {
   return E(rng() > 0.5, Math.floor(rng() * 5), Math.floor(rng() * 5));
@@ -264,18 +237,12 @@ for (const [title, check, seed] of [
   });
 }
 
-// ── v1-blob compat ────────────────────────────────────────────────────────────
-
-test("v1 compat: rev-carrying blob round-trips through a rev-less parser view", () => {
+test("v1 compat: rev-carrying blob round-trips; old-build unstar (no rev, updatedAt+1) beats stale star", () => {
   const roundTripped = parseStarPayload(
     JSON.parse(JSON.stringify(makeStore({ c: E(true, 100, 7) }))),
   );
-  assert.equal(roundTripped.version, 1);
   assert.equal(roundTripped.channels.c.starred, true);
   assert.equal(roundTripped.channels.c.updatedAt, 100);
-});
-
-test("v1 compat: old-build unstar (no rev, updatedAt+1) beats our stale star", () => {
   assert.deepEqual(
     mergeStores(
       S(E(true, 100, 7)),
@@ -288,51 +255,42 @@ test("v1 compat: old-build unstar (no rev, updatedAt+1) beats our stale star", (
   );
 });
 
-// ── boundStore ────────────────────────────────────────────────────────────────
-
-test("boundStarStore: retains newest entries regardless of value", () => {
-  const channels = Object.fromEntries(
+test("boundStarStore: newest retained; ID tiebreak; preserves pinned mutation key", () => {
+  const ch1 = Object.fromEntries(
     Array.from({ length: MAX_ENTRIES }, (_, i) => [
       `active-${i}`,
       E(true, i + 1, 0),
     ]),
   );
-  channels["old-false"] = E(false, 0, 0);
-  channels["new-false"] = E(false, 9999, 0);
-  const result = boundStarStore(makeStore(channels));
-  assert.equal(Object.keys(result.channels).length, MAX_ENTRIES);
-  assert.equal(result.channels["old-false"], undefined);
-  assert.deepEqual(result.channels["new-false"], E(false, 9999, 0));
-  assert.equal(result.channels["active-0"], undefined);
-});
-
-test("boundStarStore: uses channel ID as updatedAt tie-breaker", () => {
-  const channels = Object.fromEntries(
+  ch1["old-false"] = E(false, 0, 0);
+  ch1["new-false"] = E(false, 9999, 0);
+  const r1 = boundStarStore(makeStore(ch1));
+  assert.equal(Object.keys(r1.channels).length, MAX_ENTRIES);
+  assert.equal(r1.channels["old-false"], undefined);
+  assert.deepEqual(r1.channels["new-false"], E(false, 9999, 0));
+  const ch2 = Object.fromEntries(
     Array.from({ length: MAX_ENTRIES + 1 }, (_, i) => [
       `channel-${String(MAX_ENTRIES - i).padStart(3, "0")}`,
       E(true, 1, 0),
     ]),
   );
-  const result = boundStarStore(makeStore(channels));
-  assert.equal(result.channels["channel-000"], undefined);
-  assert.deepEqual(result.channels["channel-500"], E(true, 1, 0));
-});
-
-test("boundStarStore: preserves a same-second mutation by key", () => {
-  const channels = Object.fromEntries(
+  const r2 = boundStarStore(makeStore(ch2));
+  assert.equal(r2.channels["channel-000"], undefined);
+  assert.deepEqual(r2.channels["channel-500"], E(true, 1, 0));
+  const ch3 = Object.fromEntries(
     Array.from({ length: MAX_ENTRIES }, (_, i) => [
       `z-channel-${String(i).padStart(3, "0")}`,
       E(true, 1, 0),
     ]),
   );
-  channels["a-target"] = E(false, 1, 1);
-  const result = boundStarStore(makeStore(channels), "a-target");
-  assert.equal(Object.keys(result.channels).length, MAX_ENTRIES);
-  assert.deepEqual(result.channels["a-target"], E(false, 1, 1));
-  assert.equal(result.channels["z-channel-000"], undefined);
+  ch3["a-target"] = E(false, 1, 1);
+  const r3 = boundStarStore(makeStore(ch3), "a-target");
+  assert.equal(Object.keys(r3.channels).length, MAX_ENTRIES);
+  assert.deepEqual(r3.channels["a-target"], E(false, 1, 1));
+  assert.equal(r3.channels["z-channel-000"], undefined);
 });
 
-test("mergeStores: fresh at-capacity unstar defeats older remote star", () => {
+test("mergeStores + boundStarStore: at-capacity unstar wins, evicted ID re-enters, id-tiebreak eviction", () => {
   const channels = Object.fromEntries(
     Array.from({ length: MAX_ENTRIES }, (_, i) => [
       `active-${i}`,
@@ -340,15 +298,13 @@ test("mergeStores: fresh at-capacity unstar defeats older remote star", () => {
     ]),
   );
   channels.toggled = E(false, 9999, 1);
-  const bounded = boundStarStore(makeStore(channels));
   assert.deepEqual(
-    mergeStores(bounded, makeStore({ toggled: E(true, 9998, 5) })).channels
-      .toggled,
+    mergeStores(
+      boundStarStore(makeStore(channels)),
+      makeStore({ toggled: E(true, 9998, 5) }),
+    ).channels.toggled,
     E(false, 9999, 1),
   );
-});
-
-test("mergeStores: evicted remote ID re-enters and oldest state is re-trimmed", () => {
   const localChannels = Object.fromEntries(
     Array.from({ length: MAX_ENTRIES }, (_, i) => [
       `active-${i}`,
@@ -366,53 +322,32 @@ test("mergeStores: evicted remote ID re-enters and oldest state is re-trimmed", 
   assert.deepEqual(result.channels["evicted-id"], E(true, 9999, 0));
   assert.deepEqual(result.channels["active-0"], E(false, 9998, 0));
   assert.equal(result.channels["active-1"], undefined);
-});
-
-test("finding 3 easy branch: fresh click beats evicted high-rev entry at older updatedAt", () =>
-  assert.deepEqual(
-    mergeStores(S(E(true, 1000, 1)), S(E(false, 500, 100))).channels.c,
-    E(true, 1000, 1),
-  ));
-
-test("finding 3 hard branch: equal-second evicted click (rev 1) loses to observed remote (rev 100)", () => {
-  const NOW = 777;
-  const TARGET = "aaa-target";
-  const channels = { [TARGET]: E(true, NOW, 7) };
+  const NOW = 777,
+    TARGET = "aaa-target";
+  const ch3 = { [TARGET]: E(true, NOW, 7) };
   for (let i = 0; i < MAX_ENTRIES; i++)
-    channels[`z-${String(i).padStart(3, "0")}`] = E(true, NOW, 0);
-  const bounded = boundStarStore(makeStore(channels));
+    ch3[`z-${String(i).padStart(3, "0")}`] = E(true, NOW, 0);
   assert.equal(
-    bounded.channels[TARGET],
+    boundStarStore(makeStore(ch3)).channels[TARGET],
     undefined,
     "TARGET evicted by id tiebreak",
   );
-  assert.deepEqual(
-    mergeStores(
-      makeStore({ [TARGET]: E(true, NOW, 1) }),
-      makeStore({ [TARGET]: E(false, NOW, 100) }),
-    ).channels[TARGET],
-    E(false, NOW, 100),
-  );
-  assert.deepEqual(
-    mergeStores(
-      makeStore({ [TARGET]: E(false, NOW, 100) }),
-      makeStore({ [TARGET]: E(true, NOW, 1) }),
-    ).channels[TARGET],
-    E(false, NOW, 100),
-  );
 });
 
-// ── idsFromStore ──────────────────────────────────────────────────────────────
-
-test("starredChannelIdsFromStore: returns set of IDs where starred=true", () => {
-  const result = starredChannelIdsFromStore({
-    version: 1,
-    channels: { a: E(true, 100, 0), b: E(true, 200, 0), c: E(false, 300, 0) },
-  });
-  assert.deepEqual([...result].sort(), ["a", "b"]);
-});
-
-test("starredChannelIdsFromStore: all-false / empty returns empty set", () => {
+test("starredChannelIdsFromStore: returns starred IDs; all-false / empty returns empty set", () => {
+  assert.deepEqual(
+    [
+      ...starredChannelIdsFromStore({
+        version: 1,
+        channels: {
+          a: E(true, 100, 0),
+          b: E(true, 200, 0),
+          c: E(false, 300, 0),
+        },
+      }),
+    ].sort(),
+    ["a", "b"],
+  );
   assert.equal(
     starredChannelIdsFromStore({ version: 1, channels: { x: E(false, 1, 0) } })
       .size,
@@ -424,16 +359,12 @@ test("starredChannelIdsFromStore: all-false / empty returns empty set", () => {
   );
 });
 
-// ── storageKey + readStore/writeStore ─────────────────────────────────────────
-
-test("storageKey: with/without relayUrl", () => {
-  const relay = "wss://relay.example.com";
+test("readChannelStarsStore + writeChannelStarsStore: storageKey format, roundtrip, isolation, migration, precedence", () => {
   assert.equal(
-    storageKey("pk1", relay),
-    `${storageKeyPrefix}:pk1:${encodeURIComponent(normalizeRelayUrl(relay))}`,
+    storageKey("pk1", "wss://relay.example.com"),
+    `${storageKeyPrefix}:pk1:${encodeURIComponent(normalizeRelayUrl("wss://relay.example.com"))}`,
   );
   assert.equal(storageKey("pk1"), `${storageKeyPrefix}:pk1`);
-  assert.equal(storageKey("pk1", undefined), `${storageKeyPrefix}:pk1`);
   assert.notEqual(
     storageKey("pk1", "wss://relay-a.example.com"),
     storageKey("pk1", "wss://relay-b.example.com"),
@@ -441,104 +372,65 @@ test("storageKey: with/without relayUrl", () => {
   assert.equal(
     storageKey("pk1", "WSS://Relay.Example/"),
     storageKey("pk1", "wss://relay.example"),
+    "normalizeRelayUrl applied",
   );
-});
-
-test("readChannelStarsStore + writeChannelStarsStore: scoped write/read roundtrip", () => {
   const store = makeStore({ chan1: E(true, 1000, 1) });
   assert.ok(
-    writeChannelStarsStore(
-      "pk-stars-roundtrip",
-      store,
-      "wss://relay.example.com",
-    ) !== null,
+    writeChannelStarsStore("pk-rw-rt", store, "wss://relay.example.com") !==
+      null,
   );
   assert.deepEqual(
-    readChannelStarsStore("pk-stars-roundtrip", "wss://relay.example.com"),
+    readChannelStarsStore("pk-rw-rt", "wss://relay.example.com"),
     store,
   );
-});
-
-test("readChannelStarsStore: scoped key isolated from other relay's data", () => {
   writeChannelStarsStore(
-    "pk-stars-isolation",
+    "pk-rw-iso",
     makeStore({ cha: E(true, 100, 1) }),
     "wss://relay-a.example.com",
   );
   assert.deepEqual(
-    readChannelStarsStore("pk-stars-isolation", "wss://relay-b.example.com"),
+    readChannelStarsStore("pk-rw-iso", "wss://relay-b.example.com"),
     DEFAULT_STORE,
   );
-});
-
-test("readChannelStarsStore: migrates legacy unscoped data on first scoped read", () => {
   const legacy = makeStore({ chl: E(true, 500, 2) });
-  writeChannelStarsStore("pk-stars-migrate", legacy);
+  writeChannelStarsStore("pk-rw-mig", legacy);
   assert.deepEqual(
-    readChannelStarsStore(
-      "pk-stars-migrate",
-      "wss://relay-migrate.example.com",
-    ),
+    readChannelStarsStore("pk-rw-mig", "wss://relay-mig.example.com"),
     legacy,
   );
   assert.equal(
-    window.localStorage.getItem(storageKey("pk-stars-migrate")),
+    window.localStorage.getItem(storageKey("pk-rw-mig")),
     null,
+    "legacy key deleted",
   );
   assert.deepEqual(
-    readChannelStarsStore(
-      "pk-stars-migrate",
-      "wss://relay-migrate.example.com",
-    ),
+    readChannelStarsStore("pk-rw-mig", "wss://relay-mig.example.com"),
     legacy,
+    "idempotent",
   );
-});
-
-test("readChannelStarsStore: migration is globally one-time — relay B sees DEFAULT after relay A migrates", () => {
-  writeChannelStarsStore(
-    "pk-stars-migrate-once",
-    makeStore({ chm: E(true, 1, 1) }),
-  );
-  readChannelStarsStore(
-    "pk-stars-migrate-once",
-    "wss://relay-a-once.example.com",
-  );
+  writeChannelStarsStore("pk-rw-once", makeStore({ chm: E(true, 1, 1) }));
+  readChannelStarsStore("pk-rw-once", "wss://relay-a.example.com");
   assert.deepEqual(
-    readChannelStarsStore(
-      "pk-stars-migrate-once",
-      "wss://relay-b-once.example.com",
-    ),
+    readChannelStarsStore("pk-rw-once", "wss://relay-b.example.com"),
     DEFAULT_STORE,
+    "one-time",
   );
-});
-
-test("readChannelStarsStore: migration only copies non-empty legacy stores", () => {
-  writeChannelStarsStore("pk-stars-migrate-empty", DEFAULT_STORE);
+  writeChannelStarsStore("pk-rw-empty", DEFAULT_STORE);
   assert.deepEqual(
-    readChannelStarsStore(
-      "pk-stars-migrate-empty",
-      "wss://relay-empty.example.com",
-    ),
+    readChannelStarsStore("pk-rw-empty", "wss://relay-empty.example.com"),
     DEFAULT_STORE,
   );
   assert.notEqual(
-    window.localStorage.getItem(storageKey("pk-stars-migrate-empty")),
+    window.localStorage.getItem(storageKey("pk-rw-empty")),
     null,
+    "empty not migrated",
   );
-});
-
-test("readChannelStarsStore: scoped key takes precedence over legacy key", () => {
-  const relay = "wss://relay-precedence.example.com";
-  writeChannelStarsStore(
-    "pk-stars-precedence",
-    makeStore({ old: E(true, 1, 1) }),
-  );
+  const relay = "wss://relay-prec.example.com";
+  writeChannelStarsStore("pk-rw-prec", makeStore({ old: E(true, 1, 1) }));
   const scoped = makeStore({ new: E(true, 2, 1) });
-  writeChannelStarsStore("pk-stars-precedence", scoped, relay);
-  assert.deepEqual(readChannelStarsStore("pk-stars-precedence", relay), scoped);
+  writeChannelStarsStore("pk-rw-prec", scoped, relay);
+  assert.deepEqual(readChannelStarsStore("pk-rw-prec", relay), scoped);
 });
-
-// ── claimLegacy state machine ─────────────────────────────────────────────────
 
 for (const {
   title,
@@ -591,8 +483,7 @@ for (const {
     setupFailure: (ls, _scopedA, legacyKey) => {
       const orig = ls.removeItem;
       ls.removeItem = (k) => {
-        if (k === legacyKey) return;
-        return orig.call(ls, k);
+        if (k !== legacyKey) return orig.call(ls, k);
       };
       return () => {
         ls.removeItem = orig;

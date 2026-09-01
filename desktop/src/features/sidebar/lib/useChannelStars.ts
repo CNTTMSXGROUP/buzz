@@ -118,11 +118,11 @@ export function useChannelStars(
       const outbox = readChannelStarsOutbox(pubkey, relayUrl);
       if (outbox) {
         // Skip the publish only when the fetched head already subsumes the
-        // fold: a fresh manager's `lastPublishedStore` is null, so without this
-        // gate a lingering never-deleted legacy key (or any head-subsumed
-        // record) would re-drive an identical publish on every boot. A `hold`
-        // (no head) can't prove redundancy, so it always publishes. Merge LWW
-        // keeps this correctness-safe either way — the gate only removes noise.
+        // fold — a lingering never-deleted legacy key or head-subsumed record
+        // would otherwise re-drive an identical publish on every boot. A `hold`
+        // (no head fetched) cannot prove redundancy, so always publishes.
+        // Merge LWW keeps this correctness-safe either way; the gate removes
+        // noise only.
         const subsumed =
           result.action === "apply-remote" &&
           isStarsStoreSubsumedBy(outbox, result.data.store);

@@ -1,19 +1,14 @@
 // Compact wire-contract adapter for ChannelStarSyncManager.
-// Shared merge-lane sync engine invariants (generation CAS, retry, bootstrap
-// seed-guard, etc.) are covered by mergeLaneSync.shared.test.mjs, which runs
-// directly against ChannelStarSyncManager. This file asserts only the
-// stars-specific wiring that cannot be caught by a generic engine suite:
-// event kind, d-tag, serialized payload shape, parser delegation, and typed API.
+// Shared engine invariants are in mergeLaneSync.shared.test.mjs.
+// This file asserts only stars-specific wiring: event kind, d-tag, payload shape, parser delegation, and typed API.
 
 import assert from "node:assert/strict";
 import test, { mock } from "node:test";
 
 import { relayClient } from "@/shared/api/relayClient";
 import {
-  isStarsStoreSubsumedBy,
   parseStarPayload,
   readChannelStarsOutbox,
-  writeChannelStarsOutbox,
 } from "./channelStarsStorage.ts";
 import { ChannelStarSyncManager } from "./channelStarsSync.ts";
 import {
@@ -46,7 +41,6 @@ test("stars wire: kind=30078, d-tag='channel-stars', payload has 'channels' not 
     assert.equal(publishedEvent.kind, 30078, "kind must be 30078");
     const dTag = publishedEvent.tags.find((t) => t[0] === "d")?.[1];
     assert.equal(dTag, "channel-stars", "d-tag must be 'channel-stars'");
-    // Plaintext must serialize 'channels', not 'sections' or 'groups'.
     const plaintext = tauri.capturedPlaintext();
     const parsed = JSON.parse(plaintext);
     assert.ok("channels" in parsed, "payload must have 'channels' field");
@@ -61,7 +55,6 @@ test("stars wire: kind=30078, d-tag='channel-stars', payload has 'channels' not 
 });
 
 test("stars wire: parser delegates to parseStarPayload (starred field, version guard)", () => {
-  // Stars parser accepts starred field, rejects muted field.
   const valid = {
     version: 1,
     channels: { a: { starred: true, updatedAt: 1, rev: 0 } },
@@ -81,25 +74,48 @@ test("stars wire: parser delegates to parseStarPayload (starred field, version g
   );
 });
 
-test("stars wire: outbox/subsumption callbacks are wired to stars storage", () => {
-  const store = {
-    version: 1,
-    channels: { ch: { starred: true, updatedAt: 100, rev: 1 } },
-  };
-  writeChannelStarsOutbox("pk-wiring", store, RELAY);
-  assert.ok(
-    readChannelStarsOutbox("pk-wiring", RELAY) !== null,
-    "writeChannelStarsOutbox wired",
-  );
-  // Subsumption: head with same entry subsumes candidate.
-  const head = {
-    version: 1,
-    channels: { ch: { starred: false, updatedAt: 200, rev: 2 } },
-  };
-  assert.ok(
-    isStarsStoreSubsumedBy(store, head),
-    "isStarsStoreSubsumedBy wired",
-  );
+test("stars wire: outbox/subsumption callbacks are wired to stars storage (not mutes)", async () => {
+  // Drive the full manager publish cycle: publish sets the stars outbox;
+  // a confirming fetch returns a subsuming head → discardPending clears stars outbox.
+  // A copy/paste mutation wiring mutes outbox/subsumption to the stars config would:
+  //   (a) write to the mutes outbox prefix (readChannelStarsOutbox returns null), OR
+  //   (b) check isMutesStoreSubsumedBy instead of isStarsStoreSubsumedBy, failing to
+  //       confirm subsumption on a starred head → outbox never clears.
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
+  mock.method(relayClient, "publishEvent", () => Promise.resolve());
+  const fw = makeFakeWindow();
+  const restore = installFakeWindow(fw);
+  const tauri = installEchoTauri("pk-outbox-stars");
+  try {
+    const m = new ChannelStarSyncManager("pk-outbox-stars", RELAY);
+    const store = {
+      version: 1,
+      channels: { ch: { starred: true, updatedAt: 100, rev: 1 } },
+    };
+    m.publishStars(store);
+    // Outbox must be written synchronously on publish — proves writeChannelStarsOutbox is wired.
+    assert.ok(
+      readChannelStarsOutbox("pk-outbox-stars", RELAY) !== null,
+      "publishStars must write to the stars outbox (not mutes)",
+    );
+    // Drive through a full publish cycle: fire debounce, return a subsuming head on
+    // both fetches (fetchOwnBlob + confirmRetainedHeadSubsumes). After discardPending,
+    // the stars outbox must be cleared — proves clearChannelStarsOutbox + isStarsStoreSubsumedBy
+    // are wired (a mutes-subsumption mutation would see muted=undefined → not subsumed → no clear).
+    const subsumingHead = tauri.mintHead(store, 50, "evt-sub");
+    subsumingHead.tags = [["d", "channel-stars"]];
+    mock.method(relayClient, "fetchEvents", () =>
+      Promise.resolve([subsumingHead]),
+    );
+    fw._fireTimer(); // fires debounce → doPublish → fetchOwnBlob → publish → confirmRetained
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(readChannelStarsOutbox("pk-outbox-stars", RELAY), null);
+    m.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
 });
 
 test("stars wire: typed API (publishStars, getPendingStarStore, fetchRemoteStars, cancelPendingStarPublish)", () => {
@@ -115,10 +131,7 @@ test("stars wire: typed API (publishStars, getPendingStarStore, fetchRemoteStars
     });
     assert.ok(m.getPendingStarStore() !== null, "publishStars sets pending");
     m.cancelPendingStarPublish();
-    assert.ok(
-      typeof m.cancelPendingStarPublish === "function",
-      "cancelPendingStarPublish is callable",
-    );
+    assert.ok(typeof m.cancelPendingStarPublish === "function");
     assert.ok(
       typeof m.fetchRemoteStars === "function",
       "fetchRemoteStars exists",

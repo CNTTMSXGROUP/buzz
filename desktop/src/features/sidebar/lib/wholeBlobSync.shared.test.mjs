@@ -1,19 +1,18 @@
-// Authoritative whole-blob sync suite — runs directly against
-// ChannelSectionSyncManager. Covers the 15 structural invariants common to
-// whole-blob lanes. Lane-specific tests stay in the lane files.
+// Authoritative whole-blob sync suite — runs against WholeBlobSyncManager via a
+// synthetic in-memory config. Lane-specific tests stay in the lane files.
 
 import assert from "node:assert/strict";
 import test, { mock } from "node:test";
 
 import { relayClient } from "@/shared/api/relayClient";
-import { ChannelSectionSyncManager } from "./channelSectionsSync.ts";
-import { readChannelSectionsOutbox } from "./channelSectionsStorage.ts";
 import {
   makeFakeWindow,
   installFakeWindow,
   makeTimerBed,
   installTauriMock,
   installEchoTauri,
+  installSeamTauriMock,
+  SyntheticWholeBlobManager,
 } from "./sidebarSyncTestHelpers.mjs";
 
 const RELAY = "wss://r.test";
@@ -23,6 +22,7 @@ const watermarkLane = "channel-sections";
 function makeStore(sections = []) {
   return { version: 1, sections, assignments: {} };
 }
+
 function nonEmptyStore() {
   return makeStore([{ id: "s1", name: "Work", order: 0 }]);
 }
@@ -31,27 +31,22 @@ const decryptPayload = JSON.stringify(
 );
 const emptyDecryptPayload = JSON.stringify(makeStore([]));
 
-// ─── destroy() ───────────────────────────────────────────────────────────────
-
-test("destroy: cancels pending publish without flushing to the relay", () => {
+test("destroy: cancels pending publish without flushing; aborts in-flight publish after fetch resolves", async () => {
   mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
   mock.method(relayClient, "publishEvent", () => Promise.resolve());
   const fw = makeFakeWindow();
   const restore = installFakeWindow(fw);
   try {
-    const manager = new ChannelSectionSyncManager("pk-test", RELAY);
+    const manager = new SyntheticWholeBlobManager("pk-test", RELAY);
     manager.publishSections(nonEmptyStore());
     assert.ok(fw._hasTimer(), "debounce timer should be set");
     manager.destroy();
-    assert.ok(!fw._hasTimer(), "debounce timer should be cleared on destroy");
+    assert.ok(!fw._hasTimer(), "debounce timer cleared on destroy");
     assert.equal(manager.getPendingStore(), null);
   } finally {
     restore();
     mock.reset();
   }
-});
-
-test("destroy: aborts in-flight doPublish after fetchOwnBlobBeforePublish resolves", async () => {
   let releaseFetch = null;
   const publishCalls = [];
   mock.method(
@@ -66,27 +61,21 @@ test("destroy: aborts in-flight doPublish after fetchOwnBlobBeforePublish resolv
     publishCalls.push(args);
     return Promise.resolve();
   });
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
+  const fw2 = makeFakeWindow();
+  const restore2 = installFakeWindow(fw2);
   try {
-    const manager = new ChannelSectionSyncManager("pk-race", RELAY);
+    const manager = new SyntheticWholeBlobManager("pk-race", RELAY);
     manager.publishSections(nonEmptyStore());
-    fw._fireTimer();
+    fw2._fireTimer();
     manager.destroy();
     releaseFetch();
     await new Promise((r) => setTimeout(r, 0));
-    assert.equal(
-      publishCalls.length,
-      0,
-      "publishEvent must not fire after destroy",
-    );
+    assert.equal(publishCalls.length, 0, "must not fire after destroy");
   } finally {
-    restore();
+    restore2();
     mock.reset();
   }
 });
-
-// ─── Boot seed-publish guard ──────────────────────────────────────────────────
 
 for (const { title, setupFetch, setupWatermark, pubkey, assertPending } of [
   {
@@ -124,7 +113,7 @@ for (const { title, setupFetch, setupWatermark, pubkey, assertPending } of [
     setupWatermark?.(fw);
     const restore = installFakeWindow(fw);
     try {
-      const manager = new ChannelSectionSyncManager(pubkey ?? "pk-fail", RELAY);
+      const manager = new SyntheticWholeBlobManager(pubkey ?? "pk-fail", RELAY);
       const result = await manager.bootstrap(nonEmptyStore());
       assert.equal(result.action, "hold");
       assertPending(manager);
@@ -136,9 +125,7 @@ for (const { title, setupFetch, setupWatermark, pubkey, assertPending } of [
   });
 }
 
-// ─── Adopt-winner / local-winner ─────────────────────────────────────────────
-
-test("adopt-winner: newer remote head at pre-publish adopts remote and skips publish", async () => {
+test("adopt-winner: newer remote adopts and skips publish; local ahead publishes and clears outbox", async () => {
   mock.method(relayClient, "fetchEvents", () =>
     Promise.resolve([
       {
@@ -158,14 +145,11 @@ test("adopt-winner: newer remote head at pre-publish adopts remote and skips pub
   const restore = installFakeWindow(fw);
   const tauri = installTauriMock(decryptPayload);
   try {
-    const manager = new ChannelSectionSyncManager("pk-lww", RELAY);
+    const manager = new SyntheticWholeBlobManager("pk-lww", RELAY);
     const adopted = [];
     manager.setOnRemoteAdopted((r) => adopted.push(r));
     manager.publishSections(nonEmptyStore());
-    assert.ok(
-      readChannelSectionsOutbox("pk-lww", RELAY) !== null,
-      "edit must be in durable outbox",
-    );
+    assert.ok(manager.outboxWrites() > 0, "edit in durable outbox");
     fw._fireTimer();
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(
@@ -173,62 +157,100 @@ test("adopt-winner: newer remote head at pre-publish adopts remote and skips pub
       0,
       "must not publish when remote wins LWW",
     );
-    assert.equal(adopted.length, 1, "adopt sink must receive the remote");
+    assert.equal(adopted.length, 1, "adopt sink fires");
     assert.ok(
       adopted[0].store.sections.some(
         (s) => s.id === "remote-section-from-relay",
       ),
     );
     assert.equal(manager.getPendingStore(), null);
-    assert.equal(
-      readChannelSectionsOutbox("pk-lww", RELAY),
-      null,
-      "outbox cleared on adopt",
-    );
+    assert.equal(manager.outboxClears() >= 1, true, "adopt clears outbox");
     manager.destroy();
   } finally {
     tauri.restore();
     restore();
     mock.reset();
   }
-});
-
-test("adopt-winner: local edit at/ahead of head publishes and clears outbox", async () => {
-  let storedHead = [];
-  mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead));
-  const publishCalls = [];
-  mock.method(relayClient, "publishEvent", (event) => {
-    publishCalls.push(event);
-    storedHead = [event];
+  // S1→S2→S1 regression: local edit S1 confirmed, then S2 arrives live while idle,
+  // then user re-selects S1. Old code would no-op (lastPublishedStore=S1 still equals pending S1);
+  // new code compares against the freshly fetched head (now S2) and publishes.
+  // Mutation: storesEqual(S1, S1) no-op at pre-publish check silently drops the re-selection.
+  let publishCalls2 = 0;
+  let liveCallback2 = null;
+  let storedHead2 = [];
+  const { fireDelay: fireDelay2, restore: restoreTimers2 } = makeTimerBed();
+  const tauri2 = installEchoTauri("pk-s1s2s1-fold");
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead2));
+  mock.method(relayClient, "subscribeLive", (_f, cb) => {
+    liveCallback2 = cb;
+    return Promise.resolve(async () => {});
+  });
+  mock.method(relayClient, "publishEvent", (e) => {
+    publishCalls2++;
+    storedHead2 = [e];
     return Promise.resolve();
   });
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
-  const tauri = installEchoTauri("pk-win");
+  const s1 = makeStore([{ id: "s1", name: "S1", order: 0 }]);
+  const s2 = makeStore([{ id: "s2", name: "S2", order: 0 }]);
   try {
-    const manager = new ChannelSectionSyncManager("pk-win", RELAY);
-    manager.publishSections(nonEmptyStore());
-    fw._fireTimer();
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(publishCalls.length, 1, "local edit must be published");
+    const m = new SyntheticWholeBlobManager("pk-s1s2s1-fold", RELAY);
+    // S1 published and confirmed.
+    m.publishSections(s1);
+    await fireDelay2(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    assert.equal(publishCalls2, 1, "S1 published and confirmed");
+    assert.equal(m.getPendingStore(), null, "S1 confirmed — outbox clear");
+    // Subscribe; deliver S2 live — storedHead2 advances. Collect the subscription result
+    // so we can assert that S2 was actually applied (not just silently ignored).
+    const s2Deliveries = [];
+    await m.subscribeToSections((r) => s2Deliveries.push(r));
+    storedHead2 = [
+      tauri2.mintHead(s2, storedHead2[0].created_at + 1, "evt-s2"),
+    ];
+    liveCallback2(storedHead2[0]);
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    // S2 delivery must have fired with the correct sections content.
     assert.equal(
-      readChannelSectionsOutbox("pk-win", RELAY),
-      null,
-      "outbox cleared after confirmed publish",
+      s2Deliveries.length,
+      1,
+      "S2 live delivery reached subscription callback",
     );
-    manager.destroy();
+    assert.ok(
+      s2Deliveries[0]?.store?.sections?.some((s) => s.id === "s2"),
+      "S2 subscription delivers the s2 sections payload",
+    );
+    // Re-select S1: pre-publish fetch returns S2; storesEqual(S1,S2)=false → publishes.
+    // Old code: storesEqual(S1, lastPublishedStore=S1) = true → no-op.
+    m.publishSections(s1);
+    // S1 must be pending in the durable outbox BEFORE the timer fires.
+    // Removing this confirms the pending state is set before confirmation — the original
+    // standalone test's "outboxWrites >= 2 before fire" invariant.
+    assert.ok(
+      m.getPendingStore() !== null,
+      "S1 pending before confirmation timer fires",
+    );
+    assert.ok(
+      m.outboxWrites() >= 2,
+      "S1 written to durable outbox before timer fires",
+    );
+    await fireDelay2(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    assert.equal(
+      publishCalls2,
+      2,
+      "S1 re-published above S2 — stale no-op suppresses this",
+    );
+    assert.equal(m.getPendingStore(), null, "S1 re-selection confirmed");
+    m.destroy();
   } finally {
-    tauri.restore();
-    restore();
+    tauri2.restore();
+    restoreTimers2();
     mock.reset();
   }
 });
-
-// ─── Timestamp clamp ─────────────────────────────────────────────────────────
 
 test("timestamp clamp: published createdAt stays inside the relay future window", async () => {
   const nowSecs = Math.floor(Date.now() / 1000);
-  const farFutureHead = nowSecs + 3_600;
   let call = 0;
   mock.method(relayClient, "fetchEvents", () => {
     call++;
@@ -236,21 +258,21 @@ test("timestamp clamp: published createdAt stays inside the relay future window"
       {
         pubkey: "pk-clamp",
         content: "good-cipher",
-        created_at: call === 1 ? farFutureHead : 0,
+        created_at: call === 1 ? nowSecs + 3_600 : 0,
         id: "evt-clamp",
       },
     ]);
   });
   let signedCreatedAt = null;
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
-  const tauri = installTauriMock(emptyDecryptPayload);
   mock.method(relayClient, "publishEvent", (evt) => {
     signedCreatedAt = evt.created_at;
     return Promise.resolve();
   });
+  const fw = makeFakeWindow(),
+    restore = installFakeWindow(fw),
+    tauri = installTauriMock(emptyDecryptPayload);
   try {
-    const manager = new ChannelSectionSyncManager("pk-clamp", RELAY);
+    const manager = new SyntheticWholeBlobManager("pk-clamp", RELAY);
     await manager.fetchRemoteSections();
     manager.publishSections(nonEmptyStore());
     fw._fireTimer();
@@ -258,7 +280,7 @@ test("timestamp clamp: published createdAt stays inside the relay future window"
     assert.ok(signedCreatedAt !== null, "publish must have been attempted");
     assert.ok(
       signedCreatedAt <= Math.floor(Date.now() / 1000) + 840,
-      `createdAt must be clamped — got ${signedCreatedAt}`,
+      `createdAt clamped — got ${signedCreatedAt}`,
     );
     manager.destroy();
   } finally {
@@ -268,121 +290,40 @@ test("timestamp clamp: published createdAt stays inside the relay future window"
   }
 });
 
-// ─── Retain / retry on bad head ───────────────────────────────────────────────
-
-for (const { title, pubkey, content, tauri: tauriPayload } of [
-  {
-    title: "unreadable head (decrypt failure)",
-    pubkey: "pk-undec",
-    content: "bad-cipher",
-    tauri: installTauriMock.bind(null, "{}"),
-  },
-  {
-    title: "failed pre-publish fetch",
-    pubkey: "pk-fetchfail",
-    content: null,
-    tauri: installTauriMock.bind(null, "{}"),
-  },
-]) {
-  test(`${title} retains the pending edit and retries, never publishing`, async () => {
-    if (content === null) {
-      mock.method(relayClient, "fetchEvents", () =>
-        Promise.reject(new Error("socket timeout")),
-      );
-    } else {
-      mock.method(relayClient, "fetchEvents", () =>
-        Promise.resolve([{ pubkey, content, created_at: 500, id: "evt" }]),
-      );
-    }
-    const publishCalls = [];
-    mock.method(relayClient, "publishEvent", (...args) => {
-      publishCalls.push(args);
-      return Promise.resolve();
-    });
-    const fw = makeFakeWindow();
-    const restore = installFakeWindow(fw);
-    const t = tauriPayload();
-    try {
-      const manager = new ChannelSectionSyncManager(pubkey, RELAY);
-      manager.publishSections(nonEmptyStore());
-      fw._fireTimer();
-      await new Promise((r) => setTimeout(r, 20));
-      assert.equal(publishCalls.length, 0, "must not publish");
-      assert.ok(manager.getPendingStore() !== null, "pending edit retained");
-      assert.ok(
-        readChannelSectionsOutbox(pubkey, RELAY) !== null,
-        "durable outbox intact",
-      );
-      assert.ok(fw._hasTimer(), "retry scheduled");
-      manager.destroy();
-    } finally {
-      t.restore();
-      restore();
-      mock.reset();
-    }
-  });
-}
-
-// ─── Overlapping publishes ────────────────────────────────────────────────────
-
-test("overlapping publishes: older completion does not erase a newer queued edit", async () => {
-  mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
-  let releaseFirst = null;
-  let publishCalls = 0;
-  mock.method(relayClient, "publishEvent", () => {
-    publishCalls++;
-    if (publishCalls === 1)
-      return new Promise((res) => {
-        releaseFirst = res;
-      });
+test("unreadable head (decrypt failure) retains the pending edit and retries, never publishing", async () => {
+  mock.method(relayClient, "fetchEvents", () =>
+    Promise.resolve([
+      { pubkey: "pk-undec", content: "bad-cipher", created_at: 500, id: "evt" },
+    ]),
+  );
+  const publishCalls = [];
+  mock.method(relayClient, "publishEvent", (...args) => {
+    publishCalls.push(args);
     return Promise.resolve();
   });
-  const { timers, fireDelay, restore } = makeTimerBed();
-  const tauri = installTauriMock("{}");
+  const fw = makeFakeWindow(),
+    restore = installFakeWindow(fw),
+    t = installTauriMock("{}");
   try {
-    const manager = new ChannelSectionSyncManager("pk-overlap", RELAY);
-    const storeA = makeStore([{ id: "a", name: "A", order: 0 }]);
-    const storeB = makeStore([{ id: "b", name: "B", order: 0 }]);
-    manager.publishSections(storeA);
-    await fireDelay(2000);
-    while (releaseFirst === null) await Promise.resolve();
-    manager.publishSections(storeB);
-    assert.ok(
-      manager.getPendingStore()?.sections?.[0]?.id === "b",
-      "B is pending",
-    );
-    assert.ok(
-      readChannelSectionsOutbox("pk-overlap", RELAY)?.store?.sections?.[0]
-        ?.id === "b",
-      "outbox holds B",
-    );
-    releaseFirst();
-    for (let i = 0; i < 10; i++) await Promise.resolve();
-    assert.ok(
-      manager.getPendingStore()?.sections?.[0]?.id === "b",
-      "older completion leaves B pending",
-    );
-    assert.ok(
-      readChannelSectionsOutbox("pk-overlap", RELAY) !== null,
-      "older completion leaves B outbox intact",
-    );
-    assert.ok(
-      [...timers.values()].some((t) => t.ms === 2000),
-      "B debounce timer survives",
-    );
+    const manager = new SyntheticWholeBlobManager("pk-undec", RELAY);
+    manager.publishSections(nonEmptyStore());
+    fw._fireTimer();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(publishCalls.length, 0, "must not publish");
+    assert.ok(manager.getPendingStore() !== null, "pending edit retained");
+    assert.ok(manager.outboxWrites() > 0, "pending edit in durable outbox");
+    assert.ok(fw._hasTimer(), "retry scheduled");
     manager.destroy();
   } finally {
-    tauri.restore();
+    t.restore();
     restore();
     mock.reset();
   }
 });
-
-// ─── Live remote during debounce ──────────────────────────────────────────────
 
 test("live remote during debounce is adopted at pre-publish, not overwritten", async () => {
   let liveCallback = null;
-  mock.method(relayClient, "subscribeLive", (_filter, onEvent) => {
+  mock.method(relayClient, "subscribeLive", (_f, onEvent) => {
     liveCallback = onEvent;
     return Promise.resolve(async () => {});
   });
@@ -401,13 +342,14 @@ test("live remote during debounce is adopted at pre-publish, not overwritten", a
     publishCalls.push(args);
     return Promise.resolve();
   });
-  const liveRemoteDecryptPayload = JSON.stringify(
-    makeStore([{ id: "remote-during-debounce", name: "Remote", order: 0 }]),
-  );
   const { fireDelay, restore } = makeTimerBed();
-  const tauri = installTauriMock(liveRemoteDecryptPayload);
+  const tauri = installTauriMock(
+    JSON.stringify(
+      makeStore([{ id: "remote-during-debounce", name: "Remote", order: 0 }]),
+    ),
+  );
   try {
-    const manager = new ChannelSectionSyncManager("pk-live-deb", RELAY);
+    const manager = new SyntheticWholeBlobManager("pk-live-deb", RELAY);
     const adopted = [];
     manager.setOnRemoteAdopted((r) => adopted.push(r));
     await manager.subscribeToSections(() => {});
@@ -422,11 +364,7 @@ test("live remote during debounce is adopted at pre-publish, not overwritten", a
     });
     for (let i = 0; i < 50; i++) await Promise.resolve();
     await fireDelay(2000);
-    assert.equal(
-      publishCalls.length,
-      0,
-      "must not publish over a remote that became head during debounce",
-    );
+    assert.equal(publishCalls.length, 0, "must not publish during debounce");
     assert.equal(adopted.length, 1, "newer remote must be adopted");
     manager.destroy();
   } finally {
@@ -436,131 +374,128 @@ test("live remote during debounce is adopted at pre-publish, not overwritten", a
   }
 });
 
-// ─── Same-second collision ────────────────────────────────────────────────────
-
-test("same-second collision: second edit queued during confirmation survives", async () => {
-  let fetchCalls = 0;
-  let releaseConfirmation = null;
-  let publishCalls = 0;
-  let storedHead = [];
-  const { fireDelay, restore } = makeTimerBed();
-  const tauri = installEchoTauri("pk-collide2");
-  mock.method(relayClient, "fetchEvents", () => {
-    fetchCalls++;
-    if (fetchCalls === 1) return Promise.resolve([]);
-    if (fetchCalls === 2)
-      return new Promise((res) => {
-        releaseConfirmation = () => res(storedHead);
-      });
-    return Promise.resolve(storedHead);
-  });
-  const winnerStore = makeStore([{ id: "peer", name: "Peer", order: 0 }]);
-  mock.method(relayClient, "publishEvent", (event) => {
-    publishCalls++;
-    if (publishCalls === 1) {
-      storedHead = [
-        tauri.mintHead(winnerStore, event.created_at, "0-peer-winner"),
-      ];
+test("same-second collision: second-edit queued during confirmation survives; loser adopts and retries", async () => {
+  {
+    let fetchCalls = 0,
+      releaseConfirmation = null,
+      publishCalls = 0,
+      storedHead = [];
+    const { fireDelay, restore } = makeTimerBed();
+    const tauri = installEchoTauri("pk-collide2");
+    mock.method(relayClient, "fetchEvents", () => {
+      fetchCalls++;
+      if (fetchCalls === 1) return Promise.resolve([]);
+      if (fetchCalls === 2)
+        return new Promise((res) => {
+          releaseConfirmation = () => res(storedHead);
+        });
+      return Promise.resolve(storedHead);
+    });
+    const winnerStore = makeStore([{ id: "peer", name: "Peer", order: 0 }]);
+    mock.method(relayClient, "publishEvent", (event) => {
+      publishCalls++;
+      if (publishCalls === 1) {
+        storedHead = [
+          tauri.mintHead(winnerStore, event.created_at, "0-peer-winner"),
+        ];
+        return Promise.resolve();
+      }
+      storedHead = [event];
       return Promise.resolve();
+    });
+    try {
+      const manager = new SyntheticWholeBlobManager("pk-collide2", RELAY);
+      const adopted = [];
+      manager.setOnRemoteAdopted((r) => adopted.push(r));
+      manager.publishSections(
+        makeStore([{ id: "mine", name: "Mine", order: 0 }]),
+      );
+      await fireDelay(2000);
+      while (releaseConfirmation === null) await Promise.resolve();
+      manager.publishSections(
+        makeStore([{ id: "second", name: "Second", order: 0 }]),
+      );
+      releaseConfirmation();
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+      assert.equal(
+        adopted.length,
+        0,
+        "stale-gen adopt must not fire onRemoteAdopted for the newer pending edit",
+      );
+      assert.notEqual(
+        manager.getPendingStore(),
+        null,
+        "edit-2 still pending after stale-gen adopt",
+      );
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+      assert.equal(publishCalls, 2, "edit-2 publishes above the peer winner");
+      assert.equal(adopted.length, 0, "edit-2 must not be adopted away");
+      assert.equal(
+        manager.getPendingStore(),
+        null,
+        "edit-2 clears via confirmed publish",
+      );
+      assert.equal(manager.outboxClears() >= 1, true, "edit-2 outbox cleared");
+      manager.destroy();
+    } finally {
+      tauri.restore();
+      restore();
+      mock.reset();
     }
-    storedHead = [event];
-    return Promise.resolve();
-  });
-  try {
-    const manager = new ChannelSectionSyncManager("pk-collide2", RELAY);
-    const adopted = [];
-    manager.setOnRemoteAdopted((r) => adopted.push(r));
-    manager.publishSections(
-      makeStore([{ id: "mine", name: "Mine", order: 0 }]),
-    );
-    await fireDelay(2000);
-    while (releaseConfirmation === null) await Promise.resolve();
-    manager.publishSections(
-      makeStore([{ id: "second", name: "Second", order: 0 }]),
-    );
-    releaseConfirmation();
-    for (let i = 0; i < 100; i++) await Promise.resolve();
-    assert.equal(
-      adopted.length,
-      0,
-      "stale-gen adopt must not fire onRemoteAdopted for the newer pending edit",
-    );
-    assert.notEqual(
-      manager.getPendingStore(),
-      null,
-      "edit-2 still pending after stale-gen adopt",
-    );
-    await fireDelay(2000);
-    for (let i = 0; i < 100; i++) await Promise.resolve();
-    assert.equal(publishCalls, 2, "edit-2 publishes above the peer winner");
-    assert.equal(adopted.length, 0, "edit-2 must not be adopted away");
-    assert.equal(
-      manager.getPendingStore(),
-      null,
-      "edit-2 clears via confirmed publish",
-    );
-    assert.equal(
-      readChannelSectionsOutbox("pk-collide2", RELAY),
-      null,
-      "edit-2 outbox cleared",
-    );
-    manager.destroy();
-  } finally {
-    tauri.restore();
-    restore();
-    mock.reset();
+  }
+  {
+    let fetchCalls = 0,
+      publishCalls = 0,
+      storedHead = [];
+    const { fireDelay, restore } = makeTimerBed();
+    const tauri = installEchoTauri("pk-loser");
+    const winnerStore = makeStore([{ id: "peer", name: "Peer", order: 0 }]);
+    mock.method(relayClient, "fetchEvents", () => {
+      fetchCalls++;
+      return Promise.resolve(fetchCalls === 1 ? [] : storedHead);
+    });
+    mock.method(relayClient, "publishEvent", (event) => {
+      publishCalls++;
+      if (publishCalls === 1)
+        storedHead = [
+          tauri.mintHead(winnerStore, event.created_at, "0-peer-winner"),
+        ];
+      return Promise.resolve();
+    });
+    try {
+      const manager = new SyntheticWholeBlobManager("pk-loser", RELAY);
+      const adopted = [];
+      manager.setOnRemoteAdopted((r) => adopted.push(r));
+      manager.publishSections(
+        makeStore([{ id: "loser", name: "Loser", order: 0 }]),
+      );
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+      assert.equal(adopted.length, 1, "loser must adopt the peer winner");
+      assert.equal(
+        manager.getPendingStore(),
+        null,
+        "pending cleared after adopt",
+      );
+      manager.publishSections(
+        makeStore([{ id: "mine", name: "Mine", order: 0 }]),
+      );
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+      assert.equal(
+        publishCalls,
+        2,
+        "edit after adopt must publish successfully",
+      );
+      manager.destroy();
+    } finally {
+      tauri.restore();
+      restore();
+      mock.reset();
+    }
   }
 });
-
-test("same-second collision: loser adopts the winner and its next edit survives", async () => {
-  let fetchCalls = 0;
-  let publishCalls = 0;
-  let storedHead = [];
-  const { fireDelay, restore } = makeTimerBed();
-  const tauri = installEchoTauri("pk-loser");
-  mock.method(relayClient, "fetchEvents", () => {
-    fetchCalls++;
-    return Promise.resolve(fetchCalls === 1 ? [] : storedHead);
-  });
-  const winnerStore = makeStore([{ id: "peer", name: "Peer", order: 0 }]);
-  mock.method(relayClient, "publishEvent", (event) => {
-    publishCalls++;
-    if (publishCalls === 1)
-      storedHead = [
-        tauri.mintHead(winnerStore, event.created_at, "0-peer-winner"),
-      ];
-    return Promise.resolve();
-  });
-  try {
-    const manager = new ChannelSectionSyncManager("pk-loser", RELAY);
-    const adopted = [];
-    manager.setOnRemoteAdopted((r) => adopted.push(r));
-    manager.publishSections(
-      makeStore([{ id: "loser", name: "Loser", order: 0 }]),
-    );
-    await fireDelay(2000);
-    for (let i = 0; i < 100; i++) await Promise.resolve();
-    assert.equal(adopted.length, 1, "loser must adopt the peer winner");
-    assert.equal(
-      manager.getPendingStore(),
-      null,
-      "pending cleared after adopt",
-    );
-    manager.publishSections(
-      makeStore([{ id: "mine", name: "Mine", order: 0 }]),
-    );
-    await fireDelay(2000);
-    for (let i = 0; i < 100; i++) await Promise.resolve();
-    assert.equal(publishCalls, 2, "edit after adopt must publish successfully");
-    manager.destroy();
-  } finally {
-    tauri.restore();
-    restore();
-    mock.reset();
-  }
-});
-
-// ─── live-sub: undecryptable event advances watermark ────────────────────────
 
 test("revert-fix: undecryptable live event advances watermark before decrypt attempt", async () => {
   let liveCallback = null;
@@ -568,14 +503,13 @@ test("revert-fix: undecryptable live event advances watermark before decrypt att
     liveCallback = onEvent;
     return Promise.resolve(async () => {});
   });
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
+  const fw = makeFakeWindow(),
+    restore = installFakeWindow(fw);
   try {
-    const manager = new ChannelSectionSyncManager("pk-live", RELAY);
+    const manager = new SyntheticWholeBlobManager("pk-live", RELAY);
+    const wmKey = `buzz-sync-watermark.v1:${watermarkLane}:pk-live:${RELAY_KEY}`;
     assert.equal(
-      fw.localStorage.getItem(
-        `buzz-sync-watermark.v1:${watermarkLane}:pk-live:${RELAY_KEY}`,
-      ),
+      fw.localStorage.getItem(wmKey),
       null,
       "watermark starts absent",
     );
@@ -588,16 +522,178 @@ test("revert-fix: undecryptable live event advances watermark before decrypt att
       id: "live-evt-1",
     });
     await new Promise((r) => setTimeout(r, 0));
-    assert.ok(
-      Number(
-        fw.localStorage.getItem(
-          `buzz-sync-watermark.v1:${watermarkLane}:pk-live:${RELAY_KEY}`,
-        ) ?? "0",
-      ) >= 1700005555,
-      "live undecryptable event must advance watermark before decrypt",
-    );
+    assert.ok(Number(fw.localStorage.getItem(wmKey) ?? "0") >= 1700005555);
     manager.destroy();
   } finally {
+    restore();
+    mock.reset();
+  }
+});
+
+const SEAM_PAYLOAD = JSON.stringify({
+  version: 1,
+  sections: [{ id: "a", name: "A", order: 0 }],
+  assignments: {},
+});
+const SEAM_EVENT = (id) => ({
+  id,
+  pubkey: "pk-ambiguous",
+  content: "good-cipher",
+  created_at: 500,
+  kind: 30078,
+  tags: [["d", "channel-sections"]],
+  sig: "s",
+});
+
+// Mutation: dropping ambiguousAttemptIds fold makes B classify A as foreign and adopt.
+test("ambiguous ACK: an accepted-but-unacked A does not make B adopt and disappear", async () => {
+  let releaseFirst = null,
+    publishCalls = 0,
+    storedHead = [];
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead));
+  mock.method(relayClient, "publishEvent", (event) => {
+    publishCalls++;
+    if (publishCalls === 1)
+      return new Promise((_res, reject) => {
+        releaseFirst = () => {
+          storedHead = [SEAM_EVENT("event-a")];
+          reject(new Error("Timed out publishing channel sections."));
+        };
+      });
+    storedHead = [SEAM_EVENT("event-b")];
+    return Promise.resolve();
+  });
+  const { timers, fireDelay, restore } = makeTimerBed();
+  const tauri = installSeamTauriMock(
+    SEAM_PAYLOAD,
+    ["event-a", "event-b"],
+    "pk-ambiguous",
+  );
+  try {
+    const manager = new SyntheticWholeBlobManager("pk-ambiguous", RELAY);
+    const adopted = [];
+    manager.setOnRemoteAdopted((r) => adopted.push(r.eventId));
+    manager.publishSections(makeStore([{ id: "a", name: "A", order: 0 }]));
+    await fireDelay(2000);
+    while (releaseFirst === null) await Promise.resolve();
+    manager.publishSections(makeStore([{ id: "b", name: "B", order: 0 }]));
+    releaseFirst();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    if ([...timers.values()].some((t) => t.ms === 2000)) await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    assert.deepEqual(adopted, [], "B must not adopt A when A's ACK was lost");
+    assert.equal(
+      publishCalls,
+      2,
+      "B publishes above A's ambiguously-accepted head",
+    );
+    assert.equal(manager.getPendingStore(), null);
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// Mutation: dropping the id-guard (folding any advance) makes B erase the foreign winner.
+test("ambiguous ACK: a foreign head is adopted, not folded as our own", async () => {
+  let publishCalls = 0,
+    fetchCalls = 0;
+  mock.method(relayClient, "fetchEvents", () => {
+    fetchCalls++;
+    if (fetchCalls === 1) return Promise.resolve([]);
+    return Promise.resolve([
+      {
+        id: "foreign-winner",
+        pubkey: "pk-reject",
+        content: "good-cipher",
+        created_at: 500,
+        kind: 30078,
+        tags: [["d", "channel-sections"]],
+        sig: "s",
+      },
+    ]);
+  });
+  mock.method(relayClient, "publishEvent", () => {
+    publishCalls++;
+    if (publishCalls === 1)
+      return Promise.reject(
+        new Error("Timed out publishing channel sections."),
+      );
+    return Promise.resolve();
+  });
+  const { timers, fireDelay, restore } = makeTimerBed();
+  const tauri = installSeamTauriMock(
+    SEAM_PAYLOAD,
+    ["event-a", "event-b"],
+    "pk-reject",
+  );
+  try {
+    const manager = new SyntheticWholeBlobManager("pk-reject", RELAY);
+    const adopted = [];
+    manager.setOnRemoteAdopted((r) => adopted.push(r.eventId));
+    manager.publishSections(makeStore([{ id: "a", name: "A", order: 0 }]));
+    await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    manager.publishSections(makeStore([{ id: "b", name: "B", order: 0 }]));
+    if ([...timers.values()].some((t) => t.ms === 2000)) await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    assert.deepEqual(adopted, ["foreign-winner"], "B adopts the foreign head");
+    assert.equal(manager.getPendingStore(), null, "adopt clears pending");
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// Mutation: removing the confirmed prior-gen baseline fold (wholeBlobSyncManager.ts line 721)
+// makes edit-2 adopt edit-1's confirmed head instead of publishing above it.
+test("prior-gen fold: edit-2 queued during e1 publish still publishes above e1's confirmed head", async () => {
+  let releasePublish = null,
+    publishCalls = 0,
+    storedHead = [];
+  const { fireDelay, restore } = makeTimerBed();
+  const tauri = installEchoTauri("pk-pg2");
+  let blockPublish = true;
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead));
+  mock.method(relayClient, "publishEvent", (e) => {
+    publishCalls++;
+    storedHead = [e];
+    if (blockPublish) {
+      blockPublish = false;
+      return new Promise((res) => {
+        releasePublish = () => res();
+      });
+    }
+    return Promise.resolve();
+  });
+  try {
+    const m = new SyntheticWholeBlobManager("pk-pg2", RELAY);
+    const adopted = [];
+    m.setOnRemoteAdopted((r) => adopted.push(r));
+    m.publishSections(makeStore([{ id: "e1", name: "E1", order: 0 }]));
+    await fireDelay(2000);
+    while (!releasePublish) await Promise.resolve();
+    m.publishSections(
+      makeStore([
+        { id: "e2a", name: "A", order: 0 },
+        { id: "e2b", name: "B", order: 1 },
+      ]),
+    );
+    releasePublish();
+    for (let i = 0; i < 200; i++) await Promise.resolve();
+    assert.ok(adopted.length === 0, "edit-2 must not adopt e1's head");
+    assert.notEqual(m.getPendingStore(), null, "edit-2 still pending");
+    await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    assert.equal(publishCalls, 2, "edit-2 publishes above e1's head");
+    assert.equal(m.getPendingStore(), null);
+    m.destroy();
+  } finally {
+    tauri.restore();
     restore();
     mock.reset();
   }

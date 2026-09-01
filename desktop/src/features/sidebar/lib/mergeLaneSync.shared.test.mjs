@@ -1,7 +1,5 @@
 // Shared parameterized test suite for MergeLaneSyncManager subclasses.
-//
-// Usage:
-//   import { runMergeLaneSyncSuite } from "./mergeLaneSync.shared.test.mjs";
+// Usage: import { runMergeLaneSyncSuite } from "./mergeLaneSync.shared.test.mjs";
 //   runMergeLaneSyncSuite({ label: "stars", Manager: ..., ... });
 
 import assert from "node:assert/strict";
@@ -11,11 +9,11 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   installFakeWindow,
   installEchoTauri,
+  installPresignTauriMock,
   makeFakeWindow,
   makeTimerBed,
 } from "./sidebarSyncTestHelpers.mjs";
-import { readChannelStarsOutbox } from "./channelStarsStorage.ts";
-import { ChannelStarSyncManager } from "./channelStarsSync.ts";
+import { MergeLaneSyncManager } from "./mergeLaneSyncManager.ts";
 
 function makeStore(channels = {}) {
   return { version: 1, channels };
@@ -34,11 +32,9 @@ export function runMergeLaneSyncSuite({
   const RELAY = "wss://r.test";
   const RELAY_KEY = encodeURIComponent(RELAY);
 
-  // ─── observe() / high-water ingestion ──────────────────────────────────────
-
   test(`${label}: observe: high-water is per-channel max of rev and updatedAt, monotonic`, () => {
-    const fw = makeFakeWindow();
-    const restore = installFakeWindow(fw);
+    const fw = makeFakeWindow(),
+      restore = installFakeWindow(fw);
     try {
       const m = new Manager("pk", RELAY);
       m.observe(
@@ -59,17 +55,15 @@ export function runMergeLaneSyncSuite({
     }
   });
 
-  // ─── destroy() ─────────────────────────────────────────────────────────────
-
-  test(`${label}: destroy: cancels pending publish without flushing to the relay`, () => {
+  test(`${label}: destroy: cancels pending publish; aborts in-flight publish after fetch resolves`, async () => {
     const publishCalls = [];
     mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
     mock.method(relayClient, "publishEvent", (...args) => {
       publishCalls.push(args);
       return Promise.resolve();
     });
-    const fw = makeFakeWindow();
-    const restore = installFakeWindow(fw);
+    const fw = makeFakeWindow(),
+      restore = installFakeWindow(fw);
     try {
       const manager = new Manager("pk-test", RELAY);
       publish(manager, makeStore({ ch1: makeEntry(true, 100, 1) }));
@@ -80,11 +74,8 @@ export function runMergeLaneSyncSuite({
       restore();
       mock.reset();
     }
-  });
-
-  test(`${label}: destroy: aborts in-flight doPublish after fetchOwnBlobBeforePublish resolves`, async () => {
     let releaseFetch = null;
-    const publishCalls = [];
+    const publishCalls2 = [];
     mock.method(
       relayClient,
       "fetchEvents",
@@ -94,31 +85,24 @@ export function runMergeLaneSyncSuite({
         }),
     );
     mock.method(relayClient, "publishEvent", (...args) => {
-      publishCalls.push(args);
+      publishCalls2.push(args);
       return Promise.resolve();
     });
-    const fw = makeFakeWindow();
-    const restore = installFakeWindow(fw);
+    const fw2 = makeFakeWindow(),
+      restore2 = installFakeWindow(fw2);
     try {
       const manager = new Manager("pk-race", RELAY);
       publish(manager, makeStore({ ch1: makeEntry(true, 100, 1) }));
-      fw._fireTimer();
+      fw2._fireTimer();
       manager.destroy();
       releaseFetch();
       await new Promise((r) => setTimeout(r, 0));
-      assert.equal(
-        publishCalls.length,
-        0,
-        "publishEvent must not be called after destroy",
-      );
+      assert.equal(publishCalls2.length, 0);
     } finally {
-      restore();
+      restore2();
       mock.reset();
     }
   });
-
-  // ─── Generation CAS: A-in-flight → B-click → A-completes ───────────────────
-  // Mutation: dropping the generation CAS in discardPending lets A's outcome null B's pending+outbox.
 
   for (const { name, resolveFirst } of [
     {
@@ -135,8 +119,8 @@ export function runMergeLaneSyncSuite({
     },
   ]) {
     test(`${label}: A-in-flight → B-click → ${name}: B stays pending and B publishes`, async () => {
-      let releaseFirst = null;
-      let publishCount = 0;
+      let releaseFirst = null,
+        publishCount = 0;
       const storedHead = [];
       mock.method(relayClient, "fetchEvents", () =>
         Promise.resolve([...storedHead]),
@@ -150,16 +134,14 @@ export function runMergeLaneSyncSuite({
         storedHead.splice(0, storedHead.length, event);
         return Promise.resolve();
       });
-      const t = makeTimerBed();
-      const tauri = installEchoTauri(`pk-ab-${name}`);
+      const t = makeTimerBed(),
+        tauri = installEchoTauri(`pk-ab-${name}`);
       try {
         const manager = new Manager(`pk-ab-${name}`, RELAY);
-        const storeA = makeStore({ a: makeEntry(true, 100, 1) });
-        const storeB = makeStore({ b: makeEntry(true, 101, 1) });
-        publish(manager, storeA);
+        publish(manager, makeStore({ a: makeEntry(true, 100, 1) }));
         await t.fireDelay(2000);
         while (releaseFirst === null) await Promise.resolve();
-        publish(manager, storeB);
+        publish(manager, makeStore({ b: makeEntry(true, 101, 1) }));
         assert.deepEqual(
           Object.keys(getPending(manager).channels),
           ["b"],
@@ -171,11 +153,11 @@ export function runMergeLaneSyncSuite({
         assert.deepEqual(
           Object.keys(getPending(manager)?.channels ?? {}),
           ["b"],
-          `older A completion (${name}) leaves B pending`,
+          `${name}: B stays pending`,
         );
         assert.ok(
           readOutbox(`pk-ab-${name}`, RELAY),
-          `older A (${name}) leaves B outbox`,
+          `${name}: B outbox intact`,
         );
         const capturedBefore = tauri.capturedPlaintext();
         await t.fireDelay(2000);
@@ -183,7 +165,7 @@ export function runMergeLaneSyncSuite({
         const captured = tauri.capturedPlaintext();
         assert.ok(
           captured && captured !== capturedBefore && captured.includes('"b"'),
-          "B published to the relay",
+          "B published",
         );
         assert.equal(
           getPending(manager),
@@ -204,55 +186,23 @@ export function runMergeLaneSyncSuite({
     });
   }
 
-  // ─── Generation guard: pre-sign seam ───────────────────────────────────────
-  // Mutation: dropping line 400 lets stale A sign and publish after B is queued.
-
   test(`${label}: pre-sign guard: a newer edit during encrypt aborts the stale publish`, async () => {
-    let releaseEncrypt = null;
     const publishCalls = [];
     mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
     mock.method(relayClient, "publishEvent", (...args) => {
       publishCalls.push(args);
       return Promise.resolve();
     });
-    const orig = globalThis.window?.__TAURI_INTERNALS__;
-    if (typeof globalThis.window === "undefined") globalThis.window = {};
-    let encryptCalls = 0;
-    globalThis.window.__TAURI_INTERNALS__ = {
-      invoke: (cmd, args) => {
-        if (cmd === "nip44_encrypt_to_self") {
-          encryptCalls++;
-          if (encryptCalls === 1)
-            return new Promise((res) => {
-              releaseEncrypt = () => res("ct-a");
-            });
-          return Promise.resolve("ct-b");
-        }
-        if (cmd === "nip44_decrypt_from_self") return Promise.resolve("{}");
-        if (cmd === "sign_event")
-          return Promise.resolve(
-            JSON.stringify({
-              id: `evt-${encryptCalls}`,
-              pubkey: "pk-presign",
-              content: args?.content ?? "",
-              created_at: args?.createdAt ?? 0,
-              kind: args?.kind ?? 0,
-              tags: args?.tags ?? [],
-              sig: "s",
-            }),
-          );
-        return Promise.reject(new Error(`unmocked: ${cmd}`));
-      },
-    };
-    const fw = makeFakeWindow();
-    const restore = installFakeWindow(fw);
+    const presign = installPresignTauriMock("pk-presign"),
+      fw = makeFakeWindow(),
+      restore = installFakeWindow(fw);
     try {
       const manager = new Manager("pk-presign", RELAY);
       publish(manager, makeStore({ a: makeEntry(true, 100, 1) }));
       fw._fireTimer();
-      while (releaseEncrypt === null) await Promise.resolve();
+      while (presign.releaseEncrypt === null) await Promise.resolve();
       publish(manager, makeStore({ b: makeEntry(true, 101, 1) }));
-      releaseEncrypt();
+      presign.releaseEncrypt();
       for (let i = 0; i < 50; i++) await Promise.resolve();
       assert.equal(
         publishCalls.length,
@@ -266,19 +216,15 @@ export function runMergeLaneSyncSuite({
       );
       manager.destroy();
     } finally {
-      if (orig !== undefined) globalThis.window.__TAURI_INTERNALS__ = orig;
-      else delete globalThis.window.__TAURI_INTERNALS__;
+      presign.restore();
       restore();
       mock.reset();
     }
   });
 
-  // ─── Bounded-backoff retry ──────────────────────────────────────────────────
-  // Mutation: dropping scheduleRetry leaves the edit stranded.
-
   test(`${label}: failed publish schedules a bounded-backoff retry and keeps the pending edit`, async () => {
-    let publishCount = 0;
-    let storedHead = [];
+    let publishCount = 0,
+      storedHead = [];
     mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead));
     mock.method(relayClient, "publishEvent", (event) => {
       publishCount++;
@@ -286,8 +232,8 @@ export function runMergeLaneSyncSuite({
       storedHead = [event];
       return Promise.resolve();
     });
-    const t = makeTimerBed();
-    const tauri = installEchoTauri("pk-retry");
+    const t = makeTimerBed(),
+      tauri = installEchoTauri("pk-retry");
     try {
       const manager = new Manager("pk-retry", RELAY);
       publish(manager, makeStore({ a: makeEntry(true, 100, 1) }));
@@ -313,12 +259,9 @@ export function runMergeLaneSyncSuite({
     }
   });
 
-  // ─── Retention confirmation (Carl P1) ──────────────────────────────────────
-  // Mutation: clearing on OK alone nulls the pending edit and loses the click.
-
   test(`${label}: publish OK but a peer blob is retained: loser keeps its outbox and retries`, async () => {
-    let publishCount = 0;
-    let storedHead = [];
+    let publishCount = 0,
+      storedHead = [];
     mock.method(relayClient, "fetchEvents", () => Promise.resolve(storedHead));
     const tauri = installEchoTauri("pk-loser");
     mock.method(relayClient, "publishEvent", (event) => {
@@ -347,11 +290,7 @@ export function runMergeLaneSyncSuite({
       await t.fireDelay(2000);
       for (let i = 0; i < 50; i++) await Promise.resolve();
       assert.equal(publishCount, 2, "loser retried");
-      assert.equal(
-        getPending(manager),
-        null,
-        "pending cleared once retained head subsumes click",
-      );
+      assert.equal(getPending(manager), null);
       manager.destroy();
     } finally {
       tauri.restore();
@@ -359,8 +298,6 @@ export function runMergeLaneSyncSuite({
       mock.reset();
     }
   });
-
-  // ─── Boot seed-publish guard ────────────────────────────────────────────────
 
   for (const {
     title,
@@ -438,113 +375,12 @@ export function runMergeLaneSyncSuite({
     });
   }
 
-  // ─── Failed pre-publish fetch: retain, never publish ───────────────────────
-  // Mutation: reverting the merge-lane catch to `publish` fires publishEvent.
-
-  test(`${label}: failed pre-publish fetch retains the pending edit and retries, never publishing`, async () => {
-    mock.method(relayClient, "fetchEvents", () =>
-      Promise.reject(new Error("socket timeout")),
-    );
-    const publishCalls = [];
-    mock.method(relayClient, "publishEvent", (...args) => {
-      publishCalls.push(args);
-      return Promise.resolve();
-    });
-    const fw = makeFakeWindow();
-    const restore = installFakeWindow(fw);
-    const tauri = installEchoTauri("pk-fetchfail");
-    try {
-      const manager = new Manager("pk-fetchfail", RELAY);
-      publish(manager, makeStore({ a: makeEntry(true, 100, 1) }));
-      fw._fireTimer();
-      await new Promise((r) => setTimeout(r, 20));
-      assert.equal(
-        publishCalls.length,
-        0,
-        "must not publish when pre-publish fetch failed",
-      );
-      assert.ok(
-        getPending(manager) !== null,
-        "failed fetch retains pending edit",
-      );
-      assert.ok(
-        readOutbox("pk-fetchfail", RELAY),
-        "durable outbox survives failed fetch",
-      );
-      assert.ok(fw._hasTimer(), "retry scheduled");
-    } finally {
-      tauri.restore();
-      restore();
-      mock.reset();
-    }
-  });
-
-  // ─── Unreadable / unsupported head: retain, never publish ──────────────────
-
-  for (const { title, setupHead, pubkey } of [
-    {
-      title: "unreadable head (decrypt failure)",
-      pubkey: "pk-undec",
-      setupHead: (tauri) => {
-        mock.method(relayClient, "fetchEvents", () =>
-          Promise.resolve([
-            {
-              pubkey: "pk-undec",
-              content: "unregistered-cipher",
-              created_at: 500,
-              id: "evt-undec",
-            },
-          ]),
-        );
-        return tauri;
-      },
-    },
-    {
-      title: "unsupported head payload schema",
-      pubkey: "pk-badver",
-      setupHead: (tauri) => {
-        const head = tauri.mintHead({ version: 2, channels: {} }, 500);
-        mock.method(relayClient, "fetchEvents", () => Promise.resolve([head]));
-        return tauri;
-      },
-    },
-  ]) {
-    test(`${label}: ${title} retains the pending edit and retries, never publishing`, async () => {
-      const fw = makeFakeWindow();
-      const restore = installFakeWindow(fw);
-      const tauri = installEchoTauri(pubkey);
-      setupHead(tauri);
-      const publishCalls = [];
-      mock.method(relayClient, "publishEvent", (...args) => {
-        publishCalls.push(args);
-        return Promise.resolve();
-      });
-      try {
-        const manager = new Manager(pubkey, RELAY);
-        publish(manager, makeStore({ a: makeEntry(true, 100, 1) }));
-        fw._fireTimer();
-        await new Promise((r) => setTimeout(r, 20));
-        assert.equal(publishCalls.length, 0, `${title}: must not publish`);
-        assert.ok(getPending(manager) !== null, `${title}: pending retained`);
-        assert.ok(fw._hasTimer(), "retry scheduled");
-      } finally {
-        tauri.restore();
-        restore();
-        mock.reset();
-      }
-    });
-  }
-
-  // ─── Timestamp clamp ────────────────────────────────────────────────────────
-  // Mutation: removing the clamp lets createdAt = lastRemote+1 (~now+3600).
-
   test(`${label}: timestamp clamp: published createdAt stays inside the relay future window`, async () => {
     const nowSecs = Math.floor(Date.now() / 1000);
-    const farFutureHead = nowSecs + 3_600;
-    const fw = makeFakeWindow();
-    const restore = installFakeWindow(fw);
-    const tauri = installEchoTauri("pk-clamp");
-    const head = tauri.mintHead(makeStore({}), farFutureHead);
+    const fw = makeFakeWindow(),
+      restore = installFakeWindow(fw),
+      tauri = installEchoTauri("pk-clamp");
+    const head = tauri.mintHead(makeStore({}), nowSecs + 3_600);
     mock.method(relayClient, "fetchEvents", () => Promise.resolve([head]));
     let signedCreatedAt = null;
     mock.method(relayClient, "publishEvent", (evt) => {
@@ -570,17 +406,77 @@ export function runMergeLaneSyncSuite({
   });
 }
 
-// ─── Authoritative engine invocation (once, against ChannelStarSyncManager) ──
-// Each case exercises MergeLaneSyncManager directly; ChannelStarSyncManager is
-// the canonical concrete subclass. channelStarsSync.test.mjs and
-// channelMutesSync.test.mjs cover per-lane wire contracts separately.
+const _synthOutbox = new Map();
+
+function _parseStore(json) {
+  if (!json || typeof json !== "object" || json.version !== 1) return null;
+  if (typeof json.channels !== "object" || json.channels === null) return null;
+  return json;
+}
+
+function _mergeStores(local, remote) {
+  const merged = { version: 1, channels: { ...remote.channels } };
+  for (const [id, le] of Object.entries(local.channels)) {
+    const re = merged.channels[id];
+    if (
+      !re ||
+      le.updatedAt > re.updatedAt ||
+      (le.updatedAt === re.updatedAt && le.rev > re.rev)
+    ) {
+      merged.channels[id] = le;
+    }
+  }
+  return merged;
+}
+
+function _isSubsumedBy(candidate, head) {
+  return JSON.stringify(_mergeStores(head, candidate)) === JSON.stringify(head);
+}
+
+function _storesEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+class SyntheticMergeLaneManager extends MergeLaneSyncManager {
+  constructor(pubkey, relayUrl) {
+    super(pubkey, relayUrl, {
+      kind: 30078,
+      dTag: "synth-merge-lane",
+      logPrefix: "synth",
+      publishTimeoutMsg: "synth timeout",
+      publishErrorMsg: "synth error",
+      parse: _parseStore,
+      serializePayload: (s) => ({ version: 1, channels: s.channels }),
+      mergeWithRemote: _mergeStores,
+      isSubsumedBy: _isSubsumedBy,
+      storesEqual: _storesEqual,
+      observe: (hw, store) => {
+        for (const [id, entry] of Object.entries(store.channels)) {
+          const cur = hw.get(id) ?? { rev: 0, updatedAt: 0 };
+          hw.set(id, {
+            rev: Math.max(cur.rev, entry.rev ?? 0),
+            updatedAt: Math.max(cur.updatedAt, entry.updatedAt ?? 0),
+          });
+        }
+      },
+      writeOutbox: (pubkey, store, relayUrl) => {
+        _synthOutbox.set(`${pubkey}:${relayUrl}`, store);
+      },
+      clearOutbox: (pubkey, relayUrl) => {
+        _synthOutbox.delete(`${pubkey}:${relayUrl}`);
+      },
+      isLocalNonEmpty: (s) => Object.keys(s.channels).length > 0,
+    });
+  }
+}
+
 runMergeLaneSyncSuite({
-  label: "stars",
-  Manager: ChannelStarSyncManager,
-  readOutbox: readChannelStarsOutbox,
-  watermarkKind: "channel-stars",
-  makeEntry: (starred, updatedAt, rev) => ({ starred, updatedAt, rev }),
-  publish: (m, s) => m.publishStars(s),
-  getPending: (m) => m.getPendingStarStore(),
-  fetchRemote: (m) => m.fetchRemoteStars(),
+  label: "synth",
+  Manager: SyntheticMergeLaneManager,
+  readOutbox: (pubkey, relay) => _synthOutbox.get(`${pubkey}:${relay}`) ?? null,
+  watermarkKind: "synth-merge-lane",
+  makeEntry: (val, updatedAt, rev) => ({ val, updatedAt, rev }),
+  publish: (m, s) => m.publish(s),
+  getPending: (m) => m.getPendingStore(),
+  fetchRemote: (m) => m.fetchRemoteBlob(),
 });

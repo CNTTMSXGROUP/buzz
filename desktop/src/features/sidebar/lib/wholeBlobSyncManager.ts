@@ -43,7 +43,7 @@ export type RemoteBlob<S> = {
  *               state the client could not read.
  */
 type PublishDecision<S> =
-  | { kind: "publish"; store: S }
+  | { kind: "publish"; store: S; fetchedRemote?: RemoteBlob<S> }
   | { kind: "adopt"; remote: RemoteBlob<S> }
   | { kind: "retain" };
 
@@ -209,7 +209,6 @@ export class WholeBlobSyncManager<S> {
   // foldSupersedingAttemptWinner can require the baseline was poisoned by a
   // strictly prior generation (gen < pendingGeneration).
   private ambiguousAttemptIds = new Map<string, number>();
-  private lastPublishedStore: S | null = null;
   protected destroyed = false;
   // Set by the hook so an adopted remote head (local edit lost whole-blob LWW)
   // is written through to React state + localStorage.
@@ -403,7 +402,6 @@ export class WholeBlobSyncManager<S> {
     }
     this.pendingStore = null;
     this.config.clearOutbox(this.pubkey, this.relayUrl);
-    this.lastPublishedStore = remote.store;
     if (this.destroyed) return;
     this.onRemoteAdopted?.(remote);
   }
@@ -525,7 +523,7 @@ export class WholeBlobSyncManager<S> {
             createdAt: remote.createdAt,
             eventId: remote.eventId,
           });
-          return { kind: "publish", store };
+          return { kind: "publish", store, fetchedRemote: remote };
         }
         // Same-second lower-id peer winner that superseded our own attempted
         // head: baseline.eventId is our attempted id (still in
@@ -536,11 +534,11 @@ export class WholeBlobSyncManager<S> {
         // place. Fold the winner in so this edit publishes above the true
         // retained head rather than adopting it away (Carl P1).
         if (this.foldSupersedingAttemptWinner(remote)) {
-          return { kind: "publish", store };
+          return { kind: "publish", store, fetchedRemote: remote };
         }
         return { kind: "adopt", remote };
       }
-      return { kind: "publish", store };
+      return { kind: "publish", store, fetchedRemote: remote };
     } catch {
       // The pre-publish fetch itself failed (timeout / auth / socket) — this is
       // NOT proof that no head exists. Publishing here would sign above a stale
@@ -638,9 +636,17 @@ export class WholeBlobSyncManager<S> {
         return;
       }
       const merged = decision.store;
+      // Skip publication only when the freshly fetched, readable authoritative
+      // head is semantically equal to the pending store — the relay already holds
+      // exactly what we want to publish. Using `lastPublishedStore` here would be
+      // incorrect: passive live/fetch observations advance the observed relay head
+      // without refreshing `lastPublishedStore`, so equality with a historical
+      // published value cannot prove the relay has not moved on (e.g. a peer
+      // published S2 after our S1, and now the user re-selects S1 — discarding
+      // against lastPublishedStore=S1 would silently drop the explicit intent).
       if (
-        this.lastPublishedStore !== null &&
-        this.config.storesEqual(merged, this.lastPublishedStore)
+        decision.fetchedRemote !== undefined &&
+        this.config.storesEqual(merged, decision.fetchedRemote.store)
       ) {
         this.discardPending(gen);
         return;
@@ -722,10 +728,9 @@ export class WholeBlobSyncManager<S> {
         createdAt: event.created_at,
         eventId: event.id,
       });
-      // Only claim this store as the published head if it is still the current
-      // edit; a newer edit queued mid-flight owns lastPublishedStore now.
+      // Reset retry backoff only when this is still the current generation —
+      // a stale generation's confirmed write does not own the pending state.
       if (gen === this.pendingGeneration) {
-        this.lastPublishedStore = merged;
         this.retryDelayMs = RETRY_BASE_MS;
       }
       this.discardPending(gen);

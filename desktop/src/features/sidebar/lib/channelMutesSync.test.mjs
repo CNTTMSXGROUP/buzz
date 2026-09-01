@@ -1,18 +1,14 @@
 // Compact wire-contract adapter for ChannelMuteSyncManager.
-// Shared merge-lane sync engine invariants are covered by mergeLaneSync.shared.test.mjs,
-// which runs directly against ChannelStarSyncManager (same engine, different config).
-// This file asserts only the mutes-specific wiring: event kind, d-tag, serialized
-// payload shape, parser delegation, subsumption, and typed API.
+// Shared engine invariants are in mergeLaneSync.shared.test.mjs.
+// This file asserts only mutes-specific wiring: event kind, d-tag, payload shape, subsumption, and typed API.
 
 import assert from "node:assert/strict";
 import test, { mock } from "node:test";
 
 import { relayClient } from "@/shared/api/relayClient";
 import {
-  isMutesStoreSubsumedBy,
   parseMutePayload,
   readChannelMutesOutbox,
-  writeChannelMutesOutbox,
 } from "./channelMutesStorage.ts";
 import { ChannelMuteSyncManager } from "./channelMutesSync.ts";
 import {
@@ -44,12 +40,7 @@ test("mutes wire: kind=30078, d-tag='channel-mutes', payload has 'channels' not 
     assert.ok(publishedEvent !== null, "publish must have been called");
     assert.equal(publishedEvent.kind, 30078, "kind must be 30078");
     const dTag = publishedEvent.tags.find((t) => t[0] === "d")?.[1];
-    assert.equal(
-      dTag,
-      "channel-mutes",
-      "d-tag must be 'channel-mutes' not 'channel-stars'",
-    );
-    // Plaintext must serialize 'channels' field.
+    assert.equal(dTag, "channel-mutes", "d-tag must not be 'channel-stars'");
     const plaintext = tauri.capturedPlaintext();
     const parsed = JSON.parse(plaintext);
     assert.ok("channels" in parsed, "payload must have 'channels' field");
@@ -82,24 +73,47 @@ test("mutes wire: parser delegates to parseMutePayload (muted field, rejects sta
   );
 });
 
-test("mutes wire: outbox/subsumption callbacks are wired to mutes storage", () => {
-  const store = {
-    version: 1,
-    channels: { ch: { muted: true, updatedAt: 100, rev: 1 } },
-  };
-  writeChannelMutesOutbox("pk-wiring-m", store, RELAY);
-  assert.ok(
-    readChannelMutesOutbox("pk-wiring-m", RELAY) !== null,
-    "writeChannelMutesOutbox wired",
-  );
-  const head = {
-    version: 1,
-    channels: { ch: { muted: false, updatedAt: 200, rev: 2 } },
-  };
-  assert.ok(
-    isMutesStoreSubsumedBy(store, head),
-    "isMutesStoreSubsumedBy wired",
-  );
+test("mutes wire: outbox/subsumption callbacks are wired to mutes storage (not stars)", async () => {
+  // Drive the full manager publish cycle: publish sets the mutes outbox;
+  // a confirming fetch returns a subsuming head → discardPending clears mutes outbox.
+  // A copy/paste mutation wiring stars outbox/subsumption to the mutes config would:
+  //   (a) write to the stars outbox prefix (readChannelMutesOutbox returns null), OR
+  //   (b) check isStarsStoreSubsumedBy instead of isMutesStoreSubsumedBy, failing to
+  //       confirm subsumption on a muted head → outbox never clears.
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
+  mock.method(relayClient, "publishEvent", () => Promise.resolve());
+  const fw = makeFakeWindow();
+  const restore = installFakeWindow(fw);
+  const tauri = installEchoTauri("pk-outbox-mutes");
+  try {
+    const m = new ChannelMuteSyncManager("pk-outbox-mutes", RELAY);
+    const store = {
+      version: 1,
+      channels: { ch: { muted: true, updatedAt: 100, rev: 1 } },
+    };
+    m.publishMutes(store);
+    // Outbox must be written synchronously on publish — proves writeChannelMutesOutbox is wired.
+    assert.ok(
+      readChannelMutesOutbox("pk-outbox-mutes", RELAY) !== null,
+      "publishMutes must write to the mutes outbox (not stars)",
+    );
+    // Drive through a full publish cycle with a subsuming head. After discardPending,
+    // the mutes outbox must be cleared — proves clearChannelMutesOutbox + isMutesStoreSubsumedBy
+    // are wired (a stars-subsumption mutation would see starred=undefined → not subsumed → no clear).
+    const subsumingHead = tauri.mintHead(store, 50, "evt-sub-mutes");
+    subsumingHead.tags = [["d", "channel-mutes"]];
+    mock.method(relayClient, "fetchEvents", () =>
+      Promise.resolve([subsumingHead]),
+    );
+    fw._fireTimer(); // fires debounce → doPublish → fetchOwnBlob → publish → confirmRetained
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(readChannelMutesOutbox("pk-outbox-mutes", RELAY), null);
+    m.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
 });
 
 test("mutes wire: typed API (publishMutes, getPendingMuteStore, fetchRemoteMutes, cancelPendingMutePublish)", () => {
@@ -115,10 +129,7 @@ test("mutes wire: typed API (publishMutes, getPendingMuteStore, fetchRemoteMutes
     });
     assert.ok(m.getPendingMuteStore() !== null, "publishMutes sets pending");
     m.cancelPendingMutePublish();
-    assert.ok(
-      typeof m.cancelPendingMutePublish === "function",
-      "cancelPendingMutePublish is callable",
-    );
+    assert.ok(typeof m.cancelPendingMutePublish === "function");
     assert.ok(
       typeof m.fetchRemoteMutes === "function",
       "fetchRemoteMutes exists",

@@ -1,15 +1,16 @@
-// Shared parameterized test suite for merge-lane React hooks
-// (useChannelStars.ts, useChannelMutes.ts).
-//
-// Usage:
-//   import { runMergeLaneHookSuite } from "./mergeLaneHook.shared.test.mjs";
+// Shared parameterized test suite for merge-lane React hooks (useChannelStars.ts, useChannelMutes.ts).
+// Usage: import { runMergeLaneHookSuite } from "./mergeLaneHook.shared.test.mjs";
 //   runMergeLaneHookSuite({ label: "stars", ... });
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
-import { makeHookStubs } from "./sidebarSyncTestHelpers.mjs";
+import {
+  installEchoTauri,
+  makeHookStubs,
+  makeHookTimerBed,
+} from "./sidebarSyncTestHelpers.mjs";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -26,8 +27,6 @@ before(() => {
 
 after(() => dom.window.close());
 
-// Shared harness: stub the relay so no network/live/reconnect fires unless a
-// test installs its own live callback.
 const { stubRelay } = makeHookStubs();
 
 export function runMergeLaneHookSuite({
@@ -90,9 +89,8 @@ export function runMergeLaneHookSuite({
     }
   });
 
-  // Monotonic mint: combines persisted-local high-water, far-future observation,
-  // and same-second click sequence. Mutation: dropping maxUpdatedAtSeen or maxRevSeen
-  // tracking makes later clicks mint below the observed high-water and lose on merge.
+  // Monotonic mint: far-future live event + persisted high-water + same-second clicks.
+  // Mutation: dropping maxUpdatedAtSeen/maxRevSeen makes later clicks mint below observed high-water.
   test(`${label}: monotonic mint — persisted high-water + far-future live event + same-second clicks advance rev`, async () => {
     const { act, cleanup, renderHook } = await import("@testing-library/react");
     const { relayClient } = await import("@/shared/api/relayClient");
@@ -101,7 +99,6 @@ export function runMergeLaneHookSuite({
     const restore = stubRelay(relayClient, { live });
     const origTauri = window.__TAURI_INTERNALS__;
     const origDateNow = Date.now;
-    // Local clock: 100s. Persisted head has updatedAt 500, rev 4.
     Date.now = () => 100 * 1_000;
     const FUTURE = 500;
     window.__TAURI_INTERNALS__ = {
@@ -116,7 +113,6 @@ export function runMergeLaneHookSuite({
       },
     };
     const pubkey = `pk-${label}-mono`;
-    // Seed a persisted store at rev 4, updatedAt 500.
     window.localStorage.setItem(
       storageKey(pubkey, "wss://r"),
       makePayload({
@@ -129,7 +125,6 @@ export function runMergeLaneHookSuite({
         hook = renderHook(() => useHook(pubkey, "wss://r"));
         for (let i = 0; i < 20; i++) await Promise.resolve();
       });
-      // Deliver a live event with rev 7 (higher than persisted 4).
       await act(async () => {
         live.cb({
           id: "future-head",
@@ -142,7 +137,6 @@ export function runMergeLaneHookSuite({
         });
         for (let i = 0; i < 20; i++) await Promise.resolve();
       });
-      // First click: must mint above max(FUTURE, rev 7).
       await act(async () => hook.result.current[trueAction]("shared"));
       let p = readStore(pubkey, "wss://r");
       assert.equal(
@@ -156,7 +150,6 @@ export function runMergeLaneHookSuite({
         "updatedAt held at observed high-water",
       );
       assert.equal(p.channels.shared.rev, 8, "rev = maxRevSeen(7) + 1");
-      // Second same-second click: rev must strictly advance.
       await act(async () => hook.result.current[falseAction]("shared"));
       p = readStore(pubkey, "wss://r");
       assert.equal(
@@ -179,38 +172,59 @@ export function runMergeLaneHookSuite({
     }
   });
 
-  // Cross-window storage merge + outbox resume.
-  // (a) Cross-window storage event is max-merged into this window.
-  // (b) Click after merge mints above the observed peer high-water.
-  // (c) Bootstrap transfers resumed outbox to a fresh v2 key; persists while head
-  //     does not subsume it; clears once a subsuming head is confirmed.
-  // Mutations: (a) removing the storageEvent listener; (b) not tracking peer
-  // maxRevSeen; (c) dropping writeOwnOutbox or clearing on any retained head.
-  test(`${label}: cross-window merge, subsequent click mints above peer high-water, v2 outbox retained until subsumed`, async () => {
+  // Bootstrap replay seam: bootstrap calls publishStars/publishMutes(outbox), which drives
+  // a full timer→publish→confirm cycle for the resumed edit before any new click.
+  // Mutations: (a) removing storageEvent listener; (b) skipping bootstrap publish(outbox);
+  // (c) clearing on any ACK.
+  test(`${label}: bootstrap replay — resumed edit drives timer/publish/confirm; non-subsuming retains key; subsuming clears`, async () => {
     const { act, cleanup, renderHook } = await import("@testing-library/react");
     const { relayClient } = await import("@/shared/api/relayClient");
 
-    // Relay starts empty (hold path — no head on first bootstrap fetch).
-    // fetchEvents is overridden per-phase below.
     let fetchResult = [];
     const restore = stubRelay(relayClient, {});
     relayClient.fetchEvents = async () => fetchResult;
 
+    const { timers, fireDelay, restore: restoreTimers } = makeHookTimerBed();
     const origDateNow = Date.now;
     Date.now = () => 100 * 1_000;
     const pubkey = `pk-${label}-xwin`;
     const relayUrl = "wss://r";
     const encodedRelay = encodeURIComponent(relayUrl);
 
-    // Pre-seed a resumed outbox record using the LEGACY key format so bootstrap
-    // picks it up via the legacy-key enumeration path.
-    const legacyOutboxKey = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}`;
     window.localStorage.setItem(
-      legacyOutboxKey,
+      `${outboxKeyPrefix}:${pubkey}:${encodedRelay}`,
       makePayload({
         resumed: { [entryValueField]: true, updatedAt: 90, rev: 2 },
       }),
     );
+
+    const tauri = installEchoTauri(pubkey);
+    const nsHead = tauri.mintHead(
+      {
+        version: 1,
+        channels: { other: { [entryValueField]: false, updatedAt: 1, rev: 0 } },
+      },
+      50,
+      "evt-ns",
+    );
+    nsHead.tags = [["d", dTag]];
+    const subHead = tauri.mintHead(
+      {
+        version: 1,
+        channels: {
+          resumed: { [entryValueField]: true, updatedAt: 90, rev: 2 },
+        },
+      },
+      60,
+      "evt-sub",
+    );
+    subHead.tags = [["d", dTag]];
+
+    const v2Prefix = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:`;
+    const v2Keys = () =>
+      Array.from({ length: window.localStorage.length }, (_, i) =>
+        window.localStorage.key(i),
+      ).filter((k) => k?.startsWith(v2Prefix) && k.split(":").length >= 5);
 
     let hook = null;
     try {
@@ -218,33 +232,135 @@ export function runMergeLaneHookSuite({
         hook = renderHook(() => useHook(pubkey, relayUrl));
         for (let i = 0; i < 40; i++) await Promise.resolve();
       });
-
-      // (c1) Bootstrap must have transferred the resumed intent to a fresh v2
-      // write-once key (prefix:pubkey:relay:nonce:seq — more colons than legacy).
-      // The legacy key is never deleted; only a v2 key is mutation-valid proof.
-      const v2KeyPrefix = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:`;
-      const allKeys = Array.from(
-        { length: window.localStorage.length },
-        (_, i) => window.localStorage.key(i),
-      ).filter((k) => k && k.startsWith(v2KeyPrefix));
-      // A v2 own key has two more colon-separated segments (nonce + seq) beyond
-      // the legacy three-segment form.
-      const v2OwnKeys = allKeys.filter((k) => {
-        const segs = k.split(":").length;
-        // legacy = prefix:pubkey:encodedRelay (3+ segs but no nonce/seq)
-        // v2 own = prefix:pubkey:encodedRelay:nonce:seq (5+ segs)
-        return segs >= 5;
-      });
       assert.ok(
-        v2OwnKeys.length > 0,
-        "bootstrap must have written a v2 nonce:seq own key — dropping writeOwnOutbox breaks this",
+        v2Keys().length > 0,
+        "bootstrap must write v2 key — skipping publish(outbox) breaks this",
       );
 
-      // (a) Peer window writes a store with rev 12 and fires a storage event.
+      // Debounce fires (fetchResult=[]): publish resumed → empty confirm → retry.
+      // retryDelayMs starts at 2000ms and doubles each failed confirm.
+      await fireDelay(2000);
+      assert.ok(v2Keys().length > 0, "v2 key survives empty confirm");
+      assert.ok(
+        [...timers.values()].some((t) => t.ms === 2000),
+        "retry scheduled after empty confirm — scheduleRetry not called breaks this",
+      );
+
+      // Non-subsuming retry (delay=2000ms): other-only head does not subsume resumed → retry.
+      // retryDelayMs now doubles to 4000ms for the next cycle.
+      fetchResult = [nsHead];
+      await fireDelay(2000);
+      assert.ok(
+        v2Keys().length > 0,
+        "v2 key survives non-subsuming confirm — clearing on any ACK breaks this",
+      );
+      assert.ok(
+        [...timers.values()].some((t) => t.ms === 4000),
+        "retry rescheduled (4000ms) after non-subsuming confirmation",
+      );
+
+      // Subsuming retry (delay=4000ms): head carries resumed → discardPending → key cleared.
+      fetchResult = [subHead];
+      await fireDelay(4000);
+      assert.equal(
+        v2Keys().length,
+        0,
+        "v2 key cleared on subsuming confirm — clearing on any ACK does not reach here",
+      );
+
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreTimers();
+      restore();
+    }
+  });
+
+  // Click-before-opposite-peer-arrival: local true-click on "shared" at t=200 s, then a
+  // peer window writes shared=false at (updatedAt=900, rev=12) via StorageEvent. Peer's
+  // NEWER tuple wins max-merge → stored=false/900/12, idsField evicts "shared". The real
+  // 3 000 ms reconcile tick fires and fetches the authoritative relay head at the
+  // observably DISTINCT tuple (updatedAt=950, rev=13) → stored entry advances to 950/13.
+  //
+  // Bootstrap returns empty — no relay head on mount — so click mints at updatedAt=200
+  // and peer's 900 unambiguously wins max-merge.
+  //
+  // Mutations:
+  //   (a) Drop storage listener → peer StorageEvent never runs max-merge; stored shared
+  //       stays true/200/1 and idsField keeps "shared" — fails the arrival tuple assert.
+  //   (b) Suppress fetchRemote* inside the scheduled tick → fetchCount stays at
+  //       fetchBefore — fails "reconcile fetch fired".
+  //   (c) Perform the fetch but drop/ignore the fetched result → stored entry stays at
+  //       false/900/12 (arrival value), not the relay head's 950/13 — fails the final
+  //       tuple assert.
+  test(`${label}: click-before-opposite-peer-arrival — peer tuple evicts click; reconcile applies distinct relay head`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const { relayClient } = await import("@/shared/api/relayClient");
+    let fetchCount = 0;
+    let lastFetchFilter = null;
+    const restore = stubRelay(relayClient, {});
+    const tauri = installEchoTauri(`pk-${label}-cpeer`);
+    const pubkey = `pk-${label}-cpeer`;
+    const relayUrl = "wss://r";
+    // Bootstrap returns empty; reconcile head is set only after the storage event.
+    let fetchResult = [];
+    relayClient.fetchEvents = async (f) => {
+      fetchCount++;
+      lastFetchFilter = f;
+      return fetchResult;
+    };
+    // Relay authoritative head: shared=false at the DISTINCT tuple (updatedAt=950, rev=13).
+    // This is observably different from the peer's arrival (900, 12) so reconcile
+    // application can be proven: if applyRemote is a no-op the final stored entry
+    // stays at 900/12 instead of advancing to 950/13.
+    const authoritativeStore = {
+      version: 1,
+      channels: {
+        shared: { [entryValueField]: false, updatedAt: 950, rev: 13 },
+      },
+    };
+    const relayHead = tauri.mintHead(authoritativeStore, 951, "evt-auth");
+    relayHead.tags = [["d", dTag]];
+    relayHead.pubkey = pubkey;
+    relayHead.kind = 30078;
+    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+    const origDateNow = Date.now;
+    Date.now = () => 200 * 1_000;
+    let hook = null;
+    try {
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+      // Local true-click first: no relay head seen → mints updatedAt=200, rev=1.
+      await act(async () => hook.result.current[trueAction]("shared"));
+      assert.ok(
+        hook.result.current[idsField].has("shared"),
+        "local click applied immediately",
+      );
+      {
+        const p = readStore(pubkey, relayUrl);
+        assert.equal(
+          p.channels.shared[entryValueField],
+          true,
+          "stored shared=true after local click",
+        );
+        assert.equal(
+          p.channels.shared.updatedAt,
+          200,
+          "click minted at updatedAt=200",
+        );
+      }
+      // Peer writes shared=false at (updatedAt=900, rev=12) — NEWER than click (200).
+      // Max-merge after the storage event selects the peer's tuple as the winner.
+      // Mutation (a): drop listener → this StorageEvent is never processed; stored
+      // shared stays true/200/1; arrival tuple assert below fails.
       window.localStorage.setItem(
         storageKey(pubkey, relayUrl),
         makePayload({
-          shared: { [entryValueField]: true, updatedAt: 900, rev: 12 },
+          shared: { [entryValueField]: false, updatedAt: 900, rev: 12 },
         }),
       );
       await act(async () => {
@@ -253,84 +369,84 @@ export function runMergeLaneHookSuite({
             key: storageKey(pubkey, relayUrl),
           }),
         );
+        for (let i = 0; i < 30; i++) await Promise.resolve();
+      });
+      // Peer's tuple wins: stored entry is exactly false/900/12.
+      {
+        const p = readStore(pubkey, relayUrl);
+        assert.equal(
+          p.channels.shared[entryValueField],
+          false,
+          "arrival: shared=false — mutation (a) leaves true",
+        );
+        assert.equal(
+          p.channels.shared.updatedAt,
+          900,
+          "arrival: updatedAt=900 — mutation (a) leaves 200",
+        );
+        assert.equal(
+          p.channels.shared.rev,
+          12,
+          "arrival: rev=12 — mutation (a) leaves 1",
+        );
+      }
+      assert.ok(
+        !hook.result.current[idsField].has("shared"),
+        "peer false evicts local click from idsField — mutation (a) leaves it present",
+      );
+      // Fire the 3 000 ms reconcile timer; the relay returns the DISTINCT authoritative
+      // head at (950, 13). After applyRemote the stored entry must advance to 950/13.
+      fetchResult = [relayHead];
+      const fetchBefore = fetchCount;
+      await act(async () => {
+        await fireDelay(3000);
         for (let i = 0; i < 20; i++) await Promise.resolve();
       });
-      assert.equal(
-        hook.result.current[idsField].has("shared"),
-        true,
-        "peer write merged into this window",
-      );
-
-      // (b) Click after merge mints above peer high-water (updatedAt 900, rev 12).
-      await act(async () => hook.result.current[falseAction]("shared"));
-      const p = readStore(pubkey, relayUrl);
-      assert.equal(p.channels.shared[entryValueField], false, "click applied");
-      assert.equal(p.channels.shared.updatedAt, 900, "held at peer high-water");
-      assert.equal(p.channels.shared.rev, 13, "rev = peer rev + 1");
-
-      // (c2) Non-subsuming retained head: v2 own key must remain.
-      // Return a head that does NOT carry the resumed channel's entry.
-      const origTauri = window.__TAURI_INTERNALS__;
-      window.__TAURI_INTERNALS__ = {
-        invoke: (cmd) => {
-          if (cmd === "nip44_decrypt_from_self")
-            return Promise.resolve(
-              makePayload({
-                other: { [entryValueField]: false, updatedAt: 1, rev: 0 },
-              }),
-            );
-          if (cmd === "nip44_encrypt_to_self") return Promise.resolve("ct-enc");
-          if (cmd === "sign_event")
-            return Promise.resolve(
-              JSON.stringify({
-                id: "evt-x",
-                pubkey,
-                content: "ct-enc",
-                created_at: 0,
-                kind: 30078,
-                tags: [["d", dTag]],
-                sig: "s",
-              }),
-            );
-          return Promise.reject(new Error(`unmocked: ${cmd}`));
-        },
-      };
-      fetchResult = [
-        {
-          id: "non-subsuming-head",
-          pubkey,
-          content: "ct-nonsubsume",
-          created_at: 50,
-          kind: 30078,
-          tags: [["d", dTag]],
-          sig: "s",
-        },
-      ];
-      // Wait for a reconcile tick (bootstrap + reconcile share the fetch path).
-      for (let i = 0; i < 40; i++) await Promise.resolve();
-      // Re-enumerate: the (b) click replaced the bootstrap v2 key with a fresh
-      // one (writeOwnOutbox always writes a new key and drops superseded own
-      // keys). Assert that at least one v2 own key exists — a non-subsuming
-      // retained head must NOT clear it.
-      const currentV2Keys = Array.from(
-        { length: window.localStorage.length },
-        (_, i) => window.localStorage.key(i),
-      ).filter(
-        (k) => k && k.startsWith(v2KeyPrefix) && k.split(":").length >= 5,
-      );
+      // Mutation (b): suppress fetchRemote* inside tick → fetchCount unchanged.
       assert.ok(
-        currentV2Keys.length > 0,
-        "v2 own key must survive a non-subsuming retained head — clearing on any retained head breaks this",
+        fetchCount > fetchBefore,
+        "reconcile fetch fired — mutation (b) suppressing fetchRemote* breaks this",
       );
-      window.__TAURI_INTERNALS__ = origTauri;
-
+      assert.deepEqual(
+        lastFetchFilter,
+        {
+          kinds: [30078],
+          authors: [pubkey],
+          "#d": [dTag],
+          limit: 1,
+        },
+        "reconcile fetch filter exact shape",
+      );
+      // Mutation (c): fetch fires but result is dropped → stored entry stays at 900/12.
+      {
+        const p = readStore(pubkey, relayUrl);
+        assert.equal(
+          p.channels.shared[entryValueField],
+          false,
+          "after reconcile: shared=false",
+        );
+        assert.equal(
+          p.channels.shared.updatedAt,
+          950,
+          "after reconcile: updatedAt advanced to 950 — mutation (c) leaves 900",
+        );
+        assert.equal(
+          p.channels.shared.rev,
+          13,
+          "after reconcile: rev advanced to 13 — mutation (c) leaves 12",
+        );
+      }
+      assert.ok(
+        !hook.result.current[idsField].has("shared"),
+        "reconcile: shared stays absent from idsField",
+      );
       hook.unmount();
     } finally {
       cleanup();
       Date.now = origDateNow;
+      tauri.restore();
+      restoreTimers();
       restore();
-      // Clean up our seeded keys.
-      window.localStorage.removeItem(legacyOutboxKey);
     }
   });
 }

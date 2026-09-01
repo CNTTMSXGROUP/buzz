@@ -448,7 +448,7 @@ jobs:
       contents: read
     services:
       postgres:
-        # Match docker-compose.yml: wake FTS migration uses PG17 SET EXPRESSION.
+        # Match the PostgreSQL 17 contract in VISION.md and docker-compose.yml.
         image: postgres:17
         env:
           POSTGRES_USER: buzz

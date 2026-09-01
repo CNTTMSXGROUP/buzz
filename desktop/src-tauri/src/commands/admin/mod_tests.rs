@@ -957,13 +957,15 @@ async fn dot_localhost_origin_parses_and_probe_inner_reaches_loopback_via_nip98(
         reqs.len(),
     );
 
-    // Both requests must carry `Host: admin.localhost:<port>` verbatim.
-    let expected_host = format!("Host: admin.localhost:{port}");
+    // Both requests must carry `host: admin.localhost:<port>` (case-insensitive header name).
+    // The invariant is that the Host *value* preserves `admin.localhost`, not `127.0.0.1`.
+    let expected_host_value = format!("admin.localhost:{port}");
     for (i, raw) in reqs.iter().enumerate() {
         let text = std::str::from_utf8(raw).expect("request must be valid UTF-8");
+        let lower = text.to_lowercase();
         assert!(
-            text.contains(&expected_host),
-            "request {i} must carry {expected_host}; got headers:\n{text}",
+            lower.contains(&format!("host: {expected_host_value}")),
+            "request {i} must carry Host: {expected_host_value}; got headers:\n{text}",
         );
     }
 }

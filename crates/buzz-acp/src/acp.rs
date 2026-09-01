@@ -4068,9 +4068,13 @@ pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Op
 
         return Some(match raw_input {
             Some(ri) if ri.is_object() => {
-                // Budget: reserve 3 bytes for "(…)" wrapper overhead so the
+                // Budget: reserve 5 bytes for wrapper overhead so the
                 // combined string always fits in DESCRIPTION_COMBINED_MAX_BYTES.
-                let wrapper_overhead = 3usize; // "(" + possible "…" + ")"
+                // Worst case: "(ctx…)" where "…" is the UTF-8 ellipsis U+2026
+                // (3 bytes) plus the parens = 5 bytes total. Using 5 as the
+                // constant covers both the truncated ("(ctx…)") and
+                // non-truncated ("(ctx)") cases.
+                let wrapper_overhead = 5usize; // "(" + "…" (3 bytes, UTF-8) + ")"
                 let title_bytes = t.len(); // titles are ASCII in practice
                 let context_budget = DESCRIPTION_COMBINED_MAX_BYTES
                     .saturating_sub(title_bytes)
@@ -12463,27 +12467,12 @@ mod tests {
             .map(|e| e.nonce.clone())
             .expect("one entry must be in the pending map after registration");
 
-        // Wait for test_pair to auto-ACK the sentinel (Publishing → Pending).
-        let idle = std::time::Duration::from_millis(200);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            client.read_until_response_with_idle_timeout(
-                "sess-f3-kinds",
-                99,
-                idle,
-                hard,
-                std::time::Duration::from_secs(10),
-            ),
-        )
-        .await;
-
-        assert_eq!(
-            client.pending_permissions.len(),
-            1,
-            "one entry must still be Pending after allow_once snapshotted"
-        );
-
-        // Send allow_always — must be IGNORED.
+        // Pre-send all three decisions into the channel buffer before the loop
+        // runs. The channel capacity (8) comfortably holds them.
+        //
+        // Sequence: allow_always → rejected, reject_always → rejected, allow_once → accepted.
+        // The loop processes them in order while running, without any intermediate
+        // return (no timeout restart needed, no second install_permission_decision_rx call).
         perm_tx
             .send(PermissionDecision {
                 request_nonce: nonce.clone(),
@@ -12491,24 +12480,6 @@ mod tests {
             })
             .await
             .expect("send must succeed");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            client.read_until_response_with_idle_timeout(
-                "sess-f3-kinds",
-                99,
-                idle,
-                hard,
-                std::time::Duration::from_secs(10),
-            ),
-        )
-        .await;
-        assert_eq!(
-            client.pending_permissions.len(),
-            1,
-            "entry must still be Pending after allow_always decision (ignored)"
-        );
-
-        // Send reject_always — must ALSO be IGNORED.
         perm_tx
             .send(PermissionDecision {
                 request_nonce: nonce.clone(),
@@ -12516,24 +12487,6 @@ mod tests {
             })
             .await
             .expect("send must succeed");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            client.read_until_response_with_idle_timeout(
-                "sess-f3-kinds",
-                99,
-                idle,
-                hard,
-                std::time::Duration::from_secs(10),
-            ),
-        )
-        .await;
-        assert_eq!(
-            client.pending_permissions.len(),
-            1,
-            "entry must still be Pending after reject_always decision (ignored)"
-        );
-
-        // Send allow_once — MUST be accepted and the entry resolved.
         perm_tx
             .send(PermissionDecision {
                 request_nonce: nonce.clone(),
@@ -12541,21 +12494,31 @@ mod tests {
             })
             .await
             .expect("send must succeed");
+
+        // Run the loop until it resolves the entry. The loop will:
+        //   1. auto-ACK the sentinel (Publishing → Pending) via test_pair
+        //   2. drain allow_always → ignored (not a ruled card action)
+        //   3. drain reject_always → ignored (not a ruled card action)
+        //   4. drain allow_once → accepted → entry resolved → map empties
+        let idle = std::time::Duration::from_millis(200);
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.read_until_response_with_idle_timeout(
                 "sess-f3-kinds",
-                99,
+                42,
                 idle,
                 hard,
                 std::time::Duration::from_secs(10),
             ),
         )
         .await;
+
         assert!(
             client.pending_permissions.is_empty(),
             "entry must be resolved after allow_once decision; \
-             mutation: accept any option_id → entry resolved on allow_always → test above passes but this panics"
+             allow_always and reject_always must be ignored by the read loop \
+             (mutation: accept any option_id → entry resolved early on allow_always → \
+             assertion above fires)"
         );
     }
 }

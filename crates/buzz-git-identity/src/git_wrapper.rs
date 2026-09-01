@@ -2751,44 +2751,51 @@ mod tests {
     // Tests that use a self-contained stub signer should ALSO acquire this guard
     // (so the stub, not the ambient program, is used for signing).
 
-    #[cfg(unix)]
-    static GIT_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// A guard that clears `GIT_CONFIG_*` and signing-identity env vars for the
+    /// duration of a test.  Backed by the crate-wide `TestEnv`/`ENV_LOCK` so
+    /// the entire snapshot/clear/test/restore lifetime is serialised under one
+    /// mutex together with all sibling tests that use `TestEnv::lock()`.
+    ///
+    /// `saved` holds dynamically-discovered keys whose values are not tracked by
+    /// the `TestEnv` itself (it only tracks statically-named keys).  `Drop`
+    /// restores these pairs while the `TestEnv` lock is still held, then the
+    /// `_env` field releases the lock.
     #[cfg(unix)]
     struct GitConfigEnvGuard {
+        /// Dynamic `GIT_CONFIG_*` / signing-key pairs not tracked by `_env`.
         saved: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        /// Crate-wide env lock — released AFTER `saved` is restored in `Drop`.
+        _env: TestEnv,
     }
 
     #[cfg(unix)]
     impl Drop for GitConfigEnvGuard {
         fn drop(&mut self) {
+            // Restore dynamic vars first, while `_env` (and thus ENV_LOCK)
+            // is still held.  `_env` is dropped after this method returns,
+            // releasing the lock only once both sets of vars are back.
             for (k, v) in self.saved.drain(..) {
                 std::env::set_var(k, v);
             }
-            // `_lock` is dropped after `saved` is restored, releasing the
-            // mutex only once the env is back to its pre-test state.
         }
     }
 
     /// Clear ambient `GIT_CONFIG_*` and signing-identity env vars for the
-    /// duration of a test.  Acquires `GIT_CONFIG_ENV_LOCK` so the full
-    /// snapshot/clear/test/restore cycle is serialised across concurrent
-    /// nextest threads.  Bind the returned guard to `_guard` (not `_`) so
-    /// it lives for the full test scope.
+    /// duration of a test.  Acquires the crate-wide `ENV_LOCK` (via
+    /// `TestEnv::lock()`) so the full snapshot/clear/test/restore cycle is
+    /// serialised under one mutex with all other env-mutating tests.  Bind the
+    /// returned guard to `_guard` (not `_`) so it lives for the full test scope.
     ///
-    /// Cleared: `GIT_CONFIG_*` (injected git config), `BUZZ_PRIVATE_KEY` and
-    /// `NOSTR_PRIVATE_KEY` (loaded by `git-sign-nostr` before `nostr.keyfile`
-    /// config — without clearing these, `git-sign-nostr` uses the harness key
-    /// instead of the test-vector key even when `GIT_CONFIG_*` is clean),
-    /// and `BUZZ_AUTH_TAG` (a harness-signed owner attestation bound to the
-    /// harness key — present with a test-vector key it makes `git-sign-nostr`
-    /// abort signing with an auth-tag mismatch error).
+    /// Cleared dynamically: `GIT_CONFIG_*` (injected git config),
+    /// `BUZZ_PRIVATE_KEY` and `NOSTR_PRIVATE_KEY` (loaded by `git-sign-nostr`
+    /// before `nostr.keyfile` config — without clearing these, `git-sign-nostr`
+    /// uses the harness key instead of the test-vector key even when
+    /// `GIT_CONFIG_*` is clean), and `BUZZ_AUTH_TAG` (a harness-signed owner
+    /// attestation bound to the harness key — present with a test-vector key it
+    /// makes `git-sign-nostr` abort signing with an auth-tag mismatch error).
     #[cfg(unix)]
     fn clear_git_config_env() -> GitConfigEnvGuard {
-        let _lock = GIT_CONFIG_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = TestEnv::lock();
         let saved: Vec<_> = std::env::vars_os()
             .filter(|(k, _)| {
                 k.to_str().is_some_and(|k| {
@@ -2802,7 +2809,7 @@ mod tests {
         for (k, _) in &saved {
             std::env::remove_var(k);
         }
-        GitConfigEnvGuard { saved, _lock }
+        GitConfigEnvGuard { saved, _env }
     }
 
     const AGENT_EMAIL: &str =
@@ -5435,9 +5442,10 @@ mod tests {
     /// empty.
     ///
     /// Mutation evidence: removing the newline guard from `inspect_push_config`
-    /// makes `verify_push` proceed past the newline check; the human-authored
-    /// commit then fails the author check — but with an author-refusal message,
-    /// not a "CR or LF" message, so the assertion catches the mutation.
+    /// makes `verify_push` proceed past the newline check; execution continues
+    /// to a later refusal (destination-inventory or author check) with a
+    /// different error class — so the assertion that the error contains "CR or
+    /// LF" catches the mutation.
     #[test]
     fn verify_push_rejects_newline_in_argv_url() {
         #[cfg(unix)]
@@ -5492,8 +5500,9 @@ mod tests {
     ///
     /// Mutation evidence: `actual` is an empty bare repo.  With the guard,
     /// `verify_push` refuses on the config snapshot before reaching porcelain.
-    /// With the guard removed, the human-authored commit would fail the author
-    /// check — but with an author-refusal message, not a newline message.
+    /// With the guard removed, execution proceeds past the newline-specific
+    /// refusal to a later error class — the assertion that the error contains
+    /// "CR or LF" still catches the mutation.
     #[test]
     fn verify_push_rejects_newline_in_config_url() {
         #[cfg(unix)]
@@ -6376,30 +6385,6 @@ mod tests {
         );
     }
 
-    /// (Carl R8 P1) An unsigned agent-authored commit with a `git replace`
-    /// mapping to a signed decoy is refused by the signature gate.
-    ///
-    /// The bypass: `git replace REAL DECOY` makes `commit_signature_is_agent`
-    /// read DECOY's signature status (`G`) instead of REAL's (unsigned → `N`),
-    /// incorrectly passing the signature check while REAL (unsigned) reaches the
-    /// destination.
-    ///
-    /// Mutation evidence: removing `--no-replace-objects` from
-    /// `commit_signature_is_agent` makes the end-to-end `verify_push` return Ok
-    /// (the signature probe reads DECOY's `G` status, passing the check while
-    /// the unsigned REAL reaches the destination).  With the fix, the probe
-    /// reads REAL's raw unsigned state → `N` → refused and destination stays
-    /// empty.
-    ///
-    /// Self-contained: writes a shell stub as `gpg.x509.program` into the test
-    /// repo so signing and verification work without any external binary.  The
-    /// stub produces an opaque signature that git's status-fd protocol accepts
-    /// (GOODSIG + TRUST_FULLY), making `%G? = G` for the DECOY commit.  The
-    /// test authority mirrors the stub's program path and signing key, so the
-    /// production `commit_signature_is_agent` probe verifies against the same
-    /// stub.  Signer absence cannot silently pass — if the stub fails to write or
-    /// the DECOY commit fails to sign, the test panics before reaching the
-    /// assertions.
     /// Locate the `git-sign-nostr` binary built alongside this test binary in
     /// the Cargo target directory.  Returns `None` when the binary is absent.
     /// Tests that require this binary must call `panic!` rather than skip on

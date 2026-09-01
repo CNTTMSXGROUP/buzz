@@ -207,6 +207,21 @@ pub(crate) async fn handle(
         ProjectChangeApplyResult::InvalidMutation(message)
         | ProjectChangeApplyResult::InvalidBase(message) => return Err(invalid(message)),
     };
+    if let Err(error) = super::project_state_projection::publish_project_state_for_coordinate(
+        tenant,
+        state,
+        &parsed.owner,
+        &parsed.d_tag,
+    )
+    .await
+    {
+        tracing::warn!(
+            project_owner = %hex::encode(&parsed.owner),
+            project_d_tag = %parsed.d_tag,
+            %error,
+            "accepted Project change awaits projection repair"
+        );
+    }
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,

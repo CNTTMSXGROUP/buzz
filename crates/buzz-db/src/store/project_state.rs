@@ -490,7 +490,7 @@ impl Db {
             let project_owner: Vec<u8> = coordinate.try_get("project_owner")?;
             let project_d_tag: String = coordinate.try_get("project_d_tag")?;
             if let Some(candidate) = self
-                .load_project_state_projection_candidate(
+                .load_pending_project_state_projection(
                     community_id,
                     &project_owner,
                     &project_d_tag,
@@ -504,7 +504,13 @@ impl Db {
         Ok(candidates)
     }
 
-    async fn load_project_state_projection_candidate(
+    /// Load one coherent Project state when it requires publication by
+    /// `projection_pubkey`.
+    ///
+    /// The returned candidate is safe to sign outside the transaction because
+    /// [`Self::commit_project_state_projection`] revalidates every observed
+    /// head field while holding the same Project coordinate lock.
+    pub async fn load_pending_project_state_projection(
         &self,
         community_id: CommunityId,
         project_owner: &[u8],

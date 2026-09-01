@@ -400,18 +400,17 @@ async fn replace_parameterized_event_in_transaction_impl(
     if let Some(channels) = project_channels {
         sqlx::query(
             "INSERT INTO project_revision_heads \
-               (community_id, project_owner, project_d_tag, base_event_id, revision_event_id, related_channel_ids, updated_at) \
-             VALUES ($1,$2,$3,$4,$4,$5,$6) \
+               (community_id, project_owner, project_d_tag, base_event_id, revision_event_id, related_channel_ids) \
+             VALUES ($1,$2,$3,$4,$4,$5) \
              ON CONFLICT (community_id, project_owner, project_d_tag) DO UPDATE SET \
                base_event_id=EXCLUDED.base_event_id, revision_event_id=EXCLUDED.revision_event_id, \
-               related_channel_ids=EXCLUDED.related_channel_ids, updated_at=EXCLUDED.updated_at",
+               related_channel_ids=EXCLUDED.related_channel_ids",
         )
         .bind(community_id.as_uuid())
         .bind(pubkey_bytes.as_slice())
         .bind(d_tag)
         .bind(incoming_id)
         .bind(channels)
-        .bind(received_at)
         .execute(&mut *savepoint)
         .await?;
     }

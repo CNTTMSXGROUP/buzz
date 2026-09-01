@@ -49,6 +49,11 @@ function projectEvent(repositoryTags, overrides = {}) {
 }
 
 function projectRevision(id, expected, operation, channelId, overrides = {}) {
+  const {
+    baseRevision = expected,
+    relatedChannelIds = [],
+    ...eventOverrides
+  } = overrides;
   return {
     id,
     kind: 47001,
@@ -57,11 +62,16 @@ function projectRevision(id, expected, operation, channelId, overrides = {}) {
     content: "",
     tags: [
       ["a", `30621:${PROJECT_OWNER}:sprout`],
+      ["base", baseRevision],
       ["e", expected],
       ["op", operation],
       ["channel", channelId],
+      ...relatedChannelIds.map((relatedChannelId) => [
+        "buzz-related-channel",
+        relatedChannelId,
+      ]),
     ],
-    ...overrides,
+    ...eventOverrides,
   };
 }
 
@@ -153,6 +163,7 @@ test("buildProjectReadModels normalizes channel UUID tags before folding revisio
         base.id,
         "remove-related-channel",
         related.toUpperCase(),
+        { baseRevision: base.id, relatedChannelIds: [] },
       ),
     ],
     repositoryEvents: [],
@@ -174,8 +185,10 @@ test("buildProjectReadModels folds the relay-authorized related-channel revision
   const [project] = buildProjectReadModels({
     projectEvents: [base],
     projectRevisionEvents: [
-      projectRevision(removeId, addId, "remove-related-channel", relatedA),
-      projectRevision(addId, base.id, "add-related-channel", relatedB),
+      projectRevision(removeId, addId, "remove-related-channel", relatedA, {
+        baseRevision: base.id,
+        relatedChannelIds: [relatedB],
+      }),
     ],
     repositoryEvents: [],
     relayOrigin: RELAY_ORIGIN,
@@ -195,6 +208,8 @@ test("buildProjectReadModels keeps project freshness monotonic across revisions"
     projectEvents: [base],
     projectRevisionEvents: [
       projectRevision("b".repeat(64), base.id, "add-related-channel", related, {
+        baseRevision: base.id,
+        relatedChannelIds: [related],
         created_at: 250,
       }),
     ],

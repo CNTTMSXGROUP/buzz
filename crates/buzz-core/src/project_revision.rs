@@ -81,12 +81,16 @@ impl ProjectCoordinate {
 pub struct ProjectRevision {
     /// Stable Project coordinate.
     pub project: ProjectCoordinate,
+    /// Current owner-signed Project event on which this revision chain is based.
+    pub base_revision: String,
     /// Exact base or prior revision event id.
     pub expected_revision: String,
     /// Requested mutation.
     pub operation: ProjectRevisionOperation,
     /// Related channel being changed.
     pub channel_id: Uuid,
+    /// Complete related-channel state after applying this revision.
+    pub related_channels: Vec<Uuid>,
 }
 
 /// Project revision envelope error.
@@ -104,12 +108,18 @@ pub enum ProjectRevisionError {
     /// Revision event id is malformed.
     #[error("invalid expected Project revision")]
     InvalidExpectedRevision,
+    /// Base Project event id is malformed.
+    #[error("invalid base Project revision")]
+    InvalidBaseRevision,
     /// Operation is unsupported.
     #[error("invalid Project revision operation")]
     InvalidOperation,
     /// Channel id is malformed.
     #[error("invalid related channel id")]
     InvalidChannel,
+    /// Snapshot channel tags are malformed, duplicated, or over the limit.
+    #[error("invalid related channel snapshot")]
+    InvalidRelatedChannels,
     /// Content must be empty.
     #[error("Project revision content must be empty")]
     NonEmptyContent,
@@ -141,6 +151,11 @@ impl ProjectRevision {
             return Err(ProjectRevisionError::NonEmptyContent);
         }
         let project = ProjectCoordinate::parse(singleton_tag(event, "a")?)?;
+        let base_revision = singleton_tag(event, "base")?;
+        if base_revision.len() != 64 || !base_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ProjectRevisionError::InvalidBaseRevision);
+        }
         let expected_revision = singleton_tag(event, "e")?;
         if expected_revision.len() != 64
             || !expected_revision
@@ -150,14 +165,40 @@ impl ProjectRevision {
             return Err(ProjectRevisionError::InvalidExpectedRevision);
         }
         let operation = ProjectRevisionOperation::parse(singleton_tag(event, "op")?)?;
-        let channel_id = singleton_tag(event, "channel")?
+        let channel = singleton_tag(event, "channel")?;
+        let channel_id: Uuid = channel
             .parse()
             .map_err(|_| ProjectRevisionError::InvalidChannel)?;
+        if channel_id.to_string() != channel {
+            return Err(ProjectRevisionError::InvalidChannel);
+        }
+        let mut related_channels = Vec::new();
+        for tag in event.tags.iter() {
+            let parts = tag.as_slice();
+            if parts.first().map(String::as_str) != Some("buzz-related-channel") {
+                continue;
+            }
+            let [_, value] = parts else {
+                return Err(ProjectRevisionError::InvalidRelatedChannels);
+            };
+            let channel: Uuid = value
+                .parse()
+                .map_err(|_| ProjectRevisionError::InvalidRelatedChannels)?;
+            if channel.to_string() != *value
+                || related_channels.contains(&channel)
+                || related_channels.len() >= 64
+            {
+                return Err(ProjectRevisionError::InvalidRelatedChannels);
+            }
+            related_channels.push(channel);
+        }
         Ok(Self {
             project,
+            base_revision: base_revision.to_ascii_lowercase(),
             expected_revision: expected_revision.to_ascii_lowercase(),
             operation,
             channel_id,
+            related_channels,
         })
     }
 }
@@ -210,31 +251,46 @@ mod tests {
 
     use super::*;
 
-    fn revision_event(operation: &str) -> Event {
+    fn revision_event_with_channel(operation: &str, channel: &str) -> Event {
         let keys = Keys::generate();
         let owner = "a".repeat(64);
         EventBuilder::new(Kind::Custom(KIND_PROJECT_REVISION as u16), "")
             .tags([
                 Tag::parse(vec!["a".to_owned(), format!("30621:{owner}:buzz")]).unwrap(),
+                Tag::parse(vec!["base".to_owned(), "c".repeat(64)]).unwrap(),
                 Tag::parse(vec!["e".to_owned(), "b".repeat(64)]).unwrap(),
                 Tag::parse(vec!["op".to_owned(), operation.to_owned()]).unwrap(),
-                Tag::parse(vec![
-                    "channel".to_owned(),
-                    "11111111-1111-4111-8111-111111111111".to_owned(),
-                ])
-                .unwrap(),
+                Tag::parse(vec!["channel".to_owned(), channel.to_owned()]).unwrap(),
+                Tag::parse(vec!["buzz-related-channel".to_owned(), channel.to_owned()]).unwrap(),
             ])
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    fn revision_event(operation: &str) -> Event {
+        revision_event_with_channel(operation, "11111111-1111-4111-8111-111111111111")
     }
 
     #[test]
     fn parses_canonical_revision() {
         let parsed = ProjectRevision::parse(&revision_event("add-related-channel")).unwrap();
         assert_eq!(parsed.project.slug, "buzz");
+        assert_eq!(parsed.base_revision, "c".repeat(64));
         assert_eq!(
             parsed.operation,
             ProjectRevisionOperation::AddRelatedChannel
+        );
+        assert_eq!(parsed.related_channels, vec![parsed.channel_id]);
+    }
+
+    #[test]
+    fn rejects_noncanonical_channel_uuid() {
+        assert_eq!(
+            ProjectRevision::parse(&revision_event_with_channel(
+                "add-related-channel",
+                "11111111111141118111111111111111",
+            )),
+            Err(ProjectRevisionError::InvalidChannel)
         );
     }
 
@@ -260,6 +316,32 @@ mod tests {
         assert_eq!(
             ProjectRevision::parse(&malformed_duplicate),
             Err(ProjectRevisionError::TagCardinality("op"))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_or_noncanonical_snapshot_channels() {
+        let mut duplicate = revision_event("add-related-channel");
+        duplicate.tags.push(
+            Tag::parse([
+                "buzz-related-channel",
+                "11111111-1111-4111-8111-111111111111",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(
+            ProjectRevision::parse(&duplicate),
+            Err(ProjectRevisionError::InvalidRelatedChannels)
+        );
+
+        let mut noncanonical = revision_event("add-related-channel");
+        noncanonical.tags.pop();
+        noncanonical.tags.push(
+            Tag::parse(["buzz-related-channel", "11111111111141118111111111111111"]).unwrap(),
+        );
+        assert_eq!(
+            ProjectRevision::parse(&noncanonical),
+            Err(ProjectRevisionError::InvalidRelatedChannels)
         );
     }
 

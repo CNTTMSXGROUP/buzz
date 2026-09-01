@@ -10,7 +10,6 @@ CREATE TABLE project_revision_heads (
     base_event_id BYTEA NOT NULL CHECK (octet_length(base_event_id) = 32),
     revision_event_id BYTEA NOT NULL CHECK (octet_length(revision_event_id) = 32),
     related_channel_ids UUID[] NOT NULL DEFAULT '{}',
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, project_owner, project_d_tag)
 );
 

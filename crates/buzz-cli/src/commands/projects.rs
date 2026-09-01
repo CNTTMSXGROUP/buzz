@@ -326,17 +326,14 @@ async fn current_project_revision(
     let filter = serde_json::json!({
         "kinds": [buzz_core::kind::KIND_PROJECT_REVISION],
         "#a": [coordinate],
+        "project_revision_heads": true,
     });
-    let events: Vec<Event> = client
-        .query_all_bounded(filter, PROJECT_QUERY_EVENT_BOUND)
-        .await?
-        .into_iter()
-        .map(|event| {
-            serde_json::from_value(event).map_err(|error| {
-                CliError::Other(format!("failed to parse Project revision: {error}"))
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    let events = parse_events(&client.query(&filter).await?)?;
+    if events.len() > 1 {
+        return Err(CliError::Other(
+            "relay returned multiple current Project revisions".into(),
+        ));
+    }
     let home_channel = project
         .tags
         .iter()
@@ -358,27 +355,29 @@ async fn current_project_revision(
             related_channels.push(channel);
         }
     }
-    let parsed: Vec<(String, ProjectRevision)> = events
+    let current = if let Some(event) = events.first() {
+        let revision = ProjectRevision::parse(event).map_err(|error| {
+            CliError::Other(format!("invalid current Project revision: {error}"))
+        })?;
+        if revision.project.as_string() != coordinate
+            || revision.base_revision != project.id.to_hex()
+        {
+            return Err(CliError::Other(
+                "current Project revision does not match the Project base".into(),
+            ));
+        }
+        related_channels = revision.related_channels;
+        event.id.to_hex()
+    } else {
+        project.id.to_hex()
+    };
+    if related_channels
         .iter()
-        .filter_map(|event| {
-            ProjectRevision::parse(event)
-                .ok()
-                .map(|revision| (event.id.to_hex(), revision))
-        })
-        .collect();
-    let mut current = project.id.to_hex();
-    while let Some((event_id, revision)) = parsed
-        .iter()
-        .find(|(_, revision)| revision.expected_revision == current)
+        .any(|channel| Some(*channel) == home_channel)
     {
-        apply_project_revision(
-            &mut related_channels,
-            home_channel,
-            revision.operation,
-            revision.channel_id,
-        )
-        .map_err(|message| CliError::Other(format!("invalid Project revision chain: {message}")))?;
-        current.clone_from(event_id);
+        return Err(CliError::Other(
+            "current Project revision includes the home channel as related".into(),
+        ));
     }
     Ok(CurrentProjectRevision {
         id: current,
@@ -398,15 +397,35 @@ async fn cmd_related_channel_revision(
     let project = fetch_project(client, slug, owner)
         .await?
         .ok_or_else(|| CliError::NotFound(format!("project {slug:?} not found")))?;
-    let expected_revision = current_project_revision(client, &project, slug).await?.id;
+    let current = current_project_revision(client, &project, slug).await?;
+    let mut related_channels = current.related_channels;
+    apply_project_revision(
+        &mut related_channels,
+        project
+            .tags
+            .iter()
+            .find(|tag| tag_name(tag) == Some("buzz-channel"))
+            .and_then(tag_value)
+            .and_then(|value| value.parse().ok()),
+        operation,
+        channel_id,
+    )
+    .map_err(|message| CliError::Usage(message.into()))?;
     let coordinate = ProjectCoordinate {
         owner: project.pubkey.to_hex(),
         slug: slug.to_owned(),
     }
     .as_string();
     let event = client.sign_event(
-        build_project_revision(&coordinate, &expected_revision, operation, channel_id)
-            .map_err(crate::validate::sdk_err)?,
+        build_project_revision(
+            &coordinate,
+            &project.id.to_hex(),
+            &current.id,
+            operation,
+            channel_id,
+            &related_channels,
+        )
+        .map_err(crate::validate::sdk_err)?,
     )?;
     let raw = client
         .submit_event(event)

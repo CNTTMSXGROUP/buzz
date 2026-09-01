@@ -15,6 +15,7 @@ export function buildProjectRelatedChannelRevisionTemplate(
   project: Pick<
     Project,
     | "effectiveRevisionId"
+    | "baseRevisionId"
     | "legacy"
     | "projectAddress"
     | "projectChannelId"
@@ -27,7 +28,11 @@ export function buildProjectRelatedChannelRevisionTemplate(
     throw new Error("Only explicit Projects can link related channels.");
   }
   const expectedRevision = project.effectiveRevisionId?.toLowerCase();
+  const baseRevision = project.baseRevisionId?.toLowerCase();
   if (!expectedRevision || !/^[0-9a-f]{64}$/.test(expectedRevision)) {
+    throw new Error("Refresh this Project before changing its channels.");
+  }
+  if (!baseRevision || !/^[0-9a-f]{64}$/.test(baseRevision)) {
     throw new Error("Refresh this Project before changing its channels.");
   }
   const normalizedChannelId = channelId.trim().toLowerCase();
@@ -46,14 +51,25 @@ export function buildProjectRelatedChannelRevisionTemplate(
   if (operation === "remove-related-channel" && !alreadyRelated) {
     throw new Error("That channel is not related to this Project.");
   }
+  const relatedChannelIds =
+    operation === "add-related-channel"
+      ? [...project.relatedChannelIds, normalizedChannelId]
+      : project.relatedChannelIds.filter(
+          (candidate) => candidate.toLowerCase() !== normalizedChannelId,
+        );
   return {
     kind: KIND_PROJECT_REVISION,
     content: "",
     tags: [
       ["a", project.projectAddress],
+      ["base", baseRevision],
       ["e", expectedRevision],
       ["op", operation],
       ["channel", normalizedChannelId],
+      ...relatedChannelIds
+        .map((candidate) => candidate.toLowerCase())
+        .sort()
+        .map((candidate) => ["buzz-related-channel", candidate]),
     ],
   };
 }
@@ -124,7 +140,7 @@ export async function removeProjectRelatedChannel(
   );
   return {
     ...project,
-    createdAt: revision.created_at,
+    createdAt: Math.max(project.createdAt, revision.created_at),
     effectiveRevisionId: revision.id.toLowerCase(),
     relatedChannelIds: project.relatedChannelIds.filter(
       (candidate) => candidate.toLowerCase() !== channelId.toLowerCase(),

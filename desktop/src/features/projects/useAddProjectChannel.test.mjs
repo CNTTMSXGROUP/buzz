@@ -150,7 +150,7 @@ test("addProjectChannel publishes an actor-signed revision and advances the loca
     id: "e".repeat(64),
     kind: 47001,
     pubkey: "b".repeat(64),
-    created_at: 110,
+    created_at: 90,
     content: "",
     tags: [],
   };
@@ -171,4 +171,5 @@ test("addProjectChannel publishes an actor-signed revision and advances the loca
   ]);
   assert.deepEqual(result.project.relatedChannelIds, [CREATED_CHANNEL]);
   assert.equal(result.project.effectiveRevisionId, revision.id);
+  assert.equal(result.project.createdAt, 100);
 });

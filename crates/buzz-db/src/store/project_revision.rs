@@ -3,9 +3,8 @@
 use buzz_core::kind::KIND_PROJECT;
 use buzz_core::project_revision::{apply_project_revision, can_manage_project, ProjectRevision};
 use buzz_core::{CommunityId, StoredEvent};
-use chrono::Utc;
 use nostr::Event;
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row};
 use uuid::Uuid;
 
 use crate::event::insert_event_in_transaction;
@@ -14,10 +13,10 @@ use crate::store::channel_members::acquire_channel_membership_lock;
 use crate::{Db, DbError, Result};
 
 /// Outcome of applying a Project revision command.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProjectRevisionApplyStatus {
+#[derive(Clone, Debug)]
+pub enum ProjectRevisionApplyResult {
     /// The operation was authorized, current, and persisted.
-    Applied,
+    Applied(StoredEvent),
     /// This exact signed command was already applied.
     Duplicate,
     /// The Project coordinate has no live base event.
@@ -27,44 +26,7 @@ pub enum ProjectRevisionApplyStatus {
     /// The signer is neither the Project owner nor a home-channel owner/admin.
     Forbidden,
     /// The requested add/remove is not valid for current effective state.
-    InvalidMutation,
-}
-
-/// Result of a Project revision attempt.
-#[derive(Clone, Debug)]
-pub struct ProjectRevisionApplyResult {
-    /// Outcome category.
-    pub status: ProjectRevisionApplyStatus,
-    /// Human-readable detail suitable for a relay rejection.
-    pub message: Option<String>,
-    /// The committed event when the revision was applied.
-    pub stored_event: Option<StoredEvent>,
-}
-
-impl ProjectRevisionApplyResult {
-    fn status(status: ProjectRevisionApplyStatus) -> Self {
-        Self {
-            status,
-            message: None,
-            stored_event: None,
-        }
-    }
-
-    fn applied(stored_event: StoredEvent) -> Self {
-        Self {
-            status: ProjectRevisionApplyStatus::Applied,
-            message: None,
-            stored_event: Some(stored_event),
-        }
-    }
-
-    fn invalid(message: impl Into<String>) -> Self {
-        Self {
-            status: ProjectRevisionApplyStatus::InvalidMutation,
-            message: Some(message.into()),
-            stored_event: None,
-        }
-    }
+    InvalidMutation(String),
 }
 
 fn tag_values(tags: &serde_json::Value, name: &str) -> Vec<String> {
@@ -100,6 +62,37 @@ pub(crate) fn base_related_channels(tags: &serde_json::Value, home: Option<Uuid>
 }
 
 impl Db {
+    /// Resolve the current signed revision event ids for bounded Project coordinates.
+    pub async fn project_revision_head_event_ids(
+        &self,
+        community_id: CommunityId,
+        projects: &[buzz_core::project_revision::ProjectCoordinate],
+    ) -> Result<Vec<Vec<u8>>> {
+        if projects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::new(
+            "SELECT revision_event_id FROM project_revision_heads WHERE community_id=",
+        );
+        query.push_bind(community_id.as_uuid());
+        query.push(" AND (project_owner, project_d_tag) IN (");
+        let mut separated = query.separated(", ");
+        for project in projects {
+            let owner = hex::decode(&project.owner)
+                .map_err(|error| DbError::InvalidData(format!("invalid Project owner: {error}")))?;
+            separated.push_unseparated("(");
+            separated.push_bind(owner);
+            separated.push_unseparated(", ");
+            separated.push_bind(&project.slug);
+            separated.push_unseparated(")");
+        }
+        separated.push_unseparated(")");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| row.try_get("revision_event_id").map_err(Into::into))
+            .collect()
+    }
+
     /// Authorize and atomically apply one actor-signed Project revision.
     pub async fn apply_project_revision(
         &self,
@@ -137,9 +130,7 @@ impl Db {
         .await?;
         if already_applied {
             tx.rollback().await?;
-            return Ok(ProjectRevisionApplyResult::status(
-                ProjectRevisionApplyStatus::Duplicate,
-            ));
+            return Ok(ProjectRevisionApplyResult::Duplicate);
         }
 
         let base = sqlx::query(
@@ -156,11 +147,16 @@ impl Db {
         .await?;
         let Some(base) = base else {
             tx.rollback().await?;
-            return Ok(ProjectRevisionApplyResult::status(
-                ProjectRevisionApplyStatus::ProjectNotFound,
-            ));
+            return Ok(ProjectRevisionApplyResult::ProjectNotFound);
         };
         let base_id: Vec<u8> = base.try_get("id")?;
+        let signed_base = hex::decode(&revision.base_revision).map_err(|error| {
+            DbError::InvalidData(format!("invalid base Project revision: {error}"))
+        })?;
+        if signed_base != base_id {
+            tx.rollback().await?;
+            return Ok(ProjectRevisionApplyResult::Conflict);
+        }
         let tags: serde_json::Value = base.try_get("tags")?;
         let home = home_channel(&tags);
 
@@ -190,9 +186,7 @@ impl Db {
         };
         if !can_manage_project(actor.as_slice(), &owner, role.as_deref()) {
             tx.rollback().await?;
-            return Ok(ProjectRevisionApplyResult::status(
-                ProjectRevisionApplyStatus::Forbidden,
-            ));
+            return Ok(ProjectRevisionApplyResult::Forbidden);
         }
 
         let materialized = sqlx::query(
@@ -215,34 +209,40 @@ impl Db {
         };
         if expected != current_revision {
             tx.rollback().await?;
-            return Ok(ProjectRevisionApplyResult::status(
-                ProjectRevisionApplyStatus::Conflict,
-            ));
+            return Ok(ProjectRevisionApplyResult::Conflict);
         }
 
         if let Err(message) =
             apply_project_revision(&mut channels, home, revision.operation, revision.channel_id)
         {
             tx.rollback().await?;
-            return Ok(ProjectRevisionApplyResult::invalid(message));
+            return Ok(ProjectRevisionApplyResult::InvalidMutation(message.into()));
+        }
+        let mut computed_snapshot = channels.clone();
+        computed_snapshot.sort_unstable();
+        let mut signed_snapshot = revision.related_channels.clone();
+        signed_snapshot.sort_unstable();
+        if signed_snapshot != computed_snapshot {
+            tx.rollback().await?;
+            return Ok(ProjectRevisionApplyResult::InvalidMutation(
+                "signed related-channel snapshot does not match the requested mutation".into(),
+            ));
         }
 
         let (stored_event, inserted) =
             insert_event_in_transaction(&mut tx, community_id, event, None).await?;
         if !inserted {
             tx.rollback().await?;
-            return Ok(ProjectRevisionApplyResult::status(
-                ProjectRevisionApplyStatus::Duplicate,
-            ));
+            return Ok(ProjectRevisionApplyResult::Duplicate);
         }
 
         sqlx::query(
             "INSERT INTO project_revision_heads \
-               (community_id, project_owner, project_d_tag, base_event_id, revision_event_id, related_channel_ids, updated_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7) \
+               (community_id, project_owner, project_d_tag, base_event_id, revision_event_id, related_channel_ids) \
+             VALUES ($1,$2,$3,$4,$5,$6) \
              ON CONFLICT (community_id, project_owner, project_d_tag) DO UPDATE SET \
                base_event_id=EXCLUDED.base_event_id, revision_event_id=EXCLUDED.revision_event_id, \
-               related_channel_ids=EXCLUDED.related_channel_ids, updated_at=EXCLUDED.updated_at",
+               related_channel_ids=EXCLUDED.related_channel_ids",
         )
         .bind(community_id.as_uuid())
         .bind(&owner)
@@ -250,11 +250,10 @@ impl Db {
         .bind(&base_id)
         .bind(event.id.as_bytes().as_slice())
         .bind(&channels)
-        .bind(Utc::now())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(ProjectRevisionApplyResult::applied(stored_event))
+        Ok(ProjectRevisionApplyResult::Applied(stored_event))
     }
 }
 
@@ -307,17 +306,28 @@ mod tests {
     fn revision_event(
         actor: &Keys,
         project: &ProjectCoordinate,
+        base: &str,
         expected: &str,
         operation: ProjectRevisionOperation,
         channel: Uuid,
+        related_channels: &[Uuid],
     ) -> Event {
-        EventBuilder::new(Kind::Custom(KIND_PROJECT_REVISION as u16), "")
-            .tags([
-                Tag::parse(vec!["a".to_owned(), project.as_string()]).unwrap(),
-                Tag::parse(vec!["e".to_owned(), expected.to_owned()]).unwrap(),
-                Tag::parse(vec!["op".to_owned(), operation.as_str().to_owned()]).unwrap(),
-                Tag::parse(vec!["channel".to_owned(), channel.to_string()]).unwrap(),
+        let mut tags = vec![
+            Tag::parse(vec!["a".to_owned(), project.as_string()]).unwrap(),
+            Tag::parse(vec!["base".to_owned(), base.to_owned()]).unwrap(),
+            Tag::parse(vec!["e".to_owned(), expected.to_owned()]).unwrap(),
+            Tag::parse(vec!["op".to_owned(), operation.as_str().to_owned()]).unwrap(),
+            Tag::parse(vec!["channel".to_owned(), channel.to_string()]).unwrap(),
+        ];
+        tags.extend(related_channels.iter().map(|related_channel| {
+            Tag::parse(vec![
+                "buzz-related-channel".to_owned(),
+                related_channel.to_string(),
             ])
+            .unwrap()
+        }));
+        EventBuilder::new(Kind::Custom(KIND_PROJECT_REVISION as u16), "")
+            .tags(tags)
             .sign_with_keys(actor)
             .unwrap()
     }
@@ -427,57 +437,85 @@ mod tests {
             &admin,
             &coordinate,
             &base.id.to_hex(),
+            &base.id.to_hex(),
             ProjectRevisionOperation::AddRelatedChannel,
             related_a,
+            &[related_a],
         );
         let parsed = ProjectRevision::parse(&add).unwrap();
         let applied = db
             .apply_project_revision(community, &add, &parsed)
             .await
             .unwrap();
-        assert_eq!(applied.status, ProjectRevisionApplyStatus::Applied);
-        assert_eq!(applied.stored_event.unwrap().event.id, add.id);
+        let ProjectRevisionApplyResult::Applied(stored) = applied else {
+            panic!("expected applied Project revision");
+        };
+        assert_eq!(stored.event.id, add.id);
         assert_eq!(
+            db.project_revision_head_event_ids(community, std::slice::from_ref(&coordinate))
+                .await
+                .unwrap(),
+            vec![add.id.as_bytes().to_vec()]
+        );
+        assert!(matches!(
             db.apply_project_revision(community, &add, &parsed)
                 .await
-                .unwrap()
-                .status,
-            ProjectRevisionApplyStatus::Duplicate
-        );
+                .unwrap(),
+            ProjectRevisionApplyResult::Duplicate
+        ));
 
         for actor in [&member, &guest, &bot, &unrelated] {
             let denied = revision_event(
                 actor,
                 &coordinate,
+                &base.id.to_hex(),
                 &add.id.to_hex(),
                 ProjectRevisionOperation::AddRelatedChannel,
                 related_b,
+                &[related_a, related_b],
             );
             let parsed = ProjectRevision::parse(&denied).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 db.apply_project_revision(community, &denied, &parsed)
                     .await
-                    .unwrap()
-                    .status,
-                ProjectRevisionApplyStatus::Forbidden
-            );
+                    .unwrap(),
+                ProjectRevisionApplyResult::Forbidden
+            ));
         }
+
+        let mismatched_snapshot = revision_event(
+            &owner,
+            &coordinate,
+            &base.id.to_hex(),
+            &add.id.to_hex(),
+            ProjectRevisionOperation::AddRelatedChannel,
+            related_b,
+            &[related_a],
+        );
+        let parsed = ProjectRevision::parse(&mismatched_snapshot).unwrap();
+        assert!(matches!(
+            db.apply_project_revision(community, &mismatched_snapshot, &parsed)
+                .await
+                .unwrap(),
+            ProjectRevisionApplyResult::InvalidMutation(_)
+        ));
 
         let stale = revision_event(
             &home_owner,
             &coordinate,
             &base.id.to_hex(),
+            &base.id.to_hex(),
             ProjectRevisionOperation::AddRelatedChannel,
             related_b,
+            &[related_b],
         );
         let parsed = ProjectRevision::parse(&stale).unwrap();
-        assert_eq!(
+        assert!(matches!(
             db.apply_project_revision(community, &stale, &parsed)
                 .await
-                .unwrap()
-                .status,
-            ProjectRevisionApplyStatus::Conflict
-        );
+                .unwrap(),
+            ProjectRevisionApplyResult::Conflict
+        ));
 
         let replacement_timestamp = base.created_at.as_secs() + 1;
         let stale_base =
@@ -501,17 +539,18 @@ mod tests {
             &owner,
             &coordinate,
             &aligned_base.id.to_hex(),
+            &aligned_base.id.to_hex(),
             ProjectRevisionOperation::RemoveRelatedChannel,
             related_a,
+            &[],
         );
         let parsed = ProjectRevision::parse(&remove).unwrap();
-        assert_eq!(
+        assert!(matches!(
             db.apply_project_revision(community, &remove, &parsed)
                 .await
-                .unwrap()
-                .status,
-            ProjectRevisionApplyStatus::Applied
-        );
+                .unwrap(),
+            ProjectRevisionApplyResult::Applied(_)
+        ));
         let stored_actor: Vec<u8> =
             sqlx::query_scalar("SELECT pubkey FROM events WHERE community_id=$1 AND id=$2")
                 .bind(community.as_uuid())
@@ -524,18 +563,19 @@ mod tests {
         let add_before_promotion = revision_event(
             &owner,
             &coordinate,
+            &aligned_base.id.to_hex(),
             &remove.id.to_hex(),
             ProjectRevisionOperation::AddRelatedChannel,
             related_b,
+            &[related_b],
         );
         let parsed = ProjectRevision::parse(&add_before_promotion).unwrap();
-        assert_eq!(
+        assert!(matches!(
             db.apply_project_revision(community, &add_before_promotion, &parsed)
                 .await
-                .unwrap()
-                .status,
-            ProjectRevisionApplyStatus::Applied
-        );
+                .unwrap(),
+            ProjectRevisionApplyResult::Applied(_)
+        ));
         let promoted_home =
             project_event_with_related(&owner, "shared", related_b, &[], replacement_timestamp + 1);
         assert!(
@@ -575,6 +615,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(revision_head_count, 0);
+        assert!(db
+            .project_revision_head_event_ids(community, std::slice::from_ref(&coordinate))
+            .await
+            .unwrap()
+            .is_empty());
         let recreated = project_event_with_related(&owner, "shared", home, &[], deletion_time + 1);
         assert!(
             db.replace_parameterized_event(community, &recreated, "shared", None)
@@ -593,17 +638,18 @@ mod tests {
             &admin,
             &coordinate,
             &recreated.id.to_hex(),
+            &recreated.id.to_hex(),
             ProjectRevisionOperation::AddRelatedChannel,
             related_b,
+            &[related_b],
         );
         let parsed = ProjectRevision::parse(&after_archive).unwrap();
-        assert_eq!(
+        assert!(matches!(
             db.apply_project_revision(community, &after_archive, &parsed)
                 .await
-                .unwrap()
-                .status,
-            ProjectRevisionApplyStatus::Forbidden
-        );
+                .unwrap(),
+            ProjectRevisionApplyResult::Forbidden
+        ));
 
         sqlx::query(
             "UPDATE channels SET archived_at=NULL, deleted_at=NOW() \
@@ -618,16 +664,17 @@ mod tests {
             &admin,
             &coordinate,
             &recreated.id.to_hex(),
+            &recreated.id.to_hex(),
             ProjectRevisionOperation::AddRelatedChannel,
             related_b,
+            &[related_b],
         );
         let parsed = ProjectRevision::parse(&after_delete).unwrap();
-        assert_eq!(
+        assert!(matches!(
             db.apply_project_revision(community, &after_delete, &parsed)
                 .await
-                .unwrap()
-                .status,
-            ProjectRevisionApplyStatus::Forbidden
-        );
+                .unwrap(),
+            ProjectRevisionApplyResult::Forbidden
+        ));
     }
 }

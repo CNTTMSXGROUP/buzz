@@ -11,6 +11,7 @@ import {
 import { useChannelTemplatesQuery } from "@/features/channel-templates/hooks";
 import { useProjectsQuery } from "@/features/projects/hooks";
 import type { ProjectChannelRequest } from "@/features/projects/projectChannelRequest";
+import { projectChannelRequestApproval } from "@/features/projects/projectChannelRequestApproval";
 import {
   advanceProjectChannelRequestQueue,
   createProjectChannelRequestQueue,
@@ -18,7 +19,6 @@ import {
   type AcceptedProjectChannelRequest,
 } from "@/features/projects/projectChannelRequestQueue";
 import { useAddProjectChannelMutation } from "@/features/projects/useAddProjectChannel";
-import { canManageProjectChannels } from "@/features/projects/ui/ProjectChannelManagement";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
@@ -144,7 +144,13 @@ export function useProjectChannelRequests() {
       (member) =>
         normalizePubkey(member.pubkey) === normalizePubkey(identity ?? ""),
     )?.role;
-    if (!canManageProjectChannels(project, identity, viewerRole)) {
+    const approval = projectChannelRequestApproval(
+      project,
+      identity,
+      viewerRole,
+      sourceAgentPubkey,
+    );
+    if (!approval) {
       setError(
         "Only the project owner or a home-channel admin can approve this channel.",
       );
@@ -161,6 +167,7 @@ export function useProjectChannelRequests() {
       await mutation.mutateAsync({
         description: request.request.description,
         name: request.request.name,
+        ownerControlAgentPubkey: approval.ownerControlAgentPubkey,
         project,
         templateId: template?.id,
         ttlSeconds: request.request.ttlSeconds,

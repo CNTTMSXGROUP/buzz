@@ -13,6 +13,7 @@ const OWNER = "a".repeat(64);
 
 function project(overrides = {}) {
   return {
+    baseRevisionId: "a".repeat(64),
     effectiveRevisionId: "b".repeat(64),
     legacy: false,
     projectAddress: `30621:${OWNER}:buzz`,
@@ -34,9 +35,11 @@ test("buildProjectRelatedChannelRevisionTemplate builds add and remove CAS opera
       content: "",
       tags: [
         ["a", `30621:${OWNER}:buzz`],
+        ["base", "a".repeat(64)],
         ["e", "b".repeat(64)],
         ["op", "add-related-channel"],
         ["channel", RELATED],
+        ["buzz-related-channel", RELATED],
       ],
     },
   );
@@ -45,7 +48,7 @@ test("buildProjectRelatedChannelRevisionTemplate builds add and remove CAS opera
       project({ relatedChannelIds: [RELATED] }),
       RELATED,
       "remove-related-channel",
-    ).tags[2][1],
+    ).tags[3][1],
     "remove-related-channel",
   );
 });
@@ -83,7 +86,7 @@ test("buildProjectRelatedChannelRevisionTemplate rejects stale and invalid mutat
 test("removeProjectRelatedChannel publishes a remove revision and advances local state", async () => {
   const calls = [];
   const updated = await removeProjectRelatedChannel(
-    project({ relatedChannelIds: [RELATED] }),
+    project({ createdAt: 200, relatedChannelIds: [RELATED] }),
     RELATED,
     {
       signEvent: async (template) => ({
@@ -97,9 +100,10 @@ test("removeProjectRelatedChannel publishes a remove revision and advances local
   );
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][0].tags[2][1], "remove-related-channel");
+  assert.equal(calls[0][0].tags[3][1], "remove-related-channel");
   assert.deepEqual(updated.relatedChannelIds, []);
   assert.equal(updated.effectiveRevisionId, "c".repeat(64));
+  assert.equal(updated.createdAt, 200);
 });
 
 test("publishProjectRelatedChannelRevision can sign as a locally managed owner", async () => {

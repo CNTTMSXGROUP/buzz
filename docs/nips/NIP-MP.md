@@ -24,7 +24,7 @@ Buzz renders one card per `kind:30617`, so "the platform" — a relay, a desktop
 - **Project-level metadata has no owner.** A project name, description, and linked channel describe the *group*, not any one repository. Scattered across per-repository tags they have no single writer, no replacement semantics, and no deletion story: removing a repository from the group means editing an event you may not control.
 - **Existing list kinds do not fit.** NIP-51 sets (`kind:30004` curation sets and friends) are private-or-public user bookmarks over arbitrary content, not a shared, named, addressable container for a forge collection with its own channel binding and visibility. Overloading a curation set would make every project indistinguishable from a user's reading list.
 
-One custom kind, held by one signer, with all group state in one replaceable event, resolves all three. The cost is bounded and stated plainly: `kind:30621` is Buzz-specific, so a third-party NIP-34 client sees the member repositories individually and ignores the grouping. Nothing degrades — the repositories remain standard, portable `kind:30617` events, discoverable and renderable exactly as before.
+One custom container kind, held by one signer, with all group state in one replaceable event, resolves all three. Collaborative related-channel editing additionally uses a regular Project revision kind so each authorized actor can sign their own change without gaining the Project owner's key. The cost is bounded and stated plainly: `kind:30621` and its `kind:47001` revision events are Buzz-specific, so a third-party NIP-34 client sees the member repositories individually and ignores the grouping. Nothing degrades — the repositories remain standard, portable `kind:30617` events, discoverable and renderable exactly as before.
 
 ## Non-Goals
 
@@ -67,6 +67,8 @@ This document uses MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, and RECOMMENDED as d
 | This repository (`crates/buzz-core/src/kind.rs`) | full range | `30620` is `KIND_WORKFLOW_DEF`, `30622` is `KIND_DM_VISIBILITY` (NIP-DV). `30621` is the one free number between them. |
 
 Both external registries are advisory, not authoritative allocators: neither reserves numbers, and an unregistered kind may still be in use by an unpublished client. A future upstream assignment of `30621` would be a collision Buzz absorbs the same way it already does for its other custom kinds — the number is Buzz-specific, and interoperability rests on the member `kind:30617` events, which remain standard.
+
+`47001` is a regular event because revisions must retain the signature and attribution of each collaborating actor while allowing multiple revisions over the life of one Project. It is allocated in Buzz's local `47000`–`47999` application range next to other relay-authorized command events, rather than in the addressable range: replacement semantics would collapse the audit history and key the coordinate to the collaborator instead of the Project. The stable Project coordinate lives in the revision's `a` tag.
 
 ## Event Format
 
@@ -148,12 +150,16 @@ with the same `d` and a newer `created_at`. Changing repositories, metadata,
 visibility, or the home channel remains owner-only.
 
 Related channels additionally support actor-signed `kind:47001` revisions. A
-revision has empty content and exactly one of each of these tags:
+revision has empty content, exactly one of each singleton tag below, and zero
+to 64 `buzz-related-channel` tags:
 
 - `a`: the stable `30621:<owner>:<d>` Project coordinate
+- `base`: the current owner-signed `kind:30621` event id
 - `e`: the exact current base/revision event id (the compare-and-swap token)
 - `op`: `add-related-channel` or `remove-related-channel`
 - `channel`: the related channel UUID
+- `buzz-related-channel`: one entry for every related channel after applying
+  the operation; entries are canonical UUIDs and may not repeat
 
 The relay serializes revisions with replacements of the referenced Project,
 loads the current live `kind:30621`, and authorizes the revision signer against
@@ -165,11 +171,21 @@ to owner-only management.
 
 The relay applies the add/remove operation to its current materialized related
 channels and rejects an `e` tag that does not name the current effective
-revision. It stores the signed operation for attribution and audit. Readers
-start from the current base Project id and follow the unique accepted `e`
-chain, applying operations in order. A replacement base starts a new chain.
-This mechanism does not permit a collaborator to replace the owner's
-`kind:30621` coordinate.
+revision, a `base` tag that does not name the current owner event, or a signed
+snapshot that differs from the computed result. It stores the original signed
+event for attribution and audit. A replacement base starts a new chain. This
+mechanism does not permit a collaborator to replace the owner's `kind:30621`
+coordinate.
+
+Buzz's authenticated HTTP bridge provides a bounded current-head query for
+application reads. A filter with `kinds:[47001]`, one to 100 Project
+coordinates in `#a`, and `project_revision_heads:true` returns at most the one
+materialized head event for each coordinate. The returned events are the
+original actor-signed revisions, not relay-generated projections. When a
+Project has no revision after its current base, no revision event is returned
+and the reader uses the base event's related-channel tags. Ordinary Nostr
+queries remain available for complete audit history. The extension rejects
+other filter fields instead of silently weakening its bounded-head semantics.
 
 ### Zero-member projects
 

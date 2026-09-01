@@ -87,7 +87,10 @@ test("buildProjectHomeFromFetcher scopes startup lookup to the active channel", 
   });
   assert.deepEqual(calls[2], {
     kinds: [47001],
-    extraFilter: { "#a": [`30621:${owner}:relay`] },
+    extraFilter: {
+      "#a": [`30621:${owner}:relay`],
+      project_revision_heads: true,
+    },
   });
   assert.deepEqual(calls[3], {
     kinds: [5],
@@ -277,7 +280,12 @@ test("buildProjectsFromFetcher scopes revisions to announced Project coordinates
 
   await buildProjectsFromFetcher(fetchExhaustively);
 
-  assert.deepEqual(revisionCalls, [{ "#a": [`30621:${OWNER}:proj`] }]);
+  assert.deepEqual(revisionCalls, [
+    {
+      "#a": [`30621:${OWNER}:proj`],
+      project_revision_heads: true,
+    },
+  ]);
 });
 
 test("buildProjectsFromFetcher skips the tombstone fetch when there are no announcements", async () => {

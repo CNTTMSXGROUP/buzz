@@ -2233,21 +2233,43 @@ pub fn build_project_with_tags(content: &str, tags: Vec<Tag>) -> Result<EventBui
 /// when that exact revision is no longer current.
 pub fn build_project_revision(
     project_coordinate: &str,
+    base_revision: &str,
     expected_revision: &str,
     operation: ProjectRevisionOperation,
     channel_id: Uuid,
+    related_channels: &[Uuid],
 ) -> Result<EventBuilder, SdkError> {
     let project = ProjectCoordinate::parse(project_coordinate)
         .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    let base_revision = check_hex_exact(base_revision, 64, "base Project revision")?;
     let expected_revision = check_hex_exact(expected_revision, 64, "expected Project revision")?;
-    Ok(
-        EventBuilder::new(Kind::Custom(KIND_PROJECT_REVISION as u16), "").tags([
-            tag(&["a", &project.as_string()])?,
-            tag(&["e", &expected_revision])?,
-            tag(&["op", operation.as_str()])?,
-            tag(&["channel", &channel_id.to_string()])?,
-        ]),
-    )
+    if related_channels.len() > 64 {
+        return Err(SdkError::InvalidInput(
+            "Project revision snapshot exceeds 64 related channels".into(),
+        ));
+    }
+    let mut canonical_channels = related_channels.to_vec();
+    canonical_channels.sort_unstable();
+    canonical_channels.dedup();
+    if canonical_channels.len() != related_channels.len() {
+        return Err(SdkError::InvalidInput(
+            "Project revision snapshot contains duplicate related channels".into(),
+        ));
+    }
+    let mut tags = vec![
+        tag(&["a", &project.as_string()])?,
+        tag(&["base", &base_revision])?,
+        tag(&["e", &expected_revision])?,
+        tag(&["op", operation.as_str()])?,
+        tag(&["channel", &channel_id.to_string()])?,
+    ];
+    for related_channel in canonical_channels {
+        tags.push(tag(&[
+            "buzz-related-channel",
+            &related_channel.to_string(),
+        ])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_PROJECT_REVISION as u16), "").tags(tags))
 }
 
 /// **Layer B writer-policy builder**: Build a kind:30621 project event with
@@ -4814,9 +4836,11 @@ mod tests {
         let event = sign(
             build_project_revision(
                 &format!("30621:{OWNER64}:my-proj"),
+                &"c".repeat(64),
                 &expected,
                 ProjectRevisionOperation::AddRelatedChannel,
                 channel,
+                &[channel],
             )
             .unwrap(),
         );
@@ -4832,9 +4856,11 @@ mod tests {
             tags,
             vec![
                 vec!["a".into(), format!("30621:{OWNER64}:my-proj")],
+                vec!["base".into(), "c".repeat(64)],
                 vec!["e".into(), expected],
                 vec!["op".into(), "add-related-channel".into()],
                 vec!["channel".into(), VALID_UUID.into()],
+                vec!["buzz-related-channel".into(), VALID_UUID.into()],
             ]
         );
     }

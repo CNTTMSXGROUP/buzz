@@ -84,7 +84,7 @@ async fn handle_project_revision(
     auth: &IngestAuth,
 ) -> Result<IngestResult, IngestError> {
     use buzz_core::project_revision::ProjectRevision;
-    use buzz_db::project_revision::ProjectRevisionApplyStatus;
+    use buzz_db::project_revision::ProjectRevisionApplyResult;
 
     let revision = ProjectRevision::parse(event)
         .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
@@ -95,11 +95,8 @@ async fn handle_project_revision(
         .map_err(|error| {
             IngestError::Internal(format!("error: applying Project revision: {error}"))
         })?;
-    match result.status {
-        ProjectRevisionApplyStatus::Applied => {
-            let stored = result
-                .stored_event
-                .expect("an applied Project revision includes its committed event");
+    match result {
+        ProjectRevisionApplyResult::Applied(stored) => {
             super::event::dispatch_persistent_event(
                 tenant,
                 state,
@@ -115,26 +112,23 @@ async fn handle_project_revision(
                 message: String::new(),
             })
         }
-        ProjectRevisionApplyStatus::Duplicate => Ok(IngestResult {
+        ProjectRevisionApplyResult::Duplicate => Ok(IngestResult {
             event_id: event.id.to_hex(),
             accepted: true,
             message: String::new(),
         }),
-        ProjectRevisionApplyStatus::ProjectNotFound => Err(IngestError::Rejected(
+        ProjectRevisionApplyResult::ProjectNotFound => Err(IngestError::Rejected(
             "invalid: Project does not exist".into(),
         )),
-        ProjectRevisionApplyStatus::Conflict => Err(IngestError::Rejected(
+        ProjectRevisionApplyResult::Conflict => Err(IngestError::Rejected(
             "conflict: Project changed since it was loaded".into(),
         )),
-        ProjectRevisionApplyStatus::Forbidden => Err(IngestError::Rejected(
+        ProjectRevisionApplyResult::Forbidden => Err(IngestError::Rejected(
             "restricted: Project owner or home-channel admin required".into(),
         )),
-        ProjectRevisionApplyStatus::InvalidMutation => Err(IngestError::Rejected(format!(
-            "invalid: {}",
-            result
-                .message
-                .unwrap_or_else(|| "invalid Project mutation".into())
-        ))),
+        ProjectRevisionApplyResult::InvalidMutation(message) => {
+            Err(IngestError::Rejected(format!("invalid: {message}")))
+        }
     }
 }
 

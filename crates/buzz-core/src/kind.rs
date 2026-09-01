@@ -581,7 +581,7 @@ pub const KIND_WORKFLOW_APPROVAL_GRANTED: u32 = 46011;
 /// A pending workflow approval was denied.
 pub const KIND_WORKFLOW_APPROVAL_DENIED: u32 = 46012;
 
-// User groups (47000–47999)
+// Project collaboration and user groups (47000–47999)
 
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.

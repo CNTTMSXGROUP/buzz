@@ -41,6 +41,8 @@ export type Project = {
   relatedChannelIds: string[];
   /** Current base or collaborative revision id used as the next CAS token. */
   effectiveRevisionId?: string;
+  /** Owner-signed Project event on which the collaborative revision is based. */
+  baseRevisionId?: string;
   status: string;
   projectAddress: string;
   primaryRepositoryAddress: string | null;
@@ -392,6 +394,7 @@ export function eventToExplicitProject(
     projectChannelId,
     relatedChannelIds,
     effectiveRevisionId: event.id.toLowerCase(),
+    baseRevisionId: event.id.toLowerCase(),
     status: visibility === "listed" ? "active" : "unlisted",
     projectAddress,
     primaryRepositoryAddress,
@@ -545,58 +548,41 @@ function singletonRevisionTag(event: RelayEvent, name: string): string | null {
   return matches.length === 1 ? matches[0][1] : null;
 }
 
-/** Fold the relay-authorized linear revision chain rooted at a Project head. */
+/** Apply the relay-authorized signed snapshot for a Project's current head. */
 export function applyProjectRevisionEvents(
   project: Project,
   baseEventId: string,
   events: RelayEvent[],
 ): Project {
-  let effectiveRevisionId = baseEventId.toLowerCase();
-  let relatedChannelIds = [...project.relatedChannelIds];
+  const baseRevisionId = baseEventId.toLowerCase();
   const candidates = events.filter(
     (event) =>
       event.kind === KIND_PROJECT_REVISION &&
       singletonRevisionTag(event, "a") === project.projectAddress,
   );
-  for (;;) {
-    const next = candidates.find(
-      (event) =>
-        singletonRevisionTag(event, "e")?.toLowerCase() === effectiveRevisionId,
-    );
-    if (!next) break;
-    const operation = singletonRevisionTag(next, "op");
-    const rawChannelId = singletonRevisionTag(next, "channel");
-    const channelId = rawChannelId
-      ? normalizedProjectChannelId(rawChannelId)
-      : null;
-    if (!channelId) break;
-    if (operation === "add-related-channel") {
-      if (
-        channelId === project.projectChannelId ||
-        relatedChannelIds.includes(channelId) ||
-        relatedChannelIds.length >= MAX_PROJECT_RELATED_CHANNELS
-      ) {
-        break;
-      }
-      relatedChannelIds.push(channelId);
-    } else if (operation === "remove-related-channel") {
-      if (!relatedChannelIds.includes(channelId)) break;
-      relatedChannelIds = relatedChannelIds.filter(
-        (candidate) => candidate !== channelId,
-      );
-    } else {
-      break;
-    }
-    effectiveRevisionId = next.id.toLowerCase();
+  if (candidates.length !== 1) return project;
+  const [head] = candidates;
+  if (singletonRevisionTag(head, "base")?.toLowerCase() !== baseRevisionId) {
+    return project;
+  }
+  const relatedChannelIds = head.tags
+    .filter((tag) => tag.length === 2 && tag[0] === PROJECT_RELATED_CHANNEL_TAG)
+    .flatMap((tag) => {
+      const channelId = normalizedProjectChannelId(tag[1]);
+      return channelId ? [channelId] : [];
+    });
+  if (
+    relatedChannelIds.length > MAX_PROJECT_RELATED_CHANNELS ||
+    new Set(relatedChannelIds).size !== relatedChannelIds.length ||
+    relatedChannelIds.includes(project.projectChannelId ?? "")
+  ) {
+    return project;
   }
   return {
     ...project,
-    createdAt: Math.max(
-      project.createdAt,
-      events.find((event) => event.id.toLowerCase() === effectiveRevisionId)
-        ?.created_at ?? project.createdAt,
-    ),
-    effectiveRevisionId,
+    createdAt: Math.max(project.createdAt, head.created_at),
+    baseRevisionId,
+    effectiveRevisionId: head.id.toLowerCase(),
     relatedChannelIds,
   };
 }
@@ -681,7 +667,7 @@ export function addRelatedChannelToProject(
   ].filter((id) => id !== project.projectChannelId?.toLowerCase());
   return {
     ...project,
-    createdAt,
+    createdAt: Math.max(project.createdAt, createdAt),
     relatedChannelIds: relatedChannelIds.slice(0, MAX_PROJECT_RELATED_CHANNELS),
   };
 }

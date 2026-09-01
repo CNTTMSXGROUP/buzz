@@ -1,20 +1,54 @@
-import { useQueries } from "@tanstack/react-query";
 import * as React from "react";
 import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useChannelsQuery } from "@/features/channels/hooks";
 import {
-  CHANNEL_MEMBERS_STALE_TIME_MS,
-  channelMembersQueryKey,
-} from "@/features/channels/rosterFreshness";
+  useChannelMembersQuery,
+  useChannelsQuery,
+} from "@/features/channels/hooks";
 import type { Project } from "@/features/projects/hooks";
 import { useAddProjectChannelMutation } from "@/features/projects/useAddProjectChannel";
 import { useAddProjectRepositoryMutation } from "@/features/projects/useAddProjectRepository";
 import { AddProjectRepositoryDialog } from "@/features/projects/ui/AddProjectRepositoryDialog";
 import { CreateChannelDialog } from "@/features/sidebar/ui/CreateChannelDialog";
-import { getChannelMembers } from "@/shared/api/tauri";
 import { canManageProjectChannels } from "@/features/projects/ui/ProjectChannelManagement";
+
+export function projectsAvailableForChannelCreation(
+  projects: Project[],
+  editableProjectIds: ReadonlySet<string>,
+): Project[] {
+  return projects.filter(
+    (project) =>
+      !project.legacy &&
+      (editableProjectIds.has(project.id) || Boolean(project.projectChannelId)),
+  );
+}
+
+export function canOpenProjectChannelDialog(
+  projects: Project[],
+  editableProjects: Project[],
+): boolean {
+  return (
+    projectsAvailableForChannelCreation(
+      projects,
+      new Set(editableProjects.map((project) => project.id)),
+    ).length > 0
+  );
+}
+
+export function shouldLoadProjectHomeRoster(
+  project: Project | undefined,
+  channelOpen: boolean,
+  viewerCanControlOwner: boolean,
+  identityPubkey?: string,
+): boolean {
+  return Boolean(
+    channelOpen &&
+      project?.projectChannelId &&
+      !viewerCanControlOwner &&
+      project.owner.toLowerCase() !== identityPubkey?.toLowerCase(),
+  );
+}
 
 export function ProjectsCategoryCreateDialogs({
   channelCandidateProjects,
@@ -36,61 +70,48 @@ export function ProjectsCategoryCreateDialogs({
   repositoryOpen: boolean;
 }) {
   const { goChannel, goProject } = useAppNavigation();
-  const homeRosterQueries = useQueries({
-    queries: channelCandidateProjects.map((project) => {
-      const homeChannelId = project.projectChannelId;
-      return {
-        enabled:
-          channelOpen &&
-          Boolean(homeChannelId) &&
-          project.owner.toLowerCase() !== identityPubkey?.toLowerCase(),
-        queryFn: () => {
-          if (!homeChannelId) throw new Error("Project has no home channel.");
-          return getChannelMembers(homeChannelId);
-        },
-        queryKey: channelMembersQueryKey(homeChannelId ?? "none"),
-        staleTime: CHANNEL_MEMBERS_STALE_TIME_MS,
-      };
-    }),
-  });
-  const channelProjects = channelCandidateProjects.filter((project, index) => {
-    const role = homeRosterQueries[index]?.data?.find(
-      (member) => member.pubkey.toLowerCase() === identityPubkey?.toLowerCase(),
-    )?.role;
-    const viewerCanControlOwner = editableProjects.some(
-      (candidate) => candidate.id === project.id,
-    );
-    return canManageProjectChannels(
-      project,
-      identityPubkey,
-      role,
-      viewerCanControlOwner,
-    );
-  });
+  const editableProjectIds = React.useMemo(
+    () => new Set(editableProjects.map((project) => project.id)),
+    [editableProjects],
+  );
+  const channelProjects = projectsAvailableForChannelCreation(
+    channelCandidateProjects,
+    editableProjectIds,
+  );
   const [channelProjectId, setChannelProjectId] = React.useState("");
   const channelProject =
     channelProjects.find((project) => project.id === channelProjectId) ??
     channelProjects[0];
-  const channelProjectIndex = channelProject
-    ? channelCandidateProjects.findIndex(
-        (candidate) => candidate.id === channelProject.id,
-      )
-    : -1;
-  const channelViewerRole =
-    channelProjectIndex >= 0
-      ? homeRosterQueries[channelProjectIndex]?.data?.find(
-          (member) =>
-            member.pubkey.toLowerCase() === identityPubkey?.toLowerCase(),
-        )?.role
-      : undefined;
+  const viewerCanControlChannelOwner = Boolean(
+    channelProject && editableProjectIds.has(channelProject.id),
+  );
+  const homeMembersQuery = useChannelMembersQuery(
+    channelProject?.projectChannelId ?? null,
+    shouldLoadProjectHomeRoster(
+      channelProject,
+      channelOpen,
+      viewerCanControlChannelOwner,
+      identityPubkey,
+    ),
+  );
+  const channelViewerRole = homeMembersQuery.data?.find(
+    (member) => member.pubkey.toLowerCase() === identityPubkey?.toLowerCase(),
+  )?.role;
+  const canManageChannelProject = Boolean(
+    channelProject &&
+      canManageProjectChannels(
+        channelProject,
+        identityPubkey,
+        channelViewerRole,
+        viewerCanControlChannelOwner,
+      ),
+  );
   const channelOwnerControlAgentPubkey = channelProject
     ? ownerControlAgentPubkeyFor(channelProject)
     : undefined;
   const channelSignAsManagedOwner = Boolean(
     channelProject &&
-      editableProjects.some(
-        (candidate) => candidate.id === channelProject.id,
-      ) &&
+      viewerCanControlChannelOwner &&
       identityPubkey?.toLowerCase() !== channelProject.owner.toLowerCase() &&
       channelViewerRole !== "owner" &&
       channelViewerRole !== "admin" &&
@@ -120,7 +141,7 @@ export function ProjectsCategoryCreateDialogs({
             : "Choose a project for this channel."
         }
         isCreating={createChannelMutation.isPending}
-        submitEnabled={Boolean(channelProject)}
+        submitEnabled={canManageChannelProject}
         onCreate={async (input) => {
           if (!channelProject) throw new Error("Choose a project.");
           const result = await createChannelMutation.mutateAsync({

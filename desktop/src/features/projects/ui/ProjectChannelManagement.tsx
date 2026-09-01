@@ -69,13 +69,6 @@ export function ProjectChannelManagement({
   );
 }
 
-export function useCanManageProjectChannels(
-  project: Project,
-  identityPubkey?: string,
-): boolean {
-  return useProjectChannelManagementAccess(project, identityPubkey).canManage;
-}
-
 export function useProjectChannelManagementAccess(
   project: Project,
   identityPubkey?: string,

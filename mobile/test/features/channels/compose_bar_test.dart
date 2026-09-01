@@ -223,6 +223,7 @@ Widget _buildComposeBar({
       ),
     ],
     child: MaterialApp(
+      navigatorObservers: [voiceNoteRouteObserver],
       theme: AppTheme.light(),
       builder:
           supportsShowingSystemContextMenu == null &&
@@ -445,6 +446,23 @@ class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
   }
 }
 
+class _DelayedVoiceNoteRecorder extends _FakeVoiceNoteRecorder {
+  final Completer<void> startup = Completer<void>();
+  bool stopCalled = false;
+
+  @override
+  Future<void> start() async {
+    await startup.future;
+    await super.start();
+  }
+
+  @override
+  Future<VoiceNoteRecording> stop() async {
+    stopCalled = true;
+    return super.stop();
+  }
+}
+
 class _FakeVoiceNotePlayer extends VoiceNotePlayerController {
   VoiceNotePlaybackState _state = const VoiceNotePlaybackState(
     duration: Duration(seconds: 3),
@@ -469,6 +487,12 @@ class _FakeVoiceNotePlayer extends VoiceNotePlayerController {
     required Map<String, String> headers,
     required Duration fallbackDuration,
   }) => loadLocal(url, fallbackDuration: fallbackDuration);
+
+  @override
+  Future<void> pause() async {
+    _state = _state.copyWith(isPlaying: false);
+    notifyListeners();
+  }
 
   @override
   Future<void> seek(Duration position) async {
@@ -4762,6 +4786,76 @@ void main() {
           'filename voice-note-test.mp4',
         ]),
       );
+    });
+
+    testWidgets('disables Stop while voice-note startup is pending', (
+      tester,
+    ) async {
+      final recorder = _DelayedVoiceNoteRecorder();
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: _FakeVoiceNoteUploadService(),
+          voiceNoteRecorderFactory: () => recorder,
+          onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+        ),
+      );
+
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Voice note'));
+      await tester.pumpAndSettle();
+
+      final stop = tester.widget<IconButton>(
+        find.descendant(
+          of: find.byKey(const ValueKey('voice-note-recorder-stop')),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(stop.onPressed, isNull);
+      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      expect(recorder.stopCalled, isFalse);
+
+      recorder.startup.complete();
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<IconButton>(
+              find.descendant(
+                of: find.byKey(const ValueKey('voice-note-recorder-stop')),
+                matching: find.byType(IconButton),
+              ),
+            )
+            .onPressed,
+        isNotNull,
+      );
+    });
+
+    testWidgets('covering the route cancels its active voice-note recorder', (
+      tester,
+    ) async {
+      final recorder = _FakeVoiceNoteRecorder();
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: _FakeVoiceNoteUploadService(),
+          voiceNoteRecorderFactory: () => recorder,
+          onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+        ),
+      );
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Voice note'));
+      await tester.pumpAndSettle();
+
+      final context = tester.element(
+        find.byKey(const ValueKey('voice-note-recorder')),
+      );
+      unawaited(
+        Navigator.of(
+          context,
+        ).push(MaterialPageRoute<void>(builder: (_) => const Scaffold())),
+      );
+      await tester.pumpAndSettle();
+
+      expect(recorder.cancelled, isTrue);
+      expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
     });
 
     testWidgets('discarding an inline voice note restores the composer', (

@@ -78,7 +78,13 @@ Map<String, ImetaEntry> parseImetaTags(List<List<String>> tags) {
         case 'alt':
           alt = value;
         case 'duration':
-          duration = double.tryParse(value);
+          final parsedDuration = double.tryParse(value);
+          duration =
+              parsedDuration != null &&
+                  parsedDuration.isFinite &&
+                  parsedDuration >= 0
+              ? parsedDuration
+              : null;
         case 'filename':
           filename = value;
         case 'size':

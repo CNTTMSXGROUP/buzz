@@ -10,6 +10,15 @@ import '../../shared/theme/theme.dart';
 import 'voice_note_recording.dart';
 import 'voice_note_waveform.dart';
 
+class _VoiceNoteRouteAware extends RouteAware {
+  _VoiceNoteRouteAware(this.onCovered);
+
+  final VoidCallback onCovered;
+
+  @override
+  void didPushNext() => onCovered();
+}
+
 class VoiceNoteComposerRecorder extends HookConsumerWidget {
   const VoiceNoteComposerRecorder({
     super.key,
@@ -27,11 +36,24 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     final sampleSequence = useState(0);
     final elapsed = useState(Duration.zero);
     final error = useState<String?>(null);
+    final isStarted = useState(false);
     final isStopping = useState(false);
     final startedAt = useRef<DateTime?>(null);
+    final routeAware = useMemoized(
+      () => _VoiceNoteRouteAware(() {
+        if (context.mounted) onCancel();
+      }),
+      [onCancel],
+    );
+
+    final route = ModalRoute.of(context);
+    useEffect(() {
+      if (route != null) voiceNoteRouteObserver.subscribe(routeAware, route);
+      return () => voiceNoteRouteObserver.unsubscribe(routeAware);
+    }, [routeAware, route]);
 
     Future<void> finish() async {
-      if (isStopping.value || error.value != null) return;
+      if (!isStarted.value || isStopping.value || error.value != null) return;
       isStopping.value = true;
       unawaited(HapticFeedback.mediumImpact());
       try {
@@ -64,7 +86,10 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       unawaited(() async {
         try {
           await recorder.start();
-          if (active) startedAt.value = DateTime.now();
+          if (active) {
+            startedAt.value = DateTime.now();
+            isStarted.value = true;
+          }
         } on StateError catch (recordingError) {
           if (active) error.value = recordingError.message;
         } catch (_) {
@@ -169,7 +194,9 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
           icon: LucideIcons.square,
           foreground: Colors.white,
           background: context.colors.error,
-          onPressed: error.value == null && !isStopping.value ? finish : null,
+          onPressed: error.value == null && isStarted.value && !isStopping.value
+              ? finish
+              : null,
         ),
       ],
     );

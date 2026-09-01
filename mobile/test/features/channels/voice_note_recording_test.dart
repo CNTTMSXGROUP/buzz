@@ -1,0 +1,209 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:record/record.dart';
+import 'package:buzz/features/channels/voice_note_recording.dart';
+
+class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
+  final permission = Completer<bool>();
+  final nativeStart = Completer<void>();
+  final amplitudes = StreamController<Amplitude>.broadcast();
+  bool startCalled = false;
+  bool cancelCalled = false;
+  bool disposeCalled = false;
+
+  @override
+  Future<bool> hasPermission() => permission.future;
+
+  @override
+  Future<void> start(RecordConfig config, {required String path}) {
+    startCalled = true;
+    return nativeStart.future;
+  }
+
+  @override
+  Stream<Amplitude> onAmplitudeChanged(Duration interval) => amplitudes.stream;
+
+  @override
+  Future<String?> stop() async => '/tmp/voice-note-test.m4a';
+
+  @override
+  Future<void> cancel() async => cancelCalled = true;
+
+  @override
+  Future<void> dispose() async {
+    disposeCalled = true;
+    await amplitudes.close();
+  }
+}
+
+class _CoordinatedPlayer extends VoiceNotePlayerController {
+  _CoordinatedPlayer(
+    this.coordinator, {
+    required this.source,
+    required this.isRemote,
+  });
+
+  final VoiceNotePlaybackCoordinator coordinator;
+  final String source;
+  final bool isRemote;
+  VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
+  int pauseCount = 0;
+
+  @override
+  VoiceNotePlaybackState get state => _state;
+
+  @override
+  Future<void> loadLocal(
+    String path, {
+    required Duration fallbackDuration,
+  }) async {}
+
+  @override
+  Future<void> loadRemote(
+    String url, {
+    required Map<String, String> headers,
+    required Duration fallbackDuration,
+  }) async {}
+
+  @override
+  Future<void> pause() async {
+    pauseCount += 1;
+    _state = _state.copyWith(isPlaying: false);
+  }
+
+  @override
+  Future<void> seek(Duration position) async {}
+
+  @override
+  Future<void> setSpeed(double speed) async {}
+
+  @override
+  Future<void> toggle() async {
+    if (_state.isPlaying) {
+      await pause();
+      return;
+    }
+    if (await coordinator.activate(this)) {
+      _state = _state.copyWith(isPlaying: true);
+    }
+  }
+
+  void complete() {
+    _state = _state.copyWith(isPlaying: false);
+    coordinator.release(this);
+  }
+
+  @override
+  void dispose() {
+    coordinator.release(this);
+    super.dispose();
+  }
+}
+
+void main() {
+  test('cancellation fences delayed permission before native start', () async {
+    final backend = _DelayedRecorderBackend();
+    final directory = await Directory.systemTemp.createTemp('voice-note-test');
+    addTearDown(() => directory.delete(recursive: true));
+    final recorder = DeviceVoiceNoteRecorder(
+      backend: backend,
+      temporaryDirectory: () async => directory,
+    );
+
+    final startup = recorder.start();
+    final startupExpectation = expectLater(startup, throwsStateError);
+    final cancellation = recorder.cancel();
+    backend.permission.complete(true);
+
+    await cancellation;
+    await startupExpectation;
+    expect(backend.startCalled, isFalse);
+    await recorder.dispose();
+    expect(backend.disposeCalled, isTrue);
+  });
+
+  test('cancellation ends native recording when start resolves late', () async {
+    final backend = _DelayedRecorderBackend();
+    final directory = await Directory.systemTemp.createTemp('voice-note-test');
+    addTearDown(() => directory.delete(recursive: true));
+    final recorder = DeviceVoiceNoteRecorder(
+      backend: backend,
+      temporaryDirectory: () async => directory,
+    );
+
+    final startup = recorder.start();
+    final startupExpectation = expectLater(startup, throwsStateError);
+    backend.permission.complete(true);
+    await Future<void>.delayed(Duration.zero);
+    expect(backend.startCalled, isTrue);
+
+    final cancellation = recorder.cancel();
+    backend.nativeStart.complete();
+    await cancellation;
+    await startupExpectation;
+
+    expect(backend.cancelCalled, isTrue);
+    await recorder.dispose();
+  });
+
+  test(
+    'playback coordinator arbitrates instances and releases ownership',
+    () async {
+      final coordinator = VoiceNotePlaybackCoordinator();
+      final first = _CoordinatedPlayer(
+        coordinator,
+        source: 'https://example.com/first.mp4',
+        isRemote: true,
+      );
+      final second = _CoordinatedPlayer(
+        coordinator,
+        source: 'https://example.com/second.mp4',
+        isRemote: true,
+      );
+      final duplicateSource = _CoordinatedPlayer(
+        coordinator,
+        source: first.source,
+        isRemote: true,
+      );
+      final composerPreview = _CoordinatedPlayer(
+        coordinator,
+        source: '/tmp/voice-note.m4a',
+        isRemote: false,
+      );
+      addTearDown(second.dispose);
+      addTearDown(duplicateSource.dispose);
+      addTearDown(composerPreview.dispose);
+      expect(duplicateSource.source, first.source);
+
+      await first.toggle();
+      await second.toggle();
+
+      expect(first.pauseCount, 1);
+      expect(first.state.isPlaying, isFalse);
+      expect(second.state.isPlaying, isTrue);
+
+      await duplicateSource.toggle();
+      expect(second.pauseCount, 1);
+      expect(second.state.isPlaying, isFalse);
+      expect(duplicateSource.state.isPlaying, isTrue);
+
+      duplicateSource.complete();
+      await composerPreview.toggle();
+      expect(duplicateSource.pauseCount, 0);
+      expect(composerPreview.isRemote, isFalse);
+      expect(composerPreview.state.isPlaying, isTrue);
+
+      await first.toggle();
+      expect(composerPreview.pauseCount, 1);
+      expect(composerPreview.state.isPlaying, isFalse);
+      expect(first.state.isPlaying, isTrue);
+
+      first.dispose();
+      await second.toggle();
+      expect(first.pauseCount, 1);
+      expect(second.state.isPlaying, isTrue);
+    },
+  );
+}

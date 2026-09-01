@@ -80,10 +80,21 @@ class VoiceNoteWaveform extends StatelessWidget {
           }
         }
 
+        void adjust(double delta) =>
+            onSeek?.call((progress.clamp(0.0, 1.0) + delta).clamp(0.0, 1.0));
+
         return Semantics(
           label: 'Voice note waveform',
           slider: onSeek != null,
           value: onSeek == null ? null : '${(progress * 100).round()} percent',
+          increasedValue: onSeek == null
+              ? null
+              : '${((progress + 0.1).clamp(0.0, 1.0) * 100).round()} percent',
+          decreasedValue: onSeek == null
+              ? null
+              : '${((progress - 0.1).clamp(0.0, 1.0) * 100).round()} percent',
+          onIncrease: onSeek == null ? null : () => adjust(0.1),
+          onDecrease: onSeek == null ? null : () => adjust(-0.1),
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTapDown: onSeek == null

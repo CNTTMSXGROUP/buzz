@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:just_audio/just_audio.dart' as audio;
@@ -11,6 +11,7 @@ import 'package:record/record.dart';
 
 const voiceNoteMaxDuration = Duration(minutes: 5);
 const voiceNotePlaybackRates = <double>[1, 1.5, 2, 0.5];
+final voiceNoteRouteObserver = RouteObserver<ModalRoute<void>>();
 
 double nextVoiceNotePlaybackRate(double current) {
   final index = voiceNotePlaybackRates.indexOf(current);
@@ -49,24 +50,97 @@ final voiceNoteRecorderFactoryProvider = Provider<VoiceNoteRecorder Function()>(
   (ref) => DeviceVoiceNoteRecorder.new,
 );
 
-class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
+abstract interface class VoiceNoteRecorderBackend {
+  Future<bool> hasPermission();
+
+  Future<void> start(RecordConfig config, {required String path});
+
+  Stream<Amplitude> onAmplitudeChanged(Duration interval);
+
+  Future<String?> stop();
+
+  Future<void> cancel();
+
+  Future<void> dispose();
+}
+
+class _DeviceVoiceNoteRecorderBackend implements VoiceNoteRecorderBackend {
   final AudioRecorder _recorder = AudioRecorder();
+
+  @override
+  Future<bool> hasPermission() => _recorder.hasPermission();
+
+  @override
+  Future<void> start(RecordConfig config, {required String path}) =>
+      _recorder.start(config, path: path);
+
+  @override
+  Stream<Amplitude> onAmplitudeChanged(Duration interval) =>
+      _recorder.onAmplitudeChanged(interval);
+
+  @override
+  Future<String?> stop() => _recorder.stop();
+
+  @override
+  Future<void> cancel() => _recorder.cancel();
+
+  @override
+  Future<void> dispose() => _recorder.dispose();
+}
+
+class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
+  DeviceVoiceNoteRecorder({
+    VoiceNoteRecorderBackend? backend,
+    Future<Directory> Function()? temporaryDirectory,
+  }) : _recorder = backend ?? _DeviceVoiceNoteRecorderBackend(),
+       _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory;
+
+  final VoiceNoteRecorderBackend _recorder;
+  final Future<Directory> Function() _temporaryDirectory;
   final StreamController<double> _levels = StreamController.broadcast();
   final List<double> _samples = [];
   StreamSubscription<Amplitude>? _amplitudeSubscription;
+  Future<void>? _startup;
   DateTime? _startedAt;
   String? _path;
+  int _lifecycleGeneration = 0;
+  bool _nativeStarted = false;
+  bool _nativeEnded = false;
   bool _finished = false;
+  bool _disposed = false;
 
   @override
   Stream<double> get levels => _levels.stream;
 
+  void _ensureStartupActive(int generation) {
+    if (_disposed || _finished || generation != _lifecycleGeneration) {
+      throw StateError('Voice note recording was cancelled.');
+    }
+  }
+
   @override
-  Future<void> start() async {
-    if (!await _recorder.hasPermission()) {
+  Future<void> start() {
+    if (_startup != null || _nativeStarted || _finished || _disposed) {
+      return Future.error(
+        StateError('Voice note recording cannot be started.'),
+      );
+    }
+    final generation = ++_lifecycleGeneration;
+    final startup = _start(generation);
+    _startup = startup;
+    return startup.whenComplete(() {
+      if (identical(_startup, startup)) _startup = null;
+    });
+  }
+
+  Future<void> _start(int generation) async {
+    final hasPermission = await _recorder.hasPermission();
+    _ensureStartupActive(generation);
+    if (!hasPermission) {
       throw StateError('Microphone access is required to record a voice note.');
     }
-    final directory = await getTemporaryDirectory();
+    final directory = await _temporaryDirectory();
+    _ensureStartupActive(generation);
     final path =
         '${directory.path}${Platform.pathSeparator}'
         'voice-note-${DateTime.now().millisecondsSinceEpoch}.m4a';
@@ -82,8 +156,11 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
       ),
       path: path,
     );
+    _nativeStarted = true;
+    _ensureStartupActive(generation);
     _path = path;
     _startedAt = DateTime.now();
+    _ensureStartupActive(generation);
     _amplitudeSubscription = _recorder
         .onAmplitudeChanged(const Duration(milliseconds: 80))
         .listen((amplitude) {
@@ -100,10 +177,14 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
 
   @override
   Future<VoiceNoteRecording> stop() async {
-    if (_finished) throw StateError('Voice note recording already ended.');
+    if (_finished || !_nativeStarted || _nativeEnded) {
+      throw StateError('Voice note recording is not active.');
+    }
     _finished = true;
+    _lifecycleGeneration += 1;
     await _amplitudeSubscription?.cancel();
     final recordedPath = await _recorder.stop() ?? _path;
+    _nativeEnded = true;
     if (recordedPath == null || recordedPath.isEmpty) {
       throw StateError('Buzz could not finish the voice note.');
     }
@@ -122,13 +203,38 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   Future<void> cancel() async {
     if (_finished) return;
     _finished = true;
+    _lifecycleGeneration += 1;
+    try {
+      await _startup;
+    } catch (_) {
+      // A cancellation fence intentionally rejects stale startup work.
+    }
     await _amplitudeSubscription?.cancel();
-    await _recorder.cancel();
+    if (_nativeStarted && !_nativeEnded) {
+      await _recorder.cancel();
+      _nativeEnded = true;
+    }
   }
 
   @override
   Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    if (!_finished) {
+      await cancel();
+    } else {
+      _lifecycleGeneration += 1;
+    }
+    try {
+      await _startup;
+    } catch (_) {
+      // Startup may reject because disposal invalidated its generation.
+    }
     await _amplitudeSubscription?.cancel();
+    if (_nativeStarted && !_nativeEnded) {
+      await _recorder.cancel();
+      _nativeEnded = true;
+    }
     await _recorder.dispose();
     await _levels.close();
   }
@@ -178,25 +284,44 @@ abstract class VoiceNotePlayerController extends ChangeNotifier {
 
   Future<void> toggle();
 
+  Future<void> pause();
+
   Future<void> seek(Duration position);
 
   Future<void> setSpeed(double speed);
 }
 
+class VoiceNotePlaybackCoordinator {
+  VoiceNotePlayerController? _active;
+
+  Future<bool> activate(VoiceNotePlayerController controller) async {
+    if (identical(_active, controller)) return true;
+    final previous = _active;
+    _active = controller;
+    await previous?.pause();
+    return identical(_active, controller);
+  }
+
+  void release(VoiceNotePlayerController controller) {
+    if (identical(_active, controller)) _active = null;
+  }
+}
+
+final voiceNotePlaybackCoordinatorProvider = Provider(
+  (ref) => VoiceNotePlaybackCoordinator(),
+);
+
 final voiceNotePlayerFactoryProvider =
-    Provider<VoiceNotePlayerController Function()>(
-      (ref) => DeviceVoiceNotePlayerController.new,
-    );
+    Provider<VoiceNotePlayerController Function()>((ref) {
+      final coordinator = ref.watch(voiceNotePlaybackCoordinatorProvider);
+      return () => DeviceVoiceNotePlayerController(coordinator: coordinator);
+    });
 
 class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
-  final audio.AudioPlayer _player = audio.AudioPlayer(
-    useProxyForRequestHeaders: false,
-  );
-  final List<StreamSubscription<Object?>> _subscriptions = [];
-  VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
-  bool _disposed = false;
-
-  DeviceVoiceNotePlayerController() {
+  DeviceVoiceNotePlayerController({
+    required VoiceNotePlaybackCoordinator coordinator,
+  }) : _coordinator = coordinator,
+       _player = audio.AudioPlayer() {
     _subscriptions.add(
       _player.positionStream.listen((position) {
         _update(_state.copyWith(position: position));
@@ -210,6 +335,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     _subscriptions.add(
       _player.playerStateStream.listen((playerState) {
         if (playerState.processingState == audio.ProcessingState.completed) {
+          _coordinator.release(this);
           _update(
             _state.copyWith(
               position: Duration.zero,
@@ -231,6 +357,12 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
       }),
     );
   }
+
+  final VoiceNotePlaybackCoordinator _coordinator;
+  final audio.AudioPlayer _player;
+  final List<StreamSubscription<Object?>> _subscriptions = [];
+  VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
+  bool _disposed = false;
 
   Future<void> _stopAndRewindCompletedPlayback() async {
     await _player.pause();
@@ -274,6 +406,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         ),
       );
     } catch (_) {
+      _coordinator.release(this);
       _update(_state.copyWith(isLoading: false, hasError: true));
     }
   }
@@ -282,11 +415,15 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   Future<void> toggle() async {
     if (_state.hasError || _state.isLoading) return;
     if (_player.playing) {
-      await _player.pause();
+      await pause();
     } else {
-      await _player.play();
+      final ownsPlayback = await _coordinator.activate(this);
+      if (ownsPlayback && !_disposed) await _player.play();
     }
   }
+
+  @override
+  Future<void> pause() => _player.pause();
 
   @override
   Future<void> seek(Duration position) => _player.seek(position);
@@ -303,6 +440,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   @override
   void dispose() {
     _disposed = true;
+    _coordinator.release(this);
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }

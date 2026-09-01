@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
@@ -10,6 +11,7 @@ import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/media_viewer_page.dart';
+import 'package:buzz/features/channels/voice_note_attachment.dart';
 import 'package:buzz/features/channels/voice_note_waveform.dart';
 import 'package:buzz/features/channels/voice_note_recording.dart';
 import 'package:buzz/shared/deeplink/deep_link.dart';
@@ -74,6 +76,12 @@ class _FakeVoiceNotePlayer extends VoiceNotePlayerController {
     required Map<String, String> headers,
     required Duration fallbackDuration,
   }) => loadLocal(url, fallbackDuration: fallbackDuration);
+
+  @override
+  Future<void> pause() async {
+    _state = _state.copyWith(isPlaying: false);
+    notifyListeners();
+  }
 
   @override
   Future<void> seek(Duration position) async {
@@ -240,6 +248,60 @@ void main() {
     expect(
       (layout.barWidth * sampleCount) + (layout.gap * (sampleCount - 1)),
       closeTo(width, 0.001),
+    );
+  });
+
+  testWidgets('voice-note waveform semantics seek within bounded steps', (
+    tester,
+  ) async {
+    final progress = ValueNotifier(0.0);
+    addTearDown(progress.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ValueListenableBuilder<double>(
+          valueListenable: progress,
+          builder: (context, value, _) => VoiceNoteWaveform(
+            samples: const [0.2, 0.8],
+            progress: value,
+            onSeek: (next) => progress.value = next,
+          ),
+        ),
+      ),
+    );
+
+    final semantics = tester.getSemantics(
+      find.bySemanticsLabel('Voice note waveform'),
+    );
+    expect(semantics.value, '0 percent');
+    semantics.owner!.performAction(semantics.id, SemanticsAction.increase);
+    await tester.pump();
+    expect(
+      tester.getSemantics(find.bySemanticsLabel('Voice note waveform')).value,
+      '10 percent',
+    );
+
+    progress.value = 0.5;
+    await tester.pump();
+    final middle = tester.getSemantics(
+      find.bySemanticsLabel('Voice note waveform'),
+    );
+    middle.owner!.performAction(middle.id, SemanticsAction.decrease);
+    await tester.pump();
+    expect(
+      tester.getSemantics(find.bySemanticsLabel('Voice note waveform')).value,
+      '40 percent',
+    );
+
+    progress.value = 1;
+    await tester.pump();
+    final end = tester.getSemantics(
+      find.bySemanticsLabel('Voice note waveform'),
+    );
+    end.owner!.performAction(end.id, SemanticsAction.increase);
+    await tester.pump();
+    expect(
+      tester.getSemantics(find.bySemanticsLabel('Voice note waveform')).value,
+      '100 percent',
     );
   });
 
@@ -1152,6 +1214,66 @@ void main() {
           findsOneWidget,
         );
       });
+
+      testWidgets(
+        'keeps voice notes out of image carousels for audio-only and mixed media',
+        (tester) async {
+          const firstAudio = 'https://example.com/media/voice-note-first.mp4';
+          const secondAudio = 'https://example.com/media/voice-note-second.mp4';
+          const image = 'https://example.com/media/photo.png';
+
+          Widget message(String content, List<List<String>> tags) => _testable(
+            MessageContent(content: content, tags: tags),
+            overrides: [
+              voiceNotePlayerFactoryProvider.overrideWithValue(
+                _FakeVoiceNotePlayer.new,
+              ),
+            ],
+          );
+
+          await tester.pumpWidget(
+            message('![audio]($firstAudio)\n![audio]($secondAudio)', const [
+              [
+                'imeta',
+                'url $firstAudio',
+                'm video/mp4',
+                'filename voice-note-first.mp4',
+              ],
+              [
+                'imeta',
+                'url $secondAudio',
+                'm video/mp4',
+                'filename voice-note-second.mp4',
+              ],
+            ]),
+          );
+          await tester.pumpAndSettle();
+          expect(
+            find.byKey(const ValueKey('message-media-carousel')),
+            findsNothing,
+          );
+          expect(find.byType(VoiceNoteAttachment), findsNWidgets(2));
+
+          await tester.pumpWidget(
+            message('![image]($image)\n![audio]($firstAudio)', const [
+              ['imeta', 'url $image', 'm image/png'],
+              [
+                'imeta',
+                'url $firstAudio',
+                'm video/mp4',
+                'filename voice-note-first.mp4',
+              ],
+            ]),
+          );
+          await tester.pumpAndSettle();
+          expect(
+            find.byKey(const ValueKey('message-media-carousel')),
+            findsNothing,
+          );
+          expect(find.byType(VoiceNoteAttachment), findsOneWidget);
+          expect(_imagePreview(image), findsOneWidget);
+        },
+      );
 
       testWidgets(
         'groups uploaded photos into a carousel and opens the full gallery',

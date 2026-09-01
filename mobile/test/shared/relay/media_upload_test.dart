@@ -1249,6 +1249,7 @@ void main() {
               'size': request.bodyBytes.length,
               'type': 'video/mp4',
               'uploaded': 1,
+              'duration': 3.0,
             }),
             HttpStatus.ok,
           );
@@ -1270,7 +1271,8 @@ void main() {
         expect(packagedSourcePath, source.path);
         expect(descriptor.type, 'video/mp4');
         expect(descriptor.filename, 'voice-note-test.mp4');
-        expect(descriptor.duration, 3.25);
+        expect(descriptor.duration, 3.0);
+        expect(descriptor.toImetaTag(), contains('duration 3.0'));
         expect(descriptor.toMarkdownImage(), '![audio](${descriptor.url})');
         expect(await packaged.exists(), isFalse);
       } finally {

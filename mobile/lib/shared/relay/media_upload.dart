@@ -174,7 +174,7 @@ class BlobDescriptor {
 
   BlobDescriptor withVoiceNoteMetadata({
     required String filename,
-    required double durationSeconds,
+    required double fallbackDurationSeconds,
   }) => BlobDescriptor(
     url: url,
     sha256: sha256,
@@ -184,7 +184,7 @@ class BlobDescriptor {
     dim: dim,
     blurhash: blurhash,
     thumb: thumb,
-    duration: durationSeconds,
+    duration: duration ?? fallbackDurationSeconds,
     image: image,
     filename: filename,
   );
@@ -490,7 +490,7 @@ class MediaUploadService {
       );
       return descriptor.withVoiceNoteMetadata(
         filename: _voiceNoteMp4Filename(voiceNote.name),
-        durationSeconds: duration.inMilliseconds / 1000,
+        fallbackDurationSeconds: duration.inMilliseconds / 1000,
       );
     } finally {
       if (packagedPath != null && packagedPath != voiceNote.path) {

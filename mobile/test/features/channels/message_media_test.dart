@@ -63,6 +63,19 @@ void main() {
       );
     });
 
+    test('rejects non-finite and negative durations', () {
+      for (final duration in ['NaN', 'Infinity', '-1']) {
+        final entry = parseImetaTags([
+          [
+            'imeta',
+            'url https://example.com/media/$duration',
+            'duration $duration',
+          ],
+        ]).values.single;
+        expect(entry.duration, isNull);
+      }
+    });
+
     test('parses voice note duration and filename metadata', () {
       final entry = parseImetaTags(const [
         [

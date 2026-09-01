@@ -28,7 +28,7 @@ One custom kind, held by one signer, with all group state in one replaceable eve
 
 ## Non-Goals
 
-This NIP does not define shared or delegated project editing — a project is replaceable only by its own signer (see [Authority](#authority)).
+This NIP does not itself define shared or delegated Project editing: `kind:30621` is replaceable only by its signer. A relay MAY additionally implement [NIP-PC](NIP-PC.md), whose actor-signed commands and relay-signed projection leave that owner-only identity unchanged.
 This NIP does not define any authorization over member repositories. Membership is not a permission grant, and a project is never consulted by git push policy.
 This NIP does not define project-level branch protection, CI, or workflow configuration.
 This NIP does not define nested projects. A project's members are repositories, never other projects.
@@ -140,9 +140,9 @@ Clients MUST preserve each member repository's own owner provenance in the UI. A
 
 ### Editing model
 
-Editing is **owner-only**: publish a replacement `kind:30621` with the same `d` and a newer `created_at`. Adding, removing, or reordering members and changing metadata are all one operation — replacing the container. This falls out of the addressable-event model with no relay-side permission machinery; NIP-01 replacement already refuses to let one pubkey overwrite another's coordinate.
+Editing the portable `kind:30621` identity is **owner-only**: publish a replacement with the same `d` and a newer `created_at`. Adding, removing, or reordering members and changing metadata are all one operation — replacing the container. This falls out of the addressable-event model with no relay-side permission machinery; NIP-01 replacement already refuses to let one pubkey overwrite another's coordinate.
 
-Delegated or maintainer editing is deliberately out of scope for this version. Adding it later needs no change to this event shape — only a new rule about who may replace a coordinate.
+Optional [NIP-PC](NIP-PC.md) collaboration does not widen replacement authority. It records authorized actor-signed changes separately and projects effective relay state while `kind:30621` remains the owner-controlled identity and recovery source.
 
 ### Zero-member projects
 
@@ -324,7 +324,7 @@ Its cases are **semantic, not signed envelopes**. A repository or project is nam
 ## Relation to Other NIPs
 
 - **NIP-34**: Supplies the member repositories. Members are `kind:30617` announcements referenced by coordinate; a NIP-34 client that does not know `kind:30621` still discovers and renders each repository normally.
-- **NIP-01**: Supplies the addressable-event class, the `a` tag grammar, addressing, replacement, and the owner-only editing model. Owner-only editing is not enforcement code in Buzz — it is what NIP-01 replacement already means.
+- **NIP-01**: Supplies the addressable-event class, the `a` tag grammar, addressing, replacement, and the owner-only `kind:30621` identity model. Owner-only replacement is not enforcement code in Buzz — it is what NIP-01 replacement already means. Optional NIP-PC collaboration never replaces this coordinate for another actor.
 - **NIP-09**: Supplies container deletion, which deletes the container only. Buzz extends it in two ways that are not project-specific: an agent's registered NIP-OA owner may also delete, and a tombstone applies only at or before its own `created_at` ([Deletion](#deletion)).
 - **NIP-29**: Supplies the channel a project's `buzz-channel` names. The reference is metadata; project state is never channel-scoped.
 - **NIP-51**: The closest existing precedent — a signed, addressable list referencing content the author need not own. Not reused because a project is a shared named forge container with its own channel binding and visibility, not a user's private-or-public bookmark set.

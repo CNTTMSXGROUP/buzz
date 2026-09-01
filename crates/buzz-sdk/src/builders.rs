@@ -12,7 +12,7 @@ use buzz_core::{
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_PROJECT_CHANGE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1993,6 +1993,8 @@ pub const PROJECT_CHANNEL_MAX: usize = 256;
 pub const PROJECT_VISIBILITY_MAX: usize = 256;
 /// Maximum number of `a` member tags per project event (checked before dedup).
 pub const PROJECT_MEMBER_CAP: usize = 64;
+/// Maximum number of related channels in either side of one Project change.
+pub const PROJECT_RELATED_CHANNEL_CHANGE_CAP: usize = 64;
 
 /// A validated NIP-MP member `a`-tag coordinate with an optional relay hint.
 ///
@@ -2003,6 +2005,23 @@ pub struct ProjectMemberCoord {
     pub coord: String,
     /// Optional opaque relay hint (third `a`-tag element, never validated by content).
     pub hint: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ProjectChangeContent<'a> {
+    v: u8,
+    patch: ProjectChangePatch<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct ProjectChangePatch<'a> {
+    related_channels: ProjectRelatedChannelPatch<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct ProjectRelatedChannelPatch<'a> {
+    add: &'a [String],
+    remove: &'a [String],
 }
 
 impl PartialEq for ProjectMemberCoord {
@@ -2298,6 +2317,93 @@ pub fn build_project(
     }
 
     build_project_with_tags("", tags)
+}
+
+fn validate_project_coordinate(coordinate: &str) -> Result<(), SdkError> {
+    let mut parts = coordinate.splitn(3, ':');
+    let kind = parts.next().unwrap_or_default();
+    let owner = parts.next().unwrap_or_default();
+    let d = parts.next().unwrap_or_default();
+    if kind != "30621"
+        || owner.len() != 64
+        || !owner
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, 'a'..='f'))
+        || d.is_empty()
+        || d.len() > PROJECT_D_MAX_LEN
+    {
+        return Err(SdkError::InvalidInput(
+            "project coordinate must be canonical '30621:<lowercase-hex64>:<nonempty-d>'".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build a version-1 Project related-channel change command.
+///
+/// The command uses `expected_revision` for compare-and-swap against the
+/// relay-authored state. UUID inputs serialize in canonical lowercase,
+/// hyphenated form. The relay remains responsible for state-dependent checks
+/// and actor authorization.
+pub fn build_project_related_channel_change(
+    project_coordinate: &str,
+    expected_revision: u64,
+    add: &[Uuid],
+    remove: &[Uuid],
+) -> Result<EventBuilder, SdkError> {
+    validate_project_coordinate(project_coordinate)?;
+    if expected_revision == 0 || expected_revision > i64::MAX as u64 {
+        return Err(SdkError::InvalidInput(format!(
+            "expected revision must be from 1 through {}",
+            i64::MAX
+        )));
+    }
+    if add.is_empty() && remove.is_empty() {
+        return Err(SdkError::InvalidInput(
+            "Project change patch must not be empty".into(),
+        ));
+    }
+    if add.len() > PROJECT_RELATED_CHANNEL_CHANGE_CAP
+        || remove.len() > PROJECT_RELATED_CHANNEL_CHANGE_CAP
+    {
+        return Err(SdkError::InvalidInput(format!(
+            "Project change may add or remove at most {PROJECT_RELATED_CHANNEL_CHANGE_CAP} related channels"
+        )));
+    }
+
+    let mut add: Vec<String> = add.iter().map(Uuid::to_string).collect();
+    let mut remove: Vec<String> = remove.iter().map(Uuid::to_string).collect();
+    add.sort_unstable();
+    remove.sort_unstable();
+    let add_set: std::collections::HashSet<&str> = add.iter().map(String::as_str).collect();
+    let remove_set: std::collections::HashSet<&str> = remove.iter().map(String::as_str).collect();
+    if add_set.len() != add.len() || remove_set.len() != remove.len() {
+        return Err(SdkError::InvalidInput(
+            "Project change contains a duplicate related channel".into(),
+        ));
+    }
+    if add_set.iter().any(|channel| remove_set.contains(channel)) {
+        return Err(SdkError::InvalidInput(
+            "Project change cannot add and remove the same related channel".into(),
+        ));
+    }
+    let content = serde_json::to_string(&ProjectChangeContent {
+        v: 1,
+        patch: ProjectChangePatch {
+            related_channels: ProjectRelatedChannelPatch {
+                add: &add,
+                remove: &remove,
+            },
+        },
+    })
+    .map_err(|error| SdkError::InvalidInput(format!("invalid Project change: {error}")))?;
+    let expected_revision = expected_revision.to_string();
+    Ok(
+        EventBuilder::new(Kind::Custom(KIND_PROJECT_CHANGE as u16), content).tags([
+            tag(&["a", project_coordinate])?,
+            tag(&["expected-revision", &expected_revision])?,
+        ]),
+    )
 }
 
 /// **Generic NIP-09 coordinate delete**: Build a kind:5 deletion event with
@@ -4779,6 +4885,75 @@ mod tests {
         assert!(
             ev.content.is_empty(),
             "Layer B must always emit empty content"
+        );
+    }
+
+    // ── Project collaboration command ──────────────────────────────────────
+
+    const PROJECT_COORDINATE: &str =
+        "30621:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:platform";
+    const PROJECT_RELATED: Uuid = Uuid::from_u128(0x22222222_2222_4222_8222_222222222222);
+
+    #[test]
+    fn project_related_channel_change_has_canonical_v1_shape() {
+        let event = sign(
+            build_project_related_channel_change(PROJECT_COORDINATE, 7, &[PROJECT_RELATED], &[])
+                .unwrap(),
+        );
+        assert_eq!(event.kind.as_u16() as u32, KIND_PROJECT_CHANGE);
+        assert_eq!(
+            event.content,
+            r#"{"v":1,"patch":{"related_channels":{"add":["22222222-2222-4222-8222-222222222222"],"remove":[]}}}"#
+        );
+        assert_eq!(
+            event
+                .tags
+                .iter()
+                .map(|event_tag| event_tag.as_slice().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["a".to_string(), PROJECT_COORDINATE.to_string()],
+                vec!["expected-revision".to_string(), "7".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn project_related_channel_change_rejects_invalid_patches() {
+        assert!(build_project_related_channel_change(PROJECT_COORDINATE, 1, &[], &[]).is_err());
+        assert!(build_project_related_channel_change(
+            PROJECT_COORDINATE,
+            0,
+            &[PROJECT_RELATED],
+            &[]
+        )
+        .is_err());
+        assert!(build_project_related_channel_change(
+            PROJECT_COORDINATE,
+            1,
+            &[PROJECT_RELATED, PROJECT_RELATED],
+            &[]
+        )
+        .is_err());
+        assert!(build_project_related_channel_change(
+            PROJECT_COORDINATE,
+            1,
+            &[PROJECT_RELATED],
+            &[PROJECT_RELATED]
+        )
+        .is_err());
+        assert!(build_project_related_channel_change(
+            &PROJECT_COORDINATE.to_uppercase(),
+            1,
+            &[PROJECT_RELATED],
+            &[]
+        )
+        .is_err());
+        let over_cap = (0..=PROJECT_RELATED_CHANNEL_CHANGE_CAP)
+            .map(|index| Uuid::from_u128(index as u128 + 1))
+            .collect::<Vec<_>>();
+        assert!(
+            build_project_related_channel_change(PROJECT_COORDINATE, 1, &over_cap, &[]).is_err()
         );
     }
 

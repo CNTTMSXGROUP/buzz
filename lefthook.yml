@@ -29,6 +29,19 @@
 # - `commit-msg` has no glob: it rewrites the commit message, not files. Note
 #   Git only runs it for `git commit` and `git merge` — other flows need their own
 #   flag: `git rebase --signoff`, `git cherry-pick -s`.
+# - `rust-tests` uses scripts/rust-tests-selective.sh instead of `just test-unit`
+#   directly. The script maps changed paths to crates (directory-prefix only, no
+#   dependency graph) and runs only affected packages' shaped suites. Full-battery
+#   triggers (Cargo.lock, root Cargo.toml, Justfile, migrations/, schema/, etc.)
+#   and any unmapped path fall back to `just test-unit` unchanged. Per-package
+#   invocation shapes (buzz-auth doctests, buzz-conformance all-targets, etc.)
+#   live in the script's PACKAGE_TABLE with a drift guard. The local lane is a
+#   fast pre-filter; CI's full `cargo clippy --workspace --all-targets` and
+#   dorny/paths-filter matrix remain the authoritative gate.
+# - `desktop-tauri-checks` is intentionally coarse-grained: scoping it per-crate
+#   requires the tauri workspace's transitive path-dep closure (dependency-graph
+#   machinery deferred). It fires on all crate changes. CI remains authoritative
+#   for this lane.
 #
 # `rc` points `lefthook install` at `bin/.lefthookrc`, which the generated
 # `.git/hooks/*` dispatchers source before their `$LEFTHOOK_BIN`-first lookup. It
@@ -94,7 +107,7 @@ pre-push:
     rust-tests:
       files: git diff --name-only origin/main...HEAD
       glob: ["crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "Justfile"]
-      run: just test-unit
+      run: ./scripts/rust-tests-selective.sh
     desktop-check:
       files: git diff --name-only origin/main...HEAD
       glob: ["desktop/**", "pnpm-lock.yaml"]

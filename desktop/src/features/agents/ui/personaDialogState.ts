@@ -63,6 +63,7 @@ export function duplicatePersonaDialogState(
     initialValues: {
       displayName: `${persona.displayName} copy`,
       avatarUrl: persona.avatarUrl ?? "",
+      description: persona.description ?? undefined,
       systemPrompt: persona.systemPrompt,
       runtime: persona.runtime ?? undefined,
       model: persona.model ?? undefined,
@@ -98,6 +99,41 @@ function behaviorEntry(
           ? persona.respondToAllowlist
           : undefined,
       parallelism: persona.parallelism ?? undefined,
+    },
+  };
+}
+
+export function editPersonaDialogState(
+  persona: AgentPersona,
+  accessSource?: Pick<AgentPersona, "respondTo" | "respondToAllowlist">,
+): PersonaDialogState {
+  const behaviorSource = accessSource
+    ? {
+        ...persona,
+        respondTo: accessSource.respondTo,
+        respondToAllowlist: accessSource.respondToAllowlist,
+      }
+    : persona;
+  return {
+    title: "Edit agent",
+    description: "",
+    submitLabel: "Save changes",
+    initialValues: {
+      id: persona.id,
+      displayName: persona.displayName,
+      avatarUrl: persona.avatarUrl ?? "",
+      description: persona.description ?? undefined,
+      systemPrompt: persona.systemPrompt,
+      runtime: persona.runtime ?? undefined,
+      model: persona.model ?? undefined,
+      provider: persona.provider ?? undefined,
+      // Seed both namePool and envVars from the loaded persona so editing
+      // unrelated fields doesn't submit an empty value that wipes them.
+      // (Persona update treats Some(empty) as "clear all" intentionally;
+      // the dialog must therefore round-trip the existing values.)
+      namePool: persona.namePool ?? [],
+      envVars: persona.envVars ?? {},
+      ...behaviorEntry(behaviorSource),
     },
   };
 }

@@ -11,6 +11,7 @@ const UUID: &str = "11111111-2222-3333-4444-555555555555"; // sadscan:disable sq
 fn local_in_app() -> AgentDefinition {
     AgentDefinition {
         permission_policy: None,
+        description: None,
         id: UUID.to_string(),
         display_name: "Local".to_string(),
         avatar_url: None,
@@ -40,6 +41,7 @@ fn local_in_app() -> AgentDefinition {
 fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
         permission_policy: None,
+        description: None,
         id: d_tag.to_string(),
         display_name: display_name.to_string(),
         avatar_url: Some("https://example.com/a.png".to_string()),
@@ -164,6 +166,7 @@ const AGENT_PUBKEY: &str = "agentpubkeyhex00000000000000000000000000000000000000
 fn local_agent() -> ManagedAgentRecord {
     ManagedAgentRecord {
         definition_permission_policy: None,
+        description: None,
         pubkey: AGENT_PUBKEY.to_string(),
         name: "Local Agent".to_string(),
         persona_id: Some("persona-local".to_string()),

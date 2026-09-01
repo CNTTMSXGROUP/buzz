@@ -67,6 +67,7 @@ fn goose_runtime() -> &'static KnownAcpRuntime {
 fn agent_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         definition_permission_policy: None,
+        description: None,
         pubkey: "agent".to_string(),
         name: "Agent".to_string(),
         persona_id: Some("persona-1".to_string()),
@@ -131,6 +132,7 @@ fn agent_record() -> ManagedAgentRecord {
 fn persona_with_model(model: &str) -> AgentDefinition {
     AgentDefinition {
         permission_policy: None,
+        description: None,
         id: "persona-1".to_string(),
         display_name: "Persona".to_string(),
         avatar_url: None,

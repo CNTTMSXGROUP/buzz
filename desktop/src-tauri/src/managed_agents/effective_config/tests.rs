@@ -9,6 +9,7 @@ fn definition(
 ) -> AgentDefinition {
     AgentDefinition {
         permission_policy: None,
+        description: None,
         id: id.to_string(),
         display_name: "Test Definition".to_string(),
         avatar_url: None,
@@ -42,6 +43,7 @@ fn record(
     use crate::managed_agents::{BackendKind, RespondTo};
     ManagedAgentRecord {
         definition_permission_policy: None,
+        description: None,
         pubkey: "agent-pk".to_string(),
         name: "Agent".to_string(),
         persona_id: persona_id.map(str::to_string),

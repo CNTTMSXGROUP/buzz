@@ -30,6 +30,7 @@ fn base() -> SpawnConfigSnapshot {
         parallelism: 1,
         permission_policy: "ask".into(),
         effort_level: Some("high".into()),
+        session_policy: "channel".into(),
     }
 }
 
@@ -76,6 +77,7 @@ fn mutations() -> Vec<Mutation> {
             s.permission_policy = "allow".into()
         }),
         ("effort_level", |s| s.effort_level = None),
+        ("session_policy", |s| s.session_policy = "thread".into()),
     ]
 }
 

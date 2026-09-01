@@ -462,6 +462,24 @@ export type {
   SwitchManagedAgentModelStatus,
   ControlResultFrame,
 } from "./permissionPolicy";
+/** Outcome of a live `switch_model` control frame; `failure` lands late. */
+export type SwitchManagedAgentModelStatus =
+  | "sent"
+  | "turn_ending"
+  | "ambiguous_target"
+  | "switched"
+  | "unsupported_model"
+  | "no_active_turn"
+  | "failure";
+export type ControlResultFrame = {
+  type: "cancel_turn" | "switch_model";
+  status: string;
+  modelId?: string;
+  /** Opaque per-pick id echoed from the request; correlates late frames. */
+  requestId?: string;
+  /** Buzz channel UUID from the observer envelope; disambiguates channels. */
+  channelId?: string | null;
+};
 
 export type GitBashPrerequisite = {
   available: boolean;
@@ -787,6 +805,16 @@ export type UpdatePersonaInput = {
   envVars?: Record<string, string>;
   behavior?: PersonaBehaviorInput;
 };
+// Persona (agent definition) types live in a sibling module to keep this
+// file inside the repo-wide size ratchet; re-exported so import paths
+// (`@/shared/api/types`) are unchanged.
+export type {
+  AgentPersona,
+  CatalogSourceCoordinate,
+  CreatePersonaInput,
+  PersonaBehaviorInput,
+  UpdatePersonaInput,
+} from "./personaTypes";
 
 // ── Team types ────────────────────────────────────────────────────────────────
 export type {

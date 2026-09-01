@@ -24,6 +24,7 @@ fn persona(id: &str, prompt: &str) -> AgentDefinition {
         permission_policy: None,
         id: id.to_string(),
         display_name: id.to_string(),
+        description: None,
         avatar_url: None,
         system_prompt: prompt.to_string(),
         runtime: None,

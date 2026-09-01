@@ -29,6 +29,7 @@ fn member(id: &str, display_name: &str) -> AgentDefinition {
         permission_policy: None,
         id: id.to_string(),
         display_name: display_name.to_string(),
+        description: None,
         avatar_url: None,
         system_prompt: "Do the work.".to_string(),
         runtime: None,

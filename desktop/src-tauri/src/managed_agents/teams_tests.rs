@@ -168,6 +168,7 @@ fn validate_team_deletion_rejects_built_ins() {
 fn managed_agent(name: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
         definition_permission_policy: None,
+        description: None,
         pubkey: name.to_string(),
         name: name.to_string(),
         persona_id: None,
@@ -459,6 +460,7 @@ fn catalog_copy(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
         permission_policy: None,
         id: id.to_string(),
         display_name: id.to_string(),
+        description: None,
         avatar_url: None,
         system_prompt: String::new(),
         runtime: None,
@@ -699,6 +701,7 @@ fn catalog_persona(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
         permission_policy: None,
         id: id.to_string(),
         display_name: id.to_string(),
+        description: None,
         avatar_url: None,
         system_prompt: "Do the work.".to_string(),
         runtime: None,

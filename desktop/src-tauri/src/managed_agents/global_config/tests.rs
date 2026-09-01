@@ -301,6 +301,7 @@ fn default_global_config_serializes_all_fields() {
 fn bare_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
         definition_permission_policy: None,
+        description: None,
         pubkey: "agent".to_string(),
         name: "Agent".to_string(),
         persona_id: None,
@@ -365,6 +366,7 @@ fn bare_record() -> ManagedAgentRecord {
 fn persona(id: &str, model: Option<&str>, provider: Option<&str>) -> AgentDefinition {
     AgentDefinition {
         permission_policy: None,
+        description: None,
         id: id.to_string(),
         display_name: "Test Persona".to_string(),
         avatar_url: None,
@@ -629,6 +631,7 @@ fn record_runtime_wins_over_persona_runtime_for_command_resolution() {
 
     let persona = AgentDefinition {
         permission_policy: None,
+        description: None,
         id: "p1".to_string(),
         display_name: "Goose persona".to_string(),
         avatar_url: None,

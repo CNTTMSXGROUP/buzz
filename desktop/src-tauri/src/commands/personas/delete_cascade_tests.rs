@@ -18,6 +18,7 @@ fn make_agent(
 ) -> ManagedAgentRecord {
     ManagedAgentRecord {
         definition_permission_policy: None,
+        description: None,
         pubkey: pubkey.to_string(),
         name: "Test Agent".to_string(),
         persona_id: persona_id.map(str::to_string),

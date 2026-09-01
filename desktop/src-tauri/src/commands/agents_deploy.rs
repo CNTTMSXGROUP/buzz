@@ -43,20 +43,17 @@ pub(crate) fn resolve_deploy_model_provider(
 
 /// Serialize the portable launch contract shared with provider-backed agents.
 ///
-/// `descriptor.env` is the authoritative six-layer environment. Policy values
-/// are deliberately separate because providers apply them below that layered
-/// environment, preserving the local spawn's power-user override semantics.
-///
-/// `effective_permission_policy` is the already-resolved per-agent → global →
-/// built-in policy. Pass it from the caller so that this function does not need
-/// the global config; tests can pass `None` to get the built-in default.
-pub(super) fn build_launch_block(
+/// `descriptor.env` is the authoritative six-layer environment for ordinary
+/// values. Desktop-owned settings are reserved, stripped from that layer, and
+/// emitted through `policy_env` so local and provider launches agree.
+fn build_launch_block_for_policy(
     record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
     teams: &[crate::managed_agents::TeamRecord],
     effective_prompt: Option<&str>,
     effective_model: Option<&str>,
     owner_pubkey: &str,
+    session_policy: crate::managed_agents::AcpSessionPolicy,
     effective_permission_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy>,
 ) -> serde_json::Value {
     use crate::managed_agents::{
@@ -83,6 +80,7 @@ pub(super) fn build_launch_block(
         "BUZZ_ACP_AGENTS".into(),
         crate::managed_agents::acp_agents_value(&descriptor.command, record.parallelism),
     );
+    crate::managed_agents::insert_acp_session_policy_env(&mut policy_env, session_policy);
 
     if let Some(value) = effective_prompt {
         policy_env.insert("BUZZ_ACP_SYSTEM_PROMPT".into(), value.to_string());
@@ -157,7 +155,9 @@ pub(super) fn build_launch_block(
     // matching local, where `apply_claude_model_env(None)` removes both.
     let is_claude = runtime.map(|r| r.id == "claude").unwrap_or(false);
     let strip_key = |k: &str| {
-        (record.effort_level.is_some() && k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
+        k.eq_ignore_ascii_case(crate::managed_agents::ACP_SESSION_POLICY_ENV_VAR)
+            || k.eq_ignore_ascii_case("BUZZ_ACP_PERMISSION_POLICY")
+            || (record.effort_level.is_some() && k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
             || (is_claude
                 && (k.eq_ignore_ascii_case("BUZZ_ACP_MODEL")
                     || k.eq_ignore_ascii_case("ANTHROPIC_MODEL")))
@@ -176,6 +176,28 @@ pub(super) fn build_launch_block(
         "policy_env": policy_env,
         "owner_pubkey": owner_pubkey,
     })
+}
+
+#[cfg(test)]
+pub(super) fn build_launch_block(
+    record: &ManagedAgentRecord,
+    descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+    teams: &[crate::managed_agents::TeamRecord],
+    effective_prompt: Option<&str>,
+    effective_model: Option<&str>,
+    owner_pubkey: &str,
+    effective_permission_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy>,
+) -> serde_json::Value {
+    build_launch_block_for_policy(
+        record,
+        descriptor,
+        teams,
+        effective_prompt,
+        effective_model,
+        owner_pubkey,
+        crate::managed_agents::AcpSessionPolicy::Channel,
+        effective_permission_policy,
+    )
 }
 
 pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result<(), String> {
@@ -221,13 +243,14 @@ pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
         crate::managed_agents::permission_policy::resolve_effective_permission_policy(
             record, &personas, &global,
         );
-    let launch = build_launch_block(
+    let launch = build_launch_block_for_policy(
         record,
         &descriptor,
         &teams,
         effective.system_prompt.value.as_deref(),
         effective.model.value.as_deref(),
         &owner_pubkey,
+        crate::managed_agents::acp_session_policy(state),
         Some(effective_policy),
     );
 
@@ -287,26 +310,6 @@ pub(super) fn deploy_payload_json(
         "env_vars": merged_env,
         "launch": launch,
     })
-}
-
-use crate::managed_agents::permission_policy::PermissionPolicy;
-
-/// Extract the applied permission policy from a deploy payload — the byte-identical
-/// value `build_deploy_payload` wrote into `launch.policy_env`, not a recompute.
-///
-/// The key is unconditionally present in every payload `build_deploy_payload`
-/// produces (it falls back to `desktop_default`), so a missing or unparseable
-/// value is a broken invariant on the JSON boundary, not a legacy shape. Callers
-/// must fail the deploy rather than stamping a silent `None` that would suppress
-/// the drift row and defeat the field's purpose.
-pub(super) fn extract_applied_permission_policy(
-    agent_json: &serde_json::Value,
-) -> Result<PermissionPolicy, String> {
-    let raw = agent_json["launch"]["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"]
-        .as_str()
-        .ok_or("deploy payload is missing launch.policy_env.BUZZ_ACP_PERMISSION_POLICY")?;
-    serde_json::from_value(serde_json::Value::String(raw.to_string()))
-        .map_err(|_| format!("deploy payload has unrecognized permission policy {raw:?}"))
 }
 
 #[cfg(test)]
@@ -387,7 +390,38 @@ mod tests {
         assert_eq!(launch["policy_env"]["BUZZ_ACP_IDLE_TIMEOUT"], "17");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "channel");
         assert_eq!(launch["owner_pubkey"], "owner-hex");
+    }
+
+    #[test]
+    fn launch_block_thread_policy_is_authoritative_and_preserves_unrelated_env() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec![],
+            env: BTreeMap::from([
+                ("BUZZ_ACP_SESSION_POLICY".to_string(), "channel".to_string()),
+                ("KEEP_ME".to_string(), "yes".to_string()),
+            ]),
+        };
+
+        let launch = build_launch_block_for_policy(
+            &record,
+            &descriptor,
+            &[],
+            None,
+            None,
+            "owner-hex",
+            crate::managed_agents::AcpSessionPolicy::Thread,
+        );
+
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "thread");
+        assert!(
+            launch["env"]["BUZZ_ACP_SESSION_POLICY"].is_null(),
+            "desktop policy must not be shadowed by descriptor env"
+        );
+        assert_eq!(launch["env"]["KEEP_ME"], "yes");
     }
 
     #[test]
@@ -408,7 +442,6 @@ mod tests {
             None,
             Some("claude-opus-4"),
             "owner-hex",
-            None,
         );
         assert_eq!(
             launch["policy_env"]["ANTHROPIC_MODEL"], "claude-opus-4",
@@ -445,7 +478,6 @@ mod tests {
             None,
             Some("claude-opus-4"),
             "owner-hex",
-            None,
         );
 
         // Canonical model rides policy_env alone.
@@ -790,139 +822,6 @@ mod tests {
         assert_eq!(
             payload["parallelism"], cap,
             "legacy top-level parallelism must match launch.policy_env — both must be {cap}"
-        );
-    }
-
-    /// `build_launch_block` with an explicit `allow` policy injects `allow`.
-    #[test]
-    fn launch_block_explicit_allow_policy_injected() {
-        let record = record();
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "goose".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        let launch = build_launch_block(
-            &record,
-            &descriptor,
-            &[],
-            None,
-            None,
-            "owner-hex",
-            Some(crate::managed_agents::permission_policy::PermissionPolicy::Allow),
-        );
-        assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"], "allow",
-            "explicit allow policy must be injected into policy_env"
-        );
-    }
-
-    /// `build_launch_block` with `None` (test callers / no global) falls back to
-    /// the built-in desktop default (`ask`).
-    #[test]
-    fn launch_block_none_policy_falls_back_to_built_in_ask() {
-        let record = record();
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "goose".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
-        assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"], "ask",
-            "None effective_permission_policy must fall back to built-in ask"
-        );
-    }
-
-    /// Production deploy path: global `allow` override is respected when the
-    /// record has no per-agent policy, matching the local-spawn resolver.
-    #[test]
-    fn launch_block_global_allow_policy_used_when_record_has_none() {
-        let mut record = record();
-        record.permission_policy = None;
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "goose".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        let global = crate::managed_agents::global_config::GlobalAgentConfig {
-            permission_policy: Some(
-                crate::managed_agents::permission_policy::PermissionPolicy::Allow,
-            ),
-            ..Default::default()
-        };
-        let (effective_policy, _) =
-            crate::managed_agents::permission_policy::resolve_effective_permission_policy(
-                &record,
-                &[],
-                &global,
-            );
-        let launch = build_launch_block(
-            &record,
-            &descriptor,
-            &[],
-            None,
-            None,
-            "owner-hex",
-            Some(effective_policy),
-        );
-        assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"], "allow",
-            "global allow policy must be injected when record has no per-agent policy"
-        );
-    }
-
-    // ── Deploy-receipt invariant + applied-policy state transitions ──────────
-
-    /// A payload built by `build_launch_block` always carries the policy key, and
-    /// `extract_applied_permission_policy` reads back the byte-identical value —
-    /// not a recompute. This is the receipt the deploy path stamps.
-    #[test]
-    fn extract_applied_policy_reads_the_exact_sent_value() {
-        let record = record();
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "goose".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        let launch = build_launch_block(
-            &record,
-            &descriptor,
-            &[],
-            None,
-            None,
-            "owner-hex",
-            Some(PermissionPolicy::Allow),
-        );
-        let payload = serde_json::json!({ "launch": launch });
-        assert_eq!(
-            extract_applied_permission_policy(&payload),
-            Ok(PermissionPolicy::Allow),
-            "extract must return the exact policy the payload carries"
-        );
-    }
-
-    /// A payload missing the policy key is a broken invariant: extraction errors
-    /// so the deploy fails before the provider is invoked, never stamping None.
-    #[test]
-    fn extract_applied_policy_missing_key_errors() {
-        let payload = serde_json::json!({ "launch": { "policy_env": {} } });
-        assert!(
-            extract_applied_permission_policy(&payload).is_err(),
-            "missing policy key must error, not silently stamp None"
-        );
-    }
-
-    /// A payload whose policy value is not a recognized enum variant errors —
-    /// the deploy fails before the provider is invoked.
-    #[test]
-    fn extract_applied_policy_unparseable_value_errors() {
-        let payload = serde_json::json!({
-            "launch": { "policy_env": { "BUZZ_ACP_PERMISSION_POLICY": "bogus" } }
-        });
-        assert!(
-            extract_applied_permission_policy(&payload).is_err(),
-            "unrecognized policy value must error, not silently stamp None"
         );
     }
 }

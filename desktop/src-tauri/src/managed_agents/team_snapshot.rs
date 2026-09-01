@@ -255,6 +255,7 @@ mod tests {
     fn agent_record(name: &str) -> ManagedAgentRecord {
         ManagedAgentRecord {
             definition_permission_policy: None,
+            description: None,
             pubkey: format!("{name}-pubkey"),
             name: name.to_string(),
             display_name: Some(format!("{name} Display")),

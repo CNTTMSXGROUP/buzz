@@ -3240,6 +3240,16 @@ async fn ingest_event_inner(
         });
     }
 
+    let project_lifecycle_coordinate = if kind_u32 == KIND_PROJECT {
+        Some((
+            event.pubkey.to_bytes().to_vec(),
+            buzz_db::event::extract_d_tag(&event).unwrap_or_default(),
+        ))
+    } else {
+        project_deletion
+            .as_ref()
+            .map(|target| (target.owner.clone(), target.d_tag.clone()))
+    };
     let project_lifecycle = if kind_u32 == KIND_PROJECT {
         Some(
             state
@@ -3334,6 +3344,16 @@ async fn ingest_event_inner(
     };
 
     if !was_inserted {
+        if let Some((owner, d_tag)) = project_lifecycle_coordinate.as_ref() {
+            if let Err(error) =
+                super::project_state_projection::publish_project_state_for_coordinate(
+                    tenant, state, owner, d_tag,
+                )
+                .await
+            {
+                warn!(%error, "Project State projection repair failed after duplicate lifecycle event");
+            }
+        }
         return Ok(IngestResult {
             event_id: event_id_hex,
             accepted: true,
@@ -3408,6 +3428,16 @@ async fn ingest_event_inner(
         threaded_visibility.clone(),
     )
     .await;
+
+    if let Some((owner, d_tag)) = project_lifecycle_coordinate.as_ref() {
+        if let Err(error) = super::project_state_projection::publish_project_state_for_coordinate(
+            tenant, state, owner, d_tag,
+        )
+        .await
+        {
+            warn!(%error, "Project State projection failed after lifecycle event");
+        }
+    }
 
     info!(event_id = %event_id_hex, kind = kind_u32, "Event ingested via pipeline");
 

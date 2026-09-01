@@ -381,6 +381,7 @@ fn content_matches_nip_ap_vector() {
     let record = {
         let mut p = sample_persona();
         p.id = "test-agent".to_string();
+        p.display_name = "Test Agent".to_string();
         p
     };
     let event = build_persona_event(&record)

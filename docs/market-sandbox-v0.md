@@ -33,3 +33,25 @@ spend controls remain required before production.
 
 Use `scripts/market-sandbox.sh --help`. Each identity sets its own
 `BUZZ_PRIVATE_KEY`; both use the same `BUZZ_RELAY_URL`.
+
+## Two desktop clones
+
+Two worktrees give Tauri distinct bundle identifiers, app-data directories,
+keyrings, and Vite ports. Create them at the protocol commit, then launch each
+in a separate terminal against the same relay:
+
+```bash
+git worktree add -b market-seller-clone ../buzz-market-seller <commit>
+git worktree add -b market-buyer-clone ../buzz-market-buyer <commit>
+
+cd ../buzz-market-seller
+BUZZ_RELAY_URL=ws://localhost:3030 just desktop-standalone
+
+cd ../buzz-market-buyer
+BUZZ_RELAY_URL=ws://localhost:3030 just desktop-standalone
+```
+
+Complete onboarding independently in each app. Open
+`/#/market?market=<market-id>` to pin the projected listing. Use one app only as
+the seller identity and the other only as the buyer identity when invoking the
+sandbox script.

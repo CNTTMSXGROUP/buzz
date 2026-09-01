@@ -19,7 +19,9 @@ use super::pending::{prepare_persona_publication, PreparedPersonaPublication};
 /// (recreating the TOCTOU race) causes `try_lock()` to succeed, turning the
 /// probe test RED.
 #[cfg(test)]
-pub(crate) static REFRESH_LOCK_OBSERVER: std::sync::Mutex<Option<Box<dyn Fn(&AppState) + Send>>> =
+type RefreshLockObserver = Box<dyn Fn(&AppState) + Send>;
+#[cfg(test)]
+pub(crate) static REFRESH_LOCK_OBSERVER: std::sync::Mutex<Option<RefreshLockObserver>> =
     std::sync::Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

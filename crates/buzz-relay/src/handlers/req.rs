@@ -8,7 +8,8 @@ use tracing::{debug, warn};
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
     is_unshared_gated_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_TURN_METRIC,
-    KIND_DM_VISIBILITY, P_GATED_KINDS, RESULT_GATED_KINDS, SHARED_GATED_KINDS,
+    KIND_DM_VISIBILITY, KIND_HUDDLE_LIVENESS, P_GATED_KINDS, RESULT_GATED_KINDS,
+    SHARED_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -205,6 +206,18 @@ pub async fn handle_req(
             &sub_id,
             "restricted: not a channel member",
         ));
+        return;
+    }
+
+    if filters_are_huddle_liveness_only(&filters) {
+        handle_huddle_liveness_req(
+            &sub_id,
+            &filters,
+            authorized_requested_channels.as_deref().unwrap_or_default(),
+            &conn,
+            &state,
+        )
+        .await;
         return;
     }
 
@@ -1133,6 +1146,151 @@ pub(crate) fn extract_channel_ids_from_filters(filters: &[Filter]) -> Option<Vec
     Some(channel_ids)
 }
 
+fn filters_are_huddle_liveness_only(filters: &[Filter]) -> bool {
+    !filters.is_empty()
+        && filters.iter().all(|filter| {
+            filter.kinds.as_ref().is_some_and(|kinds| {
+                kinds.len() == 1
+                    && kinds
+                        .iter()
+                        .all(|kind| kind.as_u16() as u32 == KIND_HUDDLE_LIVENESS)
+            })
+        })
+}
+
+fn huddle_liveness_session_ids(filters: &[Filter]) -> Vec<uuid::Uuid> {
+    let d_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::D);
+    let mut session_ids = Vec::new();
+    for filter in filters {
+        if let Some(values) = filter.generic_tags.get(&d_tag) {
+            for value in values {
+                if let Ok(session_id) = value.parse::<uuid::Uuid>() {
+                    if !session_ids.contains(&session_id) {
+                        session_ids.push(session_id);
+                    }
+                }
+            }
+        }
+    }
+    session_ids.truncate(MAX_EXPLICIT_CHANNEL_VALUES);
+    session_ids
+}
+
+async fn handle_huddle_liveness_req(
+    sub_id: &str,
+    filters: &[Filter],
+    parent_channel_ids: &[uuid::Uuid],
+    conn: &ConnectionState,
+    state: &AppState,
+) {
+    if parent_channel_ids.is_empty() {
+        conn.send(RelayMessage::closed(
+            sub_id,
+            "restricted: huddle liveness requires an authorized #h channel",
+        ));
+        return;
+    }
+
+    for session_id in huddle_liveness_session_ids(filters) {
+        let channel = match state
+            .db
+            .get_channel(conn.tenant.community(), session_id)
+            .await
+        {
+            Ok(channel) => channel,
+            Err(_) => continue,
+        };
+        let mut linked_parent = None;
+        for parent_channel_id in parent_channel_ids {
+            match state
+                .db
+                .huddle_started_link_exists(
+                    conn.tenant.community(),
+                    *parent_channel_id,
+                    session_id,
+                    &channel.created_by,
+                )
+                .await
+            {
+                Ok(true) => {
+                    linked_parent = Some(*parent_channel_id);
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(session_id = %session_id, "Huddle liveness linkage lookup failed: {error}");
+                    conn.send(RelayMessage::closed(sub_id, "error: database error"));
+                    return;
+                }
+            }
+        }
+        let Some(parent_channel_id) = linked_parent else {
+            continue;
+        };
+
+        let generation = if let Some(mesh) = state.mesh() {
+            match mesh
+                .directory
+                .lookup(conn.tenant.community(), session_id)
+                .await
+            {
+                Ok(Some(lease)) if lease.profile == buzz_relay_mesh::Profile::HuddleControl => {
+                    Some(lease.generation)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(session_id = %session_id, "Huddle liveness lease lookup failed: {error}");
+                    conn.send(RelayMessage::closed(sub_id, "error: liveness unavailable"));
+                    return;
+                }
+            }
+        } else {
+            state
+                .audio_rooms
+                .get(conn.tenant.community(), session_id)
+                .filter(|room| !room.is_empty())
+                .map(|_| 0)
+        };
+        let Some(generation) = generation else {
+            continue;
+        };
+
+        let session = session_id.to_string();
+        let parent = parent_channel_id.to_string();
+        let tags = match (
+            nostr::Tag::parse(["d", session.as_str()]),
+            nostr::Tag::parse(["h", parent.as_str()]),
+        ) {
+            (Ok(d), Ok(h)) => vec![d, h],
+            _ => continue,
+        };
+        let content = serde_json::json!({
+            "ephemeral_channel_id": session,
+            "generation": generation,
+        })
+        .to_string();
+        let event = match nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_HUDDLE_LIVENESS as u16),
+            content,
+        )
+        .tags(tags)
+        .sign_with_keys(&state.relay_keypair)
+        {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(session_id = %session_id, "Huddle liveness signing failed: {error}");
+                conn.send(RelayMessage::closed(sub_id, "error: signing failed"));
+                return;
+            }
+        };
+        if !conn.send(RelayMessage::event(sub_id, &event)) {
+            return;
+        }
+    }
+
+    conn.send(RelayMessage::eose(sub_id));
+}
+
 async fn release_subscription_topics(
     state: &AppState,
     tenant: &TenantContext,
@@ -1417,6 +1575,31 @@ pub(crate) fn author_only_filters_authorized(filters: &[Filter], authed_pubkey_h
 mod tests {
     use super::*;
     use nostr::{Alphabet, Filter, SingleLetterTag};
+
+    #[test]
+    fn huddle_liveness_filters_require_only_the_snapshot_kind() {
+        let liveness = Filter::new().kind(nostr::Kind::Custom(KIND_HUDDLE_LIVENESS as u16));
+        let mixed = liveness.clone().kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_HUDDLE_STARTED as u16,
+        ));
+
+        assert!(filters_are_huddle_liveness_only(&[liveness]));
+        assert!(!filters_are_huddle_liveness_only(&[mixed]));
+        assert!(!filters_are_huddle_liveness_only(&[]));
+    }
+
+    #[test]
+    fn huddle_liveness_session_ids_are_deduplicated_and_bounded() {
+        let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let filter = Filter::new()
+            .custom_tag(d_tag, first.to_string())
+            .custom_tag(d_tag, second.to_string())
+            .custom_tag(d_tag, first.to_string());
+
+        assert_eq!(huddle_liveness_session_ids(&[filter]), vec![first, second]);
+    }
 
     #[test]
     fn global_queries_push_access_scope_before_limit() {

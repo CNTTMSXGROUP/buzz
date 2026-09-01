@@ -67,6 +67,10 @@ function lifecycleContent(event: RelayEvent): LifecycleContent {
   }
 }
 
+export function huddleSessionId(event: RelayEvent): string | null {
+  return lifecycleContent(event).ephemeralChannelId;
+}
+
 function participantPubkey(event: RelayEvent): string | null {
   const value = event.tags.find((tag) => tag[0] === "p")?.[1] ?? event.pubkey;
   const normalized = normalizePubkey(value);
@@ -282,12 +286,13 @@ export class HuddlePresenceTracker {
     if (
       content.rosterRevision !== null &&
       session.latestRosterRevision !== null &&
-      content.rosterRevision < session.latestRosterRevision &&
+      content.rosterRevision <= session.latestRosterRevision &&
       isAfterLatestRosterEvent
     ) {
-      // Relay roster revisions are process-local. A lower revision arriving
-      // after the latest authenticated roster event starts a new room
-      // generation, so admissions from the previous relay process are dead.
+      // Relay roster revisions are process-local and strictly increase for
+      // every mutation inside one room generation. A lower or repeated
+      // revision arriving after the latest authenticated roster event must
+      // therefore belong to a new generation, so prior admissions are dead.
       session.admissionsByParticipant.clear();
       session.legacyStateByParticipant.clear();
       session.creatorPresent = false;
@@ -329,10 +334,11 @@ export class HuddlePresenceTracker {
     }
   }
 
-  snapshot(): ReadonlySet<string> {
+  snapshot(activeSessionIds?: ReadonlySet<string>): ReadonlySet<string> {
     this.compactEndedSessions();
     const participants = new Set<string>();
-    for (const session of this.sessions.values()) {
+    for (const [sessionId, session] of this.sessions) {
+      if (activeSessionIds && !activeSessionIds.has(sessionId)) continue;
       if (session.endState) continue;
       for (const participant of sessionParticipants(session)) {
         participants.add(participant);

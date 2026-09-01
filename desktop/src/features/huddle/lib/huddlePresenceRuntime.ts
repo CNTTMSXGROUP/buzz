@@ -1,6 +1,7 @@
 import {
   applyHuddleLifecycleHistory,
   fetchHuddleLifecycleHistory,
+  huddleSessionId,
   HuddlePresenceTracker,
   HUDDLE_LIFECYCLE_PAGE_LIMIT,
 } from "@/features/huddle/lib/huddlePresence";
@@ -9,6 +10,7 @@ import type { RelayEvent } from "@/shared/api/types";
 import { MAX_EXPLICIT_CHANNEL_VALUES } from "@/shared/api/relayClientShared";
 import {
   KIND_HUDDLE_ENDED,
+  KIND_HUDDLE_LIVENESS,
   KIND_HUDDLE_PARTICIPANT_JOINED,
   KIND_HUDDLE_PARTICIPANT_LEFT,
   KIND_HUDDLE_STARTED,
@@ -67,6 +69,7 @@ export function startHuddlePresenceRuntime(
   let reconcileAgain = false;
   let hydrated = false;
   let tracker = new HuddlePresenceTracker(dependencies.relaySelfPubkey);
+  let activeSessionIds = new Set<string>();
   let pendingLiveEvents: RelayEvent[] = [];
   let pendingOverflowed = false;
   let retryHandle: unknown = null;
@@ -118,8 +121,13 @@ export function startHuddlePresenceRuntime(
       pendingLiveEvents.push(event);
       return;
     }
+    const sessionId = huddleSessionId(event);
+    if (sessionId) {
+      if (event.kind === KIND_HUDDLE_ENDED) activeSessionIds.delete(sessionId);
+      else activeSessionIds.add(sessionId);
+    }
     if (tracker.apply(event)) {
-      dependencies.onPresence(tracker.snapshot());
+      dependencies.onPresence(tracker.snapshot(activeSessionIds));
     }
   };
 
@@ -141,6 +149,42 @@ export function startHuddlePresenceRuntime(
           historyPages.flat().map((event) => [event.id, event]),
         ).values(),
       ];
+      const sessionIds = [
+        ...new Set(
+          history
+            .map(huddleSessionId)
+            .filter((sessionId): sessionId is string => Boolean(sessionId)),
+        ),
+      ];
+      const sessionChunks: string[][] = [];
+      for (
+        let index = 0;
+        index < sessionIds.length;
+        index += MAX_EXPLICIT_CHANNEL_VALUES
+      ) {
+        sessionChunks.push(
+          sessionIds.slice(index, index + MAX_EXPLICIT_CHANNEL_VALUES),
+        );
+      }
+      const livenessPages = await Promise.all(
+        channelChunks.flatMap((channelIds) =>
+          sessionChunks.map((sessions) =>
+            dependencies.fetchEvents({
+              kinds: [KIND_HUDDLE_LIVENESS],
+              "#h": channelIds,
+              "#d": sessions,
+              limit: sessions.length,
+            }),
+          ),
+        ),
+      );
+      const nextActiveSessionIds = new Set(
+        livenessPages
+          .flat()
+          .filter((event) => event.kind === KIND_HUDDLE_LIVENESS)
+          .map(huddleSessionId)
+          .filter((sessionId): sessionId is string => Boolean(sessionId)),
+      );
       if (disposed) return;
       const nextTracker = new HuddlePresenceTracker(
         dependencies.relaySelfPubkey,
@@ -157,12 +201,22 @@ export function startHuddlePresenceRuntime(
         ...history,
         ...pendingLiveEvents,
       ]);
+      for (const event of pendingLiveEvents) {
+        const sessionId = huddleSessionId(event);
+        if (!sessionId) continue;
+        if (event.kind === KIND_HUDDLE_ENDED) {
+          nextActiveSessionIds.delete(sessionId);
+        } else {
+          nextActiveSessionIds.add(sessionId);
+        }
+      }
       pendingLiveEvents = [];
       tracker = nextTracker;
+      activeSessionIds = nextActiveSessionIds;
       hydrated = true;
       retryDelayMs = INITIAL_RETRY_DELAY_MS;
       clearScheduledRetry();
-      dependencies.onPresence(tracker.snapshot());
+      dependencies.onPresence(tracker.snapshot(activeSessionIds));
     } catch (error) {
       if (disposed) return;
       hydrated = false;
@@ -241,5 +295,6 @@ export function startHuddlePresenceRuntime(
     liveDispose = null;
     pendingLiveEvents = [];
     pendingOverflowed = false;
+    activeSessionIds.clear();
   };
 }

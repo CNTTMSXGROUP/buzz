@@ -11,6 +11,16 @@ const HuddlePresenceContext = React.createContext<ReadonlySet<string>>(
   EMPTY_HUDDLE_PRESENCE,
 );
 
+export function memberChannelIdsKey(
+  channels: readonly { id: string; isMember: boolean }[],
+): string {
+  return channels
+    .filter((channel) => channel.isMember)
+    .map((channel) => channel.id)
+    .sort()
+    .join("\u0000");
+}
+
 /** Keeps one community-wide lifecycle subscription for name indicators. */
 export function HuddlePresenceProvider({
   children,
@@ -23,13 +33,10 @@ export function HuddlePresenceProvider({
   const [participantPubkeys, setParticipantPubkeys] = React.useState<
     ReadonlySet<string>
   >(EMPTY_HUDDLE_PRESENCE);
+  const channelIdsKey = memberChannelIdsKey(channelsQuery.data ?? []);
   const channelIds = React.useMemo(
-    () =>
-      (channelsQuery.data ?? [])
-        .filter((channel) => channel.isMember)
-        .map((channel) => channel.id)
-        .sort(),
-    [channelsQuery.data],
+    () => (channelIdsKey ? channelIdsKey.split("\u0000") : []),
+    [channelIdsKey],
   );
   React.useEffect(() => {
     if (

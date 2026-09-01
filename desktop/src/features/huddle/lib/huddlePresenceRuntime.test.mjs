@@ -35,6 +35,10 @@ function participantEvent(options) {
   return event({ pubkey: RELAY, tags: [["p", BOB]], ...options });
 }
 
+function livenessEvent(session = "room") {
+  return event({ id: `live-${session}`, kind: 48104, createdAt: 1_000 });
+}
+
 async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
@@ -58,7 +62,8 @@ function runtimeHarness(initialHistory) {
         liveDisposed = true;
       };
     },
-    fetchEvents: async () => history,
+    fetchEvents: async (filter) =>
+      filter.kinds?.includes(48104) ? [livenessEvent()] : history,
     subscribeToReconnects: (listener) => {
       reconnect = listener;
       return () => {
@@ -203,7 +208,8 @@ test("retries a failed hydration and tears down every recovery path", async () =
     subscribeLive: async () => () => {
       liveDisposed = true;
     },
-    fetchEvents: async () => {
+    fetchEvents: async (filter) => {
+      if (filter.kinds?.includes(48104)) return [livenessEvent()];
       attempts += 1;
       if (attempts === 1) throw new Error("temporary timeout");
       return [event({ id: "1", kind: 48100 })];
@@ -238,4 +244,31 @@ test("retries a failed hydration and tears down every recovery path", async () =
   reconnect();
   await settle();
   assert.equal(attempts, 2);
+});
+
+test("fails closed when persisted lifecycle has no authoritative live room", async () => {
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async () => () => {},
+    fetchEvents: async (filter) =>
+      filter.kinds?.includes(48104)
+        ? []
+        : [
+            event({ id: "1", kind: 48100 }),
+            participantEvent({
+              id: "2",
+              kind: 48101,
+              admissionId: "before-restart",
+              rosterRevision: 1,
+            }),
+          ],
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+  });
+
+  await settle();
+  assert.deepEqual([...snapshots.at(-1)], []);
+  dispose();
 });

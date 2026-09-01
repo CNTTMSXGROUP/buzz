@@ -292,6 +292,46 @@ test("accepts lower revisions from a new relay room generation", () => {
   assert.equal(hydrated.has(CHARLIE), true);
 });
 
+test("retires old admissions when a restarted room repeats revision one", () => {
+  const events = [
+    event({ id: "1", kind: 48100 }),
+    participantEvent({
+      id: "2",
+      kind: 48101,
+      admissionId: "before-restart",
+      rosterRevision: 1,
+    }),
+    participantEvent({
+      id: "3",
+      kind: 48101,
+      admissionId: "after-restart",
+      rosterRevision: 1,
+    }),
+    participantEvent({
+      id: "4",
+      kind: 48101,
+      admissionId: "charlie-after-restart",
+      rosterRevision: 2,
+      tags: [["p", CHARLIE]],
+    }),
+    participantEvent({
+      id: "5",
+      kind: 48102,
+      admissionId: "after-restart",
+      rosterRevision: 3,
+    }),
+  ];
+
+  const tracker = new HuddlePresenceTracker(RELAY);
+  for (const item of events) tracker.apply(item);
+  assert.equal(tracker.snapshot().has(BOB), false);
+  assert.equal(tracker.snapshot().has(CHARLIE), true);
+
+  const hydrated = reconstructHuddlePresence(events, RELAY);
+  assert.equal(hydrated.has(BOB), false);
+  assert.equal(hydrated.has(CHARLIE), true);
+});
+
 test("a lower-id same-second start is canonical and clears old participants", () => {
   const tracker = new HuddlePresenceTracker(RELAY);
   tracker.apply(event({ id: "z", kind: 48100, createdAt: 10 }));

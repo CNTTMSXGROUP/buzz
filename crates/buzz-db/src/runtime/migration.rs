@@ -699,7 +699,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 44);
+        assert_eq!(migrations.len(), 45);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1264,9 +1264,9 @@ mod postgres_tests {
 
         // The consolidated desired-state exclusion function must byte-match the
         // most recent CREATE OR REPLACE in the migration sequence.  Migration
-        // 0042 defines the initial NIP-FI exclusion list; migration 0043
+        // 0042 defines the initial NIP-FI exclusion list; migration 0044
         // extends it with `nip_fi_proof_replay_claims`.  schema.sql must
-        // therefore match 0043's definition, not 0042's.
+        // therefore match 0044's definition, not 0042's.
         fn extract_excluded_table_array(sql: &str) -> &str {
             let anchor = "community_write_fence_excluded_table(target NAME) RETURNS BOOLEAN";
             let start = sql.find(anchor).expect("exclusion function definition");
@@ -1280,27 +1280,27 @@ mod postgres_tests {
 
         // NIP-FI proof replay claims (migration 0043): idempotency ledger for
         // admission proofs.  Never fence-attached (immutable ledger relation).
-        // 0043 also issues a CREATE OR REPLACE for community_write_fence_excluded_table
+        // 0044 also issues a CREATE OR REPLACE for community_write_fence_excluded_table
         // to add 'nip_fi_proof_replay_claims'; that extended definition is the
         // one schema.sql must track.
-        assert_eq!(migrations[42].version, 43);
+        assert_eq!(migrations[43].version, 44);
         let replay_claims = migrations[42].sql.as_str();
         assert!(replay_claims.contains("CREATE TABLE nip_fi_proof_replay_claims"));
         assert!(
             replay_claims
                 .contains("CREATE OR REPLACE FUNCTION community_write_fence_excluded_table"),
-            "migration 0043 must update the exclusion function"
+            "migration 0044 must update the exclusion function"
         );
         assert_eq!(
             extract_excluded_table_array(replay_claims),
             extract_excluded_table_array(desired_schema),
-            "schema.sql exclusion list drifted from migration 0043"
+            "schema.sql exclusion list drifted from migration 0044"
         );
 
         // Brownfield relay databases created through SQLx still carry the
         // production/sandbox constraint from 0015. Converge them to the same
         // dogfood-only authority declared by the desired-state schema.
-        assert_eq!(migrations[42].version, 43);
+        assert_eq!(migrations[43].version, 44);
         let dogfood_profile = migrations[42].sql.as_str();
         assert!(dogfood_profile.contains("DELETE FROM push_gateway_delegations"));
         assert!(dogfood_profile.contains("DELETE FROM push_gateway_installations"));

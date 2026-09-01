@@ -1254,7 +1254,7 @@ async fn commit_admission_body(
     //     determine if it is the same connection (same-conn reuse, allowed)
     //     or a different connection (cross-conn replay, ProofReplayed).
     //
-    // The appended-only immutability trigger from migration 0043 holds:
+    // The appended-only immutability trigger from migration 0044 holds:
     // once committed, connection_id cannot change.
     {
         let retained_until = upstream_deadline;

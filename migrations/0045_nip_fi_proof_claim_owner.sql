@@ -8,7 +8,7 @@
 --
 -- A claim is inserted only during final admission (never at AUTH), after
 -- all other authority mutations succeed.  The append-only immutability
--- trigger from migration 0043 continues to hold: once a row is committed,
+-- trigger from migration 0044 continues to hold: once a row is committed,
 -- connection_id cannot be changed.
 --
 -- This column enables the amended Design C ownership protocol:
@@ -17,7 +17,7 @@
 --   3. Different conn_id → ProofReplayed (cross-connection reuse)
 --   4. No row → proceed; INSERT this row at step 9 of commit_admission_body
 
--- Existing 0043-shape rows (if any) receive a synthetic owner UUID matching no
+-- Existing 0044-shape rows (if any) receive a synthetic owner UUID matching no
 -- live connection.  This is deliberate fail-closed: replays of pre-0044 legacy
 -- proofs from any connection are rejected as cross-connection reuse (the stored
 -- sentinel never matches a live conn_id), preventing any legacy claim from being

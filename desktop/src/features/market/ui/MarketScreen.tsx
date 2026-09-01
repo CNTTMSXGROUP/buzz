@@ -84,13 +84,16 @@ export function MarketScreen({ scenarioId }: { scenarioId: MarketScenarioId }) {
   return (
     <main
       className={cn(
-        "relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-sidebar",
+        "relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-sidebar pb-2 pr-2 pt-px",
         sidebar?.open === false && "pl-2",
       )}
       data-buzz-context-detached="true"
       data-testid="market-screen"
     >
-      <section className="mb-2 ml-px mt-px flex min-h-0 min-w-60 flex-1 flex-col overflow-hidden rounded-2xl bg-background">
+      <section
+        className="ml-px flex min-h-0 min-w-60 flex-1 flex-col overflow-hidden rounded-2xl bg-background"
+        data-testid="market-content-pod"
+      >
         <ChatHeader
           actions={
             <Button

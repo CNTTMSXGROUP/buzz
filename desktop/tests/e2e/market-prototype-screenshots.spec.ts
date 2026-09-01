@@ -70,7 +70,26 @@ test.describe("market channel prototype", () => {
       await expect(
         market.getByRole("button", { name: "Hide agent wallet" }).first(),
       ).toBeVisible();
+      const contentPod = market.getByTestId("market-content-pod");
       const walletRail = market.getByTestId("market-wallet-rail");
+      const [contentBounds, marketRight, walletBounds] = await Promise.all([
+        contentPod.evaluate((element) => {
+          const bounds = element.getBoundingClientRect();
+          return { bottom: bounds.bottom, top: bounds.top };
+        }),
+        market.evaluate((element) => element.getBoundingClientRect().right),
+        walletRail.evaluate((element) => {
+          const bounds = element.getBoundingClientRect();
+          return {
+            bottom: bounds.bottom,
+            right: bounds.right,
+            top: bounds.top,
+          };
+        }),
+      ]);
+      expect(walletBounds.top).toBeCloseTo(contentBounds.top, 0);
+      expect(walletBounds.bottom).toBeCloseTo(contentBounds.bottom, 0);
+      expect(marketRight - walletBounds.right).toBeCloseTo(8, 0);
       await market.getByTestId("market-wallet-toggle").click();
       await expect(walletRail).toHaveAttribute("aria-hidden", "true");
       await expect(walletRail).toHaveCSS("width", "0px");

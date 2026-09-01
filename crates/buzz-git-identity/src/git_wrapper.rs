@@ -6390,6 +6390,7 @@ mod tests {
     /// Tests that require this binary must call `panic!` rather than skip on
     /// `None` — the test-unit recipe guarantees `git-sign-nostr` is built before
     /// the `buzz-git-identity` nextest run so absence always means a build error.
+    #[cfg(unix)]
     fn find_git_sign_nostr() -> Option<std::path::PathBuf> {
         // current_exe = target/<profile>/deps/<test_binary>-<hash>
         // parent      = target/<profile>/deps
@@ -6710,7 +6711,7 @@ mod tests {
                 .rposition(|&b| b == b'=')
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            std::str::from_utf8(&tok.as_bytes()[scheme_start..sep]).unwrap()
+            &tok[scheme_start..sep]
         };
         assert_eq!(
             new_scheme, "file",
@@ -6785,7 +6786,7 @@ mod tests {
                 .rposition(|&b| b == b'=')
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            std::str::from_utf8(&tok.as_bytes()[scheme_start..sep]).unwrap()
+            &tok[scheme_start..sep]
         };
         assert_eq!(
             new_scheme, "https",

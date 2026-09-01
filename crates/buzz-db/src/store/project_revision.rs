@@ -16,7 +16,7 @@ use crate::{Db, DbError, Result};
 #[derive(Clone, Debug)]
 pub enum ProjectRevisionApplyResult {
     /// The operation was authorized, current, and persisted.
-    Applied(StoredEvent),
+    Applied(Box<StoredEvent>),
     /// This exact signed command was already applied.
     Duplicate,
     /// The Project coordinate has no live base event.
@@ -253,7 +253,7 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(ProjectRevisionApplyResult::Applied(stored_event))
+        Ok(ProjectRevisionApplyResult::Applied(Box::new(stored_event)))
     }
 }
 

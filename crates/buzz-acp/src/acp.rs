@@ -1589,7 +1589,6 @@ impl AcpClient {
                         e.card_actions.clone(),
                         e.nonce.clone(),
                         e.expiry_unix_secs,
-                        e.deadline,
                         e.description.clone(),
                     )
                 });
@@ -1617,7 +1616,6 @@ impl AcpClient {
                     card_actions,
                     entry_nonce,
                     expiry_unix_secs,
-                    entry_deadline,
                     entry_description,
                 )) = sentinel_context
                 {
@@ -12306,6 +12304,7 @@ mod tests {
 
         let event = nostr::EventBuilder::new(nostr::Kind::from(40003), "resolved-expired")
             .sign(&keys)
+            .await
             .unwrap();
         let event_id = event.id.to_hex();
 
@@ -12357,10 +12356,10 @@ mod tests {
     // still terminate once the delivery window elapses. Under paused tokio time
     // we advance past the window and confirm the loop exits.
     //
-    // Mutation proof: replacing `RESOLVED_DELIVERY_WINDOW_SECS` with a very large
-    // value (e.g. `u64::MAX / 2`) makes the loop effectively infinite under the
-    // test's time budget — the JoinHandle would never complete and the timeout
-    // assertion fails.
+    // Mutation proof: removing the `delivery_deadline` gate from the retry loop
+    // (i.e. looping forever on Uncertain) makes `handle.is_finished()` never true
+    // within the test budget — the polling loop exhausts its window and the
+    // subsequent `timeout(1s, handle)` fires → assertion fails.
 
     #[tokio::test(start_paused = true)]
     async fn retransmit_resolved_edit_always_uncertain_bounded_exit() {
@@ -12368,6 +12367,7 @@ mod tests {
 
         let event = nostr::EventBuilder::new(nostr::Kind::from(40003), "resolved-uncertain")
             .sign(&keys)
+            .await
             .unwrap();
 
         // test_pair_silent drops ack_tx on each PublishEventAcked → every
@@ -12383,14 +12383,20 @@ mod tests {
             delivery_deadline,
         ));
 
-        // Each Uncertain attempt is followed by RESOLVED_RETRANSMIT_BACKOFF sleep.
-        // Under paused time the runtime auto-advances through parked timers.
-        // Advance well past the delivery window to drain all retry cycles.
-        tokio::time::advance(
-            delivery_window + std::time::Duration::from_secs(SENTINEL_PUBLISH_TIMEOUT_SECS * 3),
-        )
-        .await;
-        tokio::task::yield_now().await;
+        // Each Uncertain attempt is followed by RESOLVED_RETRANSMIT_BACKOFF sleep,
+        // and resolving `ack_rx` requires the test_pair_silent task to run (to drop
+        // ack_tx). Under paused time, advance in small steps so channel-driven
+        // interleaving between the retransmit task and the silent publisher task
+        // can proceed; tokio auto-advances through parked timers on each step.
+        let poll_deadline =
+            tokio::time::Instant::now() + delivery_window + std::time::Duration::from_secs(30);
+        loop {
+            if handle.is_finished() || tokio::time::Instant::now() >= poll_deadline {
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+        }
 
         let join_result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         assert!(

@@ -136,24 +136,51 @@ void main() {
     expect(requests, 2);
   });
 
-  test('rejects malformed and unexpected platform responses', () async {
-    await expectLater(
-      requestWithResponse({'status': 'unknown', 'ageUpper': null}),
-      throwsA(isA<StateError>()),
+  test('keeps malformed platform responses gated and retryable', () async {
+    expect(
+      await requestWithResponse({'status': 'unknown', 'ageUpper': null}),
+      AgeSignalState.retryableFailure,
     );
-    await expectLater(
-      requestWithResponse({'status': 'signal', 'ageUpper': '17'}),
-      throwsA(isA<StateError>()),
+    expect(
+      await requestWithResponse({'status': 'signal', 'ageUpper': '17'}),
+      AgeSignalState.retryableFailure,
     );
-    await expectLater(
-      requestWithResponse({'status': 'signal', 'ageUpper': 17, 'ageLower': 13}),
-      throwsA(isA<StateError>()),
+    expect(
+      await requestWithResponse({
+        'status': 'signal',
+        'ageUpper': 17,
+        'ageLower': 13,
+      }),
+      AgeSignalState.retryableFailure,
     );
-    await expectLater(
-      requestWithResponse({'status': 'noSignal', 'ageUpper': 17}),
-      throwsA(isA<StateError>()),
+    expect(
+      await requestWithResponse({'status': 'noSignal', 'ageUpper': 17}),
+      AgeSignalState.retryableFailure,
     );
     expect(await requestWithResponse(null), AgeSignalState.allowed);
+  });
+
+  test('a deliberate retry can recover from a malformed response', () async {
+    var requests = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () async {
+          requests += 1;
+          return requests == 1
+              ? {'status': 'unknown', 'ageUpper': null}
+              : {'status': 'noSignal', 'ageUpper': null};
+        },
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+
+    await container.read(provider.notifier).request();
+    expect(container.read(provider), AgeSignalState.allowed);
+    expect(requests, 2);
   });
 
   test('requests the signal at most once', () async {

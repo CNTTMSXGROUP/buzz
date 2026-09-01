@@ -8,6 +8,9 @@ const ageSignalChannel = MethodChannel('buzz/age_signal');
 /// Delay before the single retry of a failed native age-signal request.
 const ageSignalRetryDelay = Duration(seconds: 1);
 
+/// Maximum time allowed for each native age-signal request attempt.
+const ageSignalRequestTimeout = Duration(seconds: 30);
+
 /// Invokes the native age-signal request.
 typedef AgeSignalRequest = Future<Map<Object?, Object?>?> Function();
 
@@ -53,14 +56,19 @@ enum AgeSignalState { checking, retryableFailure, allowed, restricted }
 
 class AgeSignalNotifier extends Notifier<AgeSignalState> {
   /// Creates an age-signal notifier, optionally with test request hooks.
-  AgeSignalNotifier({AgeSignalRequest? requestSignal, AgeSignalDelay? delay})
-    : _requestSignal = requestSignal ?? _requestPlatformAgeSignal,
-      _delay = delay ?? _delayAgeSignalRetry;
+  AgeSignalNotifier({
+    AgeSignalRequest? requestSignal,
+    AgeSignalDelay? delay,
+    Duration requestTimeout = ageSignalRequestTimeout,
+  }) : _requestSignal = requestSignal ?? _requestPlatformAgeSignal,
+       _delay = delay ?? _delayAgeSignalRetry,
+       _requestTimeout = requestTimeout;
 
   static const _maxAttempts = 2;
 
   final AgeSignalRequest _requestSignal;
   final AgeSignalDelay _delay;
+  final Duration _requestTimeout;
   bool _completed = false;
   Future<void>? _requestInFlight;
 
@@ -92,7 +100,7 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
     for (var attempt = 0; attempt < _maxAttempts; attempt += 1) {
       final Map<Object?, Object?>? response;
       try {
-        response = await _requestSignal();
+        response = await _requestSignal().timeout(_requestTimeout);
       } on MissingPluginException {
         if (attempt + 1 < _maxAttempts) {
           await _delay(ageSignalRetryDelay);
@@ -108,6 +116,15 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
           continue;
         }
         // A transient native failure is not evidence that access is allowed.
+        // Keep the launch gated and expose a deliberate retry action.
+        state = AgeSignalState.retryableFailure;
+        return;
+      } on TimeoutException {
+        if (attempt + 1 < _maxAttempts) {
+          await _delay(ageSignalRetryDelay);
+          continue;
+        }
+        // A stalled platform flow is not evidence that access is allowed.
         // Keep the launch gated and expose a deliberate retry action.
         state = AgeSignalState.retryableFailure;
         return;

@@ -114,6 +114,32 @@ void main() {
     expect(requests, 2);
   });
 
+  test('times out a stalled native request and exposes a retry', () async {
+    var requests = 0;
+    var delays = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () {
+          requests += 1;
+          return Completer<Map<Object?, Object?>?>().future;
+        },
+        delay: (duration) async {
+          expect(duration, ageSignalRetryDelay);
+          delays += 1;
+        },
+        requestTimeout: const Duration(milliseconds: 1),
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+    expect(requests, 2);
+    expect(delays, 1);
+  });
+
   test('keeps a missing native channel gated and retryable', () async {
     var requests = 0;
     final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(

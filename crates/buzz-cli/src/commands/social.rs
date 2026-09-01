@@ -79,6 +79,35 @@ pub async fn cmd_get_event(client: &BuzzClient, event_id: &str) -> Result<(), Cl
     Ok(())
 }
 
+/// Get recent public Pulse notes (kind:1) across all authors.
+pub async fn cmd_get_global_notes(
+    client: &BuzzClient,
+    limit: Option<u32>,
+    since: Option<i64>,
+    before: Option<i64>,
+) -> Result<(), CliError> {
+    if let (Some(since), Some(before)) = (since, before) {
+        if since > before {
+            return Err(CliError::Usage(
+                "--since must be less than or equal to --before".to_string(),
+            ));
+        }
+    }
+    let mut filter = serde_json::json!({
+        "kinds": [1],
+        "limit": limit.unwrap_or(50).min(200)
+    });
+    if let Some(since) = since {
+        filter["since"] = serde_json::json!(since);
+    }
+    if let Some(before) = before {
+        filter["until"] = serde_json::json!(before);
+    }
+    let resp = client.query(&filter).await?;
+    println!("{resp}");
+    Ok(())
+}
+
 /// Get user notes (kind:1) by author pubkey.
 pub async fn cmd_get_user_notes(
     client: &BuzzClient,
@@ -216,6 +245,11 @@ pub async fn dispatch(cmd: crate::SocialCmd, client: &BuzzClient) -> Result<(), 
         }
         SocialCmd::SetContactList { contacts } => cmd_set_contact_list(client, &contacts).await,
         SocialCmd::GetEvent { event } => cmd_get_event(client, &event).await,
+        SocialCmd::GetGlobalNotes {
+            limit,
+            since,
+            before,
+        } => cmd_get_global_notes(client, limit, since, before).await,
         SocialCmd::GetUserNotes {
             pubkey,
             limit,

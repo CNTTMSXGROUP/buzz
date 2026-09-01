@@ -1016,6 +1016,19 @@ pub enum SocialCmd {
         #[arg(long)]
         event: String,
     },
+    /// Get recent public Pulse notes across all authors
+    #[command(name = "global-notes")]
+    GetGlobalNotes {
+        /// Maximum number of notes to return (default 50, max 200).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Unix timestamp — return notes created at or after this time.
+        #[arg(long)]
+        since: Option<i64>,
+        /// Unix timestamp cursor — return notes created before this time.
+        #[arg(long)]
+        before: Option<i64>,
+    },
     /// Get recent notes published by a user
     #[command(name = "notes")]
     GetUserNotes {
@@ -2156,6 +2169,22 @@ mod tests {
     }
 
     #[test]
+    fn social_global_notes_accepts_time_window() {
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "social",
+            "global-notes",
+            "--limit",
+            "200",
+            "--since",
+            "100",
+            "--before",
+            "200",
+        ])
+        .is_ok());
+    }
+
+    #[test]
     fn messages_thread_accepts_link_or_explicit_identifiers() {
         let channel = "123e4567-e89b-12d3-a456-426614174000";
         let event = "a".repeat(64);
@@ -2360,6 +2389,7 @@ mod tests {
             vec![
                 "contacts",
                 "event",
+                "global-notes",
                 "list",
                 "notes",
                 "publish",
@@ -2447,7 +2477,7 @@ mod tests {
             ("projects", 8),
             ("reactions", 3),
             ("repos", 5),
-            ("social", 7),
+            ("social", 8),
             ("upload", 1),
             ("users", 5),
             ("workflows", 8),

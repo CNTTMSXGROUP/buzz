@@ -71,6 +71,7 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
   final Duration _requestTimeout;
   bool _completed = false;
   Future<void>? _requestInFlight;
+  Future<Map<Object?, Object?>?>? _nativeRequestInFlight;
 
   @override
   AgeSignalState build() => AgeSignalState.checking;
@@ -100,7 +101,7 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
     for (var attempt = 0; attempt < _maxAttempts; attempt += 1) {
       final Map<Object?, Object?>? response;
       try {
-        response = await _requestSignal().timeout(_requestTimeout);
+        response = await _awaitNativeRequest();
       } on MissingPluginException {
         if (attempt + 1 < _maxAttempts) {
           await _delay(ageSignalRetryDelay);
@@ -151,6 +152,27 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
       _completed = true;
       state = shouldBlock ? AgeSignalState.restricted : AgeSignalState.allowed;
       return;
+    }
+  }
+
+  Future<Map<Object?, Object?>?> _awaitNativeRequest() async {
+    final request = _nativeRequestInFlight ??= _requestSignal();
+    try {
+      final response = await request.timeout(_requestTimeout);
+      if (identical(_nativeRequestInFlight, request)) {
+        _nativeRequestInFlight = null;
+      }
+      return response;
+    } on TimeoutException {
+      // A Dart timeout cannot cancel the platform consent flow. Keep this
+      // future as the single flight so retries cannot start overlapping native
+      // prompts and can still consume a late response.
+      rethrow;
+    } catch (_) {
+      if (identical(_nativeRequestInFlight, request)) {
+        _nativeRequestInFlight = null;
+      }
+      rethrow;
     }
   }
 }

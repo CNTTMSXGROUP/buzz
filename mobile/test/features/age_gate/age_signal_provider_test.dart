@@ -114,18 +114,49 @@ void main() {
     expect(requests, 2);
   });
 
-  test('times out a stalled native request and exposes a retry', () async {
+  test(
+    'times out a stalled single native request and exposes a retry',
+    () async {
+      var requests = 0;
+      var delays = 0;
+      final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+        () => AgeSignalNotifier(
+          requestSignal: () {
+            requests += 1;
+            return Completer<Map<Object?, Object?>?>().future;
+          },
+          delay: (duration) async {
+            expect(duration, ageSignalRetryDelay);
+            delays += 1;
+          },
+          requestTimeout: const Duration(milliseconds: 1),
+        ),
+      );
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+
+      await container.read(provider.notifier).request();
+
+      expect(container.read(provider), AgeSignalState.retryableFailure);
+      expect(requests, 1);
+      expect(delays, 1);
+    },
+  );
+
+  test('a retry consumes the late result from a timed-out request', () async {
     var requests = 0;
     var delays = 0;
+    final response = Completer<Map<Object?, Object?>?>();
     final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
       () => AgeSignalNotifier(
         requestSignal: () {
           requests += 1;
-          return Completer<Map<Object?, Object?>?>().future;
+          return response.future;
         },
         delay: (duration) async {
           expect(duration, ageSignalRetryDelay);
           delays += 1;
+          response.complete({'status': 'signal', 'ageUpper': 17});
         },
         requestTimeout: const Duration(milliseconds: 1),
       ),
@@ -135,8 +166,8 @@ void main() {
 
     await container.read(provider.notifier).request();
 
-    expect(container.read(provider), AgeSignalState.retryableFailure);
-    expect(requests, 2);
+    expect(container.read(provider), AgeSignalState.restricted);
+    expect(requests, 1);
     expect(delays, 1);
   });
 

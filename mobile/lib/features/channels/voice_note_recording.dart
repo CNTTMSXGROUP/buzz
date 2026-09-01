@@ -308,7 +308,7 @@ abstract class VoiceNotePlayerController extends ChangeNotifier {
 
   Future<void> loadRemote(
     String url, {
-    required Map<String, String> headers,
+    required Map<String, String> Function() headers,
     required Duration fallbackDuration,
   });
 
@@ -409,7 +409,11 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   final bool _requiresAuthenticatedLocalFile;
   final List<StreamSubscription<Object?>> _subscriptions = [];
   VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
-  ({String url, Map<String, String> headers, Duration fallbackDuration})?
+  ({
+    String url,
+    Map<String, String> Function() headers,
+    Duration fallbackDuration,
+  })?
   _pendingRemote;
   Completer<void>? _downloadAbort;
   File? _downloadingRemoteFile;
@@ -434,19 +438,19 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   @override
   Future<void> loadRemote(
     String url, {
-    required Map<String, String> headers,
+    required Map<String, String> Function() headers,
     required Duration fallbackDuration,
   }) {
-    if (!_requiresAuthenticatedLocalFile || headers.isEmpty) {
+    if (!_requiresAuthenticatedLocalFile) {
       _pendingRemote = null;
       return _load(
-        () => _player.setUrl(url, headers: headers),
+        () => _player.setUrl(url, headers: headers()),
         fallbackDuration: fallbackDuration,
       );
     }
     _pendingRemote = (
       url: url,
-      headers: Map.unmodifiable(headers),
+      headers: headers,
       fallbackDuration: fallbackDuration,
     );
     _update(VoiceNotePlaybackState(duration: fallbackDuration));
@@ -465,7 +469,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         'GET',
         uri,
         abortTrigger: requestAbort.future,
-      )..headers.addAll(remote.headers);
+      )..headers.addAll(remote.headers());
       final response = await _client.send(request);
       if (response.statusCode < 200 || response.statusCode >= 300) {
         await response.stream.drain<void>();

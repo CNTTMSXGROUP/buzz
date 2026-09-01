@@ -88,7 +88,7 @@ class _CoordinatedPlayer extends VoiceNotePlayerController {
   @override
   Future<void> loadRemote(
     String url, {
-    required Map<String, String> headers,
+    required Map<String, String> Function() headers,
     required Duration fallbackDuration,
   }) async {}
 
@@ -227,11 +227,15 @@ void main() {
         requiresAuthenticatedLocalFile: true,
       );
 
+      var authGeneration = 0;
       await player.loadRemote(
         'https://example.com/voice-note.mp4',
-        headers: const {'Authorization': 'Nostr signed-event'},
+        headers: () => {
+          'Authorization': 'Nostr signed-event-${authGeneration++}',
+        },
         fallbackDuration: const Duration(seconds: 7),
       );
+      expect(authGeneration, 0);
       expect(player.state.isLoading, isFalse);
       expect(player.state.duration, const Duration(seconds: 7));
       expect(client.sent.isCompleted, isFalse);
@@ -239,7 +243,8 @@ void main() {
       final playback = player.toggle();
       final request = await client.sent.future;
       expect(request, isA<http.AbortableStreamedRequest>());
-      expect(request.headers['Authorization'], 'Nostr signed-event');
+      expect(request.headers['Authorization'], 'Nostr signed-event-0');
+      expect(authGeneration, 1);
 
       final abortable = request as http.AbortableStreamedRequest;
       player.dispose();

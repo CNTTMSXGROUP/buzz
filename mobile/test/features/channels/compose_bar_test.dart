@@ -392,6 +392,7 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
       );
 
   VoiceNoteRecording? uploadedRecording;
+  Completer<BlobDescriptor>? pendingVoiceNoteUpload;
   XFile? file;
 
   @override
@@ -409,6 +410,8 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
       duration: duration,
       waveform: const [],
     );
+    final pending = pendingVoiceNoteUpload;
+    if (pending != null) return pending.future;
     onProgress?.call(1);
     return BlobDescriptor(
       url: 'https://relay.example/media/voice-note.mp4',
@@ -424,6 +427,9 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
 }
 
 class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
+  _FakeVoiceNoteRecorder({this.path = '/tmp/voice-note-test.m4a'});
+
+  final String path;
   final StreamController<double> _levels = StreamController.broadcast(
     sync: true,
   );
@@ -444,7 +450,7 @@ class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
 
   @override
   Future<VoiceNoteRecording> stop() async => VoiceNoteRecording(
-    file: XFile('/tmp/voice-note-test.m4a', mimeType: 'audio/mp4'),
+    file: XFile(path, mimeType: 'audio/mp4'),
     duration: const Duration(seconds: 3),
     waveform: const [0.2, 0.7, 0.4, 0.9],
   );
@@ -499,7 +505,7 @@ class _FakeVoiceNotePlayer extends VoiceNotePlayerController {
   @override
   Future<void> loadRemote(
     String url, {
-    required Map<String, String> headers,
+    required Map<String, String> Function() headers,
     required Duration fallbackDuration,
   }) => loadLocal(url, fallbackDuration: fallbackDuration);
 
@@ -5022,6 +5028,80 @@ void main() {
       );
       expect(find.text('extra.txt'), findsNothing);
     });
+
+    testWidgets(
+      'starting a voice note prevents a failed upload from restoring its draft',
+      (tester) async {
+        final uploadService = _FakeVoiceNoteUploadService()
+          ..pendingVoiceNoteUpload = Completer<BlobDescriptor>();
+        final recorders = [
+          _FakeVoiceNoteRecorder(path: '/tmp/first-voice-note.m4a'),
+          _FakeVoiceNoteRecorder(path: '/tmp/second-voice-note.m4a'),
+        ];
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: uploadService,
+            voiceNoteRecorderFactory: () => recorders.removeAt(0),
+            voiceNotePlayerFactory: _FakeVoiceNotePlayer.new,
+            onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+          ),
+        );
+
+        await _openAttachmentMenu(tester);
+        await tester.tap(find.text('Voice note'));
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey('voice-note-recorder-stop')),
+        );
+        await tester.pumpAndSettle();
+        final sendButton = find
+            .ancestor(
+              of: find.byIcon(LucideIcons.arrowUp),
+              matching: find.byType(IconButton),
+            )
+            .hitTestable();
+        await tester.tap(sendButton);
+        await tester.pump();
+        expect(
+          uploadService.uploadedRecording?.file.path,
+          '/tmp/first-voice-note.m4a',
+        );
+
+        await _openAttachmentMenu(tester);
+        await tester.tap(find.text('Voice note'));
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('voice-note-recorder')),
+          findsOneWidget,
+        );
+
+        uploadService.pendingVoiceNoteUpload!.completeError(
+          Exception('upload failed'),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('voice-note-recorder')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(
+            const ValueKey('voice-note-attachment:/tmp/first-voice-note.m4a'),
+          ),
+          findsNothing,
+        );
+        await tester.tap(
+          find.byKey(const ValueKey('voice-note-recorder-stop')),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(
+            const ValueKey('voice-note-attachment:/tmp/second-voice-note.m4a'),
+          ),
+          findsOneWidget,
+        );
+      },
+    );
 
     testWidgets('covering the route cancels its active voice-note recorder', (
       tester,

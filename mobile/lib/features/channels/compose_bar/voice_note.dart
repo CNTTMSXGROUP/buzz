@@ -56,6 +56,7 @@ _ComposerVoiceNote _useComposerVoiceNote({
       return;
     }
     uploadError.value = null;
+    draftRevision.value += 1;
     isPreparing.value = true;
     if (View.of(context).viewInsets.bottom == 0) beginRecording();
   }

@@ -6548,6 +6548,24 @@ mod tests {
         );
     }
 
+    /// Locate the `git-sign-nostr` binary built alongside this test binary in
+    /// the Cargo target directory.  Returns `None` when the binary is absent
+    /// (e.g. a `cargo check`-only run) so callers can skip the test.
+    fn find_git_sign_nostr() -> Option<std::path::PathBuf> {
+        // current_exe = target/<profile>/deps/<test_binary>-<hash>
+        // parent      = target/<profile>/deps
+        // parent²     = target/<profile>
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?;
+        let name = if cfg!(windows) {
+            "git-sign-nostr.exe"
+        } else {
+            "git-sign-nostr"
+        };
+        let p = profile_dir.join(name);
+        p.exists().then_some(p)
+    }
+
     /// (Carl R8 P1) An unsigned agent-authored commit with a `git replace`
     /// mapping to a signed decoy is refused by the signature gate.
     ///
@@ -6557,59 +6575,119 @@ mod tests {
     /// destination.
     ///
     /// Mutation evidence: removing `--no-replace-objects` from
-    /// `commit_signature_is_agent` makes this test's end-to-end check produce Ok
-    /// (passes the signature check by reading DECOY's signed status).  With the
-    /// fix, the probe reads REAL's raw unsigned state → `N` → refused.
+    /// `commit_signature_is_agent` makes the end-to-end `verify_push` return Ok
+    /// (the signature probe reads DECOY's `G` status, passing the check while
+    /// the unsigned REAL reaches the destination).  With the fix, the probe
+    /// reads REAL's raw unsigned state → `N` → refused and destination stays
+    /// empty.
     ///
-    /// The `rev_list_outgoing` fix (also `--no-replace-objects`) ensures graph
-    /// traversal uses raw parents; this test's sanity section confirms that
-    /// `commit_author_email` with `--no-replace-objects` correctly returns REAL's
-    /// true author rather than DECOY's.
+    /// Requires `git-sign-nostr` built in the Cargo target directory.  Skips
+    /// with a diagnostic if the binary is absent (e.g. `cargo check` only run).
     #[test]
     fn verify_push_rejects_unsigned_commit_via_replacement_ref() {
-        // Build a repo with:
-        //   DECOY = agent-authored, explicitly "signed" by making its %G? = "G"
-        //           We cannot actually sign in CI, so we use the AUTHOR-MISMATCH
-        //           version of the bypass instead: DECOY has AGENT_EMAIL, REAL
-        //           has human@example.com.  The production gate checks BOTH author
-        //           and signature; the author-mismatch bypass already has a dedicated
-        //           test.  Here we focus on the commit_author_email / commit_signature_is_agent
-        //           probes being fooled by the replacement chain, which we verify
-        //           by checking the production-function outputs directly.
-        //
-        //   REAL = has human@example.com author but DECOY has AGENT_EMAIL author.
-        //   git replace REAL DECOY: git show REAL → shows DECOY's author (AGENT_EMAIL).
-        //
-        // This directly validates that commit_author_email with --no-replace-objects
-        // returns REAL's raw author (human), not DECOY's (agent).  The end-to-end
-        // verify_push then refuses REAL.
+        // Locate the git-sign-nostr binary built alongside this test binary.
+        let Some(sign_nostr_bin) = find_git_sign_nostr() else {
+            eprintln!(
+                "SKIP verify_push_rejects_unsigned_commit_via_replacement_ref: \
+                 git-sign-nostr not found in Cargo target dir (build it first with \
+                 `cargo build -p git-sign-nostr`)"
+            );
+            return;
+        };
+
+        // Test keypair: secp256k1 spec test vector (secret scalar = 3).
+        // The public key is a known valid x-only BIP-340 point.
+        const TEST_SECRET_HEX: &str =
+            "0000000000000000000000000000000000000000000000000000000000000003";
+        const TEST_PUBKEY_HEX: &str =
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+        let test_email = format!("{TEST_PUBKEY_HEX}@relay.test");
+
+        // Write a 0600 keyfile with the test secret key.
+        let key_dir = tempfile::tempdir().unwrap();
+        let keyfile = key_dir.path().join(".nostr-key");
+        std::fs::write(&keyfile, TEST_SECRET_HEX).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Build a test authority that uses the real git-sign-nostr binary (by
+        // absolute path) and the test keypair.  Authority fields are private but
+        // accessible here because this is the same module.
+        let test_authority = Authority {
+            entries: vec![
+                ("user.name".into(), "Agent".into()),
+                ("user.email".into(), test_email.clone()),
+                ("gpg.format".into(), "x509".into()),
+                (
+                    "gpg.x509.program".into(),
+                    sign_nostr_bin.to_string_lossy().into_owned(),
+                ),
+                ("commit.gpgSign".into(), "true".into()),
+                ("tag.gpgSign".into(), "true".into()),
+                ("user.signingkey".into(), TEST_PUBKEY_HEX.into()),
+                (
+                    "nostr.keyfile".into(),
+                    keyfile.to_string_lossy().into_owned(),
+                ),
+            ],
+            email: test_email.clone(),
+        };
+
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
+
+        // Helper: run git in the repo (global/system config isolated).
         let g = |args: &[&str]| -> bool {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(&repo)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                // git-sign-nostr must find the binary via PATH; add its parent dir.
+                .env("PATH", {
+                    let parent = sign_nostr_bin.parent().unwrap();
+                    let orig = std::env::var_os("PATH").unwrap_or_default();
+                    let mut p = std::ffi::OsString::from(parent);
+                    p.push(":");
+                    p.push(orig);
+                    p
+                })
                 .status()
-                .unwrap()
-                .success()
+                .map(|s| s.success())
+                .unwrap_or(false)
         };
+
         assert!(g(&["init", "-q", "-b", "main"]));
         assert!(g(&["config", "user.name", "Agent"]));
-        assert!(g(&["config", "user.email", AGENT_EMAIL]));
-        assert!(g(&["config", "commit.gpgSign", "false"]));
-
-        // DECOY: has AGENT_EMAIL (passes the author check).
-        std::fs::write(repo.join("f"), "a").unwrap();
-        assert!(g(&["add", "f"]));
+        assert!(g(&["config", "user.email", &test_email]));
+        assert!(g(&["config", "gpg.format", "x509"]));
         assert!(g(&[
+            "config",
+            "gpg.x509.program",
+            sign_nostr_bin.to_str().unwrap(),
+        ]));
+        assert!(g(&["config", "user.signingkey", TEST_PUBKEY_HEX]));
+        assert!(g(&["config", "nostr.keyfile", keyfile.to_str().unwrap(),]));
+        assert!(g(&["config", "commit.gpgSign", "true"]));
+
+        // DECOY: agent-authored, genuinely signed with the test keypair.
+        std::fs::write(repo.join("f"), "decoy").unwrap();
+        assert!(g(&["add", "f"]));
+        let decoy_ok = g(&[
             "commit",
             "-qm",
             "decoy",
             "--author",
-            &format!("Agent <{AGENT_EMAIL}>"),
-        ]));
+            &format!("Agent <{test_email}>"),
+        ]);
+        assert!(
+            decoy_ok,
+            "DECOY commit must succeed (git-sign-nostr must be on PATH \
+             and able to sign with the test keyfile)"
+        );
         let decoy_sha = {
             let out = std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
@@ -6618,16 +6696,47 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        // REAL: has human@example.com (wrong author — should be refused).
-        assert!(g(&["checkout", "-qb", "real-branch"]));
-        std::fs::write(repo.join("f"), "b").unwrap();
+        // Sanity: DECOY has %G? = "G" (genuinely signed).
+        let decoy_gq = {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "show",
+                    "-s",
+                    "--format=%G?",
+                    &decoy_sha,
+                ])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("PATH", {
+                    let parent = sign_nostr_bin.parent().unwrap();
+                    let orig = std::env::var_os("PATH").unwrap_or_default();
+                    let mut p = std::ffi::OsString::from(parent);
+                    p.push(":");
+                    p.push(orig);
+                    p
+                })
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            decoy_gq, "G",
+            "DECOY must be a valid agent-signed commit (%G?=G); \
+             got {decoy_gq:?} — git-sign-nostr may not be signing correctly"
+        );
+
+        // REAL: agent-authored but UNSIGNED (different content so different SHA).
+        assert!(g(&["config", "commit.gpgSign", "false"]));
+        std::fs::write(repo.join("f"), "real").unwrap();
         assert!(g(&["add", "f"]));
         assert!(g(&[
             "commit",
             "-qm",
             "real",
             "--author",
-            "Human <human@example.com>",
+            &format!("Agent <{test_email}>"),
         ]));
         let real_sha = {
             let out = std::process::Command::new("git")
@@ -6642,8 +6751,9 @@ mod tests {
 
         let ctx = vec!["-C".to_string(), repo.to_string_lossy().into_owned()];
 
-        // Sanity: without --no-replace-objects, git show REAL returns DECOY's author.
-        // This is the bypass: the author probe would see AGENT_EMAIL and let it pass.
+        // Bypass precondition: without --no-replace-objects, git show REAL
+        // returns DECOY's signature status (G).  This proves the bypass is
+        // live and that the replacement is correctly wired.
         let without_flag = {
             let out = std::process::Command::new("git")
                 .args([
@@ -6651,45 +6761,58 @@ mod tests {
                     repo.to_str().unwrap(),
                     "show",
                     "-s",
-                    "--format=%ae",
+                    "--format=%G?",
                     &real_sha,
                 ])
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("PATH", {
+                    let parent = sign_nostr_bin.parent().unwrap();
+                    let orig = std::env::var_os("PATH").unwrap_or_default();
+                    let mut p = std::ffi::OsString::from(parent);
+                    p.push(":");
+                    p.push(orig);
+                    p
+                })
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         assert_eq!(
-            without_flag, AGENT_EMAIL,
-            "precondition: without --no-replace-objects, git show REAL returns DECOY's \
-             author ({AGENT_EMAIL}) — the bypass is executable; commit_author_email without \
-             the fix would return {AGENT_EMAIL} and pass the author gate"
+            without_flag, "G",
+            "bypass precondition: without --no-replace-objects, git show REAL \
+             must report DECOY's %G? (G) — the replacement chain is not active \
+             or DECOY is not signed"
         );
 
-        // The production `commit_author_email` (WITH --no-replace-objects) must
-        // return REAL's raw author, not DECOY's.
-        let probed = commit_author_email(&real_git(), &ctx, &real_sha);
+        // The production `commit_signature_is_agent` (WITH --no-replace-objects)
+        // must return Some(false): REAL is unsigned → %G? = "N".
+        // Mutation: removing --no-replace-objects from commit_signature_is_agent
+        // makes it return Some(true) (reads DECOY's G), causing verify_push below
+        // to PASS and this assertion to FAIL.
+        let sig_result = commit_signature_is_agent(&real_git(), &ctx, &test_authority, &real_sha);
         assert_eq!(
-            probed.as_deref(),
-            Some("human@example.com"),
-            "commit_author_email must return REAL's raw author with --no-replace-objects; \
-             got: {probed:?}"
+            sig_result,
+            Some(false),
+            "commit_signature_is_agent must return Some(false) for REAL (unsigned) \
+             with --no-replace-objects: got {sig_result:?}. \
+             Some(true) would mean the flag is missing and the bypass is live."
         );
 
-        // End-to-end: verify_push must refuse REAL (wrong author) even with replacement.
+        // End-to-end: verify_push must refuse REAL (unsigned) even with
+        // the REAL → DECOY replacement active.
         let remote = tempfile::tempdir().unwrap();
         assert!(g(&[
             "init",
             "-q",
             "--bare",
-            remote.path().to_str().unwrap()
+            remote.path().to_str().unwrap(),
         ]));
         assert!(g(&[
             "remote",
             "add",
             "origin",
-            remote.path().to_str().unwrap()
+            remote.path().to_str().unwrap(),
         ]));
 
         let argv = v(&[
@@ -6699,14 +6822,14 @@ mod tests {
             "origin",
             &format!("{real_sha}:refs/heads/main"),
         ]);
-        let err = verify_push(&real_git(), &argv, &argv, &ctx, &managed()).expect_err(
-            "REAL (wrong author) must be refused even with REAL→DECOY replacement; \
-                 without --no-replace-objects the author probe sees DECOY's agent email \
-                 and incorrectly passes",
+        let err = verify_push(&real_git(), &argv, &argv, &ctx, &test_authority).expect_err(
+            "REAL (unsigned agent commit) must be refused even with REAL→DECOY \
+                 replacement; without --no-replace-objects the signature probe reads \
+                 DECOY's G status and incorrectly passes",
         );
         assert!(
-            err.contains("not authored by your agent identity"),
-            "expected author refusal; got: {err}"
+            err.contains("no valid signature"),
+            "expected signature refusal; got: {err}"
         );
 
         // Destination must not have acquired REAL.
@@ -6716,7 +6839,8 @@ mod tests {
             .unwrap();
         assert!(
             String::from_utf8_lossy(&ls.stdout).trim().is_empty(),
-            "destination must remain empty; remote_refs={:?}",
+            "destination must remain empty after unsigned-via-replacement refusal; \
+             remote_refs={:?}",
             String::from_utf8_lossy(&ls.stdout)
         );
     }

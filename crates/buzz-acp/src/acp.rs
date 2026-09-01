@@ -5711,29 +5711,47 @@ mod tests {
     /// relay credential helper there).  Tests that assert the helper IS or IS
     /// NOT installed must run with a clean process env so that ambient
     /// `GIT_CONFIG_*` vars from a review host do not silently flip the outcome.
+    ///
+    /// Serializes the complete snapshot/clear/assert/restore lifetime so that
+    /// concurrent nextest threads cannot observe each other's mid-test env state
+    /// (e.g. one guard's `Drop` restoring the ambient helper while a sibling test
+    /// is still asserting the helper was installed).
     #[cfg(unix)]
-    struct GitConfigEnvGuard(Vec<(std::ffi::OsString, std::ffi::OsString)>);
+    static GIT_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    struct GitConfigEnvGuard {
+        saved: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     #[cfg(unix)]
     impl Drop for GitConfigEnvGuard {
         fn drop(&mut self) {
-            for (k, v) in self.0.drain(..) {
+            for (k, v) in self.saved.drain(..) {
                 std::env::set_var(k, v);
             }
+            // `_lock` is dropped after `saved` is restored, releasing the mutex
+            // only once the env is back to its pre-test state.
         }
     }
 
-    /// Clear ambient `GIT_CONFIG_*` for the duration of a test.  Returns the
-    /// guard; keep it alive (bound to `_guard`) for the test's full scope.
+    /// Clear ambient `GIT_CONFIG_*` for the duration of a test.  Acquires the
+    /// crate-level `GIT_CONFIG_ENV_LOCK` so the full snapshot/clear/test/restore
+    /// cycle is serialized across concurrent nextest threads.  Keep the returned
+    /// guard alive (bound to `_guard`) for the test's full scope.
     #[cfg(unix)]
     fn clear_git_config_env() -> GitConfigEnvGuard {
+        let _lock = GIT_CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved: Vec<_> = std::env::vars_os()
             .filter(|(k, _)| k.to_str().is_some_and(|k| k.starts_with("GIT_CONFIG_")))
             .collect();
         for (k, _) in &saved {
             std::env::remove_var(k);
         }
-        GitConfigEnvGuard(saved)
+        GitConfigEnvGuard { saved, _lock }
     }
 
     /// An unrecognized value fails the spawn loudly rather than silently

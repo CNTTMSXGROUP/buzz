@@ -208,9 +208,9 @@ pub(super) async fn update_persona_with<Rt: tauri::Runtime + 'static, R: Send + 
     use tauri::Manager;
 
     // Phase 1: synchronous save (persona record + linked agent avatar updates)
-    let (result, retained, profile_sync_params) = tokio::task::spawn_blocking({
+    let (result, retain_result, profile_sync_params) = tokio::task::spawn_blocking({
         let app = app.clone();
-        move || -> Result<(AgentDefinition, R, ProfileSyncParams), String> {
+        move || -> Result<(AgentDefinition, Result<R, String>, ProfileSyncParams), String> {
             let state = app.state::<AppState>();
             let display_name = trim_required(&input.display_name, "Display name")?;
             let system_prompt = input.system_prompt.clone();
@@ -369,7 +369,7 @@ pub(super) async fn update_persona_with<Rt: tauri::Runtime + 'static, R: Send + 
                 Vec::new()
             };
 
-            Ok((result, retain_result?, sync_params))
+            Ok((result, retain_result, sync_params))
         }
     })
     .await
@@ -400,6 +400,12 @@ pub(super) async fn update_persona_with<Rt: tauri::Runtime + 'static, R: Send + 
             }
         }
     }
+
+    // Propagate the retain error only after all linked identity effects have
+    // completed (local managed-agent store write and relay kind:0 profile sync).
+    // A strict publication failure must not skip these: the coordinator's
+    // publish-only retry will see the linked identities already in sync.
+    let retained = retain_result?;
 
     Ok((result, retained))
 }

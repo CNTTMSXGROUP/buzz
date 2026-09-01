@@ -560,3 +560,207 @@ fn linked_instance_rename_completes_before_retain_error_propagates() {
         None => std::env::remove_var("XDG_DATA_HOME"),
     }
 }
+
+/// P2 relay-sync regression: the relay kind:0 profile sync for linked agents
+/// must complete even when the retain/publish callback returns an error.
+///
+/// Before the fix: `retain_result?` applied `?` inside the blocking phase's
+/// return tuple, exiting before `profile_sync_params` was returned to the outer
+/// function. Phase 2 (the async `sync_managed_agent_profile` loop) never ran —
+/// the linked relay identity remained stale even though the local record updated.
+///
+/// After the fix: `retain_result` is returned un-`?`d from the blocking phase,
+/// phase 2 runs to completion, and THEN the retain error is propagated.
+///
+/// Mutation acceptance: restoring `retain_result?` inside `Ok((result, retain_result?, …))`
+/// causes the blocking phase to exit before `profile_sync_params` is returned,
+/// so the counter server receives 0 requests and this test turns RED.
+#[test]
+fn linked_instance_relay_profile_syncs_despite_retain_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tauri::Manager;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home3");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_DATA_HOME");
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_DATA_HOME", &home);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime");
+
+    rt.block_on(async {
+        let app = mock_app();
+
+        // Spawn a local HTTP server that counts POST /events requests.
+        // sync_managed_agent_profile posts kind:0 profile events here.
+        let post_count = Arc::new(AtomicUsize::new(0));
+        let post_count_clone = post_count.clone();
+        let relay_server = {
+            use axum::{routing::post, Router};
+            let app_router = Router::new().route(
+                "/events",
+                post(move |_body: String| {
+                    let counter = post_count_clone.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        serde_json::json!({
+                            "event_id": "test-event-id",
+                            "accepted": true,
+                            "message": ""
+                        })
+                        .to_string()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app_router).await.ok();
+            });
+            format!("http://{addr}")
+        };
+
+        // Point the workspace relay override at the counter server so that
+        // relay_ws_url_with_override (used to build relay_url per record)
+        // routes profile syncs to our counter, not the real relay.
+        {
+            let state = app.state::<crate::app_state::AppState>();
+            let mut override_slot = state
+                .relay_url_override
+                .lock()
+                .expect("relay_url_override must be lockable");
+            *override_slot = Some(relay_server.clone());
+        }
+
+        // Seed persona "Alice" at R1.
+        save_personas(app.handle(), &[persona("p1", "Alice", R1)]).expect("seed must succeed");
+
+        // Seed a linked agent with valid NSEC keys so sync_managed_agent_profile
+        // can sign and submit the kind:0 profile event.
+        let agent_keys = nostr::Keys::generate();
+        let agent_record = crate::managed_agents::ManagedAgentRecord {
+            pubkey: agent_keys.public_key().to_hex(),
+            name: "Alice".to_string(),
+            persona_id: Some("p1".to_string()),
+            private_key_nsec: agent_keys.secret_key().to_secret_hex(),
+            auth_tag: None,
+            relay_url: String::new(),
+            avatar_url: None,
+            acp_command: String::new(),
+            agent_command: String::new(),
+            agent_command_override: None,
+            agent_args: vec![],
+            mcp_command: String::new(),
+            turn_timeout_seconds: 0,
+            idle_timeout_seconds: None,
+            max_turn_duration_seconds: None,
+            parallelism: 1,
+            system_prompt: None,
+            model: None,
+            provider: None,
+            persona_source_version: None,
+            env_vars: std::collections::BTreeMap::new(),
+            start_on_app_launch: false,
+            auto_restart_on_config_change: false,
+            runtime_pid: None,
+            backend: Default::default(),
+            backend_agent_id: None,
+            provider_policy_pending: false,
+            provider_binary_path: None,
+            team_id: None,
+            persona_team_dir: None,
+            persona_name_in_team: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_started_at: None,
+            last_stopped_at: None,
+            last_exit_code: None,
+            last_error: None,
+            last_error_code: None,
+            respond_to: Default::default(),
+            respond_to_allowlist: vec![],
+            display_name: Some("Alice".to_string()),
+            description: None,
+            slug: None,
+            runtime: None,
+            name_pool: vec![],
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
+            definition_respond_to: None,
+            definition_respond_to_allowlist: vec![],
+            definition_parallelism: None,
+            relay_mesh: None,
+            effort_level: None,
+        };
+        crate::managed_agents::save_managed_agents(app.handle(), &[agent_record])
+            .expect("agent seed must succeed");
+
+        // Submit a rename with a retain closure that always fails — simulates
+        // strict publication failure after persona save. The display_name
+        // change triggers name propagation and relay profile sync.
+        let result = update_persona_with(
+            UpdatePersonaRequest {
+                id: "p1".to_string(),
+                display_name: "Alice Renamed".to_string(),
+                avatar_url: None,
+                description: None,
+                system_prompt: "Do the work.".to_string(),
+                runtime: None,
+                model: None,
+                provider: None,
+                name_pool: Vec::new(),
+                env_vars: None,
+                behavior: None,
+                expected_updated_at: Some(R1.to_string()),
+            },
+            app.handle().clone(),
+            |_app, _state, _persona| -> Result<(), String> {
+                Err("simulated strict publication failure after persona persisted".to_string())
+            },
+        )
+        .await;
+
+        // The retain error must propagate so the coordinator sees publishFailed.
+        assert!(
+            result.is_err(),
+            "update_persona_with must return Err when retain fails"
+        );
+
+        // Phase 2 must have run: the counter server must have received exactly
+        // one kind:0 profile-sync POST for the renamed linked agent.
+        // Before the fix (retain_result? inside the blocking Ok): profile_sync_params
+        // is never returned to the outer fn — count is 0, test RED.
+        // After the fix (retain_result? after phase 2): count is 1, test GREEN.
+        assert_eq!(
+            post_count.load(Ordering::SeqCst),
+            1,
+            "relay kind:0 profile sync must fire despite retain failure; \
+             restoring `retain_result?` before phase 2 (the pre-fix shape) turns this RED"
+        );
+    }); // rt.block_on
+
+    // Cleanup: restore HOME/XDG after the relay-profile-syncs test
+    std::env::remove_var("HOME");
+    std::env::remove_var("XDG_DATA_HOME");
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+        None => std::env::remove_var("XDG_DATA_HOME"),
+    }
+}

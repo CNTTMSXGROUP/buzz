@@ -2117,3 +2117,78 @@ test("test_combined_di_save_no_retry_seam_names_both_catalog_and_remainder", asy
     cap.restore();
   }
 });
+
+test("test_combined_dl_save_publish_retry_failure_names_both_catalog_and_remainder", async () => {
+  // D+L combined save: publish throws after persist, retry also fails — toast
+  // must name the profile as saved, the policy remainder as not saved, and
+  // catalog publication as the failure reason. Policy write must NOT be called.
+  //
+  // Symmetric to test_combined_di_save_publish_retry_failure_names_both_catalog_and_remainder
+  // for the policy (L) path. Mutation acceptance: restoring the original
+  // !observedRemainder gate suppresses the early retry entirely, so the policy
+  // write is also never blocked — the toast no longer names the policy remainder
+  // and these assertions turn RED.
+  const cap = captureToasts();
+  try {
+    const persistedDef = makeDefinition({ displayName: "Alice" });
+    const persistedInst = makeInstance({ autoRestartOnConfigChange: false });
+    let setAutoRestartCalls = 0;
+    const opts = makeOpts({
+      ctx: {
+        kind: "instance-with-definition",
+        definition: makeDefinition({ displayName: "Alice" }),
+        instance: makeInstance(),
+      },
+      personaInput: makePersonaInput({ displayName: "Alice" }),
+      agentInput: null,
+      policySets: [{ type: "autoRestart", pubkey: "pk-abc", value: true }],
+      publishCatalogUpdates: true,
+      updatePersonaAndPublish: async () => {
+        throw new Error("relay unreachable");
+      },
+      setAutoRestart: async () => {
+        setAutoRestartCalls++;
+      },
+      refetchStores: async () => ({
+        persona: persistedDef,
+        agent: persistedInst,
+      }),
+      publishRetry: async () => {
+        throw new Error("still unreachable");
+      },
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(result, false, "combined D+L failure returns false");
+    assert.equal(opts._calls.onDone, 0, "onDone must not be called");
+    // Policy write must NOT have been attempted — firstError blocks step 3.
+    assert.equal(
+      setAutoRestartCalls,
+      0,
+      "policy write must be skipped when publication retry failed",
+    );
+    const warnings = cap.captured.filter((c) => c.kind === "warning");
+    assert.equal(warnings.length, 1, "exactly one warning");
+    // Must name D as saved.
+    assert.match(
+      warnings[0].message,
+      /profile saved/i,
+      "warning must name profile as saved",
+    );
+    // Must name publication as the failure reason.
+    assert.match(
+      warnings[0].message,
+      /catalog publication failed|could not be published/i,
+      "warning must name the catalog publication failure",
+    );
+    // Must name the L remainder (policy) as not saved.
+    assert.match(
+      warnings[0].message,
+      /auto-restart policy/i,
+      "warning must name the auto-restart policy as the unsaved remainder",
+    );
+  } finally {
+    cap.restore();
+  }
+});

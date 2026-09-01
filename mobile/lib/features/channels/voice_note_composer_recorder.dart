@@ -6,6 +6,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../shared/relay/app_lifecycle_provider.dart';
 import '../../shared/theme/theme.dart';
 import 'voice_note_recording.dart';
 import 'voice_note_waveform.dart';
@@ -38,6 +39,7 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     final error = useState<String?>(null);
     final isStarted = useState(false);
     final isStopping = useState(false);
+    final lifecycle = ref.watch(appLifecycleProvider);
     final startedAt = useRef<DateTime?>(null);
     final routeAware = useMemoized(
       () => _VoiceNoteRouteAware(() {
@@ -45,6 +47,13 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       }),
       [onCancel],
     );
+
+    useEffect(() {
+      if (lifecycle != AppLifecycleState.resumed) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => onCancel());
+      }
+      return null;
+    }, [lifecycle, onCancel]);
 
     final route = ModalRoute.of(context);
     useEffect(() {

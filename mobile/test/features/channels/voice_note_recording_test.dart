@@ -8,10 +8,14 @@ import 'package:buzz/features/channels/voice_note_recording.dart';
 class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
   final permission = Completer<bool>();
   final nativeStart = Completer<void>();
+  final nativeStop = Completer<String?>();
   final amplitudes = StreamController<Amplitude>.broadcast();
   bool startCalled = false;
+  bool stopCalled = false;
+  bool stopCompleted = false;
   bool cancelCalled = false;
   bool disposeCalled = false;
+  bool terminalOverlap = false;
 
   @override
   Future<bool> hasPermission() => permission.future;
@@ -26,13 +30,22 @@ class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
   Stream<Amplitude> onAmplitudeChanged(Duration interval) => amplitudes.stream;
 
   @override
-  Future<String?> stop() async => '/tmp/voice-note-test.m4a';
+  Future<String?> stop() async {
+    stopCalled = true;
+    final path = await nativeStop.future;
+    stopCompleted = true;
+    return path;
+  }
 
   @override
-  Future<void> cancel() async => cancelCalled = true;
+  Future<void> cancel() async {
+    if (stopCalled && !stopCompleted) terminalOverlap = true;
+    cancelCalled = true;
+  }
 
   @override
   Future<void> dispose() async {
+    if (stopCalled && !stopCompleted) terminalOverlap = true;
     disposeCalled = true;
     await amplitudes.close();
   }
@@ -147,6 +160,43 @@ void main() {
     expect(backend.cancelCalled, isTrue);
     await recorder.dispose();
   });
+
+  test(
+    'dispose waits for an in-flight stop before releasing backend',
+    () async {
+      final backend = _DelayedRecorderBackend();
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-test',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final recorder = DeviceVoiceNoteRecorder(
+        backend: backend,
+        temporaryDirectory: () async => directory,
+      );
+      backend.permission.complete(true);
+      backend.nativeStart.complete();
+      await recorder.start();
+
+      final stopping = recorder.stop();
+      final disposing = recorder.dispose();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(backend.stopCalled, isTrue);
+      expect(backend.cancelCalled, isFalse);
+      expect(backend.disposeCalled, isFalse);
+      expect(backend.terminalOverlap, isFalse);
+
+      backend.nativeStop.complete('/tmp/voice-note-test.m4a');
+      final recording = await stopping;
+      await disposing;
+
+      expect(recording.file.path, '/tmp/voice-note-test.m4a');
+      expect(backend.stopCompleted, isTrue);
+      expect(backend.cancelCalled, isFalse);
+      expect(backend.disposeCalled, isTrue);
+      expect(backend.terminalOverlap, isFalse);
+    },
+  );
 
   test(
     'playback coordinator arbitrates instances and releases ownership',

@@ -4,10 +4,13 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:just_audio/just_audio.dart' as audio;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+
+import '../../shared/relay/media_image.dart';
 
 const voiceNoteMaxDuration = Duration(minutes: 5);
 const voiceNotePlaybackRates = <double>[1, 1.5, 2, 0.5];
@@ -101,6 +104,7 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   final List<double> _samples = [];
   StreamSubscription<Amplitude>? _amplitudeSubscription;
   Future<void>? _startup;
+  Future<void>? _terminalOperation;
   DateTime? _startedAt;
   String? _path;
   int _lifecycleGeneration = 0;
@@ -176,12 +180,23 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   }
 
   @override
-  Future<VoiceNoteRecording> stop() async {
+  Future<VoiceNoteRecording> stop() {
     if (_finished || !_nativeStarted || _nativeEnded) {
-      throw StateError('Voice note recording is not active.');
+      return Future.error(StateError('Voice note recording is not active.'));
     }
     _finished = true;
     _lifecycleGeneration += 1;
+    final operation = _stop();
+    final terminalOperation = operation.then<void>((_) {}, onError: (_, _) {});
+    _terminalOperation = terminalOperation;
+    return operation.whenComplete(() {
+      if (identical(_terminalOperation, terminalOperation)) {
+        _terminalOperation = null;
+      }
+    });
+  }
+
+  Future<VoiceNoteRecording> _stop() async {
     await _amplitudeSubscription?.cancel();
     final recordedPath = await _recorder.stop() ?? _path;
     _nativeEnded = true;
@@ -200,10 +215,20 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   }
 
   @override
-  Future<void> cancel() async {
-    if (_finished) return;
+  Future<void> cancel() {
+    final activeTerminalOperation = _terminalOperation;
+    if (activeTerminalOperation != null) return activeTerminalOperation;
+    if (_finished) return Future.value();
     _finished = true;
     _lifecycleGeneration += 1;
+    final operation = _cancel();
+    _terminalOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_terminalOperation, operation)) _terminalOperation = null;
+    });
+  }
+
+  Future<void> _cancel() async {
     try {
       await _startup;
     } catch (_) {
@@ -220,10 +245,15 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
-    if (!_finished) {
-      await cancel();
-    } else {
-      _lifecycleGeneration += 1;
+    _lifecycleGeneration += 1;
+    final terminalOperation =
+        _terminalOperation ?? (!_finished ? cancel() : null);
+    if (terminalOperation != null) {
+      try {
+        await terminalOperation;
+      } catch (_) {
+        // Disposal still owns backend release when a terminal operation fails.
+      }
     }
     try {
       await _startup;
@@ -314,14 +344,22 @@ final voiceNotePlaybackCoordinatorProvider = Provider(
 final voiceNotePlayerFactoryProvider =
     Provider<VoiceNotePlayerController Function()>((ref) {
       final coordinator = ref.watch(voiceNotePlaybackCoordinatorProvider);
-      return () => DeviceVoiceNotePlayerController(coordinator: coordinator);
+      final client = ref.watch(mediaHttpClientProvider);
+      return () => DeviceVoiceNotePlayerController(
+        coordinator: coordinator,
+        client: client,
+      );
     });
 
 class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   DeviceVoiceNotePlayerController({
     required VoiceNotePlaybackCoordinator coordinator,
+    required http.Client client,
+    Future<Directory> Function()? temporaryDirectory,
   }) : _coordinator = coordinator,
-       _player = audio.AudioPlayer() {
+       _client = client,
+       _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory,
+       _player = audio.AudioPlayer(useProxyForRequestHeaders: false) {
     _subscriptions.add(
       _player.positionStream.listen((position) {
         _update(_state.copyWith(position: position));
@@ -359,9 +397,12 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   }
 
   final VoiceNotePlaybackCoordinator _coordinator;
+  final http.Client _client;
+  final Future<Directory> Function() _temporaryDirectory;
   final audio.AudioPlayer _player;
   final List<StreamSubscription<Object?>> _subscriptions = [];
   VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
+  File? _remoteFile;
   bool _disposed = false;
 
   Future<void> _stopAndRewindCompletedPlayback() async {
@@ -384,10 +425,41 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     String url, {
     required Map<String, String> headers,
     required Duration fallbackDuration,
-  }) => _load(
-    () => _player.setUrl(url, headers: headers),
-    fallbackDuration: fallbackDuration,
-  );
+  }) => _load(() async {
+    if (!Platform.isIOS || headers.isEmpty) {
+      return _player.setUrl(url, headers: headers);
+    }
+    final response = await _client.get(Uri.parse(url), headers: headers);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw HttpException(
+        'Voice note download failed (${response.statusCode})',
+        uri: Uri.parse(url),
+      );
+    }
+    final directory = await _temporaryDirectory();
+    if (_disposed) return null;
+    final file = File(
+      '${directory.path}${Platform.pathSeparator}'
+      'buzz-voice-note-${DateTime.now().microsecondsSinceEpoch}.mp4',
+    );
+    await file.writeAsBytes(response.bodyBytes, flush: true);
+    if (_disposed) {
+      await _deleteRemoteFile(file);
+      return null;
+    }
+    await _deleteRemoteFile(_remoteFile);
+    _remoteFile = file;
+    return _player.setFilePath(file.path);
+  }, fallbackDuration: fallbackDuration);
+
+  Future<void> _deleteRemoteFile(File? file) async {
+    if (file == null) return;
+    try {
+      if (await file.exists()) await file.delete();
+    } on FileSystemException {
+      // Temporary playback cleanup must not make the player fail.
+    }
+  }
 
   Future<void> _load(
     Future<Duration?> Function() load, {
@@ -445,6 +517,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
       unawaited(subscription.cancel());
     }
     unawaited(_player.dispose());
+    unawaited(_deleteRemoteFile(_remoteFile));
     super.dispose();
   }
 }

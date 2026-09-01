@@ -188,6 +188,7 @@ Widget _buildComposeBar({
   VoidCallback? onFocusRequested,
   FocusNode? focusNode,
   ValueChanged<VoidCallback>? onFocusRestorerChanged,
+  AppLifecycleNotifier Function()? appLifecycle,
   String composeBarKey = 'compose-bar',
   VoiceNoteRecorder Function()? voiceNoteRecorderFactory,
   VoiceNotePlayerController Function()? voiceNotePlayerFactory,
@@ -217,6 +218,7 @@ Widget _buildComposeBar({
       relayConfigProvider.overrideWith(
         relayConfig ?? _FakeRelayConfigNotifier.new,
       ),
+      if (appLifecycle != null) appLifecycleProvider.overrideWith(appLifecycle),
       savedPrefsProvider.overrideWithValue(_testPrefs),
       channelsProvider.overrideWith(
         () => _FakeChannelsNotifier(channels, cachedMembers: cachedMembers),
@@ -328,6 +330,13 @@ class _FakeRelayConfigNotifier extends RelayConfigNotifier {
   );
 }
 
+class _FakeAppLifecycleNotifier extends AppLifecycleNotifier {
+  @override
+  AppLifecycleState build() => AppLifecycleState.resumed;
+
+  void setLifecycle(AppLifecycleState value) => state = value;
+}
+
 class _EmptyPhotoLibrary implements PhotoLibrary {
   const _EmptyPhotoLibrary();
 
@@ -416,6 +425,7 @@ class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
   );
   bool started = false;
   bool cancelled = false;
+  bool disposed = false;
 
   @override
   Stream<double> get levels => _levels.stream;
@@ -442,6 +452,7 @@ class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
 
   @override
   Future<void> dispose() async {
+    disposed = true;
     await _levels.close();
   }
 }
@@ -4828,6 +4839,41 @@ void main() {
         isNotNull,
       );
     });
+
+    for (final lifecycleState in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.paused,
+      AppLifecycleState.hidden,
+    ]) {
+      testWidgets(
+        'leaving the foreground for ${lifecycleState.name} cancels recording',
+        (tester) async {
+          final recorder = _FakeVoiceNoteRecorder();
+          final lifecycle = _FakeAppLifecycleNotifier();
+          await tester.pumpWidget(
+            _buildComposeBar(
+              uploadService: _FakeVoiceNoteUploadService(),
+              voiceNoteRecorderFactory: () => recorder,
+              appLifecycle: () => lifecycle,
+              onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+            ),
+          );
+          await _openAttachmentMenu(tester);
+          await tester.tap(find.text('Voice note'));
+          await tester.pumpAndSettle();
+
+          lifecycle.setLifecycle(lifecycleState);
+          await tester.pumpAndSettle();
+
+          expect(recorder.cancelled, isTrue);
+          expect(recorder.disposed, isTrue);
+          expect(
+            find.byKey(const ValueKey('voice-note-recorder')),
+            findsNothing,
+          );
+        },
+      );
+    }
 
     testWidgets('covering the route cancels its active voice-note recorder', (
       tester,

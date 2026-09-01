@@ -644,7 +644,7 @@ export function EncryptedBackupCreator({
   // while the native save dialog is open the password form stays put.
   if (state.ncryptsec && savedPath && guidedTest) {
     return (
-      <div data-testid="encrypted-backup-result">
+      <div className="w-full" data-testid="encrypted-backup-result">
         <BackupTestFlow
           isSaving={isSaving}
           expectedNcryptsec={state.ncryptsec}

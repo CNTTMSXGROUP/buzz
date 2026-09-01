@@ -171,16 +171,12 @@ export function DownloadKeyStep({
       <OnboardingFooter>
         {showPreviewSaved ? (
           <Button
-            className={cn(
-              ONBOARDING_SECONDARY_CTA_CLASS,
-              cardLayout && ONBOARDING_PREVIEW_SECONDARY_CTA_CLASS,
-            )}
+            className={primaryActionClass}
             data-testid="onboarding-preview-backup-done"
             onClick={onBack}
             type="button"
-            variant="ghost"
           >
-            Skip for now
+            Continue
           </Button>
         ) : (
           <div

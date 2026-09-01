@@ -478,6 +478,53 @@ void main() {
       },
     );
 
+    test(
+      'age check suspension clears a stale snapshot and allowed restores it',
+      () async {
+        final staleWriteStarted = Completer<void>();
+        final releaseStaleWrite = Completer<void>();
+        final completedSnapshots = <List<Community>>[];
+        final community = Community.create(
+          name: 'Age gated',
+          relayUrl: 'https://age-gated.example.com',
+          nsec: nostr.Keys.generate().nsec,
+        ).copyWith(pushNotificationsEnabled: true);
+        await communityStorage.save(community);
+
+        container = ProviderContainer(
+          overrides: [
+            communityStorageProvider.overrideWithValue(communityStorage),
+            communitySnapshotWriterProvider.overrideWithValue((
+              communities,
+            ) async {
+              final captured = List.of(communities);
+              if (captured.isNotEmpty && !staleWriteStarted.isCompleted) {
+                staleWriteStarted.complete();
+                await releaseStaleWrite.future;
+              }
+              completedSnapshots.add(captured);
+            }),
+          ],
+        );
+
+        final staleExport = container.read(communityListProvider.future);
+        await staleWriteStarted.future;
+        final suspension = container.read(
+          suspendCommunitySnapshotForAgeCheckProvider,
+        )();
+
+        releaseStaleWrite.complete();
+        await staleExport;
+        await suspension;
+
+        expect(completedSnapshots.last, isEmpty);
+
+        await container.read(resumeCommunitySnapshotAfterAgeCheckProvider)();
+
+        expect(completedSnapshots.last.single.id, community.id);
+      },
+    );
+
     test('removeCommunity removes from list', () async {
       container = createContainer();
       await container.read(communityListProvider.future);

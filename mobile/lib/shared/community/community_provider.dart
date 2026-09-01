@@ -93,6 +93,42 @@ final _communitySnapshotSyncProvider = Provider<_CommunitySnapshotSync>((ref) {
   return _CommunitySnapshotSync(ref.read(communitySnapshotWriterProvider));
 });
 
+/// Suspends or restores notification-service state at the launch age gate.
+typedef CommunitySnapshotAgeGateAction = Future<void> Function();
+
+/// Temporarily removes notification-service presentation material while the
+/// launch age signal has not allowed access.
+final suspendCommunitySnapshotForAgeCheckProvider =
+    Provider<CommunitySnapshotAgeGateAction>((ref) {
+      return () async {
+        try {
+          await ref.read(_communitySnapshotSyncProvider).suspendForAgeCheck();
+          pushCommunitySnapshotError.value = null;
+        } catch (error, stackTrace) {
+          reportPushCommunitySnapshotError(error, stackTrace);
+        }
+      };
+    });
+
+/// Restores notification-service presentation material after the launch age
+/// signal allows access.
+final resumeCommunitySnapshotAfterAgeCheckProvider =
+    Provider<CommunitySnapshotAgeGateAction>((ref) {
+      return () async {
+        try {
+          final communities = await ref
+              .read(communityStorageProvider)
+              .loadAll();
+          await ref
+              .read(_communitySnapshotSyncProvider)
+              .resumeAfterAgeCheck(communities);
+          pushCommunitySnapshotError.value = null;
+        } catch (error, stackTrace) {
+          reportPushCommunitySnapshotError(error, stackTrace);
+        }
+      };
+    });
+
 typedef CommunityPushLeaseDeactivator =
     Future<void> Function(Community community, {int? generation});
 
@@ -184,6 +220,44 @@ class _CommunitySnapshotSync {
   final Set<Future<void>> _writesInFlight = {};
   String? _lastSuccessfulSnapshot;
   bool _ageRestricted = false;
+  bool _ageCheckSuspended = false;
+  Future<void> _ageGateMutationTail = Future.value();
+
+  Future<void> _waitForWrites() async {
+    while (_writesInFlight.isNotEmpty) {
+      final writes = [..._writesInFlight];
+      await Future.wait(
+        writes.map(
+          (write) =>
+              write.then<void>((_) {}, onError: (Object _, StackTrace _) {}),
+        ),
+      );
+    }
+  }
+
+  Future<void> _serializeAgeGateMutation(Future<void> Function() operation) {
+    final result = _ageGateMutationTail.then((_) => operation());
+    _ageGateMutationTail = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
+  Future<void> suspendForAgeCheck() => _serializeAgeGateMutation(() async {
+    if (_ageRestricted) return;
+    _ageCheckSuspended = true;
+    await _waitForWrites();
+    await write(const <Community>[]);
+  });
+
+  Future<void> resumeAfterAgeCheck(List<Community> communities) =>
+      _serializeAgeGateMutation(() async {
+        if (_ageRestricted) return;
+        await _waitForWrites();
+        _ageCheckSuspended = false;
+        await write(communities);
+      });
 
   Future<void> write(
     List<Community> communities, {
@@ -200,7 +274,7 @@ class _CommunitySnapshotSync {
       );
     }
 
-    final effectiveCommunities = _ageRestricted
+    final effectiveCommunities = _ageRestricted || _ageCheckSuspended
         ? const <Community>[]
         : communities;
     final fingerprint = effectiveCommunities

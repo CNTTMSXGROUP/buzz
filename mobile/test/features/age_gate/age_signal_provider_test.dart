@@ -158,6 +158,10 @@ void main() {
       AgeSignalState.retryableFailure,
     );
     expect(await requestWithResponse(null), AgeSignalState.retryableFailure);
+    expect(
+      await requestWithResponse(['not', 'a', 'map']),
+      AgeSignalState.retryableFailure,
+    );
   });
 
   test('a deliberate retry can recover from a malformed response', () async {

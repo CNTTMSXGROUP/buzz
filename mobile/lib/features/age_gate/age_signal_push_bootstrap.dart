@@ -10,7 +10,7 @@ import '../../shared/push/push_bridge.dart';
 import 'age_signal_provider.dart';
 
 /// Starts the push lifecycle only after the launch age check allows access.
-class AgeSignalPushBootstrap extends ConsumerWidget {
+class AgeSignalPushBootstrap extends HookConsumerWidget {
   /// Creates the production push boundary around [child].
   const AgeSignalPushBootstrap({required this.child, super.key});
 
@@ -18,7 +18,22 @@ class AgeSignalPushBootstrap extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    return switch (ref.watch(ageSignalProvider)) {
+    final state = ref.watch(ageSignalProvider);
+    final suspendSnapshot = ref.watch(
+      suspendCommunitySnapshotForAgeCheckProvider,
+    );
+    final resumeSnapshot = ref.watch(
+      resumeCommunitySnapshotAfterAgeCheckProvider,
+    );
+
+    useEffect(() {
+      unawaited(
+        state == AgeSignalState.allowed ? resumeSnapshot() : suspendSnapshot(),
+      );
+      return null;
+    }, [state, suspendSnapshot, resumeSnapshot]);
+
+    return switch (state) {
       AgeSignalState.allowed => BuzzPushBootstrap(child: child),
       AgeSignalState.restricted => _AgeRestrictedPushCleanup(child: child),
       AgeSignalState.checking || AgeSignalState.retryableFailure => child,

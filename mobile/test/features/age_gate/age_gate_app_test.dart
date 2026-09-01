@@ -48,6 +48,8 @@ void main() {
     final response = Completer<Object?>();
     final relaySession = _CountingRelaySessionNotifier();
     var requests = 0;
+    var snapshotSuspensions = 0;
+    var snapshotRestorations = 0;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(ageSignalChannel, (call) {
           requests += 1;
@@ -61,6 +63,12 @@ void main() {
         overrides: [
           authProvider.overrideWith(() => _AuthenticatedAuthNotifier()),
           relaySessionProvider.overrideWith(() => relaySession),
+          suspendCommunitySnapshotForAgeCheckProvider.overrideWithValue(
+            () async => snapshotSuspensions += 1,
+          ),
+          resumeCommunitySnapshotAfterAgeCheckProvider.overrideWithValue(
+            () async => snapshotRestorations += 1,
+          ),
           savedPrefsProvider.overrideWithValue(prefs),
         ],
         child: const AgeSignalPushBootstrap(child: App()),
@@ -72,6 +80,8 @@ void main() {
     expect(find.byType(HomePage), findsNothing);
     expect(find.byType(Navigator), findsNothing);
     expect(relaySession.builds, 0);
+    expect(snapshotSuspensions, 1);
+    expect(snapshotRestorations, 0);
 
     response.complete({'status': 'noSignal', 'ageUpper': null});
     await tester.pump();
@@ -82,12 +92,15 @@ void main() {
     expect(find.byType(Navigator), findsOneWidget);
     expect(relaySession.builds, 1);
     expect(requests, 1);
+    expect(snapshotRestorations, 1);
   });
 
   testWidgets('offers a retry after the native age check fails', (
     tester,
   ) async {
     var requests = 0;
+    var snapshotSuspensions = 0;
+    var snapshotRestorations = 0;
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
 
@@ -107,6 +120,12 @@ void main() {
               delay: (_) async {},
             ),
           ),
+          suspendCommunitySnapshotForAgeCheckProvider.overrideWithValue(
+            () async => snapshotSuspensions += 1,
+          ),
+          resumeCommunitySnapshotAfterAgeCheckProvider.overrideWithValue(
+            () async => snapshotRestorations += 1,
+          ),
           savedPrefsProvider.overrideWithValue(prefs),
         ],
         child: const AgeSignalPushBootstrap(child: App()),
@@ -117,6 +136,8 @@ void main() {
 
     expect(find.text('Try again'), findsOneWidget);
     expect(find.byType(HomePage), findsNothing);
+    expect(snapshotSuspensions, greaterThanOrEqualTo(1));
+    expect(snapshotRestorations, 0);
 
     await tester.tap(find.text('Try again'));
     await tester.pump();
@@ -125,6 +146,7 @@ void main() {
     expect(requests, 3);
     expect(find.text('Try again'), findsNothing);
     expect(find.byType(HomePage), findsOneWidget);
+    expect(snapshotRestorations, 1);
   });
 
   testWidgets('reloads failed community storage on resume before cleanup', (

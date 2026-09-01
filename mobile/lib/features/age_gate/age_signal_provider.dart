@@ -111,6 +111,11 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
         // Keep the launch gated and expose a deliberate retry action.
         state = AgeSignalState.retryableFailure;
         return;
+      } on TypeError {
+        // A method-channel envelope with the wrong shape fails before the map
+        // validator runs. Keep the launch gated with an explicit retry.
+        state = AgeSignalState.retryableFailure;
+        return;
       }
 
       final bool shouldBlock;

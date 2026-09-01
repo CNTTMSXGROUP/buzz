@@ -115,7 +115,10 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
 
       final bool shouldBlock;
       try {
-        shouldBlock = response != null && shouldBlockForAgeSignal(response);
+        if (response == null) {
+          throw StateError('Missing age signal response.');
+        }
+        shouldBlock = shouldBlockForAgeSignal(response);
       } on StateError {
         // A malformed native response is an integration failure, not evidence
         // that access is allowed. Keep the launch gated for a deliberate retry.

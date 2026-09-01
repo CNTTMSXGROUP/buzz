@@ -157,7 +157,7 @@ void main() {
       await requestWithResponse({'status': 'noSignal', 'ageUpper': 17}),
       AgeSignalState.retryableFailure,
     );
-    expect(await requestWithResponse(null), AgeSignalState.allowed);
+    expect(await requestWithResponse(null), AgeSignalState.retryableFailure);
   });
 
   test('a deliberate retry can recover from a malformed response', () async {
@@ -168,6 +168,29 @@ void main() {
           requests += 1;
           return requests == 1
               ? {'status': 'unknown', 'ageUpper': null}
+              : {'status': 'noSignal', 'ageUpper': null};
+        },
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+
+    await container.read(provider.notifier).request();
+    expect(container.read(provider), AgeSignalState.allowed);
+    expect(requests, 2);
+  });
+
+  test('a deliberate retry can recover from a null response', () async {
+    var requests = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () async {
+          requests += 1;
+          return requests == 1
+              ? null
               : {'status': 'noSignal', 'ageUpper': null};
         },
       ),

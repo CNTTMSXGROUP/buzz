@@ -8,6 +8,8 @@
 
 use std::sync::OnceLock;
 
+use super::dns::LocalhostDnsResolver;
+
 /// Request timeout for admin API calls.
 pub(crate) const ADMIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -22,7 +24,13 @@ pub static ADMIN_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 pub fn init_admin_client() {
     ADMIN_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // Pin bare `localhost` to loopback (exact-hostname override).
             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            // Pin `.localhost` subdomain names (e.g. `admin.localhost`) to loopback.
+            // RFC 6761 §6.3 requires this but system getaddrinfo is unreliable on
+            // Linux/Windows CI runners; the custom resolver makes it deterministic
+            // across all supported platforms without changing non-localhost resolution.
+            .dns_resolver(LocalhostDnsResolver)
             .pool_idle_timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(2)
             .redirect(reqwest::redirect::Policy::none())

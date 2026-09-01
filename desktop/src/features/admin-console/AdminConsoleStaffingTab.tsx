@@ -98,6 +98,20 @@ export function StaffingTab({
     const trimmed = addPubkey.trim().toLowerCase();
     if (!trimmed) return;
     setAddError(null);
+
+    // Reject any pubkey already present in the authoritative roster.
+    // Guard is bypassed when the list hasn't loaded — the button is already
+    // disabled in that state (see disabled condition below).
+    if (listState.status === "ok") {
+      const existing = listState.data.find((op) => op.pubkey === trimmed);
+      if (existing) {
+        setAddError(
+          `Already an operator: ${existing.effectiveRole}. Use Remove to revoke before re-adding with a different role.`,
+        );
+        return;
+      }
+    }
+
     setIsAdding(true);
     try {
       await putAdminOperator(origin, trimmed, addRole);
@@ -218,7 +232,9 @@ export function StaffingTab({
             </select>
             <Button
               data-testid="staffing-add-btn"
-              disabled={isAdding || !addPubkey.trim()}
+              disabled={
+                isAdding || !addPubkey.trim() || listState.status !== "ok"
+              }
               onClick={() => void handleAdd()}
               size="sm"
               type="button"

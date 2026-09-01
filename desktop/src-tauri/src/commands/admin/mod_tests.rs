@@ -862,3 +862,108 @@ async fn probe_inner_no_sign_on_nostr_challenge_is_nip98_denied() {
     .unwrap();
     assert!(matches!(result, AdminProbeResult::Nip98Denied));
 }
+
+// ── .localhost origin: end-to-end parse, route, connect ──────────────────────
+
+/// Verifies that `http://admin.localhost:<port>` is accepted as a valid origin,
+/// that the signing closure receives the preserved `admin.localhost` probe URL
+/// (not rewritten to `127.0.0.1`), and that `ADMIN_CLIENT` actually routes
+/// both requests in a NIP-98 sequence to the loopback listener.
+///
+/// Sequence: slot-0 = `401 Unauthorized + WWW-Authenticate: Nostr` (forces the
+/// sign closure to fire), slot-1 = `200 OK + authorized nip98 JSON`. This
+/// exercises the full `admin_probe_inner` NIP-98 path via the production
+/// `ADMIN_CLIENT` that carries `LocalhostDnsResolver`.
+///
+/// Mutation evidence:
+/// - Removing `.ends_with(".localhost")` from `is_loopback_host` in `origin.rs`
+///   makes `AdminOrigin::parse` return `Err`; `admin_probe_inner` propagates
+///   that as `Err` and the `.expect()` panics → RED before any network I/O.
+/// - Removing the `.ends_with(".localhost")` branch from `LocalhostDnsResolver`
+///   makes the connection time out on Linux/Windows CI (system GAI fails) →
+///   `NetworkOrIntercepted`, not `Nip98Authorized` → the `matches!` assertion RED.
+#[tokio::test]
+async fn dot_localhost_origin_parses_and_probe_inner_reaches_loopback_via_nip98() {
+    use std::sync::{Arc, Mutex};
+
+    client::init_admin_client();
+
+    // Serve: slot-0 = 401 Nostr challenge, slot-1 = 200 authorized nip98 response.
+    let probe_body = probe_json("nip98", "\"operator\"", "\"db\"", true, true);
+    let probe_body_static: &'static str = Box::leak(probe_body.into_boxed_str());
+
+    // Use serve_sequence_inspect to capture raw request bytes for Host assertions.
+    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = Arc::clone(&captured);
+
+    let addr = serve_sequence_inspect(
+        vec![
+            ("401 Unauthorized", "WWW-Authenticate: Nostr\r\n", ""),
+            (
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                probe_body_static,
+            ),
+        ],
+        Some(Arc::new(move |_idx, bytes: &[u8]| {
+            cap.lock().unwrap().push(bytes.to_vec());
+        })),
+    )
+    .await;
+
+    let port = addr.port();
+
+    // Capture the exact URL the signing closure receives — the production seam.
+    let signed_urls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let signed_urls_clone = Arc::clone(&signed_urls);
+    let sign = move |url: &str| -> Result<String, String> {
+        signed_urls_clone.lock().unwrap().push(url.to_owned());
+        Ok("Nostr dGVzdA==".to_string())
+    };
+
+    let origin_str = format!("http://admin.localhost:{port}");
+    let result = admin_probe_inner(&origin_str, Some(sign))
+        .await
+        .expect("admin_probe_inner must succeed on a valid admin.localhost origin");
+
+    // The authorized 200 probe response must resolve to Nip98Authorized.
+    assert!(
+        matches!(result, AdminProbeResult::Nip98Authorized { .. }),
+        "admin.localhost NIP-98 probe must resolve to Nip98Authorized; got {result:?}",
+    );
+
+    // The sign closure must have been called exactly once (on the Nostr challenge).
+    let urls = signed_urls.lock().unwrap();
+    assert_eq!(
+        urls.len(),
+        1,
+        "sign closure must be called exactly once; got {} calls",
+        urls.len(),
+    );
+
+    // The URL received by the signing closure must preserve `admin.localhost` — not 127.0.0.1.
+    assert_eq!(
+        urls[0],
+        format!("http://admin.localhost:{port}/api/admin/v1/probe"),
+        "signing closure must receive the preserved admin.localhost URL",
+    );
+
+    // Both requests must have arrived at the listener (2 slots served).
+    let reqs = captured.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "listener must receive exactly 2 requests (unauthenticated + authenticated); got {}",
+        reqs.len(),
+    );
+
+    // Both requests must carry `Host: admin.localhost:<port>` verbatim.
+    let expected_host = format!("Host: admin.localhost:{port}");
+    for (i, raw) in reqs.iter().enumerate() {
+        let text = std::str::from_utf8(raw).expect("request must be valid UTF-8");
+        assert!(
+            text.contains(&expected_host),
+            "request {i} must carry {expected_host}; got headers:\n{text}",
+        );
+    }
+}

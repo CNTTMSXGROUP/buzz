@@ -120,10 +120,12 @@ impl AdminOrigin {
     }
 }
 
-/// Returns true when `host` is a loopback address (`localhost`, `127.x.x.x`,
-/// `[::1]`). This mirrors `media_download.rs`'s localhost carve-out.
+/// Returns true when `host` is a loopback address (`localhost`,
+/// names ending in `.localhost` per RFC 6761, `127.x.x.x`, `[::1]`).
+/// This mirrors `media_download.rs`'s localhost carve-out.
 fn is_loopback_host(host: &str) -> bool {
     host == "localhost"
+        || host.ends_with(".localhost")
         || host == "[::1]"
         || host
             .parse::<std::net::IpAddr>()
@@ -165,6 +167,30 @@ mod tests {
     fn http_localhost_port_accepted() {
         let o = AdminOrigin::parse("http://localhost:3000").unwrap();
         assert_eq!(o.as_str(), "http://localhost:3000");
+    }
+
+    #[test]
+    fn http_dot_localhost_accepted() {
+        let o = AdminOrigin::parse("http://admin.localhost:3000").unwrap();
+        assert_eq!(o.as_str(), "http://admin.localhost:3000");
+    }
+
+    #[test]
+    fn http_dot_localhost_no_port_accepted() {
+        let o = AdminOrigin::parse("http://admin.localhost").unwrap();
+        assert_eq!(o.as_str(), "http://admin.localhost");
+    }
+
+    #[test]
+    fn http_dot_localhost_lookalike_rejected() {
+        // `admin.localhost.evil` must not be accepted — it doesn't end in `.localhost`.
+        assert!(AdminOrigin::parse("http://admin.localhost.evil").is_err());
+    }
+
+    #[test]
+    fn http_notlocalhost_rejected() {
+        // `notlocalhost` is not loopback.
+        assert!(AdminOrigin::parse("http://notlocalhost").is_err());
     }
 
     #[test]

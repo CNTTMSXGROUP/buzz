@@ -5630,3 +5630,250 @@ for (const { name, desc, reject: makeReject } of RESOLVE_FREEZE_CASES) {
     }
   });
 }
+
+// ── P1: Staffing add is create-only — duplicate guard ────────────────────────
+//
+// Submitting an operator pubkey already present in the loaded roster must
+// produce zero PUTs and surface a specific inline error naming the effective
+// role. Submitting a new pubkey must produce exactly one PUT with the complete
+// body. The Add button must be disabled until the list loads successfully.
+//
+// Mutation evidence:
+//   - Removing the duplicate-guard `if (existing)` block → zero-PUT assertion
+//     fails when an existing key is submitted (a PUT fires instead).
+
+test("staffing-add-duplicate-guard: submitting an existing key produces zero PUTs; submitting a new key produces one complete PUT", async () => {
+  const origin = "https://admin-staffing.example.com";
+  const pubkey = "11".repeat(32);
+  const existingPubkey = "22".repeat(32);
+  const newPubkey = "33".repeat(32);
+
+  const putCalls = [];
+  const roster = [
+    {
+      pubkey: existingPubkey,
+      effectiveRole: "operator",
+      sources: ["db"],
+    },
+    {
+      pubkey: "44".repeat(32),
+      effectiveRole: "moderator",
+      sources: ["db"],
+    },
+  ];
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_operators", () => Promise.resolve([...roster]));
+  setIpcHandler("admin_put_operator", (args) => {
+    putCalls.push({ pubkey: args?.pubkey, role: args?.body?.role });
+    const newEntry = {
+      pubkey: args?.pubkey,
+      effectiveRole: args?.body?.role,
+      sources: ["db"],
+    };
+    roster.push(newEntry);
+    return Promise.resolve(newEntry);
+  });
+
+  const { container, doRender, unmount } = mountPanel({
+    origin,
+    pubkey,
+    canMutate: true,
+    role: "operator",
+    initialTab: "staffing",
+  });
+  await doRender();
+  await settle(30);
+
+  try {
+    // ── Case 1: submit an existing pubkey with the default role (moderator) ──
+    const pubkeyInput = container.querySelector(
+      "[data-testid='staffing-add-pubkey-input']",
+    );
+    assert.ok(pubkeyInput, "pubkey input must be present");
+
+    await act(async () => {
+      fireEvent.change(pubkeyInput, { target: { value: existingPubkey } });
+      await new Promise((r) => setTimeout(r, 10));
+    });
+
+    const addBtn = container.querySelector("[data-testid='staffing-add-btn']");
+    assert.ok(addBtn, "Add button must be present");
+
+    await act(async () => {
+      fireEvent.click(addBtn);
+      await new Promise((r) => setTimeout(r, 20));
+    });
+
+    assert.equal(
+      putCalls.length,
+      0,
+      "admin_put_operator must NOT be called for an existing pubkey",
+    );
+
+    // An inline error naming the existing effective role must be visible.
+    const errEls = Array.from(
+      container.querySelectorAll(
+        "[data-testid='staffing-tab'] .text-destructive",
+      ),
+    );
+    assert.ok(
+      errEls.some((el) => el.textContent.includes("operator")),
+      `inline error must name the existing effective role "operator"; found: ${errEls.map((e) => e.textContent).join(", ")}`,
+    );
+
+    // ── Case 2: clear the input and submit a genuinely new pubkey ──
+    await act(async () => {
+      fireEvent.change(pubkeyInput, { target: { value: newPubkey } });
+      await new Promise((r) => setTimeout(r, 10));
+    });
+
+    await act(async () => {
+      fireEvent.click(addBtn);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+
+    assert.equal(
+      putCalls.length,
+      1,
+      `admin_put_operator must be called exactly once for a new pubkey; got ${putCalls.length}`,
+    );
+    assert.equal(
+      putCalls[0].pubkey,
+      newPubkey,
+      `PUT must carry the new pubkey; got: ${putCalls[0].pubkey}`,
+    );
+    assert.equal(
+      putCalls[0].role,
+      "moderator",
+      `PUT must carry the selected role; got: ${putCalls[0].role}`,
+    );
+
+    // The row for the new pubkey must appear (list refreshed).
+    await settle(30);
+    const newRow = container.querySelector(
+      `[data-testid='staffing-row-${newPubkey}']`,
+    );
+    assert.ok(
+      newRow !== null,
+      "new operator row must appear after successful PUT",
+    );
+  } finally {
+    await unmount();
+  }
+});
+
+// ── P3: Read-only feedback detail shows a passive status badge ────────────────
+//
+// When canMutate=false, the feedback detail must show a programmatically-
+// readable status badge (data-testid='feedback-status-readonly') with the
+// server status value, while the mutable status control
+// (data-testid='feedback-status-control') and any PATCH call remain absent.
+//
+// Mutation evidence: removing the read-only status branch from the ternary →
+// feedback-status-readonly is absent and the assertion goes RED.
+
+test("feedback-status-readonly: read-only detail shows status badge, no status-control, no PATCH", async () => {
+  const origin = "https://admin-readonly.example.com";
+  const pubkey = "55".repeat(32);
+  const feedbackId = "00000000-0000-0000-0000-000000000055";
+
+  const patchCalls = [];
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_feedback", () =>
+    Promise.resolve([
+      {
+        id: feedbackId,
+        communityId: "comm-1",
+        communityHost: "relay.example.com",
+        submitterPubkey: "sub055",
+        category: null,
+        bodySummary: "read-only feedback item",
+        receivedAt: "2024-01-01T00:00:00Z",
+        status: "reviewed",
+      },
+    ]),
+  );
+  setIpcHandler("admin_get_feedback", () =>
+    Promise.resolve({
+      id: feedbackId,
+      communityId: "comm-1",
+      communityHost: "relay.example.com",
+      eventId: "fev055",
+      submitterPubkey: "sub055",
+      category: null,
+      body: "read-only feedback full body",
+      status: "reviewed",
+      tags: [],
+      eventCreatedAt: "2024-01-01T00:00:00Z",
+      receivedAt: "2024-01-01T00:00:00Z",
+    }),
+  );
+  setIpcHandler("admin_patch_feedback", (args) => {
+    patchCalls.push(args);
+    return Promise.resolve();
+  });
+
+  const { container, doRender, unmount } = mountPanel({
+    origin,
+    pubkey,
+    canMutate: false,
+  });
+  await doRender();
+  await settle(30);
+
+  try {
+    // Navigate to Feedback tab.
+    const feedbackTab = container.querySelector(
+      "[data-testid='admin-tab-feedback']",
+    );
+    assert.ok(feedbackTab, "Feedback tab must be present");
+    await act(async () => {
+      fireEvent.click(feedbackTab);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    await settle(30);
+
+    // Click the feedback list item to open detail.
+    const listBtns = Array.from(container.querySelectorAll("button")).filter(
+      (b) => !(b.getAttribute("data-testid") ?? "").startsWith("admin-tab"),
+    );
+    assert.ok(listBtns.length > 0, "feedback list item must be present");
+    await act(async () => {
+      fireEvent.click(listBtns[0]);
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    await settle(30);
+
+    // feedback-status-control must be absent (no mutation affordance).
+    const ctrl = container.querySelector(
+      "[data-testid='feedback-status-control']",
+    );
+    assert.equal(
+      ctrl,
+      null,
+      "feedback-status-control must be absent when canMutate=false",
+    );
+
+    // feedback-status-readonly must be present with the server status.
+    const readonlyBadge = container.querySelector(
+      "[data-testid='feedback-status-readonly']",
+    );
+    assert.ok(
+      readonlyBadge !== null,
+      "feedback-status-readonly must be present in read-only detail",
+    );
+    assert.ok(
+      readonlyBadge.textContent.includes("reviewed"),
+      `feedback-status-readonly must show server status "reviewed"; got: ${readonlyBadge.textContent}`,
+    );
+
+    // No PATCH must have been issued.
+    assert.equal(
+      patchCalls.length,
+      0,
+      "admin_patch_feedback must not be called in read-only mode",
+    );
+  } finally {
+    await unmount();
+  }
+});

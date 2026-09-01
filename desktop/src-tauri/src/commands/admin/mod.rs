@@ -26,6 +26,7 @@
 //! counter, mirroring the `media_download.rs` pattern.
 
 pub mod client;
+pub(crate) mod dns;
 pub(super) mod helpers;
 pub(crate) mod origin;
 pub(crate) mod routes;

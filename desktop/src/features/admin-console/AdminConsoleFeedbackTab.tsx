@@ -494,7 +494,7 @@ export function FeedbackDetail({
       {detailState.status === "ok" && (
         <>
           <FeedbackFields data={detailState.data} />
-          {canMutate && (
+          {canMutate ? (
             <FeedbackStatusControl
               feedbackId={feedbackId}
               currentStatus={localStatus}
@@ -504,6 +504,18 @@ export function FeedbackDetail({
                 onMutated();
               }}
             />
+          ) : (
+            localStatus !== null && (
+              <div
+                className="flex items-center gap-1.5"
+                data-testid="feedback-status-readonly"
+              >
+                <span className="text-xs font-medium text-muted-foreground">
+                  Status
+                </span>
+                <Badge variant="secondary">{localStatus}</Badge>
+              </div>
+            )
           )}
           {attachments.length > 0 && (
             <div className="space-y-3">

@@ -14,8 +14,8 @@ import type { ControlResultFrame } from "@/shared/api/types";
  *
  * This orchestrator resends the decision on a fixed cadence until it observes a
  * `control_result` for THIS nonce, then stops. The outcome depends on the frame's
- * status: `sent` and `already_decided` mean the harness routed or already applied
- * the decision — the loop resolves `"acked"`. The four failure statuses
+ * status: `sent` and `already_decided` mean the harness routed or previously
+ * forwarded/delivery-suppressed the decision — the loop resolves `"acked"`. The four failure statuses
  * (`no_active_turn`, `channel_full`, `channel_closed`, `no_channel`) mean the
  * harness received the frame but could not route it — the loop resolves
  * `"failed"`, stopping retransmission (re-sending the same nonce cannot change an
@@ -94,9 +94,10 @@ export function retransmitPermissionDecision({
         return;
       }
       // `sent` and `already_decided` are both success: the harness routed or
-      // has already applied the decision. The four failure statuses indicate the
-      // harness received the frame but could not route it — retransmitting the
-      // same nonce cannot change that, so stop and let the card retry.
+      // previously forwarded/delivery-suppressed the decision. The four failure
+      // statuses indicate the harness received the frame but could not route it —
+      // retransmitting the same nonce cannot change that, so stop and let the
+      // card retry.
       const success =
         frame.status === "sent" || frame.status === "already_decided";
       finish(success ? "acked" : "failed");

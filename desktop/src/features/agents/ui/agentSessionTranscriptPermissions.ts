@@ -418,10 +418,11 @@ export function handlePermissionWrite(
  *
  * `sent` and `already_decided` are both success: `sent` means the harness
  * forwarded the decision to the live read loop; `already_decided` means a
- * retransmit matched a nonce the harness had already applied (the deciding
- * task has since ended). Neither may fail the card — an `already_decided` that
- * incremented `deliveryFailed` would flip a correctly-resolved card back to a
- * clickable/failed state, the exact P1 the retransmit loop exists to avoid.
+ * retransmit matched a nonce the harness had previously forwarded (delivery
+ * suppressed — the deciding task has since ended). Neither may fail the card —
+ * an `already_decided` that incremented `deliveryFailed` would flip a
+ * correctly-resolved card back to a clickable/failed state, the exact P1 the
+ * retransmit loop exists to avoid.
  */
 export function handlePermissionDecisionResult(
   d: PermissionDraftSlice,

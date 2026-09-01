@@ -11270,6 +11270,91 @@ mod permission_decision_control_tests {
         );
         assert_eq!(received_b_2.unwrap().request_nonce, nonce_b);
     }
+
+    /// F4 outer signed-control path: `handle_relay_observer_control_event`
+    /// admits a valid owner-signed, NIP-44-encrypted kind-24200 frame and
+    /// delivers the enclosed `permission_decision` payload to the in-flight
+    /// task's mpsc — exactly the path the Desktop takes when submitting a
+    /// decision over the relay.
+    ///
+    /// This test proves the outer admission path (signature check, owner-pubkey
+    /// check, freshness window, NIP-44 decrypt, type dispatch) without a live
+    /// relay: we build and sign the event locally then call the handler directly.
+    ///
+    /// Mutation proof: if the `is_none()` → `true` first-wins guard is removed
+    /// the early_decision would be overwritten by a later allow → the wrong
+    /// option is applied. Pairing this signed-path admission test with the
+    /// existing `early_decision_first_wins_reject_then_allow_reject_applied`
+    /// inner-loop test (which uses the same first-wins mutation) closes the
+    /// gap between the outer signed path and the inner read loop.
+    #[tokio::test]
+    async fn signed_observer_control_event_delivers_permission_decision() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+
+        let observer = ObserverHandle::in_process();
+        let mut rx_obs = observer.subscribe();
+        let channel_id = Uuid::new_v4();
+        let nonce = "nonce-signed-outer";
+
+        // Generate agent keys (the recipient of the encrypted payload) and owner
+        // keys (the sender — the owner who clicked the card in Desktop).
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let mut rx_task = install_task(&mut pool, channel_id);
+
+        // Build the permission_decision payload and NIP-44 encrypt it from the
+        // owner to the agent, exactly as Desktop does.
+        let decision_payload_value = serde_json::json!({
+            "type": "permission_decision",
+            "channelId": channel_id.to_string(),
+            "requestNonce": nonce,
+            "optionId": "opt-reject",
+        });
+        let encrypted = buzz_core::observer::encrypt_observer_payload(
+            &owner_keys,
+            &agent_keys.public_key(),
+            &decision_payload_value,
+        )
+        .expect("encrypt permission_decision payload");
+
+        // Build a kind-24200 observer control frame signed by the owner.
+        let event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_AGENT_OBSERVER_FRAME as u16),
+            &encrypted,
+        )
+        .tags([
+            Tag::parse(["p", &agent_keys.public_key().to_hex()]).unwrap(),
+            Tag::parse(["agent", &agent_keys.public_key().to_hex()]).unwrap(),
+            Tag::parse(["frame", buzz_core::observer::OBSERVER_FRAME_CONTROL]).unwrap(),
+        ])
+        .sign_with_keys(&owner_keys)
+        .expect("sign observer control event");
+
+        // Call the outer admission handler: signature check, owner-pubkey guard,
+        // freshness check, NIP-44 decrypt, type dispatch → mpsc delivery.
+        handle_relay_observer_control_event(
+            &agent_keys,
+            event,
+            &mut pool,
+            Some(&observer),
+            &owner_keys.public_key().to_hex(),
+            RelayEventPublisher::test_pair_dead(),
+        );
+
+        // The handler is synchronous and delivers immediately.
+        assert_eq!(
+            control_result_status(&mut rx_obs),
+            "sent",
+            "signed outer-control path must deliver the decision and emit status: sent"
+        );
+        let delivered = rx_task
+            .try_recv()
+            .expect("decision must be delivered to the read loop");
+        assert_eq!(delivered.request_nonce, nonce);
+        assert_eq!(delivered.option_id, "opt-reject");
+    }
 }
 
 #[cfg(test)]

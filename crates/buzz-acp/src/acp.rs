@@ -3799,6 +3799,49 @@ fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
     s[..end].to_string()
 }
 
+/// Truncate `s` to at most `max_bytes` UTF-8 bytes using a head + "…" + tail
+/// layout that preserves both the start and the end of the string.
+///
+/// This keeps distinguishing suffixes visible even when many strings share a
+/// long common prefix, which head-only truncation collapses into identical
+/// output. The ellipsis is the UTF-8 character U+2026 (3 bytes); head and tail
+/// together fill the remaining budget. If `max_bytes < 5` (3-byte ellipsis +
+/// at least one byte each side) the function falls back to head-only
+/// truncation so it always fits within the budget.
+fn truncate_to_bytes_head_tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    const ELLIPSIS: &str = "\u{2026}"; // 3 UTF-8 bytes
+    const ELLIPSIS_BYTES: usize = 3;
+    // Need room for at least 1 head byte + ellipsis + 1 tail byte.
+    if max_bytes < 1 + ELLIPSIS_BYTES + 1 {
+        return truncate_to_bytes(s, max_bytes);
+    }
+    let available = max_bytes - ELLIPSIS_BYTES;
+    // Split evenly; tail gets the extra byte when available is odd.
+    let head_budget = available / 2;
+    let tail_budget = available - head_budget;
+
+    // Snap head to a char boundary (walk backward from head_budget).
+    let mut head_end = head_budget;
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    // Snap tail to a char boundary (walk forward from s.len() - tail_budget).
+    let tail_start_raw = s.len().saturating_sub(tail_budget);
+    let mut tail_start = tail_start_raw;
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // Guard: if the boundaries crossed (very short string with multi-byte
+    // chars), fall back to head-only.
+    if head_end >= tail_start {
+        return truncate_to_bytes(s, max_bytes);
+    }
+    format!("{}{}{}", &s[..head_end], ELLIPSIS, &s[tail_start..])
+}
+
 /// Enforce the frozen sentinel string bound on one field.
 ///
 /// Returns `None` (fail closed) when `value` exceeds `SENTINEL_STRING_MAX_BYTES`
@@ -4077,9 +4120,9 @@ pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Op
                 // The title is capped to `DESCRIPTION_COMBINED_MAX_BYTES -
                 // wrapper_overhead - context_reserve` so that even a maximum-length
                 // title always leaves room for at least `context_reserve` bytes of
-                // argument context. This preserves producer-faithful distinguishability
-                // (two different commands under the same long title produce different
-                // descriptions) while keeping the combined string within 200 bytes.
+                // argument context. Context is truncated with head+tail layout so
+                // that strings sharing a long common prefix remain distinguishable
+                // (suffix differences survive even when the budget is small).
                 const WRAPPER_OVERHEAD: usize = 5; // "(" + "…" (3 bytes) + ")"
                 const CONTEXT_RESERVE: usize = 10; // minimum visible context
                 let title_cap_limit = DESCRIPTION_COMBINED_MAX_BYTES
@@ -4092,7 +4135,7 @@ pub(crate) fn description_from_request_permission(msg: &serde_json::Value) -> Op
 
                 match summarize_raw_input(ri) {
                     Some(ctx) if !ctx.is_empty() => {
-                        let ctx_cap = truncate_to_bytes(&ctx, context_budget);
+                        let ctx_cap = truncate_to_bytes_head_tail(&ctx, context_budget);
                         let truncated = ctx.len() > ctx_cap.len();
                         if truncated {
                             format!("{title_cap}({ctx_cap}…)")
@@ -8610,37 +8653,44 @@ mod tests {
 
     /// Production-seam test: the combined description in the sentinel carries
     /// both the title and a bounded argument context — two different commands
-    /// under the same long title produce distinguishable descriptions.
+    /// under the same long title produce distinguishable descriptions, and
+    /// the distinguishing content survives the `build_sentinel_pending_payload`
+    /// serialization path.
     ///
-    /// This test drives the full `handle_permission_request` → kind-9 sentinel
-    /// path and asserts:
-    ///   1. The sentinel description fits within `DESCRIPTION_COMBINED_MAX_BYTES`.
-    ///   2. The description contains both the (truncated) tool name AND part of
-    ///      the command argument — proving neither erases the other.
-    ///   3. Two requests with the same long title but different commands produce
-    ///      distinct sentinel descriptions (producer-faithful distinguishability).
+    /// This test asserts:
+    ///   1. Both `description_from_request_permission` outputs fit within
+    ///      `DESCRIPTION_COMBINED_MAX_BYTES`.
+    ///   2. Each extractor output contains the (truncated) title AND part of
+    ///      the command — proving neither erases the other.
+    ///   3. The two extractor descriptions differ (`assert_ne!`) — proving
+    ///      distinguishability even for same-prefix contexts.
+    ///   4. The descriptions survive `build_sentinel_pending_payload` unchanged
+    ///      (the sentinel serialises the extractor output verbatim; confirming
+    ///      that the downstream cap is a no-op for well-formed descriptions).
+    ///   5. The two sentinel `description` fields also differ — proving that
+    ///      the distinguishability is not lost in the sentinel seam.
     ///
-    /// Mutation proof: removing the title-cap limit (restoring `title_cap_limit
-    /// = DESCRIPTION_COMBINED_MAX_BYTES`) saturates `context_budget` to zero for
-    /// a 185-byte title, erasing all argument context. The two descriptions then
-    /// collapse to the same truncated title and the `assert_ne!` goes red.
+    /// Mutation proofs:
+    ///   - Restoring `title_cap_limit = DESCRIPTION_COMBINED_MAX_BYTES` saturates
+    ///     `context_budget` to zero for a 200-byte title → no context appended →
+    ///     assertions 2/3 fire.
+    ///   - Replacing `truncate_to_bytes_head_tail` with `truncate_to_bytes`
+    ///     (prefix-only) with same-prefix contexts `sameprefix-a` / `sameprefix-b`
+    ///     produces identical truncated prefixes → assertion 3/5 fire.
     #[tokio::test]
     async fn production_seam_description_combined_bound_in_sentinel() {
-        // Tool name at exactly the old saturation point (185 bytes = 200 - 5 overhead - 10 reserve).
-        // With the fix: title is capped to 185, context_budget = 200 - 185 - 5 = 10 bytes.
-        // Without the fix: title fills 185, context_budget = 200 - 185 - 5 = 10 (same! but with
-        //   100-byte title: context_budget = 200 - 100 - 5 = 95; old code had context_budget = 95
-        //   but used truncate(t, 200) for title_cap, so title could be up to 200; with 185-byte
-        //   title old code gives context_budget = 200 - 185 - 5 = 10; still OK).
-        // Use 200-byte title to trigger the saturation: old code: context_budget = 200 - 200 - 5
-        //   = 0 → no context; new code: title_cap = truncate(200, 185) = 185 bytes,
+        // 200-byte title triggers the old saturation: old code → context_budget = 0.
+        // New code: title_cap = truncate(200, 185) = 185 bytes,
         //   context_budget = 200 - 185 - 5 = 10 → context preserved.
-        let long_title = "t".repeat(DESCRIPTION_COMBINED_MAX_BYTES); // 200 bytes, saturates old code
-        let cmd_a = "aaaaaaaaaa"; // 10 bytes — fits exactly in the reserved context budget
-        let cmd_b = "bbbbbbbbbb"; // different command, same title
+        let long_title = "t".repeat(DESCRIPTION_COMBINED_MAX_BYTES); // 200 bytes
+
+        // Same-prefix commands: prefix-only truncation to 10 bytes collapses both
+        // to "sameprefix" — identical. Head/tail truncation preserves the suffix
+        // ("-a" vs "-b") making them distinct.
+        let cmd_a = "sameprefix-a".repeat(20); // 240 bytes — requires truncation
+        let cmd_b = "sameprefix-b".repeat(20); // same length, different suffix
 
         let make_msg = |title: &str, cmd: &str| {
-            let cmd_long = cmd.repeat(30); // 300 bytes — requires truncation
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 77,
@@ -8653,7 +8703,7 @@ mod tests {
                         "toolCall": {
                             "toolCallId": "tc-seam",
                             "title": title,
-                            "rawInput": {"command": cmd_long},
+                            "rawInput": {"command": cmd},
                         },
                     },
                     "options": [
@@ -8664,13 +8714,13 @@ mod tests {
             })
         };
 
-        // Extract descriptions from the pure helper (no live relay needed for bound proof).
-        let desc_a = description_from_request_permission(&make_msg(&long_title, cmd_a))
+        // ── Step 1: extractor outputs ──────────────────────────────────────────
+        let desc_a = description_from_request_permission(&make_msg(&long_title, &cmd_a))
             .expect("must yield description for cmd_a");
-        let desc_b = description_from_request_permission(&make_msg(&long_title, cmd_b))
+        let desc_b = description_from_request_permission(&make_msg(&long_title, &cmd_b))
             .expect("must yield description for cmd_b");
 
-        // 1. Both descriptions must fit within the combined budget.
+        // 1. Both fit the combined budget.
         assert!(
             desc_a.len() <= DESCRIPTION_COMBINED_MAX_BYTES,
             "desc_a must fit in {DESCRIPTION_COMBINED_MAX_BYTES} bytes; got {} bytes: {desc_a:?}",
@@ -8682,26 +8732,85 @@ mod tests {
             desc_b.len()
         );
 
-        // 2. Each description must contain both title context AND argument context.
-        // The title is truncated to 185 bytes; any command prefix is appended.
-        let title_prefix = &long_title[..185]; // first 185 bytes of the title (ASCII)
+        // 2. Each description contains both title context AND argument context.
+        //    The title is truncated to 185 bytes (200 - 5 overhead - 10 reserve).
+        let title_prefix = &long_title[..185];
         assert!(
             desc_a.starts_with(title_prefix),
             "desc_a must start with the capped title; got: {desc_a:?}"
         );
+        // Contains '…' from head/tail context — proves truncation included both ends.
         assert!(
-            desc_a.contains(cmd_a),
-            "desc_a must contain the command argument; got: {desc_a:?}"
+            desc_a.contains('\u{2026}'),
+            "desc_a must contain the ellipsis from truncation; got: {desc_a:?}"
         );
 
-        // 3. Producer-faithful distinguishability: same title, different commands → different descriptions.
-        // Mutation: restoring title_cap_limit = DESCRIPTION_COMBINED_MAX_BYTES → context_budget = 0
-        // → no context appended → desc_a == desc_b → this assert_ne! goes red.
+        // 3. Same-prefix distinguishability: same title, same prefix in command,
+        //    different suffix → descriptions must differ.
+        //    Mutation: prefix-only truncation → both collapse to "sameprefix" → assert_ne! fails.
         assert_ne!(
             desc_a, desc_b,
-            "descriptions for different commands must be distinguishable; \
-             mutation: saturate context_budget to zero → both descriptions \
-             truncate to the same long title → assert_ne! fails"
+            "descriptions for same-prefix commands must be distinguishable via head/tail truncation; \
+             mutation: prefix-only truncation → both collapse to the same prefix → assert_ne! fails"
+        );
+
+        // ── Step 2: sentinel seam — descriptions survive build_sentinel_pending_payload ──
+        let card_actions = CardActions {
+            allow: serde_json::json!({"optionId": "opt-allow", "kind": "allow_once", "name": "Allow"}),
+            reject: serde_json::json!({"optionId": "opt-deny",  "kind": "reject_once", "name": "Deny"}),
+        };
+        let nonce_a = "nonce-seam-a";
+        let nonce_b = "nonce-seam-b";
+        let expiry = 9_999_999_999u64;
+        let turn_id = "turn-seam";
+
+        let payload_a = build_sentinel_pending_payload(
+            nonce_a,
+            &card_actions,
+            expiry,
+            Some("sess-seam"),
+            turn_id,
+            Some(&desc_a),
+        )
+        .expect("sentinel payload must build for cmd_a");
+        let payload_b = build_sentinel_pending_payload(
+            nonce_b,
+            &card_actions,
+            expiry,
+            Some("sess-seam"),
+            turn_id,
+            Some(&desc_b),
+        )
+        .expect("sentinel payload must build for cmd_b");
+
+        let sentinel_a: serde_json::Value =
+            serde_json::from_str(&payload_a).expect("sentinel_a must be valid JSON");
+        let sentinel_b: serde_json::Value =
+            serde_json::from_str(&payload_b).expect("sentinel_b must be valid JSON");
+
+        let sdesc_a = sentinel_a["description"]
+            .as_str()
+            .expect("sentinel_a must have a description field");
+        let sdesc_b = sentinel_b["description"]
+            .as_str()
+            .expect("sentinel_b must have a description field");
+
+        // 4. Sentinel descriptions match extractor output (downstream cap is a no-op).
+        assert_eq!(
+            sdesc_a, desc_a,
+            "sentinel description_a must equal the extractor output verbatim"
+        );
+        assert_eq!(
+            sdesc_b, desc_b,
+            "sentinel description_b must equal the extractor output verbatim"
+        );
+
+        // 5. Sentinel descriptions also differ.
+        assert_ne!(
+            sdesc_a, sdesc_b,
+            "sentinel descriptions for different commands must be distinguishable; \
+             mutation: prefix-only context truncation → both sentinel descriptions collapse \
+             to the same prefix → assert_ne! fails"
         );
     }
 
@@ -12974,6 +13083,94 @@ mod tests {
             applied_count(&obs),
             1,
             "exactly one applied ACP write must be emitted for allow_once"
+        );
+    }
+
+    /// F3 reject_once proof: the counterpart to the allow_once step above.
+    ///
+    /// A fresh client with the same four options registers one permission request.
+    /// `reject_once` must resolve the entry and emit exactly one applied ACP write
+    /// carrying the reject option ID.
+    ///
+    /// Mutation proof: changing `CardActions::accepts()` to return only
+    /// `option_id == self.allow_id()` (dropping reject acceptance) leaves the
+    /// entry pending and emits zero writes — this assertion fires.
+    #[tokio::test]
+    async fn reject_once_resolves_entry_with_applied_write() {
+        tokio::time::pause();
+        let mut client = spawn_script("sleep 600").await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+
+        let four_opts: &[(&str, &str, &str)] = &[
+            ("opt-allow-once", "allow_once", "Allow once"),
+            ("opt-reject-once", "reject_once", "Deny once"),
+            ("opt-allow-always", "allow_always", "Always allow"),
+            ("opt-reject-always", "reject_always", "Always deny"),
+        ];
+        let msg = perm_request(99, four_opts);
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+
+        let nonce = client
+            .pending_permissions
+            .values()
+            .next()
+            .map(|e| e.nonce.clone())
+            .expect("one entry must be in the pending map after registration");
+
+        let short_idle = std::time::Duration::from_millis(100);
+        let ten_s = std::time::Duration::from_secs(10);
+
+        let applied_count = |o: &crate::observer::ObserverHandle| {
+            o.snapshot()
+                .into_iter()
+                .filter(|e| {
+                    e.kind == "acp_write"
+                        && e.authorization
+                            .as_ref()
+                            .map(|a| a.reason.as_deref() == Some("applied"))
+                            .unwrap_or(false)
+                })
+                .count()
+        };
+
+        // ── reject_once resolves the entry ────────────────────────────────────
+        {
+            let (tx, rx) = tokio::sync::mpsc::channel::<PermissionDecision>(4);
+            tx.send(PermissionDecision {
+                request_nonce: nonce.clone(),
+                option_id: "opt-reject-once".to_string(),
+            })
+            .await
+            .expect("send must succeed");
+            client.install_permission_decision_rx(rx);
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_until_response_with_idle_timeout("sess-f3-ro", 99, short_idle, hard, ten_s),
+        )
+        .await;
+
+        assert!(
+            client.pending_permissions.is_empty(),
+            "entry must be resolved after reject_once decision; \
+             mutation: accepts() drops reject → entry stays pending → this fires"
+        );
+        assert_eq!(
+            applied_count(&obs),
+            1,
+            "exactly one applied ACP write must be emitted for reject_once; \
+             mutation: accepts() drops reject → zero writes → this fires"
         );
     }
 }

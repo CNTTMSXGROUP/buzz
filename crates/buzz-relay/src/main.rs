@@ -64,7 +64,9 @@ fn relay_keypair_from_config(relay_private_key: Option<&str>) -> anyhow::Result<
 /// communities would incur five-figure monthly costs if every community always
 /// gets a full set of series.  This knob is the cost lever.
 ///
-/// Fleet-wide totals (`buzz_total_*`) always emit regardless of mode.
+/// Fleet-wide totals are independent of this mode, but DB-backed families emit
+/// only when a proved reader is available. Their fixed-cardinality availability
+/// gauges distinguish a skipped collection from a real zero.
 ///
 /// Set via `BUZZ_USAGE_METRICS_PER_COMMUNITY`:
 ///   - `off` — suppress all per-community series; fleet totals only (default)
@@ -113,6 +115,7 @@ impl EmissionScope {
 
 const FLEET_STOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 const FLEET_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const FLEET_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct FleetUsageSchedule {
     next_stock: std::time::Instant,
@@ -121,6 +124,7 @@ struct FleetUsageSchedule {
     last_activity_success: Option<std::time::Instant>,
     stock_interval: std::time::Duration,
     activity_interval: std::time::Duration,
+    retry_interval: std::time::Duration,
 }
 
 impl FleetUsageSchedule {
@@ -129,6 +133,7 @@ impl FleetUsageSchedule {
             std::time::Instant::now(),
             FLEET_STOCK_INTERVAL,
             FLEET_ACTIVITY_INTERVAL,
+            FLEET_RETRY_INTERVAL,
         )
     }
 
@@ -136,6 +141,7 @@ impl FleetUsageSchedule {
         now: std::time::Instant,
         stock_interval: std::time::Duration,
         activity_interval: std::time::Duration,
+        retry_interval: std::time::Duration,
     ) -> Self {
         Self {
             next_stock: now,
@@ -144,6 +150,7 @@ impl FleetUsageSchedule {
             last_activity_success: None,
             stock_interval,
             activity_interval,
+            retry_interval,
         }
     }
 
@@ -155,12 +162,30 @@ impl FleetUsageSchedule {
         now >= self.next_activity
     }
 
-    fn mark_stock_attempt(&mut self, now: std::time::Instant) {
+    fn mark_stock_success(&mut self, now: std::time::Instant) {
         self.next_stock = now + self.stock_interval;
+        self.last_stock_success = Some(now);
     }
 
-    fn mark_activity_attempt(&mut self, now: std::time::Instant) {
+    fn mark_stock_failure(&mut self, now: std::time::Instant) {
+        self.next_stock = now + self.retry_interval;
+    }
+
+    fn mark_activity_success(&mut self, now: std::time::Instant) {
         self.next_activity = now + self.activity_interval;
+        self.last_activity_success = Some(now);
+    }
+
+    fn mark_activity_failure(&mut self, now: std::time::Instant) {
+        self.next_activity = now + self.retry_interval;
+    }
+
+    fn stock_available(&self) -> bool {
+        self.last_stock_success.is_some()
+    }
+
+    fn activity_available(&self) -> bool {
+        self.last_activity_success.is_some()
     }
 }
 
@@ -253,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
         database_url: config.database_url.clone(),
         read_database_url: config.read_database_url.clone(),
         replica_read_max_age_ms: config.replica_read_max_age_ms,
+        usage_metrics_replica_max_age_ms: config.usage_metrics_replica_max_age_ms,
         max_connections: config.db_pool_size,
         read_max_connections: config.db_read_pool_size,
         ..DbConfig::default()
@@ -1759,19 +1785,22 @@ async fn run_usage_metrics_tick(
 async fn emit_fleet_db_usage_metrics(state: &AppState, schedule: &mut FleetUsageSchedule) {
     let now = std::time::Instant::now();
     if schedule.stock_due(now) {
-        schedule.mark_stock_attempt(now);
         match state.db.usage_fleet_stock_snapshot().await {
             Ok(Some(snapshot)) => {
                 emit_fleet_stock_metrics(snapshot);
-                schedule.last_stock_success = Some(now);
+                schedule.mark_stock_success(now);
             }
-            Ok(None) => metrics::counter!(
-                "buzz_usage_query_skipped_total",
-                "family" => "stock",
-                "reason" => "reader_unavailable"
-            )
-            .increment(1),
+            Ok(None) => {
+                schedule.mark_stock_failure(now);
+                metrics::counter!(
+                    "buzz_usage_query_skipped_total",
+                    "family" => "stock",
+                    "reason" => "reader_unavailable"
+                )
+                .increment(1);
+            }
             Err(error) => {
+                schedule.mark_stock_failure(now);
                 warn!(error = %error, "fleet usage stock query failed");
                 metrics::counter!(
                     "buzz_usage_query_skipped_total",
@@ -1784,19 +1813,22 @@ async fn emit_fleet_db_usage_metrics(state: &AppState, schedule: &mut FleetUsage
     }
 
     if schedule.activity_due(now) {
-        schedule.mark_activity_attempt(now);
         match state.db.usage_fleet_active_users(chrono::Utc::now()).await {
             Ok(Some(snapshot)) => {
                 emit_fleet_active_user_metrics(snapshot);
-                schedule.last_activity_success = Some(now);
+                schedule.mark_activity_success(now);
             }
-            Ok(None) => metrics::counter!(
-                "buzz_usage_query_skipped_total",
-                "family" => "activity",
-                "reason" => "reader_unavailable"
-            )
-            .increment(1),
+            Ok(None) => {
+                schedule.mark_activity_failure(now);
+                metrics::counter!(
+                    "buzz_usage_query_skipped_total",
+                    "family" => "activity",
+                    "reason" => "reader_unavailable"
+                )
+                .increment(1);
+            }
             Err(error) => {
+                schedule.mark_activity_failure(now);
                 warn!(error = %error, "fleet usage activity query failed");
                 metrics::counter!(
                     "buzz_usage_query_skipped_total",
@@ -1807,6 +1839,15 @@ async fn emit_fleet_db_usage_metrics(state: &AppState, schedule: &mut FleetUsage
             }
         }
     }
+    metrics::gauge!("buzz_usage_snapshot_available", "family" => "stock")
+        .set(if schedule.stock_available() { 1.0 } else { 0.0 });
+    metrics::gauge!("buzz_usage_snapshot_available", "family" => "activity").set(
+        if schedule.activity_available() {
+            1.0
+        } else {
+            0.0
+        },
+    );
 
     if let Some(last_success) = schedule.last_stock_success {
         metrics::gauge!("buzz_usage_snapshot_age_seconds", "family" => "stock")
@@ -2417,19 +2458,37 @@ mod tests {
     #[test]
     fn fleet_usage_families_have_independent_cadences() {
         let now = std::time::Instant::now();
-        let mut schedule =
-            FleetUsageSchedule::new_at(now, Duration::from_secs(60), Duration::from_secs(600));
+        let mut schedule = FleetUsageSchedule::new_at(
+            now,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(10),
+        );
         assert!(schedule.stock_due(now));
         assert!(schedule.activity_due(now));
+        assert!(!schedule.stock_available());
+        assert!(!schedule.activity_available());
 
-        schedule.mark_stock_attempt(now);
-        assert!(!schedule.stock_due(now + Duration::from_secs(59)));
-        assert!(schedule.stock_due(now + Duration::from_secs(60)));
+        schedule.mark_stock_failure(now);
+        assert!(!schedule.stock_due(now + Duration::from_secs(9)));
+        assert!(schedule.stock_due(now + Duration::from_secs(10)));
         assert!(schedule.activity_due(now));
 
-        schedule.mark_activity_attempt(now);
-        assert!(!schedule.activity_due(now + Duration::from_secs(599)));
-        assert!(schedule.activity_due(now + Duration::from_secs(600)));
+        let stock_success = now + Duration::from_secs(10);
+        schedule.mark_stock_success(stock_success);
+        assert!(schedule.stock_available());
+        assert!(!schedule.stock_due(stock_success + Duration::from_secs(59)));
+        assert!(schedule.stock_due(stock_success + Duration::from_secs(60)));
+
+        schedule.mark_activity_failure(now);
+        assert!(!schedule.activity_due(now + Duration::from_secs(9)));
+        assert!(schedule.activity_due(now + Duration::from_secs(10)));
+
+        let activity_success = now + Duration::from_secs(10);
+        schedule.mark_activity_success(activity_success);
+        assert!(schedule.activity_available());
+        assert!(!schedule.activity_due(activity_success + Duration::from_secs(599)));
+        assert!(schedule.activity_due(activity_success + Duration::from_secs(600)));
     }
 
     #[test]

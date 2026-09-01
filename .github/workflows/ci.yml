@@ -735,6 +735,18 @@ jobs:
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+      - name: Fleet usage telemetry PostgreSQL tests
+        # Exact seeded aggregates and the replica-only routing contract require
+        # real Postgres and are ignored by the infrastructure-free unit job.
+        run: |
+          filter='package(buzz-db) and test(/tests::(fleet_snapshots_match_seeded_stock_and_activity_exactly|fleet_collection_is_replica_only_and_skips_without_reader)/)'
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E "${filter}" \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: Audit writer session timeout guardrails
         run: |
           cargo nextest run \

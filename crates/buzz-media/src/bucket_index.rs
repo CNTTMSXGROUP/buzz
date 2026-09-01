@@ -202,7 +202,7 @@ pub struct CommunityStorage {
 /// The full computed sweep result: fleet physical/logical totals,
 /// per-community logical breakdown, and anomaly/visibility gauges. Pure
 /// data — no I/O, cheap to clone into a cached snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketSnapshot {
     /// Every listed object, every class (kind=physical).
     pub physical_bytes: u64,
@@ -212,6 +212,8 @@ pub struct BucketSnapshot {
     pub logical_bytes: u64,
     pub logical_objects: u64,
     pub per_community: HashMap<Uuid, CommunityStorage>,
+    /// Whether `per_community` was computed. False means omitted, not empty.
+    pub community_breakdown_available: bool,
     /// Blob shas with zero sidecar binding in any community.
     pub orphan_blob_bytes: u64,
     pub orphan_blob_count: u64,
@@ -223,6 +225,26 @@ pub struct BucketSnapshot {
     pub multi_variant_bytes: u64,
     pub unknown_key_bytes: u64,
     pub unknown_key_objects: u64,
+}
+
+impl Default for BucketSnapshot {
+    fn default() -> Self {
+        Self {
+            physical_bytes: 0,
+            physical_objects: 0,
+            logical_bytes: 0,
+            logical_objects: 0,
+            per_community: HashMap::new(),
+            community_breakdown_available: true,
+            orphan_blob_bytes: 0,
+            orphan_blob_count: 0,
+            orphan_sidecar_count: 0,
+            multi_variant_shas: 0,
+            multi_variant_bytes: 0,
+            unknown_key_bytes: 0,
+            unknown_key_objects: 0,
+        }
+    }
 }
 
 /// Pure, incremental fold over classified bucket keys. Never retains a full
@@ -339,6 +361,7 @@ impl BucketAggregate {
             logical_bytes,
             logical_objects,
             per_community,
+            community_breakdown_available: include_per_community,
             orphan_blob_bytes,
             orphan_blob_count,
             orphan_sidecar_count,
@@ -601,6 +624,8 @@ mod tests {
 
         let full = full.finish();
         let totals = totals.finish_totals();
+        assert!(full.community_breakdown_available);
+        assert!(!totals.community_breakdown_available);
         assert!(totals.per_community.is_empty());
         assert_eq!(totals.physical_bytes, full.physical_bytes);
         assert_eq!(totals.physical_objects, full.physical_objects);

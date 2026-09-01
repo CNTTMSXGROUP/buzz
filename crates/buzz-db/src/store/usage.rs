@@ -19,7 +19,7 @@ use sqlx::{Connection as _, Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::{observability, Db, RouteDecision, RoutePredicate};
+use crate::{observability, Db};
 
 /// Fixed-row fleet adoption snapshot used when per-community telemetry is disabled.
 #[derive(Debug, sqlx::FromRow)]
@@ -585,17 +585,15 @@ impl Db {
     #[datastore_span(name = "usage_fleet_stock_snapshot", system = "postgresql")]
     pub async fn usage_fleet_stock_snapshot(&self) -> Result<Option<FleetStockSnapshot>> {
         let path = "usage_fleet_stock";
-        match self.route_read(path, RoutePredicate::Bounded).await {
-            RouteDecision::Replica(mut tx, _entry, reason) => {
-                sqlx::query("SET LOCAL statement_timeout = '5s'")
-                    .execute(&mut *tx)
-                    .await?;
-                let snapshot = fleet_stock_snapshot_on(&mut *tx).await?;
-                Self::record_route(path, "replica", reason);
-                Ok(Some(snapshot))
-            }
-            RouteDecision::Writer => Ok(None),
-        }
+        let Some((mut tx, reason)) = self.route_usage_read(path).await else {
+            return Ok(None);
+        };
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
+        let snapshot = fleet_stock_snapshot_on(&mut *tx).await?;
+        Self::record_route(path, "replica", reason);
+        Ok(Some(snapshot))
     }
 
     /// Collect all fleet active-user windows from a proved read-replica snapshot.
@@ -608,17 +606,15 @@ impl Db {
         observed_at: DateTime<Utc>,
     ) -> Result<Option<FleetActiveUsersSnapshot>> {
         let path = "usage_fleet_active_users";
-        match self.route_read(path, RoutePredicate::Bounded).await {
-            RouteDecision::Replica(mut tx, _entry, reason) => {
-                sqlx::query("SET LOCAL statement_timeout = '15s'")
-                    .execute(&mut *tx)
-                    .await?;
-                let snapshot = fleet_active_users_on(&mut *tx, observed_at).await?;
-                Self::record_route(path, "replica", reason);
-                Ok(Some(snapshot))
-            }
-            RouteDecision::Writer => Ok(None),
-        }
+        let Some((mut tx, reason)) = self.route_usage_read(path).await else {
+            return Ok(None);
+        };
+        sqlx::query("SET LOCAL statement_timeout = '15s'")
+            .execute(&mut *tx)
+            .await?;
+        let snapshot = fleet_active_users_on(&mut *tx, observed_at).await?;
+        Self::record_route(path, "replica", reason);
+        Ok(Some(snapshot))
     }
 
     /// Return total number of communities on this relay.
@@ -1151,5 +1147,286 @@ mod tests {
             after_row.is_none(),
             "no stream row after last channel deleted — poller will zero-fill"
         );
+    }
+
+    async fn insert_metric_event(
+        pool: &PgPool,
+        community_id: Uuid,
+        pubkey: &[u8],
+        created_at: DateTime<Utc>,
+        deleted: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, deleted_at) \
+             VALUES ($1, $2, $3, $4, 9, '[]', '', $5, $4, \
+                     CASE WHEN $6 THEN $4 ELSE NULL END)",
+        )
+        .bind(community_id)
+        .bind(random_pubkey())
+        .bind(pubkey)
+        .bind(created_at)
+        .bind(vec![0u8; 64])
+        .bind(deleted)
+        .execute(pool)
+        .await
+        .expect("insert metric event");
+    }
+
+    /// Fixed-row fleet SQL must preserve every inclusion/exclusion rule while
+    /// keeping its result shape independent of community cardinality.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fleet_snapshots_match_seeded_stock_and_activity_exactly() {
+        let admin_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin to create scratch db");
+        let (pool, scratch_name) = create_scratch_db(&admin, "usage_snapshot").await;
+        let (community_id, _, _) = make_community(&pool).await;
+
+        let human = random_pubkey();
+        let agent = random_pubkey();
+        let inactive = random_pubkey();
+        insert_user(&pool, community_id, &human, false).await;
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) VALUES ($1, $2, $3)",
+        )
+        .bind(community_id)
+        .bind(&agent)
+        .bind(&human)
+        .execute(&pool)
+        .await
+        .expect("insert agent");
+        insert_user(&pool, community_id, &inactive, false).await;
+        sqlx::query(
+            "UPDATE users SET deactivated_at = NOW() WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community_id)
+        .bind(&inactive)
+        .execute(&pool)
+        .await
+        .expect("deactivate user");
+
+        for channel_type in ["stream", "forum", "dm", "workflow"] {
+            sqlx::query(
+                "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+                 VALUES ($1, $2, $3, $4::channel_type, 'open', $5)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(community_id)
+            .bind(format!("metric-{channel_type}"))
+            .bind(channel_type)
+            .bind(&human)
+            .execute(&pool)
+            .await
+            .expect("insert live channel");
+        }
+        sqlx::query(
+            "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by, deleted_at) \
+             VALUES ($1, $2, 'deleted-stream', 'stream', 'open', $3, NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(community_id)
+        .bind(&human)
+        .execute(&pool)
+        .await
+        .expect("insert deleted channel");
+
+        for role in ["owner", "admin", "member"] {
+            sqlx::query(
+                "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, $3)",
+            )
+            .bind(community_id)
+            .bind(format!("{role}-pubkey"))
+            .bind(role)
+            .execute(&pool)
+            .await
+            .expect("insert relay member");
+        }
+        for status in ["active", "disabled", "archived"] {
+            sqlx::query(
+                "INSERT INTO workflows \
+                 (community_id, id, name, owner_pubkey, definition, definition_hash, status, enabled) \
+                 VALUES ($1, $2, $3, $4, '{}', $5, $6::workflow_status, $7)",
+            )
+            .bind(community_id)
+            .bind(Uuid::new_v4())
+            .bind(format!("metric-{status}"))
+            .bind(&human)
+            .bind(vec![0u8; 32])
+            .bind(status)
+            .bind(status == "active")
+            .execute(&pool)
+            .await
+            .expect("insert workflow");
+        }
+        sqlx::query(
+            "INSERT INTO git_repo_names (community_id, repo_id, owner_pubkey) VALUES ($1, 'metric-repo', $2)",
+        )
+        .bind(community_id)
+        .bind(hex::encode(&human))
+        .execute(&pool)
+        .await
+        .expect("insert git repo");
+        sqlx::query("ANALYZE communities")
+            .execute(&pool)
+            .await
+            .expect("refresh planner estimate");
+
+        let observed_at = Utc::now();
+        let unknown = random_pubkey();
+        insert_metric_event(
+            &pool,
+            community_id,
+            &human,
+            observed_at - Duration::hours(12),
+            false,
+        )
+        .await;
+        insert_metric_event(
+            &pool,
+            community_id,
+            &human,
+            observed_at - Duration::days(3),
+            false,
+        )
+        .await;
+        insert_metric_event(
+            &pool,
+            community_id,
+            &agent,
+            observed_at - Duration::days(3),
+            false,
+        )
+        .await;
+        insert_metric_event(
+            &pool,
+            community_id,
+            &unknown,
+            observed_at - Duration::days(20),
+            false,
+        )
+        .await;
+        insert_metric_event(
+            &pool,
+            community_id,
+            &unknown,
+            observed_at - Duration::days(31),
+            false,
+        )
+        .await;
+        insert_metric_event(
+            &pool,
+            community_id,
+            &unknown,
+            observed_at + Duration::hours(1),
+            false,
+        )
+        .await;
+        insert_metric_event(
+            &pool,
+            community_id,
+            &unknown,
+            observed_at - Duration::hours(1),
+            true,
+        )
+        .await;
+
+        let stock = fleet_stock_snapshot_on(&pool).await.expect("fleet stock");
+        assert_eq!(stock.communities_estimated, 1);
+        assert_eq!((stock.users_human, stock.users_agent), (1, 1));
+        assert_eq!(
+            (
+                stock.channels_stream,
+                stock.channels_forum,
+                stock.channels_dm,
+                stock.channels_workflow,
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(
+            (
+                stock.members_owner,
+                stock.members_admin,
+                stock.members_member
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (
+                stock.workflows_active,
+                stock.workflows_disabled,
+                stock.workflows_archived,
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(stock.git_repos, 1);
+
+        let activity = fleet_active_users_on(&pool, observed_at)
+            .await
+            .expect("fleet activity");
+        assert_eq!(
+            (activity.human_1d, activity.agent_1d, activity.unknown_1d),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            (activity.human_7d, activity.agent_7d, activity.unknown_7d),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            (activity.human_30d, activity.agent_30d, activity.unknown_30d,),
+            (1, 1, 1)
+        );
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    /// Fleet collection must read a proved replica and skip instead of
+    /// silently adding load to the writer when no reader is configured.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fleet_collection_is_replica_only_and_skips_without_reader() {
+        let admin_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect admin to create scratch db");
+        let (writer, writer_name) = create_scratch_db(&admin, "usage_writer").await;
+        let (reader, reader_name) = create_scratch_db(&admin, "usage_reader").await;
+        let (writer_community, _, _) = make_community(&writer).await;
+        let (reader_community, _, _) = make_community(&reader).await;
+        insert_user(&writer, writer_community, &random_pubkey(), false).await;
+        insert_user(&reader, reader_community, &random_pubkey(), false).await;
+        insert_user(&reader, reader_community, &random_pubkey(), false).await;
+
+        let without_reader = Db::from_pool(writer.clone());
+        assert!(
+            without_reader
+                .usage_fleet_stock_snapshot()
+                .await
+                .expect("skip without reader")
+                .is_none(),
+            "telemetry must not fall back to the writer"
+        );
+
+        let db = Db::from_pools(writer.clone(), reader.clone());
+        db.fence().force_open_for_tests(Utc::now());
+        let snapshot = db
+            .usage_fleet_stock_snapshot()
+            .await
+            .expect("replica collection")
+            .expect("fresh proved reader");
+        assert_eq!(
+            snapshot.users_human, 2,
+            "fixture proves the reader served the query"
+        );
+
+        drop(db);
+        drop_scratch_db(&admin, reader, &reader_name).await;
+        drop_scratch_db(&admin, writer, &writer_name).await;
     }
 }

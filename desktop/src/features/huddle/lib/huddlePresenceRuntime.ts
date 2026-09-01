@@ -137,14 +137,19 @@ export function startHuddlePresenceRuntime(
       pendingLiveEvents.push(event);
       return;
     }
+    const changed = tracker.apply(event);
+    if (!changed) return;
+
     const sessionId = huddleSessionId(event);
     if (sessionId) {
       if (event.kind === KIND_HUDDLE_ENDED) activeSessionIds.delete(sessionId);
       else activeSessionIds.add(sessionId);
     }
-    if (tracker.apply(event)) {
-      dependencies.onPresence(tracker.snapshot(activeSessionIds));
-    }
+    // Fence an in-flight authoritative snapshot against every accepted live
+    // lifecycle mutation. A stale response queried the old session set and
+    // must not replace newer live state.
+    livenessRequestVersion += 1;
+    dependencies.onPresence(tracker.snapshot(activeSessionIds));
   };
 
   const fetchActiveSessionIds = async (sessionIds: readonly string[]) => {
@@ -197,12 +202,20 @@ export function startHuddlePresenceRuntime(
       const nextActiveSessionIds = await fetchActiveSessionIds([
         ...activeSessionIds,
       ]);
-      if (disposed || requestVersion !== livenessRequestVersion) return;
+      if (disposed) return;
+      if (requestVersion !== livenessRequestVersion) {
+        scheduleLivenessRefresh();
+        return;
+      }
       activeSessionIds = nextActiveSessionIds;
       dependencies.onPresence(tracker.snapshot(activeSessionIds));
       scheduleLivenessRefresh();
     } catch (error) {
-      if (disposed || requestVersion !== livenessRequestVersion) return;
+      if (disposed) return;
+      if (requestVersion !== livenessRequestVersion) {
+        scheduleLivenessRefresh();
+        return;
+      }
       hydrated = false;
       dependencies.onPresence(new Set());
       dependencies.onError?.("Huddle liveness refresh failed", error);

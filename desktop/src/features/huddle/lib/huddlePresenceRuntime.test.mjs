@@ -5,6 +5,7 @@ import { startHuddlePresenceRuntime } from "./huddlePresenceRuntime.ts";
 
 const ALICE = "a".repeat(64);
 const BOB = "b".repeat(64);
+const CAROL = "d".repeat(64);
 const RELAY = "c".repeat(64);
 
 function event({
@@ -15,13 +16,14 @@ function event({
   admissionId,
   rosterRevision,
   createdAt = Number(id),
+  session = "room",
 }) {
   return {
     id,
     kind,
     pubkey,
     content: JSON.stringify({
-      ephemeral_channel_id: "room",
+      ephemeral_channel_id: session,
       admission_id: admissionId,
       roster_revision: rosterRevision,
     }),
@@ -36,7 +38,12 @@ function participantEvent(options) {
 }
 
 function livenessEvent(session = "room") {
-  return event({ id: `live-${session}`, kind: 48104, createdAt: 1_000 });
+  return event({
+    id: `live-${session}`,
+    kind: 48104,
+    createdAt: 1_000,
+    session,
+  });
 }
 
 async function settle() {
@@ -233,6 +240,70 @@ test("clears stale presence on the lease-cadence liveness refresh", async () => 
 
   assert.deepEqual([...harness.snapshots.at(-1)], []);
   harness.dispose();
+});
+
+test("keeps a live session added while an older liveness refresh is in flight", async () => {
+  let liveHandler;
+  let livenessTimer;
+  let resolveRefresh;
+  let livenessRequests = 0;
+  const queriedSessions = [];
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) {
+        return [event({ id: "1", kind: 48100 })];
+      }
+      livenessRequests += 1;
+      queriedSessions.push([...filter["#d"]]);
+      if (livenessRequests === 1) return [livenessEvent()];
+      if (livenessRequests === 2) {
+        return new Promise((resolve) => {
+          resolveRefresh = resolve;
+        });
+      }
+      return filter["#d"].map(livenessEvent);
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => {
+      livenessTimer = callback;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
+  });
+  await settle();
+
+  livenessTimer();
+  await settle();
+  liveHandler(
+    event({
+      id: "2",
+      kind: 48100,
+      pubkey: CAROL,
+      session: "new-room",
+    }),
+  );
+  assert.equal(snapshots.at(-1).has(CAROL), true);
+
+  resolveRefresh([livenessEvent()]);
+  await settle();
+  assert.equal(snapshots.at(-1).has(CAROL), true);
+  assert.equal(typeof livenessTimer, "function");
+
+  livenessTimer();
+  await settle();
+  assert.deepEqual(queriedSessions.at(-1), ["room", "new-room"]);
+  assert.equal(snapshots.at(-1).has(CAROL), true);
+  dispose();
 });
 
 test("retries a failed hydration and tears down every recovery path", async () => {

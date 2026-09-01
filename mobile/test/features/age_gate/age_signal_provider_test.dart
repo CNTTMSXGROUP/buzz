@@ -114,6 +114,28 @@ void main() {
     expect(requests, 2);
   });
 
+  test('keeps a missing native channel gated and retryable', () async {
+    var requests = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () async {
+          requests += 1;
+          throw MissingPluginException('buzz/age_signal');
+        },
+        delay: (duration) async {
+          expect(duration, ageSignalRetryDelay);
+        },
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+    expect(requests, 2);
+  });
+
   test('rejects malformed and unexpected platform responses', () async {
     await expectLater(
       requestWithResponse({'status': 'unknown', 'ageUpper': null}),

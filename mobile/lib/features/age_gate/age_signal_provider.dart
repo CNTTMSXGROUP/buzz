@@ -94,8 +94,13 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
       try {
         response = await _requestSignal();
       } on MissingPluginException {
-        _completed = true;
-        state = AgeSignalState.allowed;
+        if (attempt + 1 < _maxAttempts) {
+          await _delay(ageSignalRetryDelay);
+          continue;
+        }
+        // A missing channel is an integration failure, not evidence that the
+        // platform has no age signal. Keep the launch gated for a retry.
+        state = AgeSignalState.retryableFailure;
         return;
       } on PlatformException {
         if (attempt + 1 < _maxAttempts) {

@@ -126,6 +126,34 @@ void main() {
     expect(find.text('Try again'), findsNothing);
     expect(find.byType(HomePage), findsOneWidget);
   });
+
+  testWidgets('reloads failed community storage on resume before cleanup', (
+    tester,
+  ) async {
+    final communities = _RecoveringCommunityListNotifier();
+
+    await tester.pumpWidget(
+      ProviderScope(
+        retry: (_, _) => null,
+        overrides: [
+          ageSignalProvider.overrideWith(() => _BlockingAgeSignalNotifier()),
+          communityListProvider.overrideWith(() => communities),
+        ],
+        child: const AgeSignalPushBootstrap(child: SizedBox()),
+      ),
+    );
+    await tester.pump();
+
+    expect(communities.builds, 1);
+    expect(communities.cleanups, 0);
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+    await tester.pump();
+
+    expect(communities.builds, 2);
+    expect(communities.cleanups, 1);
+  });
 }
 
 class _AuthenticatedAuthNotifier extends AuthNotifier {
@@ -150,5 +178,22 @@ class _CountingRelaySessionNotifier extends RelaySessionNotifier {
   SessionState build() {
     builds += 1;
     return const SessionState(status: SessionStatus.disconnected);
+  }
+}
+
+class _RecoveringCommunityListNotifier extends CommunityListNotifier {
+  int builds = 0;
+  int cleanups = 0;
+
+  @override
+  Future<List<Community>> build() async {
+    builds += 1;
+    if (builds == 1) throw StateError('secure storage unavailable');
+    return const [];
+  }
+
+  @override
+  Future<void> enforceAgeRestrictionOnPush() async {
+    cleanups += 1;
   }
 }

@@ -38,7 +38,12 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
 
     useEffect(() {
       final listener = AppLifecycleListener(
-        onResume: () => resumeGeneration.value += 1,
+        onResume: () {
+          if (ref.read(communityListProvider).hasError) {
+            ref.invalidate(communityListProvider);
+          }
+          resumeGeneration.value += 1;
+        },
       );
       return listener.dispose;
     }, const []);

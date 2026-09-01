@@ -1278,13 +1278,16 @@ mod postgres_tests {
             &sql[array_start..array_end]
         }
 
-        // NIP-FI proof replay claims (migration 0043): idempotency ledger for
+        // NIP-FI proof replay claims (migration 0044): idempotency ledger for
         // admission proofs.  Never fence-attached (immutable ledger relation).
         // 0044 also issues a CREATE OR REPLACE for community_write_fence_excluded_table
         // to add 'nip_fi_proof_replay_claims'; that extended definition is the
         // one schema.sql must track.
+        //
+        // NOTE: 0043 is push_gateway_dogfood_profile (index 42); 0044 is the
+        // replay-claims migration (index 43).
         assert_eq!(migrations[43].version, 44);
-        let replay_claims = migrations[42].sql.as_str();
+        let replay_claims = migrations[43].sql.as_str();
         assert!(replay_claims.contains("CREATE TABLE nip_fi_proof_replay_claims"));
         assert!(
             replay_claims
@@ -1300,7 +1303,7 @@ mod postgres_tests {
         // Brownfield relay databases created through SQLx still carry the
         // production/sandbox constraint from 0015. Converge them to the same
         // dogfood-only authority declared by the desired-state schema.
-        assert_eq!(migrations[43].version, 44);
+        assert_eq!(migrations[42].version, 43);
         let dogfood_profile = migrations[42].sql.as_str();
         assert!(dogfood_profile.contains("DELETE FROM push_gateway_delegations"));
         assert!(dogfood_profile.contains("DELETE FROM push_gateway_installations"));

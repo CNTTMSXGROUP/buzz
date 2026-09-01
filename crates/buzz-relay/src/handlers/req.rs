@@ -1198,7 +1198,12 @@ async fn handle_huddle_liveness_req(
             .await
         {
             Ok(channel) => channel,
-            Err(_) => continue,
+            Err(buzz_db::error::DbError::ChannelNotFound(_)) => continue,
+            Err(error) => {
+                warn!(session_id = %session_id, "Huddle liveness channel lookup failed: {error}");
+                conn.send(RelayMessage::closed(sub_id, "error: database error"));
+                return;
+            }
         };
         let mut linked_parent = None;
         for parent_channel_id in parent_channel_ids {
@@ -1591,14 +1596,23 @@ mod tests {
     #[test]
     fn huddle_liveness_session_ids_are_deduplicated_and_bounded() {
         let d_tag = SingleLetterTag::lowercase(Alphabet::D);
-        let first = uuid::Uuid::new_v4();
-        let second = uuid::Uuid::new_v4();
-        let filter = Filter::new()
-            .custom_tag(d_tag, first.to_string())
-            .custom_tag(d_tag, second.to_string())
-            .custom_tag(d_tag, first.to_string());
+        let input = (0..MAX_EXPLICIT_CHANNEL_VALUES + 16)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect::<Vec<_>>();
+        let first = input.iter().fold(Filter::new(), |filter, session_id| {
+            filter.custom_tag(d_tag, session_id.to_string())
+        });
+        let second = Filter::new()
+            .custom_tag(d_tag, input[0].to_string())
+            .custom_tag(d_tag, input[1].to_string());
 
-        assert_eq!(huddle_liveness_session_ids(&[filter]), vec![first, second]);
+        let extracted = huddle_liveness_session_ids(&[first, second]);
+        let extracted_set = extracted.iter().copied().collect::<HashSet<_>>();
+        let input_set = input.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(extracted.len(), MAX_EXPLICIT_CHANNEL_VALUES);
+        assert_eq!(extracted_set.len(), extracted.len());
+        assert!(extracted_set.is_subset(&input_set));
     }
 
     #[test]

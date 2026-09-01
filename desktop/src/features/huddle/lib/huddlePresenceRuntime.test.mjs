@@ -46,8 +46,11 @@ async function settle() {
 
 function runtimeHarness(initialHistory) {
   let history = initialHistory;
+  let liveSessions = ["room"];
   let reconnect;
   let liveHandler;
+  let livenessTimer;
+  let livenessDelay;
   let liveDisposed = false;
   let reconnectDisposed = false;
   const snapshots = [];
@@ -63,7 +66,7 @@ function runtimeHarness(initialHistory) {
       };
     },
     fetchEvents: async (filter) =>
-      filter.kinds?.includes(48104) ? [livenessEvent()] : history,
+      filter.kinds?.includes(48104) ? liveSessions.map(livenessEvent) : history,
     subscribeToReconnects: (listener) => {
       reconnect = listener;
       return () => {
@@ -71,6 +74,14 @@ function runtimeHarness(initialHistory) {
       };
     },
     onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback, delayMs) => {
+      livenessTimer = callback;
+      livenessDelay = delayMs;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
     nowSeconds: () => 1_000,
   });
 
@@ -79,10 +90,15 @@ function runtimeHarness(initialHistory) {
     emit: (next) => liveHandler(next),
     filters,
     reconnect: () => reconnect(),
+    refreshLiveness: () => livenessTimer(),
     setHistory: (next) => {
       history = next;
     },
+    setLiveSessions: (next) => {
+      liveSessions = next;
+    },
     snapshots,
+    livenessDelay: () => livenessDelay,
     wasDisposed: () => liveDisposed && reconnectDisposed,
   };
 }
@@ -195,6 +211,30 @@ test("applies channel-scoped live joins, leaves, and ends without reconnecting",
   harness.dispose();
 });
 
+test("clears stale presence on the lease-cadence liveness refresh", async () => {
+  const harness = runtimeHarness([
+    event({ id: "1", kind: 48100 }),
+    participantEvent({
+      id: "2",
+      kind: 48101,
+      admissionId: "desktop",
+      rosterRevision: 1,
+    }),
+  ]);
+  await settle();
+
+  assert.equal(harness.snapshots.at(-1).has(ALICE), true);
+  assert.equal(harness.snapshots.at(-1).has(BOB), true);
+  assert.equal(harness.livenessDelay(), 10_000);
+
+  harness.setLiveSessions([]);
+  harness.refreshLiveness();
+  await settle();
+
+  assert.deepEqual([...harness.snapshots.at(-1)], []);
+  harness.dispose();
+});
+
 test("retries a failed hydration and tears down every recovery path", async () => {
   let attempts = 0;
   let retry;
@@ -228,6 +268,8 @@ test("retries a failed hydration and tears down every recovery path", async () =
     clearRetryTimer: () => {
       retry = undefined;
     },
+    setLivenessTimer: (callback) => callback,
+    clearLivenessTimer: () => {},
   });
 
   await settle();
@@ -266,6 +308,8 @@ test("fails closed when persisted lifecycle has no authoritative live room", asy
           ],
     subscribeToReconnects: () => () => {},
     onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => callback,
+    clearLivenessTimer: () => {},
   });
 
   await settle();

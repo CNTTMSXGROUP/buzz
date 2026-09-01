@@ -25,6 +25,10 @@ const LIFECYCLE_KINDS = [
 const MAX_PENDING_LIVE_EVENTS = 1_000;
 const INITIAL_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
+// Owner leases renew every 10 seconds against a 30-second TTL. Refreshing on
+// the same cadence bounds a stale badge to one lease lifetime plus one poll
+// when an owner disappears without publishing a lifecycle end event.
+const LIVENESS_REFRESH_INTERVAL_MS = 10_000;
 
 type Dispose = () => void | Promise<void>;
 
@@ -41,6 +45,8 @@ export type HuddlePresenceRuntimeDependencies = {
   onError?: (message: string, error: unknown) => void;
   setRetryTimer?: (callback: () => void, delayMs: number) => unknown;
   clearRetryTimer?: (handle: unknown) => void;
+  setLivenessTimer?: (callback: () => void, delayMs: number) => unknown;
+  clearLivenessTimer?: (handle: unknown) => void;
   nowSeconds?: () => number;
 };
 
@@ -59,6 +65,8 @@ export function startHuddlePresenceRuntime(
   const clearRetryTimer =
     dependencies.clearRetryTimer ??
     ((handle: unknown) => window.clearTimeout(handle as number));
+  const setLivenessTimer = dependencies.setLivenessTimer ?? setRetryTimer;
+  const clearLivenessTimer = dependencies.clearLivenessTimer ?? clearRetryTimer;
   const nowSeconds =
     dependencies.nowSeconds ?? (() => Math.floor(Date.now() / 1_000));
 
@@ -73,7 +81,9 @@ export function startHuddlePresenceRuntime(
   let pendingLiveEvents: RelayEvent[] = [];
   let pendingOverflowed = false;
   let retryHandle: unknown = null;
+  let livenessHandle: unknown = null;
   let retryDelayMs = INITIAL_RETRY_DELAY_MS;
+  let livenessRequestVersion = 0;
 
   const channelChunks: string[][] = [];
   const normalizedChannelIds = [...new Set(dependencies.channelIds)].sort();
@@ -96,6 +106,12 @@ export function startHuddlePresenceRuntime(
     if (retryHandle === null) return;
     clearRetryTimer(retryHandle);
     retryHandle = null;
+  };
+
+  const clearScheduledLivenessRefresh = () => {
+    if (livenessHandle === null) return;
+    clearLivenessTimer(livenessHandle);
+    livenessHandle = null;
   };
 
   const scheduleRecovery = (recover: () => void) => {
@@ -131,6 +147,69 @@ export function startHuddlePresenceRuntime(
     }
   };
 
+  const fetchActiveSessionIds = async (sessionIds: readonly string[]) => {
+    const sessionChunks: string[][] = [];
+    for (
+      let index = 0;
+      index < sessionIds.length;
+      index += MAX_EXPLICIT_CHANNEL_VALUES
+    ) {
+      sessionChunks.push(
+        sessionIds.slice(index, index + MAX_EXPLICIT_CHANNEL_VALUES),
+      );
+    }
+    const livenessPages = await Promise.all(
+      channelChunks.flatMap((channelIds) =>
+        sessionChunks.map((sessions) =>
+          dependencies.fetchEvents({
+            kinds: [KIND_HUDDLE_LIVENESS],
+            "#h": channelIds,
+            "#d": sessions,
+            limit: sessions.length,
+          }),
+        ),
+      ),
+    );
+    return new Set(
+      livenessPages
+        .flat()
+        .filter((event) => event.kind === KIND_HUDDLE_LIVENESS)
+        .map(huddleSessionId)
+        .filter((sessionId): sessionId is string => Boolean(sessionId)),
+    );
+  };
+
+  const scheduleLivenessRefresh = () => {
+    if (disposed || !hydrated || livenessHandle !== null) return;
+    livenessHandle = setLivenessTimer(() => {
+      livenessHandle = null;
+      void refreshLiveness();
+    }, LIVENESS_REFRESH_INTERVAL_MS);
+  };
+
+  async function refreshLiveness() {
+    if (disposed || !hydrated || reconciling) {
+      scheduleLivenessRefresh();
+      return;
+    }
+    const requestVersion = livenessRequestVersion;
+    try {
+      const nextActiveSessionIds = await fetchActiveSessionIds([
+        ...activeSessionIds,
+      ]);
+      if (disposed || requestVersion !== livenessRequestVersion) return;
+      activeSessionIds = nextActiveSessionIds;
+      dependencies.onPresence(tracker.snapshot(activeSessionIds));
+      scheduleLivenessRefresh();
+    } catch (error) {
+      if (disposed || requestVersion !== livenessRequestVersion) return;
+      hydrated = false;
+      dependencies.onPresence(new Set());
+      dependencies.onError?.("Huddle liveness refresh failed", error);
+      scheduleRecovery(recover);
+    }
+  }
+
   const reconcile = async () => {
     if (disposed) return;
     if (reconciling) {
@@ -138,6 +217,7 @@ export function startHuddlePresenceRuntime(
       return;
     }
     reconciling = true;
+    livenessRequestVersion += 1;
     try {
       const historyPages = await Promise.all(
         channelChunks.map((channelIds) =>
@@ -156,35 +236,7 @@ export function startHuddlePresenceRuntime(
             .filter((sessionId): sessionId is string => Boolean(sessionId)),
         ),
       ];
-      const sessionChunks: string[][] = [];
-      for (
-        let index = 0;
-        index < sessionIds.length;
-        index += MAX_EXPLICIT_CHANNEL_VALUES
-      ) {
-        sessionChunks.push(
-          sessionIds.slice(index, index + MAX_EXPLICIT_CHANNEL_VALUES),
-        );
-      }
-      const livenessPages = await Promise.all(
-        channelChunks.flatMap((channelIds) =>
-          sessionChunks.map((sessions) =>
-            dependencies.fetchEvents({
-              kinds: [KIND_HUDDLE_LIVENESS],
-              "#h": channelIds,
-              "#d": sessions,
-              limit: sessions.length,
-            }),
-          ),
-        ),
-      );
-      const nextActiveSessionIds = new Set(
-        livenessPages
-          .flat()
-          .filter((event) => event.kind === KIND_HUDDLE_LIVENESS)
-          .map(huddleSessionId)
-          .filter((sessionId): sessionId is string => Boolean(sessionId)),
-      );
+      const nextActiveSessionIds = await fetchActiveSessionIds(sessionIds);
       if (disposed) return;
       const nextTracker = new HuddlePresenceTracker(
         dependencies.relaySelfPubkey,
@@ -217,6 +269,8 @@ export function startHuddlePresenceRuntime(
       retryDelayMs = INITIAL_RETRY_DELAY_MS;
       clearScheduledRetry();
       dependencies.onPresence(tracker.snapshot(activeSessionIds));
+      clearScheduledLivenessRefresh();
+      scheduleLivenessRefresh();
     } catch (error) {
       if (disposed) return;
       hydrated = false;
@@ -290,6 +344,7 @@ export function startHuddlePresenceRuntime(
   return () => {
     disposed = true;
     clearScheduledRetry();
+    clearScheduledLivenessRefresh();
     unsubscribeReconnect();
     if (liveDispose) void liveDispose();
     liveDispose = null;

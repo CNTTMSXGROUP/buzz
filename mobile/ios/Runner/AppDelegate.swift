@@ -278,7 +278,13 @@ import os.log
           let ageUpper = range.upperBound.map { $0 as Any } ?? NSNull()
           result(["status": "signal", "ageUpper": ageUpper])
         @unknown default:
-          result(Self.noAgeSignalResponse)
+          result(
+            FlutterError(
+              code: "age_signal_unavailable",
+              message: "The age signal response is unsupported.",
+              details: nil
+            )
+          )
         }
       } catch {
         result(

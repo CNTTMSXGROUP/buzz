@@ -64,10 +64,23 @@ void main() {
           authProvider.overrideWith(() => _AuthenticatedAuthNotifier()),
           relaySessionProvider.overrideWith(() => relaySession),
           suspendCommunitySnapshotForAgeCheckProvider.overrideWithValue(
-            () async => snapshotSuspensions += 1,
+            () async {
+              snapshotSuspensions += 1;
+              if (snapshotSuspensions == 1) {
+                throw StateError('injected suspension failure');
+              }
+            },
           ),
           resumeCommunitySnapshotAfterAgeCheckProvider.overrideWithValue(
-            () async => snapshotRestorations += 1,
+            () async {
+              snapshotRestorations += 1;
+              if (snapshotRestorations == 1) {
+                throw StateError('injected restoration failure');
+              }
+            },
+          ),
+          ageSignalPushSnapshotRetryWaitProvider.overrideWithValue(
+            (_) async {},
           ),
           savedPrefsProvider.overrideWithValue(prefs),
         ],
@@ -80,7 +93,9 @@ void main() {
     expect(find.byType(HomePage), findsNothing);
     expect(find.byType(Navigator), findsNothing);
     expect(relaySession.builds, 0);
-    expect(snapshotSuspensions, 1);
+    await tester.pump();
+    await tester.pump();
+    expect(snapshotSuspensions, 2);
     expect(snapshotRestorations, 0);
 
     response.complete({'status': 'noSignal', 'ageUpper': null});
@@ -92,7 +107,9 @@ void main() {
     expect(find.byType(Navigator), findsOneWidget);
     expect(relaySession.builds, 1);
     expect(requests, 1);
-    expect(snapshotRestorations, 1);
+    await tester.pump();
+    await tester.pump();
+    expect(snapshotRestorations, 2);
   });
 
   testWidgets('offers a retry after the native age check fails', (

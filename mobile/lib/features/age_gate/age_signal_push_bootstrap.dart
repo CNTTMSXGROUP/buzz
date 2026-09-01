@@ -9,6 +9,19 @@ import '../../shared/push/push_bootstrap.dart';
 import '../../shared/push/push_bridge.dart';
 import 'age_signal_provider.dart';
 
+/// Delay between failed age-gate snapshot transitions.
+const ageSignalPushSnapshotRetryDelay = Duration(seconds: 5);
+
+/// Waits before retrying a failed age-gate snapshot transition.
+typedef AgeSignalPushSnapshotRetryWait =
+    Future<void> Function(Duration duration);
+
+/// Retry wait used by the launch age gate's notification snapshot boundary.
+final ageSignalPushSnapshotRetryWaitProvider =
+    Provider<AgeSignalPushSnapshotRetryWait>((ref) {
+      return Future<void>.delayed;
+    });
+
 /// Starts the push lifecycle only after the launch age check allows access.
 class AgeSignalPushBootstrap extends HookConsumerWidget {
   /// Creates the production push boundary around [child].
@@ -25,13 +38,32 @@ class AgeSignalPushBootstrap extends HookConsumerWidget {
     final resumeSnapshot = ref.watch(
       resumeCommunitySnapshotAfterAgeCheckProvider,
     );
+    final waitBeforeRetry = ref.watch(ageSignalPushSnapshotRetryWaitProvider);
+    final retryGeneration = useState(0);
 
-    useEffect(() {
-      unawaited(
-        state == AgeSignalState.allowed ? resumeSnapshot() : suspendSnapshot(),
-      );
-      return null;
-    }, [state, suspendSnapshot, resumeSnapshot]);
+    useEffect(
+      () {
+        var cancelled = false;
+        unawaited(() async {
+          try {
+            await (state == AgeSignalState.allowed
+                ? resumeSnapshot()
+                : suspendSnapshot());
+          } catch (_) {
+            await waitBeforeRetry(ageSignalPushSnapshotRetryDelay);
+            if (!cancelled) retryGeneration.value += 1;
+          }
+        }());
+        return () => cancelled = true;
+      },
+      [
+        state,
+        suspendSnapshot,
+        resumeSnapshot,
+        waitBeforeRetry,
+        retryGeneration.value,
+      ],
+    );
 
     return switch (state) {
       AgeSignalState.allowed => BuzzPushBootstrap(child: child),

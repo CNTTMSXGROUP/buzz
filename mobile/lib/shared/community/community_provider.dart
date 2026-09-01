@@ -106,6 +106,7 @@ final suspendCommunitySnapshotForAgeCheckProvider =
           pushCommunitySnapshotError.value = null;
         } catch (error, stackTrace) {
           reportPushCommunitySnapshotError(error, stackTrace);
+          Error.throwWithStackTrace(error, stackTrace);
         }
       };
     });
@@ -125,6 +126,7 @@ final resumeCommunitySnapshotAfterAgeCheckProvider =
           pushCommunitySnapshotError.value = null;
         } catch (error, stackTrace) {
           reportPushCommunitySnapshotError(error, stackTrace);
+          Error.throwWithStackTrace(error, stackTrace);
         }
       };
     });

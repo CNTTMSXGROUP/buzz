@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:buzz/features/age_gate/age_signal_provider.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -11,7 +13,7 @@ void main() {
         .setMockMethodCallHandler(ageSignalChannel, null);
   });
 
-  Future<bool> requestWithResponse(Object? response) async {
+  Future<AgeSignalState> requestWithResponse(Object? response) async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(ageSignalChannel, (call) async {
           expect(call.method, 'requestAgeSignal');
@@ -28,35 +30,35 @@ void main() {
   test('blocks when the signal upper bound is 17', () async {
     expect(
       await requestWithResponse({'status': 'signal', 'ageUpper': 17}),
-      isTrue,
+      AgeSignalState.restricted,
     );
   });
 
   test('allows when the signal upper bound is 18', () async {
     expect(
       await requestWithResponse({'status': 'signal', 'ageUpper': 18}),
-      isFalse,
+      AgeSignalState.allowed,
     );
   });
 
   test('allows when a signal has an open-ended upper bound', () async {
     expect(
       await requestWithResponse({'status': 'signal', 'ageUpper': null}),
-      isFalse,
+      AgeSignalState.allowed,
     );
   });
 
   test('allows when no signal is available', () async {
     expect(
       await requestWithResponse({'status': 'noSignal', 'ageUpper': null}),
-      isFalse,
+      AgeSignalState.allowed,
     );
   });
 
   test('allows when the platform request throws', () async {
     var requests = 0;
     var delays = 0;
-    final provider = NotifierProvider<AgeSignalNotifier, bool>(
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
       () => AgeSignalNotifier(
         requestSignal: () async {
           requests += 1;
@@ -74,14 +76,14 @@ void main() {
     await container.read(provider.notifier).request();
     await container.read(provider.notifier).request();
 
-    expect(container.read(provider), isFalse);
+    expect(container.read(provider), AgeSignalState.allowed);
     expect(requests, 2);
     expect(delays, 1);
   });
 
   test('retries a transient platform failure and applies the signal', () async {
     var requests = 0;
-    final provider = NotifierProvider<AgeSignalNotifier, bool>(
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
       () => AgeSignalNotifier(
         requestSignal: () async {
           requests += 1;
@@ -100,7 +102,7 @@ void main() {
 
     await container.read(provider.notifier).request();
 
-    expect(container.read(provider), isTrue);
+    expect(container.read(provider), AgeSignalState.restricted);
     expect(requests, 2);
   });
 
@@ -121,7 +123,7 @@ void main() {
       requestWithResponse({'status': 'noSignal', 'ageUpper': 17}),
       throwsA(isA<StateError>()),
     );
-    expect(await requestWithResponse(null), isFalse);
+    expect(await requestWithResponse(null), AgeSignalState.allowed);
   });
 
   test('requests the signal at most once', () async {
@@ -139,5 +141,21 @@ void main() {
     await notifier.request();
 
     expect(requests, 1);
+  });
+
+  test('remains checking until the platform request completes', () async {
+    final response = Completer<Map<Object?, Object?>?>();
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(requestSignal: () => response.future),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    final request = container.read(provider.notifier).request();
+
+    expect(container.read(provider), AgeSignalState.checking);
+    response.complete({'status': 'noSignal', 'ageUpper': null});
+    await request;
+    expect(container.read(provider), AgeSignalState.allowed);
   });
 }

@@ -301,7 +301,7 @@ class App extends HookConsumerWidget {
     );
     final schemeName = communityTheme.theme;
     final authState = ref.watch(authProvider);
-    final ageRestricted = ref.watch(ageSignalProvider);
+    final ageSignalState = ref.watch(ageSignalProvider);
 
     useEffect(() {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -332,7 +332,8 @@ class App extends HookConsumerWidget {
     // Eagerly initialize websocket session and lifecycle observer when
     // authenticated. These providers connect and manage the websocket.
     var hasUnreadInbox = false;
-    if (authState.value?.status == AuthStatus.authenticated) {
+    if (ageSignalState == AgeSignalState.allowed &&
+        authState.value?.status == AuthStatus.authenticated) {
       ref.watch(relaySessionProvider);
       ref.watch(observerRelayProvider);
       ref.watch(appLifecycleProvider);
@@ -381,12 +382,14 @@ class App extends HookConsumerWidget {
       themeMode: effectiveMode,
       // Above the navigator, so an age restriction cannot be bypassed by a
       // route that was pushed while the store signal request was in flight.
-      builder: (context, child) => ageRestricted
-          ? const AgeRestrictionPage()
-          : MobileHuddleShell(
-              navigatorKey: _mobileRootNavigatorKey,
-              child: EmojiBurstOverlay(child: child ?? const SizedBox.shrink()),
-            ),
+      builder: (context, child) => switch (ageSignalState) {
+        AgeSignalState.checking => const _AgeSignalLoadingPage(),
+        AgeSignalState.restricted => const AgeRestrictionPage(),
+        AgeSignalState.allowed => MobileHuddleShell(
+          navigatorKey: _mobileRootNavigatorKey,
+          child: EmojiBurstOverlay(child: child ?? const SizedBox.shrink()),
+        ),
+      },
       home: authState.when(
         loading: () => const _SplashScreen(),
         error: (_, _) => const PairingPage(),
@@ -435,6 +438,22 @@ class _SplashScreen extends StatelessWidget {
     return const Scaffold(
       body: Center(
         child: BuzzLoadingIndicator(size: 56, semanticLabel: 'Starting Buzz'),
+      ),
+    );
+  }
+}
+
+class _AgeSignalLoadingPage extends StatelessWidget {
+  const _AgeSignalLoadingPage();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      body: Center(
+        child: BuzzLoadingIndicator(
+          size: 56,
+          semanticLabel: 'Checking age eligibility',
+        ),
       ),
     );
   }

@@ -48,7 +48,10 @@ bool shouldBlockForAgeSignal(Map<Object?, Object?> response) {
   return ageUpper < 18;
 }
 
-class AgeSignalNotifier extends Notifier<bool> {
+/// Result of the platform age-signal check for this app launch.
+enum AgeSignalState { checking, allowed, restricted }
+
+class AgeSignalNotifier extends Notifier<AgeSignalState> {
   /// Creates an age-signal notifier, optionally with test request hooks.
   AgeSignalNotifier({AgeSignalRequest? requestSignal, AgeSignalDelay? delay})
     : _requestSignal = requestSignal ?? _requestPlatformAgeSignal,
@@ -62,7 +65,7 @@ class AgeSignalNotifier extends Notifier<bool> {
   Future<void>? _requestInFlight;
 
   @override
-  bool build() => false;
+  AgeSignalState build() => AgeSignalState.checking;
 
   Future<void> request() async {
     if (_completed) return;
@@ -91,7 +94,7 @@ class AgeSignalNotifier extends Notifier<bool> {
         response = await _requestSignal();
       } on MissingPluginException {
         _completed = true;
-        state = false;
+        state = AgeSignalState.allowed;
         return;
       } on PlatformException {
         if (attempt + 1 < _maxAttempts) {
@@ -99,19 +102,19 @@ class AgeSignalNotifier extends Notifier<bool> {
           continue;
         }
         _completed = true;
-        state = false;
+        state = AgeSignalState.allowed;
         return;
       }
 
       _completed = true;
-      if (response != null) {
-        state = shouldBlockForAgeSignal(response);
-      }
+      state = response != null && shouldBlockForAgeSignal(response)
+          ? AgeSignalState.restricted
+          : AgeSignalState.allowed;
       return;
     }
   }
 }
 
-final ageSignalProvider = NotifierProvider<AgeSignalNotifier, bool>(
+final ageSignalProvider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
   AgeSignalNotifier.new,
 );

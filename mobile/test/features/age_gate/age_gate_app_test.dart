@@ -39,7 +39,7 @@ void main() {
     expect(find.byType(HomePage), findsNothing);
   });
 
-  testWidgets('requests after the first frame and gates pushed routes', (
+  testWidgets('keeps app content unmounted until the signal resolves', (
     tester,
   ) async {
     final response = Completer<Object?>();
@@ -55,7 +55,7 @@ void main() {
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
-          authProvider.overrideWith(() => _FakeAuthNotifier()),
+          authProvider.overrideWith(() => _AuthenticatedAuthNotifier()),
           savedPrefsProvider.overrideWithValue(prefs),
         ],
         child: const App(),
@@ -63,23 +63,17 @@ void main() {
     );
 
     expect(requests, 1);
-    final navigator = tester.state<NavigatorState>(find.byType(Navigator));
-    unawaited(
-      navigator.push<void>(
-        MaterialPageRoute<void>(
-          builder: (_) => const Scaffold(body: Text('Pushed route')),
-        ),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('Pushed route'), findsOneWidget);
+    expect(find.bySemanticsLabel('Checking age eligibility'), findsOneWidget);
+    expect(find.byType(HomePage), findsNothing);
+    expect(find.byType(Navigator), findsNothing);
 
-    response.complete({'status': 'signal', 'ageUpper': 17});
+    response.complete({'status': 'noSignal', 'ageUpper': null});
     await tester.pump();
     await tester.pump();
 
-    expect(find.byType(AgeRestrictionPage), findsOneWidget);
-    expect(find.text('Pushed route'), findsNothing);
+    expect(find.bySemanticsLabel('Checking age eligibility'), findsNothing);
+    expect(find.byType(HomePage), findsOneWidget);
+    expect(find.byType(Navigator), findsOneWidget);
     expect(requests, 1);
   });
 }
@@ -93,12 +87,5 @@ class _AuthenticatedAuthNotifier extends AuthNotifier {
 
 class _BlockingAgeSignalNotifier extends AgeSignalNotifier {
   @override
-  bool build() => true;
-}
-
-class _FakeAuthNotifier extends AuthNotifier {
-  @override
-  Future<AuthState> build() async {
-    return const AuthState(status: AuthStatus.unauthenticated);
-  }
+  AgeSignalState build() => AgeSignalState.restricted;
 }

@@ -198,6 +198,25 @@ export class WholeBlobSyncManager<S> {
   // touching shared manager state, so a stale generation can never sign or
   // publish after a newer edit exists.
   private publishInFlight = false;
+  // Whether bootstrap() has been called (started) and whether it has completed.
+  // publish() defers the debounce timer only when bootstrap was started but has
+  // not yet resolved. When bootstrap() is never called (e.g. standalone tests
+  // or managers used without the standard hook lifecycle), both flags stay false
+  // and publish() behaves as before — schedules the timer immediately.
+  //
+  // The P2a queue-until-bootstrap contract: no publish debounce fires between
+  // bootstrap starting and bootstrap resolving, so a click during an unresolved
+  // bootstrap is never silently adopted away against an empty `{0,""}` baseline.
+  private bootstrapStarted = false;
+  private bootstrapResolved = false;
+  // True when bootstrap completed with a failed fetch — no remote head was ever
+  // established. Used by the P2a failed-bootstrap exception in
+  // fetchOwnBlobBeforePublish so an edit whose baseline is {0,""} because
+  // bootstrap failed still publishes ABOVE the first head it discovers rather
+  // than adopting it away. (For a successful bootstrap, releaseDeferred re-freezes
+  // publishBaseline to lastRemoteHead, so the baseline is not {0,""} at doPublish
+  // and this flag is never consulted.)
+  private bootstrapFailed = false;
   // Event ids we signed and sent to the relay but whose ACK never arrived (the
   // publish promise rejected as a timeout/socket error after the frame left).
   // The relay MAY have accepted such a write, so if a later cycle's pre-publish
@@ -318,10 +337,12 @@ export class WholeBlobSyncManager<S> {
    * would be published over instead of adopted (Carl P1). Waking the existing
    * generation keeps the frozen baseline, so the debounced cycle's pre-publish
    * check still adopts a genuinely-advanced remote. No-op when nothing is
-   * pending.
+   * pending or when bootstrap has not yet resolved (the deferred-release path
+   * handles that case once bootstrap completes).
    */
   retryPendingPublish(): void {
     if (this.pendingStore === null) return;
+    if (this.bootstrapStarted && !this.bootstrapResolved) return;
     this.cancelPendingPublish();
     this.startCycle();
   }
@@ -329,6 +350,42 @@ export class WholeBlobSyncManager<S> {
   /** True while an unpublished local edit is queued (debouncing or retrying). */
   hasPendingEdit(): boolean {
     return this.pendingStore !== null;
+  }
+
+  /**
+   * Release any edit that was deferred until bootstrap resolved. Called by
+   * bootstrap() after it sets bootstrapResolved=true. If a pending edit exists
+   * with no timer or in-flight cycle, re-freeze publishBaseline from the
+   * now-established lastRemoteHead and schedule the normal 2s debounce.
+   *
+   * Re-freezing the baseline here (rather than leaving it at the {0,""} it had
+   * when publish() was called during unresolved bootstrap) is the P2a fix for
+   * the success path: the edit's comparison point becomes the head that
+   * bootstrap just established, so the pre-publish fetch for the same head
+   * returns "not advanced" and the edit publishes above it correctly. A peer
+   * head that arrives BETWEEN bootstrap resolution and doPublish is correctly
+   * seen as a genuine advance (its timestamp exceeds the just-frozen baseline)
+   * and is adopted per normal LWW. For a failed bootstrap, lastRemoteHead stays
+   * {0,""} and the bootstrapFailed flag enables the doPublish-time exception.
+   */
+  private releaseDeferred(): void {
+    if (
+      !this.destroyed &&
+      this.pendingStore !== null &&
+      this.debounceTimer === null &&
+      this.retryTimer === null &&
+      !this.publishInFlight
+    ) {
+      // Re-freeze the baseline to the head now known from bootstrap. For a
+      // successful bootstrap this is the fetched head; for a failed bootstrap
+      // lastRemoteHead is still {0,""} (the bootstrapFailed exception handles
+      // that case separately in fetchOwnBlobBeforePublish).
+      this.publishBaseline = { ...this.lastRemoteHead };
+      this.debounceTimer = window.setTimeout(() => {
+        this.debounceTimer = null;
+        this.startCycle();
+      }, DEBOUNCE_MS);
+    }
   }
 
   /**
@@ -441,6 +498,7 @@ export class WholeBlobSyncManager<S> {
     const durable = this.config.writeOutbox(this.pubkey, store, this.relayUrl);
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
     }
     // A fresh edit supersedes any retry scheduled for the previous generation.
     if (this.retryTimer !== null) {
@@ -448,10 +506,19 @@ export class WholeBlobSyncManager<S> {
       this.retryTimer = null;
     }
     this.retryDelayMs = RETRY_BASE_MS;
-    this.debounceTimer = window.setTimeout(() => {
-      this.debounceTimer = null;
-      this.startCycle();
-    }, DEBOUNCE_MS);
+    // Do not start the debounce timer until bootstrap resolves. The intent is
+    // durably held (outbox write + pendingStore set above) — it will be released
+    // by releaseDeferred() once bootstrap completes. This prevents doPublish
+    // from running against the empty `{0,""}` baseline and adopting the edit
+    // away on a fresh device whose bootstrap fetch hasn't returned yet.
+    // When bootstrap() has not been called at all, bootstrapStarted is false
+    // and the timer is scheduled immediately (preserving prior behavior).
+    if (!this.bootstrapStarted || this.bootstrapResolved) {
+      this.debounceTimer = window.setTimeout(() => {
+        this.debounceTimer = null;
+        this.startCycle();
+      }, DEBOUNCE_MS);
+    }
     return durable;
   }
 
@@ -534,6 +601,27 @@ export class WholeBlobSyncManager<S> {
         // place. Fold the winner in so this edit publishes above the true
         // retained head rather than adopting it away (Carl P1).
         if (this.foldSupersedingAttemptWinner(remote)) {
+          return { kind: "publish", store, fetchedRemote: remote };
+        }
+        // Failed-bootstrap exception (P2a): the edit was queued while bootstrap
+        // was in-flight and bootstrap subsequently FAILED — no head was ever
+        // fetched, so publishBaseline and lastRemoteHead were never advanced.
+        // releaseDeferred() re-freezes publishBaseline from lastRemoteHead, but
+        // when bootstrap failed that is still {0,""}. Any head the relay returns
+        // here is the TRUE first established baseline; publish above it rather
+        // than adopting it away. (When bootstrap SUCCEEDS, releaseDeferred sets
+        // publishBaseline to the fetched head before scheduling the timer, so
+        // this branch is not reached for successful bootstraps whose head was
+        // already known when the debounce fired.)
+        if (
+          this.bootstrapFailed &&
+          this.publishBaseline.createdAt === 0 &&
+          this.publishBaseline.eventId === ""
+        ) {
+          this.publishBaseline = canonicalMax(this.publishBaseline, {
+            createdAt: remote.createdAt,
+            eventId: remote.eventId,
+          });
           return { kind: "publish", store, fetchedRemote: remote };
         }
         return { kind: "adopt", remote };
@@ -794,16 +882,37 @@ export class WholeBlobSyncManager<S> {
   /**
    * Fetches the remote blob on first mount, records the remote head, and
    * delegates the seed/hold/apply-remote decision to `runBootstrap`.
+   *
+   * Sets `bootstrapResolved` before returning so the hook's `.then()` callback
+   * (which may call publish() for outbox replay) sees the flag as true and
+   * schedules the debounce timer immediately. Then releases any edit that was
+   * queued BEFORE the hook's callback runs (callers who called publish() from
+   * another code path during the async fetch).
    */
   async bootstrap(localStore: S) {
+    // Set bootstrapStarted synchronously (before the first await) so any
+    // publish() call that races the async fetch defers its debounce timer.
+    this.bootstrapStarted = true;
     const fetchResult = await this.fetchRemoteBlob();
-    return runBootstrap({
+    // Track whether the bootstrap fetch failed so the P2a failed-bootstrap
+    // exception in fetchOwnBlobBeforePublish can fire when appropriate.
+    if (fetchResult.status === "failed") {
+      this.bootstrapFailed = true;
+    }
+    const result = runBootstrap({
       fetchResult,
       lastHead: this.lastRemoteCreatedAt,
       localStore,
       isLocalNonEmpty: this.config.isLocalNonEmpty,
       publishFn: (s) => this.publish(s),
     });
+    // Mark bootstrap resolved BEFORE returning. The hook's .then() runs
+    // synchronously on the resolved promise, so any publish() it calls will
+    // already see bootstrapResolved=true and schedule the debounce normally.
+    // releaseDeferred() covers edits queued via other paths during the fetch.
+    this.bootstrapResolved = true;
+    this.releaseDeferred();
+    return result;
   }
 
   destroy(): void {

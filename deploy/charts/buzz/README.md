@@ -115,6 +115,20 @@ disables that probe through `relay.extraEnv`, `/_readiness` does not test object
 storage; configuration is still parsed strictly, but reachability and addressing
 errors surface on the first storage operation.
 
+### Early-startup telemetry contract
+
+`buzz_process_lifecycle` JSON records are the authoritative history for the
+fixed phases `crypto_init`, `tracing_init`, `config_load`, `key_load`, and
+`metrics_bind`. They use bounded status/reason values and never contain raw
+configuration, keys, URLs, or errors.
+
+Two gauges describe only currently running processes that lived long enough
+to install Prometheus: `buzz_startup_phase_terminal{phase="process_telemetry",
+result}` and `buzz_startup_phase_duration_seconds{phase="process_telemetry"}`.
+They are refreshed before gauge-idle eviction and add exactly two raw series
+per pod. They are not historical boot counters; Kubernetes state and external
+scrape freshness remain authoritative for missing processes or exporters.
+
 ### Readiness telemetry contract
 
 Only requests served by the private health listener (`BUZZ_HEALTH_PORT`) emit

@@ -293,10 +293,14 @@ event to confirm receipt. This is an `acp_read`-style telemetry frame (kind =
 `status: "sent"` means the decision was delivered to the in-flight read loop.
 `status: "already_decided"` means the nonce was already applied by a prior delivery
 (a retransmit reached the harness after the first copy was accepted); treat it as
-success. The four remaining statuses (`no_active_turn`, `channel_full`,
-`channel_closed`, `no_channel`) indicate delivery failure — the harness received
-the frame but could not route the decision; the desktop should re-enable the card
-so the owner can retry.
+success. `status: "channel_full"` is a transient queue-saturation signal — the
+owning read loop's queue was momentarily full. The desktop SHOULD keep retransmitting
+(the scheduler remains active); the card stays disabled during the automatic retry.
+The owning loop's first-wins dedup tolerates duplicate deliveries once the queue drains.
+The three remaining failure statuses (`no_active_turn`, `channel_closed`, `no_channel`)
+indicate authoritative routing refusals — the harness received the frame but could not
+route the decision and retransmitting the same nonce cannot change that; the desktop
+should re-enable the card so the owner can retry.
 
 ## Ephemerality Contract
 

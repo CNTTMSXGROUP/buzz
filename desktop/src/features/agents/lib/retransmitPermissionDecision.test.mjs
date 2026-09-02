@@ -205,18 +205,71 @@ test("retransmitPermissionDecision expires cleanly when every send rejects", asy
   assert.deepEqual(unhandled, [], "rejected sends must not surface unhandled");
 });
 
-test("retransmitPermissionDecision resolves failed on a negative control_result status", async () => {
-  // Carl's regression: a failure status (no_active_turn / channel_full /
-  // channel_closed / no_channel) means the harness answered authoritatively but
-  // could not route the decision. The loop must stop retransmitting (re-sending
-  // the same nonce cannot change the routing refusal) and resolve "failed" so
-  // the card can re-enable for owner retry.
-  for (const status of [
-    "no_active_turn",
-    "channel_full",
-    "channel_closed",
-    "no_channel",
-  ]) {
+test("retransmitPermissionDecision: channel_full keeps the loop active and resends until acked", async () => {
+  // `channel_full` is a transient queue-saturation signal. The loop must NOT
+  // settle on it — it stays subscribed and the scheduler keeps firing. A later
+  // `sent` frame (once the queue drains) must settle `acked`.
+  const h = harness();
+  await drainMicrotasks();
+  assert.equal(h.sendCalls, 1, "first send fired");
+
+  // Harness replies with channel_full — loop must stay active.
+  h.push(frame({ status: "channel_full" }));
+  await drainMicrotasks();
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+  await drainMicrotasks();
+  assert.equal(settled, false, "channel_full must not settle the loop");
+  assert.equal(
+    h.cancelRetransmitCalls,
+    0,
+    "scheduler must still be running after channel_full",
+  );
+  assert.equal(
+    h.unsubscribeCalls,
+    0,
+    "listener must still be subscribed after channel_full",
+  );
+
+  // Scheduler fires on the next tick — loop resends.
+  h.tick();
+  await drainMicrotasks();
+  assert.equal(h.sendCalls, 2, "loop resends on next tick after channel_full");
+
+  // A later `sent` frame settles the loop.
+  h.push(frame({ status: "sent" }));
+  assert.equal(await h.outcome, "acked");
+  assert.equal(h.unsubscribeCalls, 1, "listener torn down on acked");
+  assert.equal(h.cancelRetransmitCalls, 1, "scheduler torn down on acked");
+});
+
+test("retransmitPermissionDecision: channel_full then deadline expires without acking resolves expired", async () => {
+  // If the deadline fires while waiting for the queue to drain, the loop
+  // resolves "expired" (fail-closed) — not "failed" and not stuck open.
+  const h = harness();
+  await drainMicrotasks();
+
+  h.push(frame({ status: "channel_full" }));
+  await drainMicrotasks();
+
+  h.expire();
+  h.tick();
+  assert.equal(await h.outcome, "expired");
+  assert.equal(
+    h.sendCalls,
+    1,
+    "no resend after deadline while waiting on channel_full",
+  );
+});
+
+test("retransmitPermissionDecision resolves failed on authoritative negative control_result statuses", async () => {
+  // The three authoritative failure statuses (no_active_turn / channel_closed /
+  // no_channel) mean the harness answered with a routing refusal. The loop must
+  // stop retransmitting (re-sending cannot change the refusal) and resolve
+  // "failed" so the card can re-enable for owner retry.
+  for (const status of ["no_active_turn", "channel_closed", "no_channel"]) {
     const h = harness();
     await drainMicrotasks();
     assert.equal(h.sendCalls, 1, `first send fired (${status})`);
@@ -225,7 +278,7 @@ test("retransmitPermissionDecision resolves failed on a negative control_result 
     assert.equal(
       await h.outcome,
       "failed",
-      `negative status "${status}" must resolve "failed"`,
+      `authoritative status "${status}" must resolve "failed"`,
     );
     assert.equal(h.unsubscribeCalls, 1, `listener torn down on "${status}"`);
     assert.equal(

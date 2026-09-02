@@ -185,11 +185,13 @@ function PermissionButtons({
                 })
                   .then((outcome) => {
                     // `"failed"` means the harness received the frame but could
-                    // not route it (no_active_turn / channel_full / etc.) —
-                    // re-enable so the owner can retry. `"acked"` and `"expired"`
-                    // are terminal: the harness applied the decision or the card
-                    // timed out; the card transitions away via the kind-40003 edit
-                    // or expiry countdown and no retry is needed.
+                    // not route it (no_active_turn / channel_closed / no_channel)
+                    // — re-enable so the owner can retry. `"acked"` and
+                    // `"expired"` are terminal: the harness applied the decision
+                    // or the card timed out; the card transitions away via the
+                    // kind-40003 edit or expiry countdown and no retry is needed.
+                    // `"channel_full"` is transient: the retransmit loop stays
+                    // active and keeps resending — no re-enable needed here.
                     if (outcome === "failed") setSubmitted(null);
                   })
                   .catch(() => {

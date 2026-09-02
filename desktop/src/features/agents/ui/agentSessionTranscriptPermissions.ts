@@ -343,21 +343,20 @@ export function retireLivePermissionCardsForTurn(
       }
     }
   }
-  // `pendingPermissions` keys use the format `ch:session:turn:id`; retire only
-  // entries belonging to this channel-turn combination.
-  const turnPrefix = `${channelId}:`;
+  // `pendingPermissions` keys use the compound format `ch:session:turn:id`
+  // where `session` and `turn` are unrestricted strings that may themselves
+  // contain `:`. Positional splitting is unsafe. Instead, look up the item
+  // for each entry and match by its `turnId` — the item already carries the
+  // authoritative identity, so no key parsing is needed.
   let permsMutated = false;
-  for (const key of d.pendingPermissions.keys()) {
-    if (key.startsWith(turnPrefix)) {
-      // Parse `ch:session:turn:id` — the turn segment is index 2.
-      const parts = key.split(":");
-      if (parts[2] === turnId) {
-        if (!permsMutated) {
-          d.pendingPermissions = new Map(d.pendingPermissions);
-          permsMutated = true;
-        }
-        d.pendingPermissions.delete(key);
+  for (const [key, { itemId }] of d.pendingPermissions) {
+    const item = d.itemsById.get(itemId);
+    if (item && item.turnId === turnId) {
+      if (!permsMutated) {
+        d.pendingPermissions = new Map(d.pendingPermissions);
+        permsMutated = true;
       }
+      d.pendingPermissions.delete(key);
     }
   }
 }

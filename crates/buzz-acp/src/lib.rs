@@ -2059,9 +2059,9 @@ fn handle_permission_decision_control(
 
     // Summarise into a single status for the observer frame.
     // all_tx_accepted → "sent" (Desktop retransmit stops, decision confirmed).
-    // any_sent + any_full → "channel_full" (retryable: Desktop re-enables buttons,
-    //   owner can retry once the queue drains; the owning loop's dedup tolerates
-    //   duplicate deliveries from later retransmits).
+    // any_sent + any_full → "channel_full" (transient queue saturation: Desktop
+    //   keeps the retransmit loop active and resends on the next tick; the owning
+    //   loop's first-wins dedup tolerates duplicate deliveries once the queue drains).
     // No Sent → fall through to the existing priority ladder.
     let status = if all_tx_accepted {
         tracing::info!(
@@ -2076,7 +2076,7 @@ fn handle_permission_decision_control(
         // Mixed: at least one sibling accepted but the owner queue was full.
         // Reporting "sent" here would stop Desktop's retransmit loop while the
         // nonce-owning read loop never received the decision. Return "channel_full"
-        // so Desktop keeps retrying until the queue drains.
+        // so Desktop keeps the retransmit loop active until the queue drains.
         tracing::warn!(
             channel = %channel_id,
             nonce = %request_nonce,

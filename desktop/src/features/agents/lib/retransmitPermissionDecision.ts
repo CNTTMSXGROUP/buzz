@@ -14,15 +14,28 @@ import type { ControlResultFrame } from "@/shared/api/types";
  *
  * This orchestrator resends the decision on a fixed cadence until it observes a
  * `control_result` for THIS nonce, then stops. The outcome depends on the frame's
- * status: `sent` and `already_decided` mean the harness routed or previously
- * forwarded/delivery-suppressed the decision — the loop resolves `"acked"`. The four failure statuses
- * (`no_active_turn`, `channel_full`, `channel_closed`, `no_channel`) mean the
- * harness received the frame but could not route it — the loop resolves
- * `"failed"`, stopping retransmission (re-sending the same nonce cannot change an
- * authoritative routing refusal), and the card returns to the actionable state for
- * owner retry. If no reply arrives before the card's own `expiresAt` deadline the
- * loop resolves `"expired"`: the card times out on its own and a decision applied
- * past expiry would be rejected anyway, so retransmitting past it is pointless.
+ * status:
+ *
+ * - `sent` / `already_decided` → the harness routed or previously
+ *   delivery-suppressed the decision. Resolves `"acked"` (loop stops, card stays
+ *   disabled while the terminal edit arrives).
+ *
+ * - `channel_full` → a transient queue-saturation condition (the owning read
+ *   loop's 8-slot queue was full at the moment of delivery). The loop stays
+ *   active and resends on the next scheduler tick; the owning loop's first-wins
+ *   dedup tolerates duplicates once the queue drains. The card stays disabled
+ *   during the automatic retry. Worst case: the deadline bound in
+ *   `deadlineReached()` ends the loop with `"expired"` and the card fails closed
+ *   exactly as it would without this retry.
+ *
+ * - `no_active_turn` / `channel_closed` / `no_channel` → authoritative routing
+ *   refusals (no in-flight turn, channel gone). The loop resolves `"failed"`,
+ *   stopping retransmission (re-sending the same nonce cannot change the refusal),
+ *   and the card returns to the actionable state for owner retry.
+ *
+ * If no reply arrives before the card's own `expiresAt` deadline the loop
+ * resolves `"expired"`: the card times out on its own and a decision applied past
+ * expiry would be rejected anyway, so retransmitting past it is pointless.
  *
  * A nonce guard scopes the settling frame to this exact decision: a replayed or
  * concurrent `control_result` for a different card carries a different nonce and
@@ -84,23 +97,32 @@ export function retransmitPermissionDecision({
     };
     unsubscribe = subscribe((frame) => {
       // A `control_result` for THIS nonce means the harness received the
-      // decision and has an authoritative answer — stop retransmitting. Frames
-      // for other cards (or non-permission frames) carry a different nonce (or
-      // none) and are inert.
+      // decision. Frames for other cards (or non-permission frames) carry a
+      // different nonce (or none) and are inert.
       if (
         frame.type !== "permission_decision" ||
         frame.requestNonce !== requestNonce
       ) {
         return;
       }
-      // `sent` and `already_decided` are both success: the harness routed or
-      // previously forwarded/delivery-suppressed the decision. The four failure
-      // statuses indicate the harness received the frame but could not route it —
-      // retransmitting the same nonce cannot change that, so stop and let the
-      // card retry.
-      const success =
-        frame.status === "sent" || frame.status === "already_decided";
-      finish(success ? "acked" : "failed");
+      // `sent` / `already_decided` → harness routed or delivery-suppressed the
+      // decision; settle `acked`.
+      if (frame.status === "sent" || frame.status === "already_decided") {
+        finish("acked");
+        return;
+      }
+      // `channel_full` is a transient queue-saturation signal: the owning read
+      // loop's queue was momentarily full. Do NOT settle — stay subscribed and
+      // let the scheduler keep resending. The card remains disabled until the
+      // loop either acks or the deadline expires. The owning loop's first-wins
+      // dedup tolerates the duplicate delivery once the queue drains.
+      if (frame.status === "channel_full") {
+        return;
+      }
+      // `no_active_turn` / `channel_closed` / `no_channel` are authoritative
+      // routing refusals — retransmitting the same nonce cannot change them.
+      // Settle `failed` so the card re-enables for owner retry.
+      finish("failed");
     });
     cancelRetransmit = scheduleRetransmit(transmit);
 

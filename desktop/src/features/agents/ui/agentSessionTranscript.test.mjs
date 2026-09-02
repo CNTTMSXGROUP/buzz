@@ -3073,3 +3073,81 @@ test("buildTranscript_turn_error_scoped_retirement_does_not_retire_sibling_threa
     "Thread A card must be retired after its own decision",
   );
 });
+
+test("buildTranscript_turn_scoped_retirement_cleans_legacy_key_with_colon_in_sessionId", () => {
+  // Regression guard for the P2 MINOR: the legacy `pendingPermissions` key
+  // format is `ch:sessionId:turnId:requestId` — if `sessionId` contains `:`,
+  // positional `split(":")` at index 2 returns part of `sessionId` instead of
+  // `turnId`, leaving the legacy key behind after turn-scoped retirement.
+  //
+  // The fix: match by the item's `turnId` field instead of parsing the key.
+  // This test confirms a card whose sessionId is "session:with:colon" is fully
+  // cleaned up (card retired + nonce cleared + legacy key deleted) by
+  // `retireLivePermissionCardsForTurn`, with no stale entry remaining.
+  const CH = "ch-colon";
+  // Craft the event directly — makePermissionRequestWithAuth hardcodes sessionId.
+  const requestEvent = {
+    seq: 1,
+    timestamp: "2026-07-01T10:00:00.000Z",
+    kind: "acp_read",
+    agentIndex: 0,
+    channelId: CH,
+    sessionId: "session:with:colon",
+    turnId: "turn-colon",
+    payload: {
+      jsonrpc: "2.0",
+      id: "req-col",
+      method: "session/request_permission",
+      params: {
+        title: "Colon test",
+        toolCallId: "tool-col",
+        options: [
+          { optionId: "allow_once", kind: "allow_once", name: "Allow" },
+          { optionId: "reject_once", kind: "reject_once", name: "Reject" },
+        ],
+      },
+    },
+    authorization: { requestNonce: "nonce-col", actionable: true },
+  };
+  // turn_completed for the same turn triggers retireLivePermissionCardsForTurn.
+  const completedEvent = makeTurnCompleted(2, {
+    channelId: CH,
+    sessionId: "session:with:colon",
+    turnId: "turn-colon",
+  });
+
+  const state = buildTranscriptState([requestEvent, completedEvent]);
+
+  // Card must be retired.
+  const card = state.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === "nonce-col",
+  );
+  assert.ok(card, "permission card must exist");
+  assert.equal(
+    card.actionable,
+    false,
+    "card must be retired by turn_completed even when sessionId contains ':'",
+  );
+
+  // Nonce index must be cleared.
+  assert.ok(
+    !state.pendingPermissionsByNonce.has("nonce-col"),
+    "nonce index must be cleared after turn-scoped retirement",
+  );
+
+  // Legacy pendingPermissions key must be cleaned up (not left behind by
+  // the old positional-split implementation).
+  const legacyKey = `${CH}:session:with:colon:turn-colon:"req-col"`;
+  assert.ok(
+    !state.pendingPermissions.has(legacyKey),
+    "legacy pendingPermissions key must be deleted after turn-scoped retirement",
+  );
+
+  // Verify no stale pendingPermissions entries remain for this channel at all.
+  for (const key of state.pendingPermissions.keys()) {
+    assert.ok(
+      !key.startsWith(`${CH}:`),
+      `stale pendingPermissions entry found after retirement: ${key}`,
+    );
+  }
+});

@@ -23,8 +23,50 @@ function normalizePubkeys(pubkeys: string[]) {
     .sort();
 }
 
+type UserStatusVersion = { updatedAt: number; eventId: string };
+type UserStatusCacheEntry = UserStatus | null;
+
+function statusVersionIsAtLeast(
+  current: Pick<UserStatus, "updatedAt" | "eventId"> | undefined,
+  candidate: UserStatusVersion,
+): boolean {
+  if (!current) return false;
+  if (current.updatedAt !== candidate.updatedAt) {
+    return current.updatedAt > candidate.updatedAt;
+  }
+  if (!current.eventId) return false;
+  return current.eventId <= candidate.eventId;
+}
+
+function newerUserStatus(
+  current: UserStatusCacheEntry | undefined,
+  candidate: UserStatus,
+): UserStatus {
+  return statusVersionIsAtLeast(current ?? undefined, {
+    updatedAt: candidate.updatedAt,
+    eventId: candidate.eventId ?? "",
+  })
+    ? (current ?? candidate)
+    : candidate;
+}
+
+function hiddenUserStatus(version: UserStatusVersion): UserStatus {
+  return {
+    text: "",
+    emoji: "",
+    updatedAt: version.updatedAt,
+    eventId: version.eventId,
+  };
+}
+
+export function visibleUserStatus(
+  status: UserStatusCacheEntry | undefined,
+): UserStatus | null {
+  return status && (status.text || status.emoji) ? status : null;
+}
+
 function statusIsExpired(
-  status: UserStatus | null | undefined,
+  status: UserStatusCacheEntry | undefined,
   nowSeconds: number,
 ): boolean {
   return status?.expiresAt !== undefined && status.expiresAt <= nowSeconds;
@@ -42,9 +84,12 @@ export function expireUserStatusQueries(
     if (!old) continue;
     let next: UserStatusLookup | null = null;
     for (const [pubkey, status] of Object.entries(old)) {
-      if (!statusIsExpired(status, nowSeconds)) continue;
+      if (!status || !statusIsExpired(status, nowSeconds)) continue;
       next ??= { ...old };
-      next[pubkey] = null;
+      next[pubkey] = hiddenUserStatus({
+        updatedAt: status.updatedAt,
+        eventId: status.eventId ?? "",
+      });
     }
     if (!next) continue;
     queryClient.setQueryData(queryKey, next);
@@ -84,6 +129,7 @@ export function parseUserStatusEvent(event: RelayEvent): {
   text: string;
   emoji: string;
   updatedAt: number;
+  eventId: string;
   expiresAt?: number;
 } {
   const emojiTag = event.tags.find(
@@ -98,8 +144,48 @@ export function parseUserStatusEvent(event: RelayEvent): {
     text: event.content,
     emoji: emojiTag?.[1] ?? "",
     updatedAt: event.created_at,
+    eventId: event.id,
     expiresAt: Number.isFinite(parsedExpiration) ? parsedExpiration : undefined,
   };
+}
+
+export function applyUserStatusEventToQueries(
+  queryClient: Pick<QueryClient, "setQueriesData">,
+  event: RelayEvent,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+): void {
+  const dTag = event.tags.find((tag) => tag[0] === "d");
+  if (dTag?.[1] !== "general") return;
+  const parsed = parseUserStatusEvent(event);
+  const isExpired =
+    parsed.expiresAt !== undefined && parsed.expiresAt <= nowSeconds;
+  const status: UserStatus =
+    (parsed.text || parsed.emoji) && !isExpired
+      ? {
+          text: parsed.text,
+          emoji: parsed.emoji,
+          updatedAt: parsed.updatedAt,
+          eventId: parsed.eventId,
+          expiresAt: parsed.expiresAt,
+        }
+      : hiddenUserStatus(parsed);
+
+  queryClient.setQueriesData<UserStatusLookup>(
+    { queryKey: ["user-status"] },
+    (old) => {
+      if (!old || !(parsed.pubkey in old)) return old;
+      const existing = old[parsed.pubkey];
+      if (
+        statusVersionIsAtLeast(existing ?? undefined, {
+          updatedAt: parsed.updatedAt,
+          eventId: parsed.eventId,
+        })
+      ) {
+        return old;
+      }
+      return { ...old, [parsed.pubkey]: status };
+    },
+  );
 }
 
 /** Keeps focused polling at the established 2-minute backstop cadence. */
@@ -170,9 +256,10 @@ export async function fetchUserStatusLookup(
             text: parsed.text,
             emoji: parsed.emoji,
             updatedAt: parsed.updatedAt,
+            eventId: parsed.eventId,
             expiresAt: parsed.expiresAt,
           }
-        : null;
+        : hiddenUserStatus(parsed);
   }
   return lookup;
 }
@@ -246,31 +333,7 @@ export function useUserStatusSubscription() {
 
     function handleStatusEvent(event: RelayEvent) {
       if (isCancelled) return;
-      const dTag = event.tags.find((t) => t[0] === "d");
-      if (dTag?.[1] !== "general") return;
-      const parsed = parseUserStatusEvent(event);
-      const isExpired =
-        parsed.expiresAt !== undefined &&
-        parsed.expiresAt <= Math.floor(Date.now() / 1_000);
-      const status: UserStatus | null =
-        (parsed.text || parsed.emoji) && !isExpired
-          ? {
-              text: parsed.text,
-              emoji: parsed.emoji,
-              updatedAt: parsed.updatedAt,
-              expiresAt: parsed.expiresAt,
-            }
-          : null;
-
-      queryClient.setQueriesData<UserStatusLookup>(
-        { queryKey: ["user-status"] },
-        (old) => {
-          if (!old || !(parsed.pubkey in old)) return old;
-          const existing = old[parsed.pubkey];
-          if (existing && existing.updatedAt >= parsed.updatedAt) return old;
-          return { ...old, [parsed.pubkey]: status };
-        },
-      );
+      applyUserStatusEventToQueries(queryClient, event);
     }
 
     function subscribeWithRetry(attempt = 0) {
@@ -318,32 +381,43 @@ export function useSetUserStatusMutation(pubkey?: string) {
 
   return useMutation({
     mutationFn: async ({ text, emoji, expiresAt }: UserStatusInput) => {
-      await relayClient.publishUserStatus({ text, emoji, expiresAt });
-      return { text, emoji, expiresAt };
+      const event = await relayClient.publishUserStatus({
+        text,
+        emoji,
+        expiresAt,
+      });
+      return { event };
     },
-    onSuccess: ({ text, emoji, expiresAt }) => {
+    onSuccess: ({ event }) => {
       if (normalizedPubkey.length === 0) return;
-
-      const status: UserStatus | null =
-        text || emoji
+      const parsed = parseUserStatusEvent(event);
+      const status: UserStatus =
+        parsed.text || parsed.emoji
           ? {
-              text,
-              emoji,
-              updatedAt: Math.floor(Date.now() / 1_000),
-              expiresAt,
+              text: parsed.text,
+              emoji: parsed.emoji,
+              updatedAt: parsed.updatedAt,
+              eventId: parsed.eventId,
+              expiresAt: parsed.expiresAt,
             }
-          : null;
+          : hiddenUserStatus(parsed);
 
       queryClient.setQueryData<UserStatusLookup>(
         userStatusQueryKey([normalizedPubkey]),
-        (old) => ({ ...(old ?? {}), [normalizedPubkey]: status }),
+        (old) => ({
+          ...(old ?? {}),
+          [normalizedPubkey]: newerUserStatus(old?.[normalizedPubkey], status),
+        }),
       );
 
       queryClient.setQueriesData<UserStatusLookup>(
         { queryKey: ["user-status"] },
         (old) => {
           if (!old || !(normalizedPubkey in old)) return old;
-          return { ...old, [normalizedPubkey]: status };
+          const next = newerUserStatus(old[normalizedPubkey], status);
+          return next === old[normalizedPubkey]
+            ? old
+            : { ...old, [normalizedPubkey]: next };
         },
       );
     },

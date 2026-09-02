@@ -2,7 +2,10 @@ import * as React from "react";
 
 import { useIsUserInHuddle } from "@/features/huddle/HuddlePresenceContext";
 import { useUserStatusLookupContext } from "@/features/user-status/UserStatusLookupContext";
-import { useUserStatusQuery } from "@/features/user-status/hooks";
+import {
+  useUserStatusQuery,
+  visibleUserStatus,
+} from "@/features/user-status/hooks";
 import {
   DEFAULT_USER_STATUS_EMOJI,
   StatusEmoji,
@@ -30,10 +33,11 @@ export function UserNameIndicators({
   const fallbackStatusQuery = useUserStatusQuery(
     !sharedStatus && normalizedPubkey ? [normalizedPubkey] : [],
   );
-  const status = normalizedPubkey
+  const cachedStatus = normalizedPubkey
     ? (sharedStatus?.lookup[normalizedPubkey] ??
       fallbackStatusQuery.data?.[normalizedPubkey])
     : null;
+  const status = visibleUserStatus(cachedStatus);
   const isInHuddle = useIsUserInHuddle(normalizedPubkey);
   const statusEmoji = status?.emoji || DEFAULT_USER_STATUS_EMOJI;
   const indicatorTextClass =

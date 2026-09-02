@@ -161,6 +161,8 @@ export type UserStatus = {
   text: string;
   emoji: string;
   updatedAt: number;
+  /** NIP-01 tie-breaker for replacement events sharing `updatedAt`. */
+  eventId?: string;
   expiresAt?: number;
 };
 export type UserStatusLookup = Record<string, UserStatus | null>;

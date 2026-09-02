@@ -376,7 +376,7 @@ export class RelayClient {
       onEvent,
     );
   }
-  async publishUserStatus(status: UserStatusInput): Promise<void> {
+  async publishUserStatus(status: UserStatusInput): Promise<RelayEvent> {
     await this.ensureConnected();
     const tags: string[][] = [["d", "general"]];
     if (status.emoji) tags.push(["emoji", status.emoji]);
@@ -386,7 +386,7 @@ export class RelayClient {
       content: status.text,
       tags,
     });
-    await this.publishEvent(
+    return this.publishEvent(
       event,
       "Timed out publishing user status",
       "Failed to publish user status",

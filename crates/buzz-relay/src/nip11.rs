@@ -234,12 +234,14 @@ pub async fn relay_info_handler(
 fn push_descriptor(
     push_configured: bool,
     relay_url: &str,
+    gateway_origin: Option<&str>,
     executor_key_id: &str,
     relay_keypair: &nostr::Keys,
     tenant_host: Option<&str>,
 ) -> Option<serde_json::Value> {
     let host = tenant_host?;
     push_configured.then_some(())?;
+    let gateway_origin = gateway_origin?;
     let scheme = if relay_url.starts_with("wss://") {
         "wss"
     } else {
@@ -247,6 +249,7 @@ fn push_descriptor(
     };
     Some(serde_json::json!({
         "origin": format!("{scheme}://{host}"),
+        "gateway_origin": gateway_origin,
         "keys": [{
             "id": executor_key_id,
             "pubkey": relay_keypair.public_key().to_hex(),
@@ -301,9 +304,15 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
     } else {
         None
     };
+    let gateway_origin = state
+        .config
+        .push_gateway_delivery_url
+        .as_ref()
+        .map(|url| url.origin().ascii_serialization());
     if let Some(push) = push_descriptor(
         state.config.push_enabled,
         &state.config.relay_url,
+        gateway_origin.as_deref(),
         &state.config.push_executor_key_id,
         &state.relay_keypair,
         tenant_host.as_deref(),
@@ -406,13 +415,44 @@ mod tests {
     #[test]
     fn push_descriptor_is_gated_by_gateway_configuration_and_tenant_binding() {
         let keys = nostr::Keys::generate();
-        assert!(
-            push_descriptor(false, "ws://relay", "key", &keys, Some("tenant.example")).is_none()
-        );
-        assert!(push_descriptor(true, "ws://relay", "key", &keys, None).is_none());
-        let descriptor = push_descriptor(true, "ws://relay", "key", &keys, Some("tenant.example"))
-            .expect("configured push descriptor");
+        assert!(push_descriptor(
+            false,
+            "ws://relay",
+            Some("https://push.example"),
+            "key",
+            &keys,
+            Some("tenant.example")
+        )
+        .is_none());
+        assert!(push_descriptor(
+            true,
+            "ws://relay",
+            None,
+            "key",
+            &keys,
+            Some("tenant.example")
+        )
+        .is_none());
+        assert!(push_descriptor(
+            true,
+            "ws://relay",
+            Some("https://push.example"),
+            "key",
+            &keys,
+            None
+        )
+        .is_none());
+        let descriptor = push_descriptor(
+            true,
+            "ws://relay",
+            Some("https://push.example"),
+            "key",
+            &keys,
+            Some("tenant.example"),
+        )
+        .expect("configured push descriptor");
         assert_eq!(descriptor["origin"], "ws://tenant.example");
+        assert_eq!(descriptor["gateway_origin"], "https://push.example");
         assert_eq!(
             descriptor["push_kinds"],
             serde_json::json!(crate::handlers::push_lease::PUSH_KINDS)

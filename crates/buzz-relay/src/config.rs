@@ -347,8 +347,8 @@ pub struct Config {
     /// Descriptor key identifier accepted in kind:30350 `exec` tags.
     pub push_executor_key_id: String,
     /// Exact HTTPS gateway endpoint used to submit client-authorized APNs delivery capabilities.
-    /// An absent setting selects the canonical Buzz gateway. An explicitly
-    /// empty setting is allowed only while push is disabled.
+    /// Required while push is enabled. An explicitly empty setting is allowed
+    /// only while push is disabled.
     pub push_gateway_delivery_url: Option<url::Url>,
     /// Hard timeout for one gateway delivery request.
     pub push_gateway_timeout: Duration,

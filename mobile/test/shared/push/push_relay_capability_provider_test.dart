@@ -61,6 +61,7 @@ void main() {
 
 const _descriptor = BuzzPushLeaseDescriptor(
   origin: 'wss://relay.example',
+  gatewayOrigin: 'https://push.example',
   executorKeyId: 'relay-v1',
   executorPubkey:
       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',

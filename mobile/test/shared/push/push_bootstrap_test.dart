@@ -191,6 +191,7 @@ BuzzPushLeaseDescriptor _descriptor({
   required String pubkey,
 }) => BuzzPushLeaseDescriptor(
   origin: 'wss://relay.example',
+  gatewayOrigin: 'https://push.example',
   executorKeyId: keyId,
   executorPubkey: pubkey,
   transport: 'apns',

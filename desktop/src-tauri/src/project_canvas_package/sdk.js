@@ -152,6 +152,78 @@
     },
   });
 
+  // --- Layout persistence --------------------------------------------------
+  // The host persists widget placement per dashboard; no capability is needed
+  // because it only records direct user manipulation of host-rendered chrome.
+  // Sends are debounced here so a held arrow key cannot trip the host's port
+  // rate limit, which tears the frame down rather than failing one message.
+
+  const LAYOUT_DEBOUNCE_MS = 300;
+  const LAYOUT_COORDINATE_LIMIT = 100000;
+  const LAYOUT_MAX_WIDGETS = 256;
+  let layoutTimer = 0;
+  let layoutPending = null;
+
+  function layoutCoordinate(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return null;
+    return Math.max(
+      -LAYOUT_COORDINATE_LIMIT,
+      Math.min(LAYOUT_COORDINATE_LIMIT, numeric),
+    );
+  }
+
+  function layoutPoint(value) {
+    if (!value || typeof value !== "object") return null;
+    const x = layoutCoordinate(value.x);
+    const y = layoutCoordinate(value.y);
+    return x === null || y === null ? null : { x, y };
+  }
+
+  function layoutWidgets(value) {
+    const widgets = {};
+    if (!value || typeof value !== "object") return widgets;
+    let count = 0;
+    for (const [widgetId, point] of Object.entries(value)) {
+      if (count >= LAYOUT_MAX_WIDGETS) break;
+      if (!/^[A-Za-z0-9._-]{1,128}$/.test(widgetId)) continue;
+      const sanitized = layoutPoint(point);
+      if (!sanitized) continue;
+      Object.defineProperty(widgets, widgetId, {
+        configurable: true,
+        enumerable: true,
+        value: sanitized,
+        writable: true,
+      });
+      count += 1;
+    }
+    return widgets;
+  }
+
+  function flushLayout() {
+    layoutTimer = 0;
+    const next = layoutPending;
+    layoutPending = null;
+    if (next) send(next);
+  }
+
+  const layout = Object.freeze({
+    save(next) {
+      const options = next || {};
+      const dashboard = String(options.dashboard || "");
+      if (!dashboard || dashboard.length > 128) return;
+      // Last write wins: only the final arrangement of a burst is sent.
+      layoutPending = {
+        dashboard,
+        pan: layoutPoint(options.pan),
+        type: "canvas.layout",
+        widgets: layoutWidgets(options.widgets),
+      };
+      clearTimeout(layoutTimer);
+      layoutTimer = setTimeout(flushLayout, LAYOUT_DEBOUNCE_MS);
+    },
+  });
+
   // --- Standard components -------------------------------------------------
   // Identity semantics mirror the app's UserAvatar: same initials derivation
   // and the same 7-tone hash, so a person renders identically inside and
@@ -310,6 +382,7 @@
     app,
     capabilities: () => session.capabilities.slice(),
     data,
+    layout,
     ui: Object.freeze({ avatar, channelRow, reviewRow }),
     version: 1,
   });

@@ -8,7 +8,9 @@ import {
   parseProjectCanvasPackageDescriptor,
   parseProjectCanvasPackageDescriptorForE2e,
   parseProjectCanvasReady,
+  PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT,
   PROJECT_CANVAS_MAX_INIT_MESSAGE_BYTES,
+  PROJECT_CANVAS_MAX_LAYOUT_WIDGETS,
   PROJECT_CANVAS_MESSAGE_RATE_LIMIT,
   PROJECT_CANVAS_MESSAGE_RATE_WINDOW_MS,
   projectCanvasConsentCapabilities,
@@ -393,6 +395,67 @@ test("rpc child messages parse strictly and reject malformed ids and payloads", 
   assert.equal(
     parseProjectCanvasChildMessage(
       { ...open, target: { date: new Date() } },
+      binding,
+    ),
+    null,
+  );
+});
+
+test("layout messages carry bounded coordinates for well-formed widget ids", () => {
+  const binding = { loadId: LOAD_ID, nonce: NONCE };
+  const base = { loadId: LOAD_ID, nonce: NONCE, protocolVersion: 1 };
+  const layout = {
+    ...base,
+    dashboard: "dev",
+    pan: { x: 24, y: -48 },
+    type: "canvas.layout",
+    widgets: { "active-channels": { x: 0, y: 384 } },
+  };
+  assert.deepEqual(parseProjectCanvasChildMessage(layout, binding), layout);
+  assert.deepEqual(
+    parseProjectCanvasChildMessage({ ...layout, pan: null }, binding),
+    { ...layout, pan: null },
+  );
+  assert.deepEqual(
+    parseProjectCanvasChildMessage({ ...layout, widgets: {} }, binding),
+    { ...layout, widgets: {} },
+  );
+
+  const widgets = {};
+  for (let index = 0; index <= PROJECT_CANVAS_MAX_LAYOUT_WIDGETS; index += 1) {
+    widgets[`widget-${index}`] = { x: index, y: index };
+  }
+  assert.equal(
+    parseProjectCanvasChildMessage({ ...layout, widgets }, binding),
+    null,
+  );
+
+  for (const invalid of [
+    { dashboard: "" },
+    { dashboard: "d".repeat(129) },
+    { pan: { x: 0 } },
+    { pan: { x: 0, y: 0, z: 0 } },
+    { pan: { x: Number.NaN, y: 0 } },
+    { pan: { x: Number.POSITIVE_INFINITY, y: 0 } },
+    { pan: { x: PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT + 1, y: 0 } },
+    { pan: { x: 0, y: -PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT - 1 } },
+    { widgets: { "bad id": { x: 0, y: 0 } } },
+    { widgets: { ["w".repeat(129)]: { x: 0, y: 0 } } },
+    { widgets: { widget: { x: "0", y: 0 } } },
+    { widgets: { widget: null } },
+    { widgets: null },
+    { extra: true },
+  ]) {
+    assert.equal(
+      parseProjectCanvasChildMessage({ ...layout, ...invalid }, binding),
+      null,
+      `expected ${JSON.stringify(invalid)} to be rejected`,
+    );
+  }
+
+  assert.equal(
+    parseProjectCanvasChildMessage(
+      { ...layout, loadId: "fedcba9876543210fedcba9876543210" },
       binding,
     ),
     null,

@@ -4173,12 +4173,44 @@ function mockProjectCanvasPackageDescriptor(candidate = false) {
 <html><head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src data:; media-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
-<style>html,body,#canvas-root{height:100%;margin:0}body{font-family:system-ui;background:#f7f7f8;color:#18181b}#canvas-root{display:grid;place-items:center}</style>
+<style>html,body,#canvas-root{height:100%;margin:0}body{font-family:system-ui;background:#f7f7f8;color:#18181b}#canvas-root{display:grid;place-items:center}.layout-control{position:fixed;top:2px;z-index:1}</style>
 </head><body><main id="canvas-root"></main><script>
 (() => {
   const loadId = ${JSON.stringify(loadId)};
   const nonce = ${JSON.stringify(nonce)};
   const root = document.getElementById("canvas-root");
+  // Layout persistence is host state, so the shell only needs to report the
+  // layouts it was handed and post arrangements back. Controls live outside
+  // #canvas-root so its text stays the project name.
+  const installLayoutControls = (port, layouts) => {
+    const stored = (layouts && layouts.e2e && layouts.e2e.widgets) || {};
+    const placed = stored["e2e-widget"];
+    let x = placed && typeof placed.x === "number" ? placed.x : 0;
+    root.dataset.canvasLayouts = JSON.stringify(layouts || {});
+    root.dataset.canvasWidgetX = String(x);
+    const save = (widgets) => {
+      root.dataset.canvasWidgetX = String(x);
+      port.postMessage({ dashboard: "e2e", loadId, nonce, pan: null, protocolVersion: 1, type: "canvas.layout", widgets });
+    };
+    const control = (testId, label, left, onClick) => {
+      const button = document.createElement("button");
+      button.className = "layout-control";
+      button.dataset.testid = testId;
+      button.style.left = left;
+      button.textContent = label;
+      button.type = "button";
+      button.addEventListener("click", onClick);
+      document.body.append(button);
+    };
+    control("canvas-move-widget", "Move", "2px", () => {
+      x += 24;
+      save({ "e2e-widget": { x, y: 0 } });
+    });
+    control("canvas-reset-layout", "Reset", "56px", () => {
+      x = 0;
+      save({});
+    });
+  };
   const connect = (event) => {
     const message = event.data;
     if (event.source !== parent || !message || message.type !== "host.connect" || message.protocolVersion !== 1 || message.loadId !== loadId || message.nonce !== nonce || event.ports.length !== 1) return;
@@ -4191,6 +4223,7 @@ function mockProjectCanvasPackageDescriptor(candidate = false) {
         root.dataset.canvasReady = "true";
         root.dataset.canvasMode = data.mode;
         root.textContent = data.project.name;
+        installLayoutControls(port, data.layouts);
         try {
           void parent.document.body;
           root.dataset.parentDom = "allowed";

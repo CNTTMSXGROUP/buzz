@@ -2,6 +2,7 @@
   const PROTOCOL_VERSION = 1;
   const INTERACTIVE_SELECTOR =
     "a,button,input,label,select,textarea,video[controls],[role='button'],[data-no-drag]";
+  const DEFAULT_PAN = { x: 24, y: 24 };
   const runtime = window.buzzCanvas;
   const root = document.getElementById("canvas-root");
   const widgetModules = Object.values(window.buzzCanvasWidgets || {});
@@ -34,7 +35,7 @@
     positions: new Map(),
     project: null,
     snapshots: null,
-    translation: { x: 24, y: 24 },
+    translation: { ...DEFAULT_PAN },
   };
 
   const port = runtime.port;
@@ -70,10 +71,12 @@
     state.snapshots = message.snapshots || null;
     state.mode = normalizeMode(message.mode);
     state.dashboard = selectDashboard(message.data, message.project);
-    state.translation = { x: 24, y: 24 };
+    const stored = storedLayout(message.layouts, state.dashboard.id);
+    state.translation = sanitizePoint(stored?.pan) || { ...DEFAULT_PAN };
     state.positions.clear();
     for (const widget of state.dashboard.widgets) {
-      state.positions.set(widget.id, { ...widget.position });
+      const override = sanitizePoint(stored?.widgets?.[widget.id]);
+      state.positions.set(widget.id, override || { ...widget.position });
     }
     renderCanvas();
     port.postMessage({
@@ -97,6 +100,41 @@
 
   function normalizeMode(mode) {
     return mode === "full" ? "full" : "preview";
+  }
+
+  function storedLayout(layouts, dashboardId) {
+    if (!layouts || typeof layouts !== "object") return null;
+    const layout = layouts[dashboardId];
+    return layout && typeof layout === "object" ? layout : null;
+  }
+
+  function sanitizePoint(point) {
+    if (!point || typeof point !== "object") return null;
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
+    return { x: point.x, y: point.y };
+  }
+
+  // Persist only what the user changed: widgets still sitting on their package
+  // default are left out, so a later package revision can still move them.
+  function saveLayout() {
+    if (!state.dashboard || !runtime.sdk?.layout) return;
+    const widgets = {};
+    for (const widget of state.dashboard.widgets) {
+      const position = state.positions.get(widget.id);
+      const fallback = sanitizePoint(widget.position) || { x: 0, y: 0 };
+      if (!position) continue;
+      if (position.x === fallback.x && position.y === fallback.y) continue;
+      widgets[widget.id] = { x: position.x, y: position.y };
+    }
+    const pan = {
+      x: Math.round(state.translation.x),
+      y: Math.round(state.translation.y),
+    };
+    runtime.sdk.layout.save({
+      dashboard: state.dashboard.id,
+      pan: pan.x === DEFAULT_PAN.x && pan.y === DEFAULT_PAN.y ? null : pan,
+      widgets,
+    });
   }
 
   function normalizeName(name) {
@@ -307,7 +345,10 @@
         updateTranslationData(canvas);
         updateWorldTransform(canvas.querySelector(".canvas-world"));
       },
-      () => canvas.classList.remove("dragging"),
+      () => {
+        canvas.classList.remove("dragging");
+        saveLayout();
+      },
     );
   }
 
@@ -341,6 +382,7 @@
         article.dataset.worldX = String(snapped.x);
         article.dataset.worldY = String(snapped.y);
         group.classList.remove("dragging");
+        saveLayout();
       },
     );
   }
@@ -384,6 +426,7 @@
     moveWidgetGroup(group, next);
     event.currentTarget.dataset.worldX = String(next.x);
     event.currentTarget.dataset.worldY = String(next.y);
+    saveLayout();
   }
 
   function snapPoint(point) {
@@ -409,21 +452,44 @@
 
   function renderResetButton() {
     const button = element("button", "reset-button", {
-      ariaLabel: "Reset canvas position",
+      ariaLabel: "Reset canvas layout",
       testId: "project-widget-canvas-reset",
-      title: "Reset canvas position",
+      title: "Reset canvas layout",
       type: "button",
     });
     button.append(icon("⌖"));
-    button.addEventListener("click", () => {
-      state.translation = { x: 24, y: 24 };
-      const canvas = root.querySelector(
-        "[data-testid='project-widget-canvas']",
-      );
+    button.addEventListener("click", resetLayout);
+    return button;
+  }
+
+  // Always reachable recovery: restores the package's pan and every widget
+  // position, then clears the stored overrides. Widget elements are moved in
+  // place rather than re-rendered so live subscriptions survive the reset.
+  function resetLayout() {
+    state.translation = { ...DEFAULT_PAN };
+    const groups = new Map(
+      [...root.querySelectorAll("[data-widget-id]")].map((group) => [
+        group.dataset.widgetId,
+        group,
+      ]),
+    );
+    for (const widget of state.dashboard.widgets) {
+      const position = sanitizePoint(widget.position) || { x: 0, y: 0 };
+      state.positions.set(widget.id, position);
+      const group = groups.get(widget.id);
+      if (!group) continue;
+      moveWidgetGroup(group, position);
+      const article = group.querySelector(".widget");
+      if (!article) continue;
+      article.dataset.worldX = String(position.x);
+      article.dataset.worldY = String(position.y);
+    }
+    const canvas = root.querySelector("[data-testid='project-widget-canvas']");
+    if (canvas) {
       updateTranslationData(canvas);
       updateWorldTransform(canvas.querySelector(".canvas-world"));
-    });
-    return button;
+    }
+    saveLayout();
   }
 
   function renderDialogLayer() {

@@ -14,6 +14,8 @@ export const PROJECT_CANVAS_COMMAND_RATE_LIMIT = 10;
 export const PROJECT_CANVAS_COMMAND_RATE_WINDOW_MS = 60_000;
 export const PROJECT_CANVAS_OPEN_RATE_LIMIT = 3;
 export const PROJECT_CANVAS_OPEN_RATE_WINDOW_MS = 10_000;
+export const PROJECT_CANVAS_MAX_LAYOUT_WIDGETS = 256;
+export const PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT = 100_000;
 
 const MAX_IDENTIFIER_LENGTH = 1_024;
 const MAX_NONCE_LENGTH = 256;
@@ -170,6 +172,32 @@ const childBindingSchema = {
 
 const rpcIdSchema = z.string().regex(/^[A-Za-z0-9._-]{1,64}$/);
 
+const widgetIdSchema = z.string().regex(/^[A-Za-z0-9._-]{1,128}$/);
+
+const layoutCoordinateSchema = z
+  .number()
+  .finite()
+  .gte(-PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT)
+  .lte(PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT);
+
+const layoutPointSchema = z
+  .object({ x: layoutCoordinateSchema, y: layoutCoordinateSchema })
+  .strict();
+
+export type ProjectCanvasLayoutPoint = z.infer<typeof layoutPointSchema>;
+
+/**
+ * A dashboard's user-arranged layout: only the widgets the user actually
+ * moved, plus a pan offset when it differs from the package default. Untouched
+ * widgets keep following the package, so a later revision can still move them.
+ */
+export type ProjectCanvasDashboardLayout = {
+  pan: ProjectCanvasLayoutPoint | null;
+  widgets: Record<string, ProjectCanvasLayoutPoint>;
+};
+
+export type ProjectCanvasLayouts = Record<string, ProjectCanvasDashboardLayout>;
+
 const rpcQuerySchema = z
   .object({
     name: z.string().min(1).max(64),
@@ -224,9 +252,29 @@ const childMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("canvas.open"),
     })
     .strict(),
+  z
+    .object({
+      ...childBindingSchema,
+      dashboard: z.string().min(1).max(128),
+      pan: layoutPointSchema.nullable(),
+      type: z.literal("canvas.layout"),
+      widgets: z
+        .record(widgetIdSchema, layoutPointSchema)
+        .refine(
+          (widgets) =>
+            Object.keys(widgets).length <= PROJECT_CANVAS_MAX_LAYOUT_WIDGETS,
+          `A canvas layout carries at most ${PROJECT_CANVAS_MAX_LAYOUT_WIDGETS} widgets.`,
+        ),
+    })
+    .strict(),
 ]);
 
 export type ProjectCanvasChildMessage = z.infer<typeof childMessageSchema>;
+
+export type ProjectCanvasLayoutMessage = Extract<
+  ProjectCanvasChildMessage,
+  { type: "canvas.layout" }
+>;
 
 export type ProjectCanvasRpcErrorCode =
   | "failed"

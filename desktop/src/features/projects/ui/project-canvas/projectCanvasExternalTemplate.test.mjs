@@ -653,3 +653,127 @@ test("targeted data updates preserve the widget root and receive previous and ne
     true,
   );
 });
+
+const LAYOUT_FLUSH_MS = 400;
+
+function flushLayoutSaves() {
+  return new Promise((resolve) => setTimeout(resolve, LAYOUT_FLUSH_MS));
+}
+
+function layoutMessages(harness) {
+  return harness.sent.filter((message) => message.type === "canvas.layout");
+}
+
+function widgetArticle(document, widgetId) {
+  return document.querySelector(
+    `[data-testid='project-canvas-widget-${widgetId}']`,
+  );
+}
+
+test("persisted layout overrides seed widget positions and canvas pan", async () => {
+  const harness = await createCanvasHarness();
+  const { document } = harness.dom.window;
+  harness.port.emit(
+    initMessage(harness.fixtureData, {
+      layouts: {
+        dev: {
+          pan: { x: -24, y: 48 },
+          widgets: { "active-channels": { x: 120, y: 96 } },
+        },
+      },
+    }),
+  );
+
+  const moved = widgetArticle(document, "active-channels");
+  assert.equal(moved.dataset.worldX, "120");
+  assert.equal(moved.dataset.worldY, "96");
+  assert.equal(
+    moved.parentElement.style.transform,
+    "translate3d(120px, 96px, 0)",
+  );
+  // A widget with no override keeps following the package default.
+  assert.equal(widgetArticle(document, "reviews").dataset.worldX, "384");
+
+  const canvas = document.querySelector(
+    "[data-testid='project-widget-canvas']",
+  );
+  assert.equal(canvas.dataset.panX, "-24");
+  assert.equal(canvas.dataset.panY, "48");
+  assert.equal(
+    canvas.querySelector(".canvas-world").style.transform,
+    "translate3d(-24px, 48px, 0)",
+  );
+  assert.deepEqual(layoutMessages(harness), []);
+});
+
+test("keyboard nudges send one debounced layout carrying only the moved widget", async () => {
+  const harness = await createCanvasHarness();
+  const { document } = harness.dom.window;
+  harness.port.emit(initMessage(harness.fixtureData));
+
+  const article = widgetArticle(document, "active-channels");
+  for (const key of ["ArrowRight", "ArrowRight", "ArrowDown"]) {
+    article.dispatchEvent(
+      new harness.dom.window.KeyboardEvent("keydown", {
+        cancelable: true,
+        key,
+      }),
+    );
+  }
+  assert.equal(article.dataset.worldX, "48");
+  assert.equal(article.dataset.worldY, "24");
+  assert.deepEqual(layoutMessages(harness), [], "sends are debounced");
+
+  await flushLayoutSaves();
+  const saved = layoutMessages(harness);
+  assert.equal(saved.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved[0])), {
+    dashboard: "dev",
+    loadId: "load-1",
+    nonce: "nonce-1",
+    pan: null,
+    protocolVersion: 1,
+    type: "canvas.layout",
+    widgets: { "active-channels": { x: 48, y: 24 } },
+  });
+});
+
+test("resetting the canvas restores defaults and clears the stored overrides", async () => {
+  const harness = await createCanvasHarness();
+  const { document } = harness.dom.window;
+  harness.port.emit(
+    initMessage(harness.fixtureData, {
+      layouts: {
+        dev: {
+          pan: { x: -24, y: 48 },
+          widgets: { "active-channels": { x: 120, y: 96 } },
+        },
+      },
+    }),
+  );
+
+  const reset = document.querySelector(
+    "[data-testid='project-widget-canvas-reset']",
+  );
+  assert.equal(reset.getAttribute("aria-label"), "Reset canvas layout");
+  reset.dispatchEvent(new harness.dom.window.Event("click"));
+
+  const article = widgetArticle(document, "active-channels");
+  assert.equal(article.dataset.worldX, "0");
+  assert.equal(article.dataset.worldY, "0");
+  assert.equal(
+    article.parentElement.style.transform,
+    "translate3d(0px, 0px, 0)",
+  );
+  const canvas = document.querySelector(
+    "[data-testid='project-widget-canvas']",
+  );
+  assert.equal(canvas.dataset.panX, "24");
+  assert.equal(canvas.dataset.panY, "24");
+
+  await flushLayoutSaves();
+  const saved = layoutMessages(harness);
+  assert.equal(saved.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved[0].widgets)), {});
+  assert.equal(saved[0].pan, null);
+});

@@ -38,7 +38,10 @@ export type ProjectCanvasRpcSessionOptions = {
 export type ProjectCanvasRpcSession = {
   dispose: () => void;
   handle: (
-    message: Exclude<ProjectCanvasChildMessage, { type: "canvas.rendered" }>,
+    message: Exclude<
+      ProjectCanvasChildMessage,
+      { type: "canvas.layout" } | { type: "canvas.rendered" }
+    >,
   ) => void;
 };
 

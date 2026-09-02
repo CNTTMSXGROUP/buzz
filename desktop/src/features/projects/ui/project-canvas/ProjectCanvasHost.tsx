@@ -1,4 +1,3 @@
-import { invokeTauri } from "@/shared/api/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -14,36 +13,32 @@ import { toast } from "sonner";
 
 import type { ProjectCanvasBroker } from "./projectCanvasBroker";
 import {
+  openProjectCanvasSource,
+  projectCanvasErrorMessage,
+  releaseProjectCanvasPackage,
+  requestProjectCanvasPackage,
+  requestProjectCanvasUpdates,
+} from "./projectCanvasCommands";
+import {
   effectiveProjectCanvasCapabilities,
   readProjectCanvasConsent,
   writeProjectCanvasConsent,
   type ProjectCanvasConsentDecision,
 } from "./projectCanvasConsent";
+import { ProjectCanvasFrame } from "./ProjectCanvasFrame";
 import {
-  isMessageWithinSizeLimit,
-  parseProjectCanvasChildMessage,
-  parseProjectCanvasPackageDescriptor,
-  parseProjectCanvasPackageDescriptorForE2e,
-  parseProjectCanvasPendingUpdates,
-  parseProjectCanvasReady,
+  readProjectCanvasLayouts,
+  writeProjectCanvasDashboardLayout,
+} from "./projectCanvasLayout";
+import {
   parseProjectCanvasSourceUpdateEvent,
-  PROJECT_CANVAS_HANDSHAKE_TIMEOUT_MS,
-  PROJECT_CANVAS_MAX_INIT_MESSAGE_BYTES,
-  PROJECT_CANVAS_PROTOCOL_VERSION,
   projectCanvasConsentCapabilities,
-  ProjectCanvasMessageRateLimiter,
-  selectGrantedProjectCanvasSnapshots,
-  type ProjectCanvasCapability,
+  type ProjectCanvasLayoutMessage,
+  type ProjectCanvasLayouts,
   type ProjectCanvasPackageDescriptor,
   type ProjectCanvasPendingUpdates,
   type ProjectCanvasSnapshots,
 } from "./projectCanvasProtocol";
-import {
-  createProjectCanvasRpcSession,
-  type ProjectCanvasRpcSession,
-} from "./projectCanvasRpc";
-
-type ProjectCanvasMode = "preview" | "full";
 
 type ProjectCanvasHostProps = {
   broker: ProjectCanvasBroker | null;
@@ -60,6 +55,8 @@ const CONSENT_CAPABILITY_LABELS: Record<string, string> = {
   "app.open": "open channels, people, and work items",
   "project.tasks.write": "update project tasks",
 };
+
+const PROJECT_CANVAS_SOURCE_UPDATE_EVENT = "project-canvas-source-updated";
 
 function commandToastLabel(commandName: string): string {
   if (commandName === "tasks.setStatus") return "updated a task's status";
@@ -80,47 +77,6 @@ function consentPhrase(labels: string[]): string {
     return `${labels.slice(0, -1).join(", ")}, and ${labels.at(-1)}`;
   }
   return labels.join(" and ");
-}
-
-type PackageRequest = {
-  communityId: string;
-  projectId: string;
-};
-
-const MAX_INVALID_PORT_MESSAGES = 3;
-const PROJECT_CANVAS_SOURCE_UPDATE_EVENT = "project-canvas-source-updated";
-const parsePackageDescriptor =
-  import.meta.env.MODE === "e2e"
-    ? parseProjectCanvasPackageDescriptorForE2e
-    : parseProjectCanvasPackageDescriptor;
-
-async function requestProjectCanvasPackage(
-  command: "activate_project_canvas_package" | "get_project_canvas_package",
-  request: PackageRequest,
-): Promise<ProjectCanvasPackageDescriptor> {
-  const response = await invokeTauri<unknown>(command, { request });
-  return parsePackageDescriptor(response);
-}
-
-async function releaseProjectCanvasPackage(loadId: string): Promise<void> {
-  await invokeTauri("release_project_canvas_package", { loadId });
-}
-
-async function commitProjectCanvasPackage(loadId: string): Promise<void> {
-  await invokeTauri("commit_project_canvas_package", { loadId });
-}
-
-async function requestProjectCanvasUpdates(
-  request: PackageRequest,
-): Promise<ProjectCanvasPendingUpdates> {
-  const response = await invokeTauri<unknown>("get_project_canvas_updates", {
-    request,
-  });
-  return parseProjectCanvasPendingUpdates(response);
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "Canvas package failed.";
 }
 
 export function ProjectCanvasHost({
@@ -198,7 +154,7 @@ export function ProjectCanvasHost({
           requestGenerationRef.current === generation &&
           bindingKeyRef.current === requestedBinding
         ) {
-          setLoadError(errorMessage(error));
+          setLoadError(projectCanvasErrorMessage(error));
         }
       });
 
@@ -220,7 +176,7 @@ export function ProjectCanvasHost({
         updates = await requestProjectCanvasUpdates({ communityId, projectId });
       } catch (error) {
         if (!disposed && bindingKeyRef.current === requestedBinding) {
-          setLoadError(errorMessage(error));
+          setLoadError(projectCanvasErrorMessage(error));
         }
         return;
       }
@@ -282,7 +238,7 @@ export function ProjectCanvasHost({
       })
       .catch((error: unknown) => {
         if (!disposed && bindingKeyRef.current === requestedBinding) {
-          setLoadError(errorMessage(error));
+          setLoadError(projectCanvasErrorMessage(error));
         }
       });
 
@@ -326,7 +282,7 @@ export function ProjectCanvasHost({
         requestGenerationRef.current === generation &&
         bindingKeyRef.current === requestedBinding
       ) {
-        setLoadError(errorMessage(error));
+        setLoadError(projectCanvasErrorMessage(error));
       }
     } finally {
       if (requestGenerationRef.current === generation) {
@@ -376,7 +332,7 @@ export function ProjectCanvasHost({
           ) {
             setDescriptor(null);
             setLoadError(
-              `Canvas reload failed and the active version could not be restored. ${errorMessage(error)}`,
+              `Canvas reload failed and the active version could not be restored. ${projectCanvasErrorMessage(error)}`,
             );
           }
         })
@@ -404,11 +360,9 @@ export function ProjectCanvasHost({
   const openSource = React.useCallback(async () => {
     if (!communityId) return;
     try {
-      await invokeTauri("open_project_canvas_source", {
-        request: { communityId, projectId },
-      });
+      await openProjectCanvasSource({ communityId, projectId });
     } catch (error) {
-      setLoadError(errorMessage(error));
+      setLoadError(projectCanvasErrorMessage(error));
     }
   }, [communityId, projectId]);
 
@@ -448,6 +402,25 @@ export function ProjectCanvasHost({
     },
     [communityId, descriptor, projectId],
   );
+  // Both callbacks capture the binding they were built for, so a layout
+  // message that lands while the host is switching community or project can
+  // never read or write under the next binding's key.
+  const loadLayouts = React.useCallback((): ProjectCanvasLayouts => {
+    if (!communityId || bindingKeyRef.current !== bindingKey) return {};
+    return readProjectCanvasLayouts(communityId, projectId);
+  }, [bindingKey, communityId, projectId]);
+  const handleLayoutChanged = React.useCallback(
+    (message: ProjectCanvasLayoutMessage) => {
+      if (!communityId || bindingKeyRef.current !== bindingKey) return;
+      writeProjectCanvasDashboardLayout(
+        communityId,
+        projectId,
+        message.dashboard,
+        { pan: message.pan, widgets: message.widgets },
+      );
+    },
+    [bindingKey, communityId, projectId],
+  );
   const handleCommandSettled = React.useCallback(
     (commandName: string, commandError: string | null) => {
       if (commandError) {
@@ -475,9 +448,11 @@ export function ProjectCanvasHost({
           descriptor={descriptor}
           dataUpdate={dataUpdate}
           key={`${descriptor.loadId}:${consentDecision ?? "pending"}`}
+          loadLayouts={loadLayouts}
           mode={full ? "full" : "preview"}
           onCommandSettled={handleCommandSettled}
           onFailure={handleFrameFailure}
+          onLayoutChanged={handleLayoutChanged}
           onRendered={handleFrameRendered}
           projectId={projectId}
           projectName={projectName}
@@ -643,350 +618,6 @@ function CanvasFailure({
         <RefreshCw className="h-4 w-4" />
         Retry
       </Button>
-    </div>
-  );
-}
-
-function ProjectCanvasFrame({
-  broker,
-  capabilities,
-  dataUpdate,
-  descriptor,
-  mode,
-  onCommandSettled,
-  onFailure,
-  onRendered,
-  projectId,
-  projectName,
-  projectNames,
-  snapshots,
-}: {
-  broker: ProjectCanvasBroker | null;
-  capabilities: readonly ProjectCanvasCapability[];
-  dataUpdate: ProjectCanvasPendingUpdates["data"];
-  descriptor: ProjectCanvasPackageDescriptor;
-  mode: ProjectCanvasMode;
-  onCommandSettled: (commandName: string, error: string | null) => void;
-  onFailure: (loadId: string, message: string) => void;
-  onRendered: (loadId: string) => void;
-  projectId: string;
-  projectName: string;
-  projectNames: readonly string[];
-  snapshots: ProjectCanvasSnapshots;
-}) {
-  const frameRef = React.useRef<HTMLIFrameElement>(null);
-  const portRef = React.useRef<MessagePort | null>(null);
-  const rpcRef = React.useRef<ProjectCanvasRpcSession | null>(null);
-  const modeRef = React.useRef(mode);
-  const snapshotsRef = React.useRef(snapshots);
-  const projectNameRef = React.useRef(projectName);
-  const projectNamesRef = React.useRef(projectNames);
-  const capabilitiesRef = React.useRef(capabilities);
-  const brokerRef = React.useRef(broker);
-  const onCommandSettledRef = React.useRef(onCommandSettled);
-  const connectedRef = React.useRef(false);
-  const loadCountRef = React.useRef(0);
-  const lastSnapshotsJsonRef = React.useRef<string | null>(null);
-  const lastWidgetDataNotificationRef = React.useRef<string | null>(null);
-  const [connected, setConnected] = React.useState(false);
-  const [rendered, setRendered] = React.useState(false);
-  const [failed, setFailed] = React.useState(false);
-  const [frameSource, setFrameSource] = React.useState<string | undefined>();
-
-  modeRef.current = mode;
-  snapshotsRef.current = snapshots;
-  projectNameRef.current = projectName;
-  projectNamesRef.current = projectNames;
-  capabilitiesRef.current = capabilities;
-  brokerRef.current = broker;
-  onCommandSettledRef.current = onCommandSettled;
-
-  const fail = React.useCallback(
-    (message: string) => {
-      connectedRef.current = false;
-      rpcRef.current?.dispose();
-      rpcRef.current = null;
-      portRef.current?.close();
-      portRef.current = null;
-      setConnected(false);
-      setRendered(false);
-      setFailed(true);
-      setFrameSource(undefined);
-      void releaseProjectCanvasPackage(descriptor.loadId).catch(() => {});
-      onFailure(descriptor.loadId, message);
-    },
-    [descriptor.loadId, onFailure],
-  );
-
-  React.useLayoutEffect(() => {
-    const frameWindow = frameRef.current?.contentWindow;
-    if (!frameWindow) {
-      fail("Canvas frame could not be created.");
-      return;
-    }
-
-    const grantedCapabilities = [...capabilitiesRef.current];
-    const rateLimiter = new ProjectCanvasMessageRateLimiter();
-    let invalidMessageCount = 0;
-    let handshakeComplete = false;
-    let renderAcknowledged = false;
-    let stopped = false;
-    let timeoutId = 0;
-    const stop = (message: string) => {
-      if (stopped) return;
-      stopped = true;
-      window.clearTimeout(timeoutId);
-      fail(message);
-    };
-    timeoutId = window.setTimeout(() => {
-      stop("Canvas did not complete its secure handshake and render.");
-    }, PROJECT_CANVAS_HANDSHAKE_TIMEOUT_MS);
-
-    const handleReady = (event: MessageEvent) => {
-      if (stopped) return;
-      if (event.source !== frameWindow) return;
-      if (
-        typeof event.data !== "object" ||
-        event.data === null ||
-        !("type" in event.data) ||
-        event.data.type !== "canvas.ready"
-      ) {
-        return;
-      }
-      if (!parseProjectCanvasReady(event.data, descriptor.nonce)) {
-        stop("Canvas sent an invalid handshake.");
-        return;
-      }
-      if (handshakeComplete || connectedRef.current) {
-        stop("Canvas attempted to reconnect unexpectedly.");
-        return;
-      }
-
-      const channel = new MessageChannel();
-      const grantedSnapshots = selectGrantedProjectCanvasSnapshots(
-        snapshotsRef.current,
-        grantedCapabilities,
-      );
-      const initMessage = {
-        canvasId: projectId,
-        capabilities: grantedCapabilities,
-        data: descriptor.data,
-        loadId: descriptor.loadId,
-        mode: modeRef.current,
-        nonce: descriptor.nonce,
-        project: {
-          displayName: projectNameRef.current,
-          id: projectId,
-          name: projectNameRef.current,
-          names: [...projectNamesRef.current].slice(0, 8),
-        },
-        protocolVersion: PROJECT_CANVAS_PROTOCOL_VERSION,
-        snapshots: grantedSnapshots,
-        type: "host.init",
-      } as const;
-      if (
-        !isMessageWithinSizeLimit(
-          initMessage,
-          PROJECT_CANVAS_MAX_INIT_MESSAGE_BYTES,
-        )
-      ) {
-        channel.port1.close();
-        channel.port2.close();
-        stop("Canvas initialization exceeds the host size limit.");
-        return;
-      }
-
-      const rpcSession = createProjectCanvasRpcSession({
-        broker: brokerRef.current,
-        capabilities: grantedCapabilities,
-        loadId: descriptor.loadId,
-        nonce: descriptor.nonce,
-        onCommandSettled: (commandName, commandError) => {
-          if (!stopped) {
-            onCommandSettledRef.current(commandName, commandError);
-          }
-        },
-        post: (message) => {
-          if (!stopped && portRef.current === channel.port1) {
-            channel.port1.postMessage(message);
-          }
-        },
-      });
-      rpcRef.current = rpcSession;
-
-      channel.port1.addEventListener("message", (portEvent) => {
-        if (!rateLimiter.accept(performance.now())) {
-          stop("Canvas exceeded the host message rate limit.");
-          return;
-        }
-        const message = parseProjectCanvasChildMessage(portEvent.data, {
-          loadId: descriptor.loadId,
-          nonce: descriptor.nonce,
-        });
-        if (!message) {
-          invalidMessageCount += 1;
-          if (invalidMessageCount >= MAX_INVALID_PORT_MESSAGES) {
-            stop("Canvas sent repeated invalid messages.");
-          }
-          return;
-        }
-        invalidMessageCount = 0;
-        if (message.type === "canvas.rendered") {
-          if (renderAcknowledged) {
-            stop("Canvas reported completion more than once.");
-            return;
-          }
-          renderAcknowledged = true;
-          void commitProjectCanvasPackage(descriptor.loadId)
-            .then(() => {
-              if (stopped) return;
-              window.clearTimeout(timeoutId);
-              setRendered(true);
-              onRendered(descriptor.loadId);
-            })
-            .catch((error: unknown) => {
-              stop(errorMessage(error));
-            });
-          return;
-        }
-        rpcSession.handle(message);
-      });
-      channel.port1.addEventListener("messageerror", () => {
-        stop("Canvas sent an unreadable message.");
-      });
-      channel.port1.start();
-      portRef.current = channel.port1;
-
-      frameWindow.postMessage(
-        {
-          loadId: descriptor.loadId,
-          nonce: descriptor.nonce,
-          protocolVersion: PROJECT_CANVAS_PROTOCOL_VERSION,
-          type: "host.connect",
-        },
-        "*",
-        [channel.port2],
-      );
-      channel.port1.postMessage(initMessage);
-      lastSnapshotsJsonRef.current = JSON.stringify(grantedSnapshots);
-      handshakeComplete = true;
-      connectedRef.current = true;
-      setConnected(true);
-    };
-
-    window.addEventListener("message", handleReady);
-    setFrameSource(descriptor.url);
-    return () => {
-      stopped = true;
-      handshakeComplete = true;
-      window.clearTimeout(timeoutId);
-      window.removeEventListener("message", handleReady);
-      connectedRef.current = false;
-      rpcRef.current?.dispose();
-      rpcRef.current = null;
-      portRef.current?.close();
-      portRef.current = null;
-    };
-  }, [descriptor, fail, onRendered, projectId]);
-
-  React.useEffect(() => {
-    if (!connectedRef.current || !portRef.current) return;
-    portRef.current.postMessage({
-      loadId: descriptor.loadId,
-      mode,
-      nonce: descriptor.nonce,
-      protocolVersion: PROJECT_CANVAS_PROTOCOL_VERSION,
-      type: "host.mode",
-    });
-  }, [descriptor.loadId, descriptor.nonce, mode]);
-
-  React.useEffect(() => {
-    const port = portRef.current;
-    if (!connected || !port) return;
-    const grantedSnapshots = selectGrantedProjectCanvasSnapshots(
-      snapshots,
-      capabilities,
-    );
-    const serialized = JSON.stringify(grantedSnapshots);
-    if (serialized === lastSnapshotsJsonRef.current) return;
-    const message = {
-      loadId: descriptor.loadId,
-      nonce: descriptor.nonce,
-      protocolVersion: PROJECT_CANVAS_PROTOCOL_VERSION,
-      snapshots: grantedSnapshots,
-      type: "host.dataChanged",
-    } as const;
-    if (
-      !isMessageWithinSizeLimit(message, PROJECT_CANVAS_MAX_INIT_MESSAGE_BYTES)
-    ) {
-      fail("Canvas data update exceeds the host size limit.");
-      return;
-    }
-    port.postMessage(message);
-    lastSnapshotsJsonRef.current = serialized;
-  }, [capabilities, connected, descriptor, fail, snapshots]);
-
-  React.useEffect(() => {
-    const port = portRef.current;
-    if (
-      !connected ||
-      !port ||
-      !dataUpdate ||
-      dataUpdate.notificationId === lastWidgetDataNotificationRef.current
-    ) {
-      return;
-    }
-    const message = {
-      data: dataUpdate.data,
-      loadId: descriptor.loadId,
-      nonce: descriptor.nonce,
-      notificationId: dataUpdate.notificationId,
-      protocolVersion: PROJECT_CANVAS_PROTOCOL_VERSION,
-      type: "host.widgetDataChanged",
-      widgetId: dataUpdate.widgetId,
-    } as const;
-    if (
-      !isMessageWithinSizeLimit(message, PROJECT_CANVAS_MAX_INIT_MESSAGE_BYTES)
-    ) {
-      fail("Canvas widget data update exceeds the host size limit.");
-      return;
-    }
-    port.postMessage(message);
-    lastWidgetDataNotificationRef.current = dataUpdate.notificationId;
-  }, [connected, dataUpdate, descriptor.loadId, descriptor.nonce, fail]);
-
-  return (
-    <div className="relative h-full min-h-0 w-full bg-background">
-      {!failed ? (
-        <iframe
-          allow="autoplay"
-          className="h-full w-full border-0 bg-transparent"
-          data-canvas-connected={connected ? "true" : "false"}
-          data-canvas-rendered={rendered ? "true" : "false"}
-          data-testid="project-canvas-frame"
-          onError={() => fail("Canvas frame failed to load.")}
-          onLoad={() => {
-            if (!frameSource) return;
-            loadCountRef.current += 1;
-            if (loadCountRef.current > 1) {
-              fail("Canvas navigated away from its host shell.");
-            }
-          }}
-          ref={frameRef}
-          referrerPolicy="no-referrer"
-          sandbox="allow-scripts"
-          src={frameSource}
-          title={`${projectName} Canvas`}
-        />
-      ) : null}
-      {!rendered && !failed ? (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/70 text-muted-foreground">
-          <LoaderCircle
-            aria-label="Connecting Canvas"
-            className="h-5 w-5 animate-spin"
-          />
-        </div>
-      ) : null}
     </div>
   );
 }

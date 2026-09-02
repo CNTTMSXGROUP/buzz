@@ -18,6 +18,9 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   }
 
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
+    try delete(account: Self.legacyRecordsAccount)
+    try delete(account: Self.legacyPendingAccount)
+
     let allRecords = try records()
     let retainedRecords = allRecords.filter { $0.gatewayOrigin == gatewayOrigin }
     if retainedRecords.count != allRecords.count {
@@ -29,26 +32,6 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     if retainedPending.count != allPending.count {
       try replace(retainedPending, account: Self.pendingAccount)
     }
-  }
-
-  func legacyEnrollmentState() throws -> BuzzPushLegacyEnrollmentState {
-    BuzzPushLegacyEnrollmentState(
-      records: try read(
-        [BuzzPushLegacyEndpointGrantRecord].self,
-        account: Self.legacyRecordsAccount,
-        operation: "read legacy endpoint grants"
-      ) ?? [],
-      pending: try read(
-        [BuzzPushLegacyPendingEnrollmentRecord].self,
-        account: Self.legacyPendingAccount,
-        operation: "read legacy pending enrollments"
-      ) ?? []
-    )
-  }
-
-  func removeLegacyEnrollmentState() throws {
-    try delete(account: Self.legacyRecordsAccount)
-    try delete(account: Self.legacyPendingAccount)
   }
 
   func records() throws -> [BuzzPushEndpointGrantRecord] {
@@ -154,31 +137,6 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     let addStatus = SecItemAdd(add as CFDictionary, nil)
     guard addStatus == errSecSuccess else {
       throw keychainError(addStatus, operation: "add")
-    }
-  }
-
-  private func read<T: Decodable>(
-    _ type: T.Type,
-    account: String,
-    operation: String
-  ) throws -> T? {
-    var query = baseQuery(account: account)
-    query[kSecReturnData as String] = true
-    query[kSecMatchLimit as String] = kSecMatchLimitOne
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    if status == errSecItemNotFound { return nil }
-    guard status == errSecSuccess, let data = result as? Data else {
-      throw keychainError(status, operation: operation)
-    }
-    do {
-      return try JSONDecoder().decode(type, from: data)
-    } catch {
-      throw NSError(
-        domain: "BuzzPushEndpointGrantStore",
-        code: 3,
-        userInfo: [NSLocalizedDescriptionKey: "Stored legacy push state is invalid: \(error)"]
-      )
     }
   }
 

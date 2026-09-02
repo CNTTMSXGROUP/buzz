@@ -133,7 +133,7 @@ test("hydrates lifecycle history in global phase and revision order", async () =
 
   await settle();
 
-  assert.equal(harness.snapshots.at(-1).has(ALICE), true);
+  assert.equal(harness.snapshots.at(-1).has(ALICE), false);
   assert.equal(harness.snapshots.at(-1).has(BOB), true);
   assert.equal(harness.filters[0].limit > 0, true);
   assert.equal(harness.filters[0].since, 1_000);
@@ -168,7 +168,7 @@ test("reconciles joins, leaves, and ends missed during disconnect", async () => 
   harness.reconnect();
   await settle();
   assert.equal(harness.snapshots.at(-1).has(BOB), false);
-  assert.equal(harness.snapshots.at(-1).has(ALICE), true);
+  assert.equal(harness.snapshots.at(-1).has(ALICE), false);
 
   harness.setHistory([ended, left, join, start]);
   harness.reconnect();
@@ -213,7 +213,7 @@ test("applies channel-scoped live joins, leaves, and ends without reconnecting",
     }),
   );
   assert.equal(harness.snapshots.at(-1).has(BOB), false);
-  assert.equal(harness.snapshots.at(-1).has(ALICE), true);
+  assert.equal(harness.snapshots.at(-1).has(ALICE), false);
 
   harness.emit(
     event({
@@ -239,7 +239,7 @@ test("clears stale presence on the lease-cadence liveness refresh", async () => 
   ]);
   await settle();
 
-  assert.equal(harness.snapshots.at(-1).has(ALICE), true);
+  assert.equal(harness.snapshots.at(-1).has(ALICE), false);
   assert.equal(harness.snapshots.at(-1).has(BOB), true);
   assert.equal(harness.livenessDelay(), 10_000);
 
@@ -809,7 +809,7 @@ test("opaque lifecycle overflow fences an older liveness settlement", async () =
   const generation2 = "22222222-2222-4222-8222-222222222222";
   let liveHandler;
   let livenessTimer;
-  let resolveRefresh;
+  let resolveOldRefresh;
   let retry;
   let livenessRequests = 0;
   const snapshots = [];
@@ -835,12 +835,15 @@ test("opaque lifecycle overflow fences an older liveness settlement", async () =
         ];
       }
       livenessRequests += 1;
-      if (livenessRequests === 1) {
+      if (livenessRequests === 1 || livenessRequests >= 3) {
         return [livenessEvent("room", generation1)];
       }
-      return new Promise((resolve) => {
-        resolveRefresh = resolve;
-      });
+      if (livenessRequests === 2) {
+        return new Promise((resolve) => {
+          resolveOldRefresh = resolve;
+        });
+      }
+      throw new Error(`Unexpected liveness request ${livenessRequests}`);
     },
     subscribeToReconnects: () => () => {},
     onPresence: (participants) => snapshots.push(new Set(participants)),
@@ -880,10 +883,88 @@ test("opaque lifecycle overflow fences an older liveness settlement", async () =
   assert.deepEqual([...snapshots.at(-1)], []);
   assert.equal(typeof retry, "function");
 
-  resolveRefresh([livenessEvent("room", generation1)]);
+  retry();
   await settle();
-  assert.deepEqual([...snapshots.at(-1)], []);
-  assert.equal(typeof retry, "function");
+  assert.equal(livenessRequests >= 3, true);
+  assert.equal(snapshots.at(-1).has(BOB), true);
+
+  resolveOldRefresh([]);
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), true);
+  dispose();
+});
+
+test("ignores a rejected liveness request from before completed recovery", async () => {
+  let reconnect;
+  let livenessTimer;
+  let rejectOldRefresh;
+  let livenessRequests = 0;
+  let errors = 0;
+  let retryScheduled = false;
+  const snapshots = [];
+  const history = [
+    event({ id: "start", kind: 48100, createdAt: 1 }),
+    participantEvent({
+      id: "join",
+      kind: 48101,
+      admissionId: "admission",
+      rosterRevision: 1,
+      generation: "1",
+      createdAt: 2,
+    }),
+  ];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async () => () => {},
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) return history;
+      livenessRequests += 1;
+      if (livenessRequests === 2) {
+        return new Promise((_resolve, reject) => {
+          rejectOldRefresh = reject;
+        });
+      }
+      return [livenessEvent()];
+    },
+    subscribeToReconnects: (listener) => {
+      reconnect = listener;
+      return () => {};
+    },
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    onError: () => {
+      errors += 1;
+    },
+    setRetryTimer: (callback) => {
+      retryScheduled = true;
+      return callback;
+    },
+    clearRetryTimer: () => {
+      retryScheduled = false;
+    },
+    setLivenessTimer: (callback) => {
+      livenessTimer = callback;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
+  });
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), true);
+
+  livenessTimer();
+  await settle();
+  reconnect();
+  await settle();
+  assert.equal(livenessRequests, 3);
+  assert.equal(snapshots.at(-1).has(BOB), true);
+
+  rejectOldRefresh(new Error("obsolete timeout"));
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), true);
+  assert.equal(errors, 0);
+  assert.equal(retryScheduled, false);
   dispose();
 });
 
@@ -964,6 +1045,105 @@ test("stale liveness removes unchanged requested sessions and preserves new ones
   dispose();
 });
 
+test("bounds Cartesian liveness requests while preserving every chunk", async () => {
+  const channels = Array.from(
+    { length: 257 },
+    (_, index) => `channel-${index}`,
+  );
+  const history = Array.from({ length: 257 }, (_, index) =>
+    event({
+      id: `start-${index}`,
+      kind: 48100,
+      session: `room-${index}`,
+      createdAt: index + 1,
+    }),
+  );
+  let activeRequests = 0;
+  let peakRequests = 0;
+  let totalRequests = 0;
+  const filters = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: channels,
+    subscribeLive: async () => () => {},
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) return history;
+      filters.push(filter);
+      totalRequests += 1;
+      activeRequests += 1;
+      peakRequests = Math.max(peakRequests, activeRequests);
+      await new Promise((resolve) => setImmediate(resolve));
+      activeRequests -= 1;
+      return filter["#d"].map((session) => livenessEvent(session));
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: () => {},
+    setLivenessTimer: (callback) => callback,
+    clearLivenessTimer: () => {},
+  });
+
+  await settle();
+  await settle();
+  assert.equal(totalRequests, 9);
+  assert.equal(peakRequests, 4);
+  assert.equal(
+    filters.every((filter) => filter["#h"].length <= 128),
+    true,
+  );
+  assert.equal(
+    filters.every((filter) => filter["#d"].length <= 128),
+    true,
+  );
+  dispose();
+});
+
+test("retries hydration when one bounded liveness request fails", async () => {
+  let retry;
+  let livenessRequests = 0;
+  const snapshots = [];
+  const history = [
+    event({ id: "start", kind: 48100 }),
+    participantEvent({
+      id: "join",
+      kind: 48101,
+      admissionId: "admission",
+      rosterRevision: 1,
+    }),
+  ];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: Array.from({ length: 129 }, (_, index) => `channel-${index}`),
+    subscribeLive: async () => () => {},
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) return history;
+      livenessRequests += 1;
+      if (livenessRequests === 1) throw new Error("temporary timeout");
+      return [livenessEvent()];
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setRetryTimer: (callback) => {
+      retry = callback;
+      return callback;
+    },
+    clearRetryTimer: () => {
+      retry = undefined;
+    },
+    setLivenessTimer: (callback) => callback,
+    clearLivenessTimer: () => {},
+  });
+
+  await settle();
+  assert.deepEqual([...snapshots.at(-1)], []);
+  assert.equal(typeof retry, "function");
+
+  retry();
+  await settle();
+  assert.equal(livenessRequests, 4);
+  assert.equal(snapshots.at(-1).has(BOB), true);
+  dispose();
+});
+
 test("retries a failed hydration and tears down every recovery path", async () => {
   let attempts = 0;
   let retry;
@@ -1007,7 +1187,7 @@ test("retries a failed hydration and tears down every recovery path", async () =
 
   retry();
   await settle();
-  assert.equal(snapshots.at(-1).has(ALICE), true);
+  assert.equal(snapshots.at(-1).has(ALICE), false);
 
   dispose();
   assert.equal(liveDisposed, true);

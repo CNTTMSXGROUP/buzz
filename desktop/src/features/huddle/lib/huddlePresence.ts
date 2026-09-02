@@ -19,8 +19,7 @@ type AdmissionState = {
 type LivenessGeneration = string;
 
 type HuddleSession = {
-  creator: string;
-  creatorPresent: boolean;
+  startCreator: string;
   startCreatedAt: number;
   startEventId: string;
   endState: AdmissionState | null;
@@ -172,15 +171,11 @@ function participantIsPresent(
   session: HuddleSession,
   participant: string,
 ): boolean {
-  return (
-    participantHasExplicitPresence(session, participant) ||
-    (participant === session.creator && session.creatorPresent)
-  );
+  return participantHasExplicitPresence(session, participant);
 }
 
 function sessionParticipants(session: HuddleSession): Set<string> {
   const candidates = new Set<string>([
-    session.creator,
     ...session.admissionsByParticipant.keys(),
     ...session.legacyStateByParticipant.keys(),
   ]);
@@ -277,8 +272,7 @@ export class HuddlePresenceTracker {
         return false;
       }
       this.sessions.set(sessionId, {
-        creator,
-        creatorPresent: true,
+        startCreator: creator,
         startCreatedAt: event.created_at,
         startEventId: event.id,
         endState: null,
@@ -301,7 +295,9 @@ export class HuddlePresenceTracker {
     const generation = content.generation;
     if (event.kind === KIND_HUDDLE_ENDED) {
       const signer = normalizePubkey(event.pubkey);
-      if (signer !== this.relaySelf && signer !== session.creator) return false;
+      if (signer !== this.relaySelf && signer !== session.startCreator) {
+        return false;
+      }
       if (
         generation !== null &&
         session.generation !== null &&
@@ -361,7 +357,6 @@ export class HuddlePresenceTracker {
       session.legacyStateByParticipant.clear();
       session.departedAdmissions.clear();
       session.compactedRosterRevisionFloor = null;
-      session.creatorPresent = false;
     }
     if (generation !== null) session.generation = generation;
 
@@ -394,7 +389,6 @@ export class HuddlePresenceTracker {
       session.legacyStateByParticipant.clear();
       session.departedAdmissions.clear();
       session.compactedRosterRevisionFloor = null;
-      session.creatorPresent = false;
     }
 
     if (
@@ -456,13 +450,6 @@ export class HuddlePresenceTracker {
       session.latestRosterCreatedAt = event.created_at;
       session.latestRosterEventId = event.id;
     }
-    if (
-      participant === session.creator &&
-      event.kind === KIND_HUDDLE_PARTICIPANT_LEFT &&
-      !participantHasExplicitPresence(session, participant)
-    ) {
-      session.creatorPresent = false;
-    }
     return true;
   }
 
@@ -483,7 +470,6 @@ export class HuddlePresenceTracker {
         session.legacyStateByParticipant.clear();
         session.departedAdmissions.clear();
         session.compactedRosterRevisionFloor = null;
-        session.creatorPresent = false;
       }
       session.generation = generation;
       session.generationIsAuthoritative = true;

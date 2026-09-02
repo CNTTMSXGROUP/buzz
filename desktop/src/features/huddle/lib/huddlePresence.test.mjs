@@ -90,7 +90,7 @@ test("ignores forged participant lifecycle events", () => {
     RELAY,
   );
 
-  assert.deepEqual([...result], [ALICE]);
+  assert.deepEqual([...result], []);
 });
 
 test("keeps a participant until their final admission leaves", () => {
@@ -436,12 +436,12 @@ test("preserves distinct admissions that share one roster revision", () => {
 
   const tracker = new HuddlePresenceTracker(RELAY);
   for (const item of events) tracker.apply(item);
-  assert.equal(tracker.snapshot().has(ALICE), true);
+  assert.equal(tracker.snapshot().has(ALICE), false);
   assert.equal(tracker.snapshot().has(BOB), true);
   assert.equal(tracker.snapshot().has(CHARLIE), true);
 
   const hydrated = reconstructHuddlePresence(events, RELAY);
-  assert.equal(hydrated.has(ALICE), true);
+  assert.equal(hydrated.has(ALICE), false);
   assert.equal(hydrated.has(BOB), true);
   assert.equal(hydrated.has(CHARLIE), true);
 });
@@ -505,7 +505,7 @@ test("a lower-id same-second start is canonical and clears old participants", ()
     true,
   );
   assert.equal(tracker.snapshot().has(BOB), false);
-  assert.equal(tracker.snapshot().has(ALICE), true);
+  assert.equal(tracker.snapshot().has(ALICE), false);
 });
 
 test("rejects an unauthorized end signer", () => {
@@ -517,7 +517,7 @@ test("rejects an unauthorized end signer", () => {
     RELAY,
   );
 
-  assert.deepEqual([...result], [ALICE]);
+  assert.deepEqual([...result], []);
 });
 
 test("accepts either creator-signed or relay-signed end events", () => {
@@ -552,7 +552,7 @@ test("tracks simultaneous sessions and clears only the ended huddle", () => {
     RELAY,
   );
 
-  assert.deepEqual([...result], [BOB]);
+  assert.deepEqual([...result], []);
 });
 
 test("pages complete lifecycle history without a fixed lifetime horizon", async () => {
@@ -723,27 +723,40 @@ test("incremental state ignores an older start replayed after an active session"
   assert.equal(tracker.snapshot().has(BOB), true);
 });
 
-test("removes the creator after their final admission leaves", () => {
+test("shows only participants with authenticated audio admissions", () => {
   const tracker = new HuddlePresenceTracker(RELAY);
   tracker.apply(event({ id: "1", kind: 48100 }));
   tracker.apply(
     participantEvent({
       id: "2",
       kind: 48101,
-      tags: [["p", ALICE]],
-      admissionId: "creator-device",
+      admissionId: "participant-device",
       rosterRevision: 1,
     }),
   );
+
+  assert.equal(tracker.snapshot().has(ALICE), false);
+  assert.equal(tracker.snapshot().has(BOB), true);
+
   tracker.apply(
     participantEvent({
       id: "3",
-      kind: 48102,
+      kind: 48101,
       tags: [["p", ALICE]],
       admissionId: "creator-device",
       rosterRevision: 2,
     }),
   );
+  assert.equal(tracker.snapshot().has(ALICE), true);
 
+  tracker.apply(
+    participantEvent({
+      id: "4",
+      kind: 48102,
+      tags: [["p", ALICE]],
+      admissionId: "creator-device",
+      rosterRevision: 3,
+    }),
+  );
   assert.equal(tracker.snapshot().has(ALICE), false);
 });

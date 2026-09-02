@@ -7,6 +7,7 @@ import {
   HUDDLE_LIFECYCLE_PAGE_LIMIT,
   compareHuddleGenerations,
 } from "@/features/huddle/lib/huddlePresence";
+import { collectWithConcurrency } from "@/shared/api/concurrency";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -26,6 +27,7 @@ const LIFECYCLE_KINDS = [
   KIND_HUDDLE_ENDED,
 ] as const;
 const MAX_PENDING_LIVE_EVENTS = 1_000;
+const LIVENESS_REQUEST_CONCURRENCY = 4;
 const INITIAL_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 // Owner leases renew every 10 seconds against a 30-second TTL. Refreshing on
@@ -87,6 +89,7 @@ export function startHuddlePresenceRuntime(
   let livenessHandle: unknown = null;
   let retryDelayMs = INITIAL_RETRY_DELAY_MS;
   let livenessRequestVersion = 0;
+  let reconciliationEpoch = 0;
   const pendingOpaqueLifecycleEvents = new Map<string, RelayEvent>();
 
   const channelChunks: string[][] = [];
@@ -284,17 +287,19 @@ export function startHuddlePresenceRuntime(
         sessionIds.slice(index, index + MAX_EXPLICIT_CHANNEL_VALUES),
       );
     }
-    const livenessPages = await Promise.all(
-      channelChunks.flatMap((channelIds) =>
-        sessionChunks.map((sessions) =>
-          dependencies.fetchEvents({
-            kinds: [KIND_HUDDLE_LIVENESS],
-            "#h": channelIds,
-            "#d": sessions,
-            limit: sessions.length,
-          }),
-        ),
-      ),
+    const requests = channelChunks.flatMap((channelIds) =>
+      sessionChunks.map((sessions) => ({ channelIds, sessions })),
+    );
+    const livenessPages = await collectWithConcurrency(
+      requests,
+      LIVENESS_REQUEST_CONCURRENCY,
+      ({ channelIds, sessions }) =>
+        dependencies.fetchEvents({
+          kinds: [KIND_HUDDLE_LIVENESS],
+          "#h": channelIds,
+          "#d": sessions,
+          limit: sessions.length,
+        }),
     );
     const generations = new Map<string, string>();
     for (const event of livenessPages.flat()) {
@@ -329,13 +334,14 @@ export function startHuddlePresenceRuntime(
       return;
     }
     const requestVersion = livenessRequestVersion;
+    const requestEpoch = reconciliationEpoch;
     const requestedSessionGenerations = new Map(activeSessionGenerations);
     try {
       const nextActiveSessionGenerations = await fetchActiveSessionIds([
         ...requestedSessionGenerations.keys(),
       ]);
       if (disposed) return;
-      if (!hydrated) return;
+      if (!hydrated || requestEpoch !== reconciliationEpoch) return;
       if (requestVersion !== livenessRequestVersion) {
         const mergedGenerations = new Map(activeSessionGenerations);
         for (const [
@@ -382,7 +388,7 @@ export function startHuddlePresenceRuntime(
       );
       scheduleLivenessRefresh();
     } catch (error) {
-      if (disposed) return;
+      if (disposed || requestEpoch !== reconciliationEpoch) return;
       if (requestVersion !== livenessRequestVersion) {
         scheduleLivenessRefresh();
         return;
@@ -466,6 +472,7 @@ export function startHuddlePresenceRuntime(
       tracker = nextTracker;
       pendingOpaqueLifecycleEvents.clear();
       activeSessionGenerations = nextActiveSessionGenerations;
+      reconciliationEpoch += 1;
       hydrated = true;
       retryDelayMs = INITIAL_RETRY_DELAY_MS;
       clearScheduledRetry();

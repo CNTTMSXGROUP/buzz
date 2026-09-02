@@ -18,7 +18,7 @@ struct BuzzPushPresentationCacheTests {
     let writer = BuzzAgeRestrictionFenceStore(containerURL: directory)
     let reader = BuzzAgeRestrictionFenceStore(containerURL: directory)
 
-    #expect(reader.current() == .initial)
+    #expect(reader.current() == .unavailable)
     let first = try writer.begin()
     #expect(first.isFencing)
     #expect(reader.current() == first)
@@ -26,6 +26,26 @@ struct BuzzPushPresentationCacheTests {
     #expect(!second.isFencing)
     #expect(second.token != first.token)
     #expect(reader.current() == second)
+  }
+
+  @Test("Legacy notification state without a fence fails closed until restored")
+  func legacyNotificationStateWithoutFenceFailsClosed() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let legacySnapshot = directory.appendingPathComponent(
+      BuzzPushPresentationCacheStore.fileName
+    )
+    try Data("legacy notification snapshot".utf8).write(to: legacySnapshot)
+    let store = BuzzAgeRestrictionFenceStore(containerURL: directory)
+
+    let beforeAgeCheck = store.current()
+    #expect(beforeAgeCheck == .unavailable)
+    #expect(beforeAgeCheck.requiresDiscard(since: beforeAgeCheck))
+
+    let restored = try store.settleIfFencing()
+    #expect(!restored.isFencing)
+    #expect(store.current() == restored)
+    #expect(!restored.requiresDiscard(since: restored))
   }
 
   @Test("Fenced cleanup rotates before work and settles only after success")

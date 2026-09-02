@@ -14,7 +14,7 @@ public struct BuzzAgeRestrictionFence: Codable, Equatable, Sendable {
     self.isFencing = isFencing
   }
 
-  /// Default value before any restricted cleanup has begun.
+  /// In-memory sentinel used before a notification extension loads the store.
   public static let initial = BuzzAgeRestrictionFence(
     token: "initial",
     isFencing: false
@@ -47,7 +47,9 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
     fileURL = containerURL.appendingPathComponent(Self.fileName)
   }
 
-  /// Returns the latest fence, failing closed for malformed persisted data.
+  /// Returns the latest fence, failing closed when persisted data is absent or
+  /// malformed. An absent file can represent an upgraded installation whose
+  /// legacy notification credentials have not passed the age gate yet.
   public func current() -> BuzzAgeRestrictionFence {
     lock.lock()
     defer { lock.unlock() }
@@ -117,7 +119,7 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
 
   private func loadLocked() -> BuzzAgeRestrictionFence {
     guard FileManager.default.fileExists(atPath: fileURL.path) else {
-      return .initial
+      return .unavailable
     }
     guard let data = try? Data(contentsOf: fileURL),
       let fence = try? JSONDecoder().decode(BuzzAgeRestrictionFence.self, from: data)

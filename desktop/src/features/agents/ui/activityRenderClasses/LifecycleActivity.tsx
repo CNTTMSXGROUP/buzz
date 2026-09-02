@@ -90,8 +90,11 @@ function PermissionDecisionButtons({
   requestNonce: string;
   /**
    * Monotonically increasing failure token from the reducer — incremented on
-   * every non-`sent` `control_result`. Keying the effect on this number (not a
-   * boolean) ensures a second failure after a retry also re-enables buttons.
+   * every authoritative delivery failure (`no_active_turn`, `channel_closed`,
+   * `no_channel`). The transient `channel_full` status does NOT increment this
+   * token; the retransmit orchestrator handles that status automatically.
+   * Keying the effect on this number (not a boolean) ensures a second failure
+   * after a retry also re-enables buttons.
    */
   deliveryFailed?: number;
   /**
@@ -108,9 +111,11 @@ function PermissionDecisionButtons({
   const deliveryFn = _deliveryFn ?? startPermissionDecisionDelivery;
   const [pending, setPending] = React.useState<string | null>(null);
 
-  // Re-enable buttons when the reducer signals delivery failure (non-`sent`
-  // control_result status). The relay send succeeded but the harness couldn't
-  // route the click — the user should be able to retry.
+  // Re-enable buttons when the reducer signals an authoritative delivery
+  // failure (`no_active_turn`, `channel_closed`, `no_channel`). The transient
+  // `channel_full` status does NOT increment this token — the retransmit
+  // orchestrator stays subscribed and keeps resending automatically, so buttons
+  // must remain disabled until the retry settles or the deadline expires.
   React.useEffect(() => {
     if (deliveryFailed) {
       setPending(null);

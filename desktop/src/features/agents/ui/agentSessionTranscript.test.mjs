@@ -2403,7 +2403,7 @@ test("buildTranscript_control_result_second_failure_increments_delivery_failed",
       turnId: "turn-1",
       payload: {
         type: "permission_decision",
-        status: "channel_closed",
+        status: "no_channel",
         requestNonce: nonce,
         optionId: "allow_once",
       },
@@ -2496,6 +2496,53 @@ test("buildTranscript_control_result_already_decided_does_not_mark_delivery_fail
     card.deliveryFailed,
     undefined,
     "deliveryFailed must not be set on already_decided control_result",
+  );
+});
+
+test("buildTranscript_control_result_channel_full_does_not_mark_delivery_failed", () => {
+  // `channel_full` is a transient queue-saturation status — the retransmit
+  // orchestrator stays subscribed and keeps resending automatically. The card
+  // must remain DISABLED (deliveryFailed must NOT be incremented) so a second
+  // click cannot start a racing delivery loop while the first is still alive.
+  //
+  // Mutation proof: restoring `channel_full` to increment `deliveryFailed` in
+  // `handlePermissionDecisionResult` → `deliveryFailed` becomes 1 → this
+  // assertion fails at `expected undefined, got 1`.
+  const nonce = "nonce-channel-full";
+  const events = [
+    makePermissionRequestWithAuth(1, "req-cf", nonce),
+    {
+      seq: 2,
+      timestamp: "2026-07-01T10:00:01.000Z",
+      kind: "control_result",
+      agentIndex: 0,
+      channelId: "ch-1",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      payload: {
+        type: "permission_decision",
+        status: "channel_full",
+        requestNonce: nonce,
+        optionId: "allow_once",
+      },
+    },
+  ];
+  const transcript = buildTranscript(events);
+
+  const card = transcript.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === nonce,
+  );
+  assert.ok(card, "permission card must exist");
+  assert.equal(
+    card.deliveryFailed,
+    undefined,
+    "deliveryFailed must not be set on channel_full — it is transient; buttons must stay disabled while the retransmit loop is active",
+  );
+  // Card must remain actionable (the request is still live).
+  assert.equal(
+    card.actionable,
+    true,
+    "card must remain actionable after channel_full — the retransmit loop is still in progress",
   );
 });
 

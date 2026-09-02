@@ -518,6 +518,249 @@ test("test_f3_cross_layer_four_options_acp_read_to_lifecycle_activity_two_button
 });
 
 // ---------------------------------------------------------------------------
+// Cross-layer reducer+mounted regression: channel_full leaves buttons disabled
+//
+// Proves that the full pipeline — acp_read → buildTranscript reducer →
+// LifecycleActivity component — correctly leaves both buttons DISABLED after
+// a `channel_full` control_result, matching the "transient, retransmit
+// orchestrator keeps going" contract.
+//
+// The companion case proves authoritative failures (`no_active_turn`) DO
+// re-enable buttons — so the effect path is also covered.
+//
+// Mutation proof: restoring `channel_full` to increment `deliveryFailed` in
+// `handlePermissionDecisionResult` → the card acquires `deliveryFailed: 1` →
+// the component re-renders with `deliveryFailed={1}` → the useEffect fires →
+// `setPending(null)` re-enables both buttons → the disabled assertion fails.
+// ---------------------------------------------------------------------------
+
+test("test_channel_full_reducer_to_component_buttons_stay_disabled", async () => {
+  const { createElement, act } = await import("react");
+  const { render, fireEvent } = await import("@testing-library/react");
+
+  const FAKE_NOW_SECS = Math.floor(FAKE_NOW_MS / 1000);
+  const FUTURE_EXPIRY = FAKE_NOW_SECS + 9_999_999;
+  const nonce = "nonce-cross-layer-cf";
+
+  // Base acp_read event.
+  const acpReadEvent = {
+    seq: 1,
+    timestamp: "2026-09-01T10:00:00.000Z",
+    kind: "acp_read",
+    agentIndex: 0,
+    channelId: "ch-cross-cf",
+    sessionId: "sess-cross-cf",
+    turnId: "turn-cross-cf",
+    payload: {
+      jsonrpc: "2.0",
+      id: "req-cross-cf",
+      method: "session/request_permission",
+      params: {
+        title: "Tool requires approval",
+        toolCallId: "tc-cross-cf",
+        options: [
+          {
+            optionId: "opt-allow-once",
+            kind: "allow_once",
+            name: "Allow once",
+          },
+          { optionId: "opt-reject-once", kind: "reject_once", name: "Deny" },
+        ],
+      },
+    },
+    authorization: {
+      requestNonce: nonce,
+      actionable: true,
+      expiresAt: FUTURE_EXPIRY,
+    },
+  };
+
+  // `channel_full` control_result — transient; must NOT set deliveryFailed.
+  const channelFullResult = {
+    seq: 2,
+    timestamp: "2026-09-01T10:00:01.000Z",
+    kind: "control_result",
+    agentIndex: 0,
+    channelId: "ch-cross-cf",
+    sessionId: "sess-cross-cf",
+    turnId: "turn-cross-cf",
+    payload: {
+      type: "permission_decision",
+      status: "channel_full",
+      requestNonce: nonce,
+      optionId: "opt-allow-once",
+    },
+  };
+
+  // `no_active_turn` control_result — authoritative failure; MUST set deliveryFailed.
+  const authoritativeFailure = {
+    seq: 2,
+    timestamp: "2026-09-01T10:00:01.000Z",
+    kind: "control_result",
+    agentIndex: 0,
+    channelId: "ch-cross-cf",
+    sessionId: "sess-cross-cf",
+    turnId: "turn-cross-cf",
+    payload: {
+      type: "permission_decision",
+      status: "no_active_turn",
+      requestNonce: nonce,
+      optionId: "opt-allow-once",
+    },
+  };
+
+  // Build both card states through the real transcript reducer.
+  const cardAfterChannelFull = buildTranscript([
+    acpReadEvent,
+    channelFullResult,
+  ]).find((i) => i.renderClass === "permission");
+  const cardAfterAuthoritativeFailure = buildTranscript([
+    acpReadEvent,
+    authoritativeFailure,
+  ]).find((i) => i.renderClass === "permission");
+  assert.ok(cardAfterChannelFull, "card must exist after channel_full");
+  assert.ok(
+    cardAfterAuthoritativeFailure,
+    "card must exist after authoritative failure",
+  );
+
+  // Reducer-level gate: channel_full must NOT set deliveryFailed.
+  assert.equal(
+    cardAfterChannelFull.deliveryFailed,
+    undefined,
+    "channel_full must not set deliveryFailed in the reducer (mutation: restoring increment → 1 here → test fails)",
+  );
+  // Reducer-level gate: no_active_turn MUST set deliveryFailed.
+  assert.equal(
+    cardAfterAuthoritativeFailure.deliveryFailed,
+    1,
+    "no_active_turn must set deliveryFailed in the reducer",
+  );
+
+  // ── Component: channel_full → buttons stay disabled ───────────────────────
+  // Start with the initial card (no deliveryFailed), click Allow to set pending.
+  const initialCard = buildTranscript([acpReadEvent]).find(
+    (i) => i.renderClass === "permission",
+  );
+
+  // Track delivery calls to ensure no second delivery is started.
+  const deliveryCalls = [];
+  // The first delivery is intentionally stalled — never resolves.
+  function stalledDelivery({ optionId }) {
+    deliveryCalls.push(optionId);
+    return new Promise(() => {});
+  }
+
+  let container, rerender;
+  await act(async () => {
+    ({ container, rerender } = render(
+      createElement(LifecycleActivity, {
+        ...BASE_PROPS,
+        item: initialCard,
+        _deliveryFn: stalledDelivery,
+      }),
+    ));
+  });
+
+  // Click Allow — sets pending, disables both buttons.
+  const allowBtn = container.querySelector(
+    '[data-testid="permission-decision-opt-allow-once"]',
+  );
+  assert.ok(allowBtn, "allow_once button must be present before click");
+  await act(async () => {
+    fireEvent.click(allowBtn);
+    await Promise.resolve();
+  });
+  assert.equal(deliveryCalls.length, 1, "first delivery must fire on click");
+
+  // Now rerender with the post-channel_full card (deliveryFailed undefined).
+  // The useEffect must NOT fire (deliveryFailed didn't change), so pending stays
+  // set and both buttons remain disabled.
+  await act(async () => {
+    rerender(
+      createElement(LifecycleActivity, {
+        ...BASE_PROPS,
+        item: cardAfterChannelFull,
+        _deliveryFn: stalledDelivery,
+      }),
+    );
+    await Promise.resolve();
+  });
+
+  const allowBtnAfterCF = container.querySelector(
+    '[data-testid="permission-decision-opt-allow-once"]',
+  );
+  const denyBtnAfterCF = container.querySelector(
+    '[data-testid="permission-decision-opt-reject-once"]',
+  );
+  assert.ok(allowBtnAfterCF, "allow button must still be in DOM");
+  assert.ok(denyBtnAfterCF, "deny button must still be in DOM");
+  assert.ok(
+    allowBtnAfterCF.disabled,
+    "allow button must remain DISABLED after channel_full (mutation: increment deliveryFailed → setPending(null) fires → button enabled → this fails)",
+  );
+  assert.ok(
+    denyBtnAfterCF.disabled,
+    "deny button must remain DISABLED after channel_full — both buttons stay disabled during automatic retry",
+  );
+  assert.equal(
+    deliveryCalls.length,
+    1,
+    "no second delivery must start after channel_full — retransmit orchestrator handles resend, not a second click",
+  );
+
+  // ── Companion: authoritative failure re-enables buttons ───────────────────
+  // Render a fresh card, click, then rerender with deliveryFailed: 1.
+  const deliveryCalls2 = [];
+  function stalledDelivery2({ optionId }) {
+    deliveryCalls2.push(optionId);
+    return new Promise(() => {});
+  }
+
+  let container2, rerender2;
+  await act(async () => {
+    ({ container: container2, rerender: rerender2 } = render(
+      createElement(LifecycleActivity, {
+        ...BASE_PROPS,
+        item: initialCard,
+        _deliveryFn: stalledDelivery2,
+      }),
+    ));
+  });
+
+  const allowBtn2 = container2.querySelector(
+    '[data-testid="permission-decision-opt-allow-once"]',
+  );
+  assert.ok(allowBtn2, "allow button must be present for companion case");
+  await act(async () => {
+    fireEvent.click(allowBtn2);
+    await Promise.resolve();
+  });
+
+  // Rerender with authoritative failure card (deliveryFailed: 1).
+  // useEffect sees deliveryFailed change 0→1 → setPending(null) → buttons enabled.
+  await act(async () => {
+    rerender2(
+      createElement(LifecycleActivity, {
+        ...BASE_PROPS,
+        item: cardAfterAuthoritativeFailure,
+        _deliveryFn: stalledDelivery2,
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  const allowBtnAfterFail = container2.querySelector(
+    '[data-testid="permission-decision-opt-allow-once"]',
+  );
+  assert.ok(
+    !allowBtnAfterFail.disabled,
+    "allow button must be RE-ENABLED after no_active_turn — user can retry",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // F3 interactive delivery-seam: acp_read → buildTranscript → LifecycleActivity
 // click buttons → assert _deliveryFn called with ruled allow_once/reject_once IDs
 //

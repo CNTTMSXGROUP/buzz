@@ -481,17 +481,25 @@ export function handlePermissionWrite(
 
 /**
  * Handle a `control_result` frame for a `permission_decision` delivery.
- * A non-success status means the click did not reach the harness — marks the
- * card with an incremented `deliveryFailed` counter so buttons re-enable for
- * retry.
  *
- * `sent` and `already_decided` are both success: `sent` means the harness
- * forwarded the decision to the live read loop; `already_decided` means a
- * retransmit matched a nonce the harness had previously forwarded (delivery
- * suppressed — the deciding task has since ended). Neither may fail the card —
- * an `already_decided` that incremented `deliveryFailed` would flip a
- * correctly-resolved card back to a clickable/failed state, the exact P1 the
- * retransmit loop exists to avoid.
+ * Three statuses are treated as authoritative failures — the harness cannot
+ * route the decision at all, so the card's `deliveryFailed` token is
+ * incremented and the buttons re-enable for a manual retry:
+ *   `no_active_turn`, `channel_closed`, `no_channel`
+ *
+ * Two statuses are success and must not fail the card:
+ *   `sent` — the harness forwarded the decision to the live read loop.
+ *   `already_decided` — a retransmit matched a nonce the harness had already
+ *     applied (suppressed); incrementing `deliveryFailed` here would flip a
+ *     correctly-resolved card back to clickable, the exact P1 this exists to
+ *     prevent.
+ *
+ * `channel_full` is a transient queue-saturation condition (one or more
+ * eligible queues could not accept the frame). The retransmit orchestrator
+ * (`retransmitPermissionDecision.ts`) stays subscribed and keeps resending
+ * until the harness accepts or the deadline expires. The card must remain
+ * DISABLED while the automatic retry is in progress — do NOT increment
+ * `deliveryFailed` here.
  */
 export function handlePermissionDecisionResult(
   d: PermissionDraftSlice,
@@ -500,8 +508,12 @@ export function handlePermissionDecisionResult(
   const frameType = asString(payload.type);
   if (frameType !== "permission_decision") return;
   const deliveryStatus = asString(payload.status);
+  // Success statuses — no card update needed.
   if (deliveryStatus === "sent" || deliveryStatus === "already_decided") return;
-  // Delivery failed — find the card by nonce and mark it retryable.
+  // Transient queue-saturation — retransmit orchestrator keeps retrying;
+  // do not re-enable the buttons mid-retry.
+  if (deliveryStatus === "channel_full") return;
+  // Authoritative failure — find the card by nonce and mark it retryable.
   const nonce = asString(payload.requestNonce);
   if (!nonce) return;
   const itemId = d.pendingPermissionsByNonce.get(nonce);

@@ -713,6 +713,8 @@ pub struct AppState {
     pub audio_rooms: Arc<AudioRoomManager>,
     /// Set to `true` on SIGTERM — readiness probe returns 503.
     pub shutting_down: Arc<AtomicBool>,
+    /// Orders readiness gauge publication against terminal shutdown.
+    pub(crate) readiness: Arc<crate::readiness::ReadinessCoordinator>,
     /// Process start time — used by `/_status` endpoint.
     pub started_at: Instant,
     /// Shared, community-scoped NIP-98 replay prevention.
@@ -914,6 +916,7 @@ impl AppState {
             git_pack_cache,
             audio_rooms: Arc::new(AudioRoomManager::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            readiness: Arc::new(crate::readiness::ReadinessCoordinator::default()),
             started_at: Instant::now(),
             nip98_replay,
             gif_http_client,
@@ -953,6 +956,23 @@ impl AppState {
                 handle: audit_worker_handle,
             },
         )
+    }
+
+    /// Atomically closes readiness publication before exposing shutdown to
+    /// the relay's other fast-path lifecycle checks.
+    pub fn begin_shutdown(&self) {
+        self.readiness.begin_shutdown();
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_readiness_evaluator(
+        &mut self,
+        evaluator: Arc<dyn crate::readiness::ReadinessEvaluator>,
+    ) {
+        self.readiness = Arc::new(crate::readiness::ReadinessCoordinator::with_evaluator(
+            evaluator,
+        ));
     }
 
     /// Inter-relay mesh handle. `None` ⇒ mesh-off / single-instance: callers
@@ -1386,7 +1406,7 @@ impl std::fmt::Debug for AppState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::connection::{AuthState, ConnectionState};
     use std::collections::HashMap;
@@ -1425,7 +1445,10 @@ mod tests {
         (mgr, conn_id, rx, ctrl_rx, cancel, bp)
     }
 
-    async fn test_state() -> Arc<AppState> {
+    /// A relay state whose Redis is deliberately unreachable, so admission
+    /// checks resolve to `AdmissionError::Unavailable` without any live
+    /// infrastructure. Shared with `crate::rejection`'s tests.
+    pub(crate) async fn test_state() -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -1462,8 +1485,6 @@ mod tests {
         Arc::new(state)
     }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn audit_worker_retries_lock_timeout_until_original_entry_is_appended_once() {
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let observer = sqlx::PgPool::connect(&database_url)
@@ -1585,6 +1606,14 @@ mod tests {
             .execute(&observer)
             .await
             .expect("remove test community");
+    }
+
+    mod postgres_tests {
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn audit_worker_retries_lock_timeout_until_original_entry_is_appended_once() {
+            super::audit_worker_retries_lock_timeout_until_original_entry_is_appended_once().await;
+        }
     }
 
     #[test]

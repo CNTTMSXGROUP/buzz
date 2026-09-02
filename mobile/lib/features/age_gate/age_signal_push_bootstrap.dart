@@ -45,6 +45,9 @@ final ageRestrictedNotificationPurgerProvider =
 /// Delay between successful maintenance purges while restriction remains active.
 const ageRestrictedNotificationMaintenanceDelay = Duration(seconds: 30);
 
+/// Number of delayed purge passes after an initial successful purge.
+const ageRestrictedNotificationMaintenancePurgeLimit = 3;
+
 /// Schedules a recheck for interactions donated by stale extensions.
 final ageRestrictedNotificationMaintenanceScheduleProvider =
     Provider<VoidCallback Function(VoidCallback)>((ref) {
@@ -144,6 +147,9 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
     final consecutiveFailures = useRef(0);
     final purgeRetryGeneration = useState(0);
     final consecutivePurgeFailures = useRef(0);
+    final remainingMaintenancePurges = useRef(
+      ageRestrictedNotificationMaintenancePurgeLimit,
+    );
 
     useEffect(() {
       final listener = AppLifecycleListener(
@@ -151,6 +157,8 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
           if (ref.read(communityListProvider).hasError) {
             ref.invalidate(communityListProvider);
           }
+          remainingMaintenancePurges.value =
+              ageRestrictedNotificationMaintenancePurgeLimit;
           resumeGeneration.value += 1;
         },
       );
@@ -165,7 +173,8 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
           try {
             await purgeNotifications();
             consecutivePurgeFailures.value = 0;
-            if (!cancelled) {
+            if (!cancelled && remainingMaintenancePurges.value > 0) {
+              remainingMaintenancePurges.value -= 1;
               cancelMaintenancePurge = scheduleMaintenancePurge(() {
                 if (!cancelled) {
                   purgeRetryGeneration.value += 1;

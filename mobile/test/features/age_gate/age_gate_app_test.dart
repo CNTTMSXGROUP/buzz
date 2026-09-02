@@ -284,7 +284,7 @@ void main() {
     'retries a successful purge for interactions donated by stale extensions',
     (tester) async {
       var purges = 0;
-      VoidCallback? runMaintenance;
+      final scheduledMaintenance = <VoidCallback>[];
 
       await tester.pumpWidget(
         ProviderScope(
@@ -298,7 +298,7 @@ void main() {
             }),
             ageRestrictedNotificationMaintenanceScheduleProvider
                 .overrideWithValue((callback) {
-                  runMaintenance = callback;
+                  scheduledMaintenance.add(callback);
                   return () {};
                 }),
           ],
@@ -307,12 +307,20 @@ void main() {
       );
       await tester.pump();
       expect(purges, 1);
+      expect(scheduledMaintenance, hasLength(1));
 
-      runMaintenance!();
-      await tester.pump();
-      await tester.pump();
+      for (
+        var attempt = 0;
+        attempt < ageRestrictedNotificationMaintenancePurgeLimit;
+        attempt += 1
+      ) {
+        scheduledMaintenance.removeAt(0)();
+        await tester.pump();
+        await tester.pump();
+      }
 
-      expect(purges, 2);
+      expect(purges, 1 + ageRestrictedNotificationMaintenancePurgeLimit);
+      expect(scheduledMaintenance, isEmpty);
     },
   );
 }

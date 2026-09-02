@@ -195,6 +195,11 @@ export type OutboxRecord<T> = {
   // Seconds since epoch when the edit was queued (0 for a legacy entry written
   // before per-window keys, which therefore never wins a whole-blob tie).
   queuedAt: number;
+  // The channelId that was preserved through the capacity bounding step when
+  // this edit was queued (Kalvin P3). Present on v2 records written after this
+  // field was introduced; absent on legacy records. Used on bootstrap outbox
+  // replay to re-protect the same channel across remount.
+  preservedKey?: string;
   isOwn: boolean;
 };
 
@@ -206,7 +211,7 @@ export type OutboxRecord<T> = {
 function parseEnvelope<T>(
   raw: string | null,
   parseStore: (json: unknown) => T | null,
-): { store: T; queuedAt: number } | null {
+): { store: T; queuedAt: number; preservedKey?: string } | null {
   if (!raw) return null;
   try {
     const json = JSON.parse(raw);
@@ -216,14 +221,20 @@ function parseEnvelope<T>(
       !Array.isArray(json) &&
       "store" in (json as Record<string, unknown>)
     ) {
-      const env = json as { store: unknown; queuedAt?: unknown };
+      const env = json as {
+        store: unknown;
+        queuedAt?: unknown;
+        preservedKey?: unknown;
+      };
       const store = parseStore(env.store);
       if (!store) return null;
       const queuedAt =
         typeof env.queuedAt === "number" && Number.isFinite(env.queuedAt)
           ? env.queuedAt
           : 0;
-      return { store, queuedAt };
+      const preservedKey =
+        typeof env.preservedKey === "string" ? env.preservedKey : undefined;
+      return { store, queuedAt, preservedKey };
     }
     // Legacy bare-store shape from a pre-envelope build.
     const store = parseStore(json);
@@ -260,15 +271,15 @@ export function writeOwnOutbox(
   relayUrl: string,
   store: unknown,
   nowSecs: number = Math.floor(Date.now() / 1_000),
+  preservedKey?: string,
 ): boolean {
   const base = ownKeyBase(prefix, pubkey, relayUrl);
   let key: string;
   try {
     key = nextOwnKey(base);
-    window.localStorage.setItem(
-      key,
-      JSON.stringify({ store, queuedAt: nowSecs }),
-    );
+    const envelope: Record<string, unknown> = { store, queuedAt: nowSecs };
+    if (preservedKey !== undefined) envelope.preservedKey = preservedKey;
+    window.localStorage.setItem(key, JSON.stringify(envelope));
   } catch {
     // The fresh key could not be persisted — the intent is NOT durably held.
     return false;
@@ -338,6 +349,7 @@ export function enumerateOutbox<T>(
           store: parsed.store,
           raw,
           queuedAt: parsed.queuedAt,
+          preservedKey: parsed.preservedKey,
           isOwn: key.startsWith(ownPrefix),
         });
       }
@@ -350,6 +362,7 @@ export function enumerateOutbox<T>(
         store: legacy.store,
         raw: legacyRaw,
         queuedAt: legacy.queuedAt,
+        preservedKey: legacy.preservedKey,
         isOwn: false,
       });
     }

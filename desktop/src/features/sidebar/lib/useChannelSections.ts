@@ -163,15 +163,22 @@ export function useChannelSections(
       // to supersede is consumed into pending here and can never be GC'd out.
       const outbox = readChannelSectionsOutbox(pubkey, relayUrl);
       if (outbox) {
-        // When bootstrap fetched and applied a remote head, only replay an
-        // outbox edit that was queued AFTER that head — an edit queued before
-        // the applied head was authored without knowledge of that state and has
-        // already lost whole-blob LWW. Legacy records (queuedAt=0) are treated
-        // as pre-head under any non-zero head. A `hold` (absent/failed fetch)
-        // carries no confirmed head, so we always replay.
-        const headCreatedAt =
-          result.action === "apply-remote" ? result.data.createdAt : 0;
-        if (outbox.queuedAt > headCreatedAt) {
+        // When bootstrap fetched and applied a remote head, suppress replay
+        // only for an outbox edit that is STRICTLY older than that head:
+        // `queuedAt < appliedHead.createdAt`. Equality replays — a same-second
+        // edit was in-flight with the head and must not be silently swallowed —
+        // and this keeps the guard aligned with reclamation's strict `<` so an
+        // equal-second edit is neither stranded on disk nor double-suppressed.
+        // A `hold` (absent/failed fetch) carries no confirmed applied head so
+        // we always replay regardless of queuedAt. Note: `queuedAt` and relay
+        // `created_at` are independent device wall clocks; a slow-clocked
+        // device can produce a queuedAt that appears to predate a head it never
+        // saw — this is an accepted residual of the LWW max-merge strategy the
+        // feature already relies on.
+        const shouldReplay =
+          result.action !== "apply-remote" ||
+          outbox.queuedAt >= result.data.createdAt;
+        if (shouldReplay) {
           // publishSections synchronously copies the intent into this window's
           // own v2 key and returns whether that transfer is durable. Mark the
           // legacy blob consumed ONLY when it is: a `setItem` failure (quota)
@@ -191,8 +198,8 @@ export function useChannelSections(
             );
           }
         }
-        // Stale outbox (queuedAt ≤ headCreatedAt) is left for reclamation
-        // below — reclaimSupersededSectionsOutbox will clean it up.
+        // Stale outbox (queuedAt < appliedHead.createdAt) is left for
+        // reclamation below — reclaimSupersededSectionsOutbox will clean it up.
       } else {
         clearChannelSectionsOutbox(pubkey, relayUrl);
       }

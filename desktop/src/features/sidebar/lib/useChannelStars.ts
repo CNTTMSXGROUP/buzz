@@ -8,6 +8,7 @@ import {
   isStarsStoreSubsumedBy,
   mergeStores,
   readChannelStarsOutbox,
+  readChannelStarsOutboxPreservedKey,
   readChannelStarsStore,
   reclaimSubsumedStarsOutbox,
   starredChannelIdsFromStore,
@@ -127,7 +128,15 @@ export function useChannelStars(
           result.action === "apply-remote" &&
           isStarsStoreSubsumedBy(outbox, result.data.store);
         if (!subsumed) {
-          managerRef.current?.publishStars(outbox);
+          // Restore the preservedKey written alongside this window's outbox
+          // record so the clicked channel's capacity reservation survives
+          // remount (Kalvin P3). Old records without the field produce
+          // undefined, which publishes without a reservation — same as before.
+          const preservedKey = readChannelStarsOutboxPreservedKey(
+            pubkey,
+            relayUrl,
+          );
+          managerRef.current?.publishStars(outbox, preservedKey);
         }
       } else {
         clearChannelStarsOutbox(pubkey, relayUrl);
@@ -228,10 +237,11 @@ export function useChannelStars(
         if (result.status === "found") {
           setStore(applyRemote(result.data));
         }
-        const pending = managerRef.current?.getPendingStarStore();
-        if (pending) {
-          managerRef.current?.publishStars(pending);
-        }
+        // Re-drive the existing generation rather than opening a new one so
+        // pendingPreservedKey is not reset — a new publish() call would clear
+        // the key and let a 501-entry pre-publish merge evict the clicked
+        // channel (Kalvin P3).
+        managerRef.current?.retryReconnectStarsPublish();
       });
     });
     return () => {

@@ -67,6 +67,14 @@ export class ChannelStarSyncManager extends MergeLaneSyncManager<ChannelStarStor
     this.publish(store, preservedKey);
   }
 
+  /**
+   * Re-drive the current pending star edit without resetting the preserved key
+   * — used by the reconnect handler (Kalvin P3).
+   */
+  retryReconnectStarsPublish(): void {
+    this.retryReconnectPublish();
+  }
+
   /** Fetch the current remote head for this pubkey's stars blob. */
   fetchRemoteStars() {
     return this.fetchRemoteBlob();

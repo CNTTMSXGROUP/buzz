@@ -9,6 +9,7 @@ import {
   mergeStores,
   mutedChannelIdsFromStore,
   readChannelMutesOutbox,
+  readChannelMutesOutboxPreservedKey,
   readChannelMutesStore,
   reclaimSubsumedMutesOutbox,
   storageKey,
@@ -126,7 +127,15 @@ export function useChannelMutes(
           result.action === "apply-remote" &&
           isMutesStoreSubsumedBy(outbox, result.data.store);
         if (!subsumed) {
-          managerRef.current?.publishMutes(outbox);
+          // Restore the preservedKey written alongside this window's outbox
+          // record so the clicked channel's capacity reservation survives
+          // remount (Kalvin P3). Old records without the field produce
+          // undefined, which publishes without a reservation — same as before.
+          const preservedKey = readChannelMutesOutboxPreservedKey(
+            pubkey,
+            relayUrl,
+          );
+          managerRef.current?.publishMutes(outbox, preservedKey);
         }
       } else {
         clearChannelMutesOutbox(pubkey, relayUrl);
@@ -227,10 +236,11 @@ export function useChannelMutes(
         if (result.status === "found") {
           setStore(applyRemote(result.data));
         }
-        const pending = managerRef.current?.getPendingMuteStore();
-        if (pending) {
-          managerRef.current?.publishMutes(pending);
-        }
+        // Re-drive the existing generation rather than opening a new one so
+        // pendingPreservedKey is not reset — a new publish() call would clear
+        // the key and let a 501-entry pre-publish merge evict the clicked
+        // channel (Kalvin P3).
+        managerRef.current?.retryReconnectMutesPublish();
       });
     });
     return () => {

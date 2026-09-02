@@ -158,8 +158,16 @@ export function writeOutbox<S>(
   store: S,
   relayUrl: string,
   bound: (s: S) => S,
+  preservedKey?: string,
 ): void {
-  writeOwnOutbox(outboxPrefix, pubkey, relayUrl, bound(store));
+  writeOwnOutbox(
+    outboxPrefix,
+    pubkey,
+    relayUrl,
+    bound(store),
+    undefined,
+    preservedKey,
+  );
 }
 
 /**
@@ -193,6 +201,34 @@ export function clearOutbox(
   relayUrl: string,
 ): void {
   clearOwnOutbox(outboxPrefix, pubkey, relayUrl);
+}
+
+/**
+ * Read the `preservedKey` stored by the most recent click in THIS window's own
+ * outbox record, or `undefined` when no own record exists or it carries none.
+ *
+ * The `preservedKey` identifies the channel that must survive capacity bounding
+ * across a remount. It is intentionally read from this window's own record
+ * only — merging multiple windows' records into one store loses the per-click
+ * provenance, so we recover protection from the authoritative own-window entry.
+ */
+export function readOutboxPreservedKey(
+  outboxPrefix: string,
+  pubkey: string,
+  relayUrl: string,
+  parseStore: (json: unknown) => unknown,
+): string | undefined {
+  const records = enumerateOutbox(
+    outboxPrefix,
+    legacyOutboxKey(outboxPrefix, pubkey, relayUrl),
+    pubkey,
+    relayUrl,
+    parseStore,
+  );
+  // Return the preservedKey from this window's own record (if any). Own records
+  // are the only ones that carry a preservedKey written by this session.
+  const own = records.find((r) => r.isOwn);
+  return own?.preservedKey;
 }
 
 /**

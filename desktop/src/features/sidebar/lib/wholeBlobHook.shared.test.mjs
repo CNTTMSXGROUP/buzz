@@ -257,48 +257,112 @@ export function runWholeBlobHookSuite({
     }
   });
 
-  // Mutation: removing queuedAt > headCreatedAt guard in the hook replays the
-  // stale outbox, overwriting device-B's t=200 state with a t=100 edit.
-  test(`${label}: stale outbox record (queuedAt < bootstrap head) is NOT replayed`, async () => {
+  // Mutation: removing queuedAt >= appliedHead.createdAt guard in the hook
+  // replays the stale outbox above the applied head, overwriting device-B's
+  // state. All four sub-cases advance the real 2s debounce via makeHookTimerBed
+  // so the assertion is causal: the unfixed code fires publishEvent after the
+  // debounce while the fixed code does not (strict <) or does (hold / equality).
+  test(`${label}: P1 bootstrap outbox replay gate — strict < suppresses, equality/hold/legacy replays`, async () => {
+    const { makeHookTimerBed } = await import("./sidebarSyncTestHelpers.mjs");
     const { act, cleanup, renderHook } = await import("@testing-library/react");
     const { relayClient } = await import("@/shared/api/relayClient");
-    const pubkey = `pk-${label}-sr`;
-    const relayUrl = `wss://r.${label}-sr`;
-    // Relay head at t=200 (device B's state).
-    const head = {
-      pubkey,
-      content: "good-cipher",
-      created_at: 200,
-      id: "evt-head-200",
-    };
-    const publishCalls = [];
-    const restoreRelay = stubRelay(relayClient, { publishCalls });
-    relayClient.fetchEvents = async () => [head];
-    const restoreTauri = stubTauri(pubkey, () => makeRemotePayload());
-    // Pre-populate a stale legacy outbox record queued at t=100 (before the head).
-    const legKey = legacyOutboxKey(pubkey, relayUrl);
-    const staleRaw = JSON.stringify({
-      store: JSON.parse(makeRemotePayload()),
-      queuedAt: 100,
-    });
-    window.localStorage.setItem(legKey, staleRaw);
-    let hook = null;
-    try {
-      await act(async () => {
-        hook = renderHook(() => useHook(pubkey, relayUrl));
-        for (let i = 0; i < 6; i++) await Promise.resolve();
-      });
-      assert.equal(
-        publishCalls.length,
-        0,
-        `${label}: stale outbox record (queuedAt=100 < head=200) must not be replayed`,
+
+    // Helper: mount the hook with a legacy outbox record at queuedAt and an
+    // optional relay head, fire the 2s debounce, return publishEvent call count.
+    async function runCase({ queuedAt, headCreatedAt, noHead = false }) {
+      const bed = makeHookTimerBed();
+      const pubkey = `pk-${label}-p1-${queuedAt}-${headCreatedAt}`;
+      const relayUrl = `wss://r.${label}-p1`;
+      // Write via the legacy key — recognised by the outbox reader for both
+      // sections and sort hooks, and queuedAt is explicit in the envelope.
+      const legKey = legacyOutboxKey(pubkey, relayUrl);
+      window.localStorage.setItem(
+        legKey,
+        JSON.stringify({ store: JSON.parse(makeRemotePayload()), queuedAt }),
       );
-      hook.unmount();
-    } finally {
-      cleanup();
-      window.localStorage.removeItem(legKey);
-      restoreRelay();
-      restoreTauri();
+
+      const publishCalls = [];
+      const restoreRelay = stubRelay(relayClient, { publishCalls });
+      const origFetch = relayClient.fetchEvents;
+      relayClient.fetchEvents = async () => {
+        if (noHead) return [];
+        return [
+          {
+            pubkey,
+            content: "good-cipher",
+            created_at: headCreatedAt,
+            id: `evt-${headCreatedAt}`,
+          },
+        ];
+      };
+      const restoreTauri = stubTauri(pubkey, () => makeRemotePayload());
+      let hook = null;
+      try {
+        await act(async () => {
+          hook = renderHook(() => useHook(pubkey, relayUrl));
+          for (let i = 0; i < 8; i++) await Promise.resolve();
+        });
+        // Whether publish() was called is observable via the 2s debounce timer:
+        // publish() schedules the timer synchronously. hasDelay(2000) is true
+        // iff publish() fired (replay happened); false iff the guard suppressed.
+        // This is causal: without the guard, the timer would be present for all
+        // cases; with it, only the non-suppressed cases schedule the timer.
+        return bed.hasDelay(2000) ? 1 : 0;
+      } finally {
+        hook?.unmount();
+        cleanup();
+        window.localStorage.removeItem(legKey);
+        bed.restore();
+        restoreRelay();
+        restoreTauri();
+        relayClient.fetchEvents = origFetch;
+      }
+    }
+
+    // Case 1: strict queuedAt < headCreatedAt → suppressed (0 publish calls)
+    {
+      const calls = await runCase({ queuedAt: 100, headCreatedAt: 200 });
+      assert.equal(
+        calls,
+        0,
+        `${label}: stale outbox (queuedAt=100 < head=200) must NOT be replayed`,
+      );
+    }
+
+    // Case 2: queuedAt === headCreatedAt → replays (≥1 publish call)
+    {
+      const calls = await runCase({ queuedAt: 200, headCreatedAt: 200 });
+      assert.ok(
+        calls >= 1,
+        `${label}: same-second outbox (queuedAt=200 === head=200) MUST replay`,
+      );
+    }
+
+    // Case 3: hold path (no relay head) with a v2 queuedAt > 0 → always replays
+    {
+      const calls = await runCase({
+        queuedAt: 50,
+        headCreatedAt: 0,
+        noHead: true,
+      });
+      assert.ok(
+        calls >= 1,
+        `${label}: hold path (no relay head) MUST replay outbox regardless of queuedAt`,
+      );
+    }
+
+    // Case 4: hold path with legacy queuedAt=0 → always replays (was silently
+    //         stranded by the old guard: 0 > 0 was false on hold)
+    {
+      const calls = await runCase({
+        queuedAt: 0,
+        headCreatedAt: 0,
+        noHead: true,
+      });
+      assert.ok(
+        calls >= 1,
+        `${label}: hold path with legacy queuedAt=0 MUST replay (was stranded by old 0>0 guard)`,
+      );
     }
   });
 }

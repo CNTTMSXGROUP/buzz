@@ -67,6 +67,14 @@ export class ChannelMuteSyncManager extends MergeLaneSyncManager<ChannelMuteStor
     this.publish(store, preservedKey);
   }
 
+  /**
+   * Re-drive the current pending mute edit without resetting the preserved key
+   * — used by the reconnect handler (Kalvin P3).
+   */
+  retryReconnectMutesPublish(): void {
+    this.retryReconnectPublish();
+  }
+
   /** Fetch the current remote head for this pubkey's mutes blob. */
   fetchRemoteMutes() {
     return this.fetchRemoteBlob();

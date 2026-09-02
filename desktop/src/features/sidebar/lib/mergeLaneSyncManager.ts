@@ -78,7 +78,12 @@ export type MergeLaneConfig<S> = {
     store: S,
   ) => void;
   /** Persist this window's pending edit to the durable outbox. */
-  writeOutbox: (pubkey: string, store: S, relayUrl: string) => void;
+  writeOutbox: (
+    pubkey: string,
+    store: S,
+    relayUrl: string,
+    preservedKey?: string,
+  ) => void;
   /** Clear this window's own outbox key. */
   clearOutbox: (pubkey: string, relayUrl: string) => void;
   /** True when the local store is non-empty and eligible for a first-sync seed-publish. */
@@ -211,6 +216,20 @@ export class MergeLaneSyncManager<S> {
     }
   }
 
+  /**
+   * Re-drive the currently pending edit without opening a new generation —
+   * used by the reconnect handler so `pendingPreservedKey` is not reset (Kalvin
+   * P3). Calling the public `publish()` on reconnect would bump the generation
+   * and clear the preserved key, so a subsequent 501-entry pre-publish merge
+   * could evict the clicked channel again. Waking the existing cycle instead
+   * keeps the frozen key. No-op when nothing is pending.
+   */
+  retryReconnectPublish(): void {
+    if (this.pendingStore === null) return;
+    this.cancelPendingPublish();
+    this.startCycle();
+  }
+
   getPendingStore(): S | null {
     return this.pendingStore;
   }
@@ -225,8 +244,9 @@ export class MergeLaneSyncManager<S> {
     // Persist synchronously so a click made <2s before quit/community-switch
     // survives teardown and resumes on next mount (durable outbox). This
     // window's own key is the only one written — a single unconditional
-    // setItem, never a shared-key read-modify-write.
-    this.config.writeOutbox(this.pubkey, store, this.relayUrl);
+    // setItem, never a shared-key read-modify-write. Pass preservedKey so the
+    // capacity-bounding reservation survives remount (Kalvin P3).
+    this.config.writeOutbox(this.pubkey, store, this.relayUrl, preservedKey);
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
     }
@@ -505,5 +525,6 @@ export class MergeLaneSyncManager<S> {
     this.destroyed = true;
     this.cancelPendingPublish();
     this.pendingStore = null;
+    this.pendingPreservedKey = undefined;
   }
 }

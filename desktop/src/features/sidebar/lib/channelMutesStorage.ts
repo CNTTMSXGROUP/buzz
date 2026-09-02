@@ -2,6 +2,7 @@ import {
   clearOutbox,
   makeStorageKey,
   readOutbox,
+  readOutboxPreservedKey,
   readStore,
   reclaimSubsumedOutbox,
   writeOutbox,
@@ -282,8 +283,16 @@ export function writeChannelMutesOutbox(
   pubkey: string,
   store: ChannelMuteStore,
   relayUrl: string,
+  preservedKey?: string,
 ): void {
-  writeOutbox(OUTBOX_KEY_PREFIX, pubkey, store, relayUrl, boundMuteStore);
+  writeOutbox(
+    OUTBOX_KEY_PREFIX,
+    pubkey,
+    store,
+    relayUrl,
+    boundMuteStore,
+    preservedKey,
+  );
 }
 
 /**
@@ -302,6 +311,23 @@ export function readChannelMutesOutbox(
     parseMutePayload,
     mergeStores,
     DEFAULT_STORE,
+  );
+}
+
+/**
+ * Read the `preservedKey` from this window's own outbox record, or `undefined`
+ * when none exists. Used on bootstrap to restore the capacity-bounding
+ * reservation across remount (Kalvin P3).
+ */
+export function readChannelMutesOutboxPreservedKey(
+  pubkey: string,
+  relayUrl: string,
+): string | undefined {
+  return readOutboxPreservedKey(
+    OUTBOX_KEY_PREFIX,
+    pubkey,
+    relayUrl,
+    parseMutePayload,
   );
 }
 

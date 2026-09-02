@@ -226,6 +226,109 @@ export function runWholeBlobP2aSuite({
     }
   });
 
+  // T6: baseline regression — live B fully applies before click, then bootstrap
+  //   resolves with older A. canonicalMax must keep the queue-time baseline B so
+  //   the click publishes above B; plain replacement regresses baseline to A and
+  //   the pre-publish fetch adopts B away, discarding the click.
+  // Mutation: revert releaseDeferred to plain replacement
+  //   (this.publishBaseline = { ...bootstrapResultHead }) →
+  //   publishBaseline regresses B→A → pre-publish sees B as advance → adopt
+  //   (0 publishes, 1 adopt).
+  test(`P2a ${label}: click authored from a live peer head B publishes above B when bootstrap resolves with older head A`, async () => {
+    let releaseBootstrap = null;
+    let publishCalls = 0;
+    let liveCallback = null;
+    const { fireDelay, restore } = makeHookTimerBed();
+    const tauri = installEchoTauri(`pk-p2a-t6-${label}`);
+
+    // Head A: the head bootstrap will return (older, lower createdAt).
+    const headA = tauri.mintHead(makeRemoteStore(), 200, `evt-boot-a-${label}`);
+    // Head B: the live peer head that arrives and fully applies before the click
+    // (higher createdAt, so canonicalMax picks B over A).
+    const headB = tauri.mintHead(makeRemoteStore(), 400, `evt-live-b-${label}`);
+
+    // subscribeLive: capture the callback so we can deliver headB.
+    mock.method(relayClient, "subscribeLive", (_f, cb) => {
+      liveCallback = cb;
+      return Promise.resolve(async () => {});
+    });
+
+    let fetchCalls = 0;
+    mock.method(relayClient, "fetchEvents", () => {
+      fetchCalls++;
+      // Call 1 = bootstrap fetch (blocked), resolves to [headA].
+      // Later calls (pre-publish fetch + confirmation) resolve to storedHead,
+      // which starts as [headB] and is updated to [publishedEvent] after publish.
+      if (fetchCalls === 1)
+        return new Promise((res) => {
+          releaseBootstrap = () => res([headA]);
+        });
+      return Promise.resolve(storedHead);
+    });
+    let storedHead = [headB];
+    mock.method(relayClient, "publishEvent", (e) => {
+      publishCalls++;
+      storedHead = [e]; // relay retains our event → confirmation succeeds
+      return Promise.resolve();
+    });
+
+    try {
+      const manager = new Manager(`pk-p2a-t6-${label}`, RELAY);
+      const adopted = [];
+      manager.setOnRemoteAdopted((r) => adopted.push(r));
+
+      // Subscribe so the live callback is captured.
+      await subscribe(manager, () => {});
+
+      // Bootstrap blocked; NO edit pending yet.
+      const bootstrapPromise = manager.bootstrap(makeNonEmptyStore());
+
+      // Deliver live head B; let it fully apply (no edit in flight).
+      while (liveCallback === null) await Promise.resolve();
+      liveCallback(headB);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+
+      // Click authored from B: publish() freezes publishBaseline = B (lastRemoteHead).
+      publishEdit(manager, makeEditStore());
+
+      // Bootstrap resolves with older A.
+      while (releaseBootstrap === null) await Promise.resolve();
+      releaseBootstrap();
+      await bootstrapPromise;
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+
+      // releaseDeferred fires. Fix: canonicalMax(B, A) = B → publishBaseline
+      // stays B. Pre-publish fetch returns storedHead=[headB]: remoteAdvancedSince(B, B)
+      // = false → publish. publishEvent mock updates storedHead=[publishedEvent].
+      // confirmRetainedHead fetches storedHead=[publishedEvent] → event.id matches
+      // → confirmed → pending cleared.
+      // Mutation (plain replace): publishBaseline = A → pre-publish sees B as
+      // advance → adopt fires (0 publishes, 1 adopt) → click lost.
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      assert.ok(
+        publishCalls >= 1,
+        "click authored from B must publish above B, not adopt B away",
+      );
+      assert.equal(
+        adopted.length,
+        0,
+        "B must not be adopted — click was authored from it",
+      );
+      assert.equal(
+        manager.getPendingStore(),
+        null,
+        "pending cleared after successful publish",
+      );
+      manager.destroy();
+    } finally {
+      tauri.restore();
+      restore();
+      mock.reset();
+    }
+  });
+
   // T3: non-empty mount, click during blocked bootstrap, relay confirms absent
   //   → the edit (not the mount snapshot) is the published payload.
   // Mutation: drop `if (this.pendingStore === null)` guard in bootstrap's

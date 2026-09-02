@@ -401,12 +401,15 @@ export class WholeBlobSyncManager<S> {
       this.retryTimer === null &&
       !this.publishInFlight
     ) {
-      // Re-freeze the baseline to the head established by bootstrap. For a
-      // successful bootstrap this is the exact head returned by the fetch
-      // (snapshotted before runBootstrap ran, so subscribeLive cannot race it);
-      // for a failed bootstrap bootstrapResultHead is {0,""} (the bootstrapFailed
-      // exception handles that case in fetchOwnBlobBeforePublish).
-      this.publishBaseline = { ...bootstrapResultHead };
+      // canonicalMax preserves the queue-time baseline (frozen by publish() at
+      // click time) when bootstrap resolves with an older head. Plain replacement
+      // would regress the baseline, causing the pre-publish fetch to adopt a head
+      // the click was authored from. For a failed bootstrap, bootstrapResultHead
+      // is {0,""} and canonicalMax leaves the baseline unchanged.
+      this.publishBaseline = canonicalMax(
+        this.publishBaseline,
+        bootstrapResultHead,
+      );
       this.debounceTimer = window.setTimeout(() => {
         this.debounceTimer = null;
         this.startCycle();

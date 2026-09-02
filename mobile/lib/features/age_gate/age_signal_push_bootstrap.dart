@@ -35,6 +35,12 @@ final ageSignalPushSnapshotRetryWaitProvider =
       return Future<void>.delayed;
     });
 
+/// Native notification purge performed once restriction is confirmed.
+final ageRestrictedNotificationPurgerProvider =
+    Provider<Future<void> Function()>(
+      (ref) => purgeAgeRestrictedBuzzNotifications,
+    );
+
 /// Starts the push lifecycle only after the launch age check allows access.
 class AgeSignalPushBootstrap extends HookConsumerWidget {
   /// Creates the production push boundary around [child].
@@ -108,9 +114,14 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final communitiesReady = ref.watch(communityListProvider).hasValue;
     final waitBeforeRetry = ref.watch(ageSignalPushSnapshotRetryWaitProvider);
+    final purgeNotifications = ref.watch(
+      ageRestrictedNotificationPurgerProvider,
+    );
     final resumeGeneration = useState(0);
     final retryGeneration = useState(0);
     final consecutiveFailures = useRef(0);
+    final purgeRetryGeneration = useState(0);
+    final consecutivePurgeFailures = useRef(0);
 
     useEffect(() {
       final listener = AppLifecycleListener(
@@ -123,6 +134,35 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
       );
       return listener.dispose;
     }, const []);
+
+    useEffect(
+      () {
+        var cancelled = false;
+        unawaited(() async {
+          try {
+            await purgeNotifications();
+            consecutivePurgeFailures.value = 0;
+          } catch (error, stackTrace) {
+            reportPushLeaseCleanupError(error, stackTrace);
+            final delay = ageSignalPushSnapshotRetryDelay(
+              consecutivePurgeFailures.value,
+            );
+            await waitBeforeRetry(delay);
+            if (!cancelled) {
+              consecutivePurgeFailures.value += 1;
+              purgeRetryGeneration.value += 1;
+            }
+          }
+        }());
+        return () => cancelled = true;
+      },
+      [
+        purgeNotifications,
+        waitBeforeRetry,
+        resumeGeneration.value,
+        purgeRetryGeneration.value,
+      ],
+    );
 
     useEffect(
       () {

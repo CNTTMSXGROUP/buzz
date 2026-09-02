@@ -1,6 +1,7 @@
 import BuzzPushKit
 import Flutter
 import Foundation
+import UserNotifications
 
 final class BuzzPushSnapshotBridge {
   private let appGroupIdentifier: String?
@@ -18,6 +19,14 @@ final class BuzzPushSnapshotBridge {
     else { return nil }
     return BuzzPushPresentationCacheStore(containerURL: container)
   }()
+  private lazy var ageRestrictionFenceStore: BuzzAgeRestrictionFenceStore? = {
+    guard let appGroupIdentifier,
+      let container = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: appGroupIdentifier
+      )
+    else { return nil }
+    return BuzzAgeRestrictionFenceStore(containerURL: container)
+  }()
 
   init(
     appGroupIdentifier: String?,
@@ -31,6 +40,10 @@ final class BuzzPushSnapshotBridge {
 
   @discardableResult
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) -> Bool {
+    if call.method == "purgeAgeRestrictedNotifications" {
+      purgeAgeRestrictedNotifications(result: result)
+      return true
+    }
     let strictAgeGateWrite = call.method == "syncAgeGatePushSnapshot"
     guard strictAgeGateWrite || call.method == "syncPushSnapshot",
       let arguments = call.arguments as? [String: Any],
@@ -51,6 +64,45 @@ final class BuzzPushSnapshotBridge {
     default: return false
     }
     return true
+  }
+
+  private func purgeAgeRestrictedNotifications(result: @escaping FlutterResult) {
+    queue.async { [weak self] in
+      do {
+        guard let self, let store, let ageRestrictionFenceStore
+        else {
+          throw NSError(
+            domain: "BuzzPushSnapshotBridge",
+            code: 1,
+            userInfo: [
+              NSLocalizedDescriptionKey: "The age-restriction fence store is unavailable."
+            ]
+          )
+        }
+        try ageRestrictionFenceStore.begin()
+        try store.replaceCommunities([])
+        try BuzzPushKeychain.replace(
+          signingKeys: [:],
+          accessGroup: keychainAccessGroup
+        )
+        try ageRestrictionFenceStore.settleIfFencing()
+        DispatchQueue.main.async {
+          let center = UNUserNotificationCenter.current()
+          center.removeAllDeliveredNotifications()
+          center.removeAllPendingNotificationRequests()
+          result(nil)
+        }
+      } catch {
+        Self.complete(
+          result,
+          value: FlutterError(
+            code: "age_restriction_purge_failed",
+            message: "Unable to fence and purge restricted notifications.",
+            details: error.localizedDescription
+          )
+        )
+      }
+    }
   }
 
   private func syncCommunities(
@@ -120,6 +172,11 @@ final class BuzzPushSnapshotBridge {
           signingKeys: signingKeys,
           accessGroup: keychainAccessGroup
         )
+        if requiresStore {
+          // Only the acknowledged age-gate path may end a failed purge fence.
+          // An older best-effort export must never reopen notification access.
+          try ageRestrictionFenceStore?.settleIfFencing()
+        }
         Self.complete(result, value: nil)
       } catch {
         Self.complete(
@@ -284,7 +341,8 @@ final class BuzzPushSnapshotBridge {
       let container = FileManager.default.containerURL(
         forSecurityApplicationGroupIdentifier: appGroupIdentifier
       ),
-      let data = try? Data(contentsOf: container.appendingPathComponent(BuzzPushPresentationCacheStore.fileName)),
+      let data = try? Data(
+        contentsOf: container.appendingPathComponent(BuzzPushPresentationCacheStore.fileName)),
       let snapshot = try? JSONDecoder().decode(BuzzPushPresentationCacheSnapshot.self, from: data)
     else { return nil }
     return snapshot.communities.first { $0.id == id }

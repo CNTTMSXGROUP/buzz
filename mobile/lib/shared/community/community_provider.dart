@@ -618,7 +618,6 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     // Fence every older or later authenticated export before touching storage.
     // The final empty write wins even if a stale export is already in I/O.
     await _enforceAgeRestrictedCommunitySnapshot(ref);
-    await purgeAgeRestrictedBuzzNotifications();
     final attempts = <({String id, bool advanceGeneration})>[];
     await _serializePushMutation(() async {
       final storage = ref.read(communityStorageProvider);

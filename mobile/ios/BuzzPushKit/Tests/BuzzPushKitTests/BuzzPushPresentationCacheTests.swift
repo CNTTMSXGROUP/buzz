@@ -11,6 +11,35 @@ struct BuzzPushPresentationCacheTests {
   private let relayKey = String(repeating: "0", count: 63) + "2"
   private let otherRelayKey = String(repeating: "0", count: 63) + "3"
 
+  @Test("Age restriction fence persists a new token for other processes")
+  func ageRestrictionFencePersistsGeneration() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let reader = BuzzAgeRestrictionFenceStore(containerURL: directory)
+
+    #expect(reader.current() == .initial)
+    let first = try writer.begin()
+    #expect(first.isFencing)
+    #expect(reader.current() == first)
+    let second = try writer.settleIfFencing()
+    #expect(!second.isFencing)
+    #expect(second.token != first.token)
+    #expect(reader.current() == second)
+  }
+
+  @Test("Age restriction fence discards active and superseded resolutions")
+  func ageRestrictionFenceDiscardPolicy() {
+    let initial = BuzzAgeRestrictionFence.initial
+    let active = BuzzAgeRestrictionFence(token: "active", isFencing: true)
+    let settled = BuzzAgeRestrictionFence(token: "settled", isFencing: false)
+
+    #expect(!initial.requiresDiscard(since: initial))
+    #expect(active.requiresDiscard(since: initial))
+    #expect(settled.requiresDiscard(since: initial))
+    #expect(!settled.requiresDiscard(since: settled))
+  }
+
   @Test("Verified profile uses display_name, then name, and attaches a bounded local avatar")
   func verifiedProfilePrecedenceAndAvatar() throws {
     let directory = try temporaryDirectory()

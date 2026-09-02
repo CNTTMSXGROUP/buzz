@@ -224,6 +224,61 @@ void main() {
 
     expect(communities.cleanups, 2);
   });
+
+  testWidgets(
+    'purges restricted notifications before community storage recovers',
+    (tester) async {
+      var purges = 0;
+
+      await tester.pumpWidget(
+        ProviderScope(
+          retry: (_, _) => null,
+          overrides: [
+            ageSignalProvider.overrideWith(() => _BlockingAgeSignalNotifier()),
+            communityListProvider.overrideWith(
+              () => _UnavailableCommunityListNotifier(),
+            ),
+            ageRestrictedNotificationPurgerProvider.overrideWithValue(() async {
+              purges += 1;
+            }),
+          ],
+          child: const AgeSignalPushBootstrap(child: SizedBox()),
+        ),
+      );
+      await tester.pump();
+
+      expect(purges, 1);
+    },
+  );
+
+  testWidgets('retries a failed restricted notification purge', (tester) async {
+    var purges = 0;
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          ageSignalProvider.overrideWith(() => _BlockingAgeSignalNotifier()),
+          communityListProvider.overrideWith(
+            () => _RetryingCleanupCommunityListNotifier(),
+          ),
+          ageRestrictedNotificationPurgerProvider.overrideWithValue(() async {
+            purges += 1;
+            if (purges == 1) {
+              throw StateError('injected notification purge failure');
+            }
+          }),
+          ageSignalPushSnapshotRetryWaitProvider.overrideWithValue(
+            (_) async {},
+          ),
+        ],
+        child: const AgeSignalPushBootstrap(child: SizedBox()),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(purges, 2);
+  });
 }
 
 class _AuthenticatedAuthNotifier extends AuthNotifier {
@@ -280,5 +335,12 @@ class _RetryingCleanupCommunityListNotifier extends CommunityListNotifier {
     if (cleanups == 1) {
       throw StateError('injected restricted cleanup failure');
     }
+  }
+}
+
+class _UnavailableCommunityListNotifier extends CommunityListNotifier {
+  @override
+  Future<List<Community>> build() async {
+    throw StateError('secure storage unavailable');
   }
 }

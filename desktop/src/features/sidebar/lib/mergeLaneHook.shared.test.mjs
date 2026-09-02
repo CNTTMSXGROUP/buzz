@@ -660,9 +660,14 @@ export function runMergeLaneHookSuite({
 
     const publishCalls = [];
     let fetchCalls = 0;
+    // Bootstrap fetch returns hold (empty) so publishStars is always called
+    // unconditionally — the subsumed guard only suppresses on apply-remote.
+    // The per-publish mergeWithRemote fetch (fetchCalls === 2) returns the
+    // 500-entry remote head, triggering the 501-entry merge that evicts the
+    // clicked channel without preservedKey.
     relayClient.fetchEvents = async () => {
       fetchCalls++;
-      return fetchCalls === 1 ? [remoteHead] : [];
+      return fetchCalls === 2 ? [remoteHead] : [];
     };
     relayClient.publishEvent = async (evt) => {
       publishCalls.push(evt);

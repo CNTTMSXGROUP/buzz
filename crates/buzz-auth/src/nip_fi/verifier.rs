@@ -918,7 +918,7 @@ fn optional_numeric_date(
 /// them) is converted with subsecond nanosecond precision. NaN, infinity, a
 /// non-number, and any magnitude outside the representable `i64`-seconds range
 /// deny as invalid time bounds.
-fn parse_numeric_date(value: &Value) -> Result<DateTime<Utc>, VerifierError> {
+pub(super) fn parse_numeric_date(value: &Value) -> Result<DateTime<Utc>, VerifierError> {
     // Integer NumericDate: exact, no float round-trip.
     if let Some(secs) = value.as_i64() {
         return Utc

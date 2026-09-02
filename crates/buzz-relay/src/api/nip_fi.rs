@@ -42,7 +42,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, Response, StatusCode},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::{debug, warn};
 
 use buzz_auth::{
@@ -63,13 +63,6 @@ pub const DEFAULT_DENY_SET_CAPACITY: usize = 50_000;
 pub struct DisconnectRequest {
     /// Lowercase hex encoding of the 32-byte target Nostr public key.
     pub pubkey: String,
-}
-
-/// JSON body for a successful `POST /api/nip-fi/disconnect` response.
-#[derive(Debug, Serialize)]
-pub struct DisconnectResponse {
-    /// `true` when the command was accepted and sessions were (or attempted to be) closed.
-    pub disconnected: bool,
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -98,14 +91,12 @@ pub async fn disconnect(
     let token = match extract_command_jwt(&headers) {
         Ok(t) => t,
         Err(status) => {
-            return plain_response(
-                status,
-                if status == StatusCode::UNAUTHORIZED {
-                    "authentication required\n"
-                } else {
-                    "evidence rejected\n"
-                },
-            );
+            return if status == StatusCode::UNAUTHORIZED {
+                // [NIP-FI.md §Rejection table]: 401 MUST carry WWW-Authenticate: Nostr.
+                auth_required_response()
+            } else {
+                plain_response(status, "evidence rejected\n")
+            };
         }
     };
 
@@ -142,11 +133,9 @@ pub async fn disconnect(
             let pubkey_bytes = cmd.target_pubkey.to_bytes();
             let closed = state.conn_manager.disconnect_nip_fi(&pubkey_bytes);
             if closed > 0 {
-                debug!(
-                    closed,
-                    caller_iss = %cmd.caller_iss,
-                    "nip-fi disconnect: closed sessions"
-                );
+                // [FI-TRACE-PRIVACY-NONPUBLIC]: raw `iss` MUST NOT appear in
+                // logs, metrics, or traces.  Log only a count.
+                debug!(closed, "nip-fi disconnect: closed sessions");
             }
             metrics::counter!("buzz_nip_fi_disconnect_total").increment(1);
             metrics::counter!(
@@ -154,7 +143,26 @@ pub async fn disconnect(
                 "reason" => "admin_disconnect"
             )
             .increment(closed as u64);
-            json_response(StatusCode::OK, &DisconnectResponse { disconnected: true })
+
+            // Cross-pod propagation: publish to global NIP-FI Redis channel
+            // so remote pods can merge the deny entry and close their sessions.
+            // Asynchronous: HTTP response does not wait on remote delivery.
+            {
+                let pubsub = Arc::clone(&state.pubsub);
+                let msg = buzz_pubsub::NipFiDisconnect {
+                    issuer: cmd.caller_iss.clone(),
+                    pubkey_bytes: pubkey_bytes.to_vec(),
+                    until_unix: cmd.until.timestamp(),
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = pubsub.publish_nip_fi_disconnect(&msg).await {
+                        // [FI-TRACE-PRIVACY-NONPUBLIC]: no iss or pubkey in logs
+                        tracing::warn!("nip-fi: cross-pod propagation publish failed: {e}");
+                    }
+                });
+            }
+
+            disconnected_response()
         }
         Err(CommandError::DenySetFull) => {
             warn!("nip-fi disconnect: deny set full — command rejected, no sessions closed");
@@ -183,7 +191,7 @@ pub async fn disconnect(
 ///
 /// Added to each entry in S4.  All three fields are optional (absent =
 /// command API disabled for that issuer / default capacity used).
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct CommandIssuerEnvConfig {
     /// Positive seconds, ≤ 60.  Required for the command API to be enabled.
     pub maximum_command_age_seconds: Option<u64>,
@@ -331,12 +339,27 @@ fn plain_response(status: StatusCode, body: &'static str) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Body> {
-    let body = serde_json::to_vec(value).unwrap_or_default();
+/// Build the `401 authentication required` response with the mandatory
+/// `WWW-Authenticate: Nostr` header. [NIP-FI.md §Rejection table]
+fn auth_required_response() -> Response<Body> {
     Response::builder()
-        .status(status)
+        .status(StatusCode::UNAUTHORIZED)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("WWW-Authenticate", "Nostr")
+        .body(Body::from("authentication required\n"))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Spec-exact 200 success response.
+///
+/// The spec body is `{"disconnected": true}` (note the space after `:`).
+/// `serde_json::to_vec` produces `{"disconnected":true}` without the space.
+/// We produce the literal bytes directly to stay byte-exact.
+fn disconnected_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
         .header("Content-Type", "application/json")
-        .body(Body::from(body))
+        .body(Body::from("{\"disconnected\": true}"))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
@@ -415,22 +438,61 @@ mod tests {
             authorized_principals: Some(vec!["admin@example.com".into()]),
             deny_set_capacity: None,
         };
-        // Verify the default is picked up in build_nip_fi_command_components.
-        // We can't easily call it without a ProductionJwksSource, but we can
-        // verify the constant matches the documented intent.
         assert!(cfg.deny_set_capacity.is_none());
         assert_eq!(DEFAULT_DENY_SET_CAPACITY, 50_000);
     }
 
-    // ── FI-TRACE-DENY-SET: 503 on capacity exhaustion ─────────────────────
-    //
-    // The disconnect handler returns "deny set full\n" with 503 on
-    // CommandError::DenySetFull.  This is tested by the full-path integration
-    // test in this module (requires a live CommandVerifier with a real key;
-    // see the #[ignore] integration test suite for the live oracle).
-    //
-    // The unit test here pins the response body for the error path directly.
+    // ── HTTP response contract ─────────────────────────────────────────────
 
+    /// The spec requires `{"disconnected": true}` (note the space after `:`).
+    #[tokio::test]
+    async fn disconnected_response_is_spec_exact() {
+        let resp = disconnected_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+        // Body bytes are verified directly — serde_json compact and the spec
+        // literal are NOT the same (serde_json omits the space).
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(
+            body_bytes.as_ref(),
+            b"{\"disconnected\": true}",
+            "success body must be byte-exact per spec"
+        );
+    }
+
+    /// `401` MUST carry `WWW-Authenticate: Nostr` and the spec body.
+    #[tokio::test]
+    async fn auth_required_response_has_www_authenticate() {
+        let resp = auth_required_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(www_auth, "Nostr", "401 MUST carry WWW-Authenticate: Nostr");
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(body_bytes.as_ref(), b"authentication required\n");
+    }
+
+    /// `403` error responses MUST NOT carry `WWW-Authenticate`.
+    #[test]
+    fn error_responses_have_no_www_authenticate() {
+        for body in &["evidence rejected\n", "authorization denied\n"] {
+            let resp = plain_response(StatusCode::FORBIDDEN, body);
+            assert!(
+                resp.headers().get("WWW-Authenticate").is_none(),
+                "403 must not carry WWW-Authenticate"
+            );
+        }
+    }
+
+    /// `503` plain responses have the spec-exact body.
     #[test]
     fn deny_set_full_response_body_is_spec_exact() {
         use buzz_auth::CommandError;

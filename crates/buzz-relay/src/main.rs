@@ -420,6 +420,12 @@ async fn main() -> anyhow::Result<()> {
     let pubsub_for_conn_ctrl = Arc::clone(&pubsub);
     tokio::spawn(async move { pubsub_for_conn_ctrl.run_conn_control_subscriber().await });
 
+    // Spawn Redis pub/sub subscriber for NIP-FI cross-pod disconnect commands.
+    // Remote pods publish to this global channel after accepting a disconnect
+    // command; every pod merges the deny entry and closes matching sessions.
+    let pubsub_for_nip_fi = Arc::clone(&pubsub);
+    tokio::spawn(async move { pubsub_for_nip_fi.run_nip_fi_disconnect_subscriber().await });
+
     let auth = AuthService::new(config.auth.clone());
 
     // Postgres FTS: the searchable row IS the persisted event row (its
@@ -452,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to initialize media storage: {e}"))?;
     info!("Media storage connected");
 
-    let (app_state, audit_shutdown) = AppState::new(
+    let (mut app_state, audit_shutdown) = AppState::new(
         config.clone(),
         db,
         redis_health_pool,
@@ -464,13 +470,34 @@ async fn main() -> anyhow::Result<()> {
         relay_keypair,
         media_storage,
     );
+    // NIP-FI S4: construct deny map + command verifier from startup config,
+    // before Arc::new so we can mutate app_state directly.
+    // Fail-closed: malformed command policy in enforce mode was already rejected
+    // at Config::from_env() (the startup gate); this path runs only on valid config.
+    {
+        let nip_fi = &config.nip_fi;
+        if let Some(key_source) = buzz_auth::ProductionJwksSource::new(
+            nip_fi.jwks_configs.clone(),
+            buzz_auth::HttpJwksFetcher::new(),
+        ) {
+            if let Some(components) = buzz_relay::api::nip_fi::build_nip_fi_command_components(
+                nip_fi.mode,
+                &nip_fi.registry,
+                Arc::new(key_source),
+                &nip_fi.command_configs,
+            ) {
+                app_state.nip_fi_deny_map = Some(components.deny_map);
+                app_state.nip_fi_command_verifier = Some(components.command_verifier);
+                tracing::info!(
+                    "NIP-FI S4: command API enabled ({} issuer(s))",
+                    nip_fi.command_configs.len()
+                );
+            }
+        }
+    }
     let state = Arc::new(app_state);
 
-    // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
-    // kill switch is off — nothing is bound, published, or spawned, so the
-    // relay behaves byte-identically to a build without the mesh. When
-    // enabled, a misconfigured mesh is fatal here (bind/Redis failure): an
-    // operator who asked for the mesh gets it or gets told why not.
+    // Inter-relay mesh
     if let Some(handle) = buzz_relay::mesh_boot::boot_mesh(
         &state.config,
         state.redis_pool.clone(),
@@ -1018,6 +1045,57 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::error!("Connection-control broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Cross-pod NIP-FI disconnect consumer: receive deny entries from remote
+    // pods, merge them into the local deny map (same max(until) rule), and
+    // close any matching sessions.  Every pod subscribes; the publishing pod
+    // also receives its own message and applies it — this is idempotent because
+    // the deny entry was already inserted locally before the publish.
+    {
+        let state_for_nip_fi = Arc::clone(&state);
+        let mut rx = state_for_nip_fi.pubsub.subscribe_nip_fi_disconnect();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        // Only apply if the deny map is present (command API enabled).
+                        if let Some(deny_map) = state_for_nip_fi.nip_fi_deny_map.as_deref() {
+                            // Reconstruct the pubkey from raw bytes.
+                            if let Ok(pubkey) = nostr::PublicKey::from_slice(&msg.pubkey_bytes) {
+                                let until = chrono::DateTime::from_timestamp_secs(msg.until_unix)
+                                    .unwrap_or_else(chrono::Utc::now);
+                                let now = chrono::Utc::now();
+                                // Merge the deny entry (idempotent via max(until) rule;
+                                // synthetic jti generated internally per delivery).
+                                deny_map.merge_cross_pod_deny(&msg.issuer, &pubkey, until, now);
+                                // Close matching sessions.
+                                let closed = state_for_nip_fi
+                                    .conn_manager
+                                    .disconnect_nip_fi(&msg.pubkey_bytes);
+                                if closed > 0 {
+                                    // [FI-TRACE-PRIVACY-NONPUBLIC]: no iss or pubkey in logs
+                                    tracing::debug!(closed, "nip-fi cross-pod: closed sessions");
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "nip-fi cross-pod: received malformed pubkey bytes (len={})",
+                                    msg.pubkey_bytes.len()
+                                );
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        metrics::counter!("buzz_nip_fi_disconnect_lag_total").increment(n);
+                        tracing::warn!("NIP-FI disconnect consumer lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::error!("NIP-FI disconnect broadcast channel closed");
                         break;
                     }
                 }

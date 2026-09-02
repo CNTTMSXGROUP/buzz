@@ -367,6 +367,12 @@ pub struct Config {
     /// Whether the configured web bundle serves Git browser routes in addition
     /// to the public invite landing page. Defaults to false.
     pub serve_git_web_gui: bool,
+
+    /// NIP-FI relay-level configuration: enforcement mode, issuer registry,
+    /// JWKS endpoints, and S4 admin-command fields.  Parsed from
+    /// `BUZZ_NIP_FI_MODE` and `BUZZ_NIP_FI_ISSUERS`.  Always present; mode
+    /// defaults to `Off` when the env vars are absent.
+    pub nip_fi: crate::nip_fi_config::NipFiRelayConfig,
 }
 
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
@@ -1257,6 +1263,7 @@ impl Config {
             admin,
             web_dir,
             serve_git_web_gui,
+            nip_fi: crate::nip_fi_config::NipFiRelayConfig::from_env()?,
         })
     }
 }

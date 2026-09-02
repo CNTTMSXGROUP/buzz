@@ -45,6 +45,9 @@ pub use rate_limit::{
 };
 pub use scope::{parse_scopes, Scope};
 
+/// Re-export `jsonwebtoken::Algorithm` so crates that use NIP-FI issuer policy
+/// construction do not need a direct `jsonwebtoken` dependency.
+pub use jsonwebtoken::Algorithm as JwtAlgorithm;
 pub use nip_fi::{
     validate_nip_fi_config, AssertionKeySet, AssertionPolicyId, CanonicalCapabilities,
     ClientSubjectPosture, CommandError, CommandIssuerPolicy, CommandPolicyError, CommandResult,

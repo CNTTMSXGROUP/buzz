@@ -7,17 +7,17 @@
 //!
 //! 1. Bounded decode + `typ` check (`nip-fi-command+jwt` only).
 //! 2. Select issuer policy; verify signature with authenticated JWKS.
-//! 3. Validate all pure claims (iss, aud, time bounds, method/path/cmd,
-//!    target_pubkey, until ceiling).
+//! 3. Validate all pure claims: iss, aud, time bounds, method/path/cmd,
+//!   target_pubkey, and until ceiling.
 //! 4. Principal authorization (issuer-configured authorized `sub` list).
 //! 5. Signed-target / request-body agreement.
-//! 6+7. Atomic jti reservation + deny-entry insertion (both-or-neither).
-//! Return [`CommandResult`].
+//! 6. Atomic jti reservation + deny-entry insertion (both-or-neither).
+//! 7. Return [`CommandResult`].
 //!
 //! Fail-closed: any failure returns an error without side effects.  The jti is
 //! burned and the deny entry is inserted only on success.
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use nostr::PublicKey;
 use serde_json::{Map, Value};
@@ -26,8 +26,8 @@ use super::config::{IssuerPolicy, IssuerRegistry, MAX_SUBJECT_BYTES, MAX_TOKEN_B
 use super::deny_map::{NipFiDenyMap, ReserveError};
 use super::verifier::{
     enforce_compact_structure_pub, enforce_signature_shape_pub, parse_header_pub,
-    parse_unique_claims_pub, select_unique_jwk_pub, validate_jwk_pub, AssertionKeySet,
-    IssuerKeySource, VerifierError,
+    parse_numeric_date, parse_unique_claims_pub, select_unique_jwk_pub, validate_jwk_pub,
+    AssertionKeySet, IssuerKeySource, VerifierError,
 };
 
 /// The expected `typ` value for command JWTs ([NIP-FI.md §Command JWT]).
@@ -138,7 +138,7 @@ impl CommandIssuerPolicy {
 /// Side effects (jti reservation + deny entry) have been committed atomically
 /// before this is returned.  The caller should proceed to close matching
 /// sessions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     /// The target pubkey from the signed JWT (and verified against the body).
     pub target_pubkey: PublicKey,
@@ -447,23 +447,7 @@ fn claim_str<'a>(claims: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 
 fn numeric_date(claims: &Map<String, Value>, key: &str) -> Result<DateTime<Utc>, CommandError> {
     let value = claims.get(key).ok_or(CommandError::EvidenceRejected)?;
-    if let Some(secs) = value.as_i64() {
-        return Utc
-            .timestamp_opt(secs, 0)
-            .single()
-            .ok_or(CommandError::EvidenceRejected);
-    }
-    let seconds = value.as_f64().ok_or(CommandError::EvidenceRejected)?;
-    if !seconds.is_finite() {
-        return Err(CommandError::EvidenceRejected);
-    }
-    let whole = seconds.floor();
-    if whole < i64::MIN as f64 || whole >= i64::MAX as f64 {
-        return Err(CommandError::EvidenceRejected);
-    }
-    Utc.timestamp_opt(whole as i64, 0)
-        .single()
-        .ok_or(CommandError::EvidenceRejected)
+    parse_numeric_date(value).map_err(|_| CommandError::EvidenceRejected)
 }
 
 fn parse_hex_pubkey(raw: &str) -> Option<PublicKey> {
@@ -525,6 +509,7 @@ fn verify_jwt_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nip_fi::deny_map::IssuerCapacity;
     use chrono::{Duration, Utc};
 
     // ── CommandIssuerPolicy validation ────────────────────────────────────────
@@ -665,16 +650,13 @@ mod tests {
 
     // ── Mutation evidence: time-bound oracles ─────────────────────────────────
     //
-    // These tests are pure unit tests for the time-bound checks in `verify_at`.
-    // A full integration test requires a real ES256 key; see `verifier/tests.rs`
-    // for the pattern used in the assertion verifier.  The command verifier
-    // full-path tests live in `command/tests.rs` (behind `#[ignore]`,
-    // requires real keys — see the S4 implementation report for evidence runs).
+    // The tests below exercise `verify_at` via real ES256-signed command JWTs.
+    // The same test key and JWKS helpers as `verifier/tests.rs` are used so
+    // key-selection and claim-validation semantics are identical.
 
     // FI-TRACE-DENY-SET oracle: past-until inserts with expired value.
     #[test]
     fn past_until_command_creates_no_future_denial_when_no_active_entry() {
-        use crate::nip_fi::deny_map::IssuerCapacity;
         use nostr::Keys;
 
         let deny_map = NipFiDenyMap::new(
@@ -710,7 +692,6 @@ mod tests {
     // FI-TRACE-DENY-SET oracle: both delivery orders → max(until_A, until_B).
     #[test]
     fn deny_set_both_delivery_orders_give_max_until() {
-        use crate::nip_fi::deny_map::IssuerCapacity;
         use nostr::Keys;
 
         let iss = "https://issuer.example.com";
@@ -760,5 +741,449 @@ mod tests {
                 "Order 2 (shorter first): deny at 400s must hold — delivery order must not shorten longer deny"
             );
         }
+    }
+
+    // ── Full-path CommandVerifier::verify_at tests (real ES256 key) ───────────
+    //
+    // Uses the same test key material as `verifier/tests.rs` so the key-
+    // selection and signature-validation paths are exercised identically.
+    // Each test carries a named mutation anchor: the assertion that goes wrong
+    // when the guarded code path is removed.
+
+    const TEST_EC_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcnxDM4EiirH9dHUE\nWZc759TX4s5PAn8kO5ovXSnGxCWhRANCAARFb6ZnsfkqOOXyEhj3KBQphGKF4vTa\nzhebbavbZ1ZoklqkF1cGg+jTO7rONAVEzXvXUWtV6CdDV+rybiVmFP2w\n-----END PRIVATE KEY-----\n";
+    const TEST_JWK_X: &str = "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI";
+    const TEST_JWK_Y: &str = "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA";
+    const TEST_KID: &str = "cmd-test-key-1";
+    const ISS: &str = "https://idp.example.com";
+    const AUD: &str = "https://relay.example.com";
+    const PRINCIPAL: &str = "admin@idp.example.com";
+    const METHOD: &str = "POST";
+    const PATH: &str = "/api/nip-fi/disconnect";
+
+    fn test_jwks_cmd() -> jsonwebtoken::jwk::JwkSet {
+        serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256",
+                "use": "sig", "alg": "ES256",
+                "kid": TEST_KID,
+                "x": TEST_JWK_X,
+                "y": TEST_JWK_Y,
+            }]
+        }))
+        .expect("valid test JWKS")
+    }
+
+    fn test_issuer_policy() -> IssuerPolicy {
+        let contract = crate::nip_fi::jwks::JwksSourceContract::new(
+            format!("{ISS}/.well-known/jwks.json"),
+            300,
+            3600,
+        )
+        .expect("valid contract");
+        IssuerPolicy::new(
+            ISS.to_owned(),
+            vec![AUD.to_owned()],
+            crate::nip_fi::config::TokenClass::DedicatedNipFi,
+            crate::nip_fi::config::FreshnessClass::OfflineJwt,
+            vec![jsonwebtoken::Algorithm::ES256],
+            30,
+            3600,
+            None,
+            contract,
+        )
+        .expect("valid policy")
+    }
+
+    fn test_command_policy() -> CommandIssuerPolicy {
+        CommandIssuerPolicy::new(ISS.to_owned(), 30, vec![PRINCIPAL.to_owned()], 1000)
+            .expect("valid cmd policy")
+    }
+
+    fn test_command_verifier() -> CommandVerifier<crate::nip_fi::verifier::StaticIssuerKeySource> {
+        use crate::nip_fi::verifier::{AssertionKeySet, StaticIssuerKeySource};
+        let future = Utc::now() + Duration::seconds(3600);
+        let key_set = AssertionKeySet::new(ISS.to_owned(), 1, test_jwks_cmd(), future)
+            .expect("valid key set");
+        let mut registry = IssuerRegistry::new();
+        registry.insert(test_issuer_policy());
+        let deny_map = NipFiDenyMap::new(
+            1000,
+            vec![IssuerCapacity {
+                issuer: ISS.to_owned(),
+                capacity: 1000,
+            }],
+        );
+        CommandVerifier::new(
+            registry,
+            StaticIssuerKeySource::new([key_set]),
+            vec![test_command_policy()],
+            deny_map,
+        )
+    }
+
+    fn now_ts() -> i64 {
+        Utc::now().timestamp()
+    }
+
+    fn target_key() -> nostr::PublicKey {
+        nostr::Keys::generate().public_key()
+    }
+
+    /// Mint a real ES256 command JWT with optional claim overrides.
+    fn mint_cmd_jwt(
+        target: &nostr::PublicKey,
+        until_offset_secs: i64,
+        overrides: serde_json::Value,
+    ) -> String {
+        let now = now_ts();
+        let mut claims = serde_json::json!({
+            "iss": ISS,
+            "aud": AUD,
+            "sub": PRINCIPAL,
+            "iat": now,
+            "exp": now + 55,
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "method": METHOD,
+            "path": PATH,
+            "cmd": "disconnect",
+            "target_pubkey": target.to_hex(),
+            "until": now + until_offset_secs,
+        });
+        if let serde_json::Value::Object(ref ov) = overrides {
+            for (k, v) in ov {
+                claims[k] = v.clone();
+            }
+        }
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_owned());
+        header.typ = Some(COMMAND_JWT_TYP.to_owned());
+        let key = jsonwebtoken::EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes())
+            .expect("valid EC PEM");
+        jsonwebtoken::encode(&header, &claims, &key).expect("sign")
+    }
+
+    // ── Happy path ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn full_path_happy_path_returns_ok_and_inserts_deny() {
+        // Mutation anchor: removing the deny-entry insertion (step 6) makes
+        // is_denied return false even after Ok — caught here.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let token = mint_cmd_jwt(&target, 300, serde_json::json!({}));
+        let result = cv.verify_at(&token, METHOD, PATH, &target, now);
+        assert!(result.is_ok(), "happy path must succeed: {result:?}");
+        assert!(
+            cv.deny_map()
+                .is_denied(ISS, &target, now + Duration::seconds(1)),
+            "deny entry must be inserted on success [FI-TRACE-DENY-SET]"
+        );
+    }
+
+    // ── typ / signature ───────────────────────────────────────────────────────
+
+    #[test]
+    fn wrong_typ_rejects_as_evidence_rejected() {
+        // Mutation anchor: removing the typ check admits at+jwt tokens as commands.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_owned());
+        header.typ = Some("at+jwt".to_owned());
+        let claims = serde_json::json!({
+            "iss": ISS, "aud": AUD, "sub": PRINCIPAL,
+            "iat": now_ts(), "exp": now_ts() + 55,
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "method": METHOD, "path": PATH, "cmd": "disconnect",
+            "target_pubkey": target.to_hex(), "until": now_ts() + 300,
+        });
+        let key = jsonwebtoken::EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes()).unwrap();
+        let token = jsonwebtoken::encode(&header, &claims, &key).unwrap();
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected),
+            "wrong typ must be EvidenceRejected"
+        );
+    }
+
+    #[test]
+    fn corrupted_signature_rejects_as_evidence_rejected() {
+        // Mutation anchor: removing sig verification admits forged tokens.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let mut token = mint_cmd_jwt(&target, 300, serde_json::json!({}));
+        let last = token.pop().unwrap();
+        token.push(if last == 'A' { 'B' } else { 'A' });
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected),
+            "corrupted signature must be EvidenceRejected"
+        );
+    }
+
+    // ── aud ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wrong_aud_rejects_as_evidence_rejected() {
+        // Mutation anchor: removing aud check admits tokens for other relays.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let token = mint_cmd_jwt(
+            &target,
+            300,
+            serde_json::json!({"aud": "https://other.relay.example.com"}),
+        );
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected),
+            "wrong aud must be EvidenceRejected"
+        );
+    }
+
+    // ── Time bounds ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn expired_token_rejects_as_evidence_rejected() {
+        // Mutation anchor: removing exp check admits expired tokens indefinitely.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let past = now_ts() - 600;
+        let token = mint_cmd_jwt(
+            &target,
+            300,
+            serde_json::json!({"iat": past, "exp": past + 55}),
+        );
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected),
+            "expired token must be EvidenceRejected"
+        );
+    }
+
+    #[test]
+    fn future_iat_beyond_skew_rejects() {
+        // Mutation anchor: removing iat>now+skew check admits pre-issued tokens.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let far_future_iat = now_ts() + 300; // 5 min future, skew=30s
+        let token = mint_cmd_jwt(
+            &target,
+            300,
+            serde_json::json!({"iat": far_future_iat, "exp": far_future_iat + 55}),
+        );
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected),
+            "future iat > now+skew must be EvidenceRejected"
+        );
+    }
+
+    #[test]
+    fn token_older_than_command_age_rejects() {
+        // Mutation anchor: removing iat+cmd_age check admits stale commands.
+        let cv = test_command_verifier();
+        let target = target_key();
+        // iat at exactly max_command_age ago (30s) = now >= iat+30 → expired.
+        let stale_iat = now_ts() - 30;
+        let token = mint_cmd_jwt(
+            &target,
+            300,
+            serde_json::json!({"iat": stale_iat, "exp": stale_iat + 55}),
+        );
+        let now = Utc::now();
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected),
+            "token at iat+max_cmd_age must be EvidenceRejected (equality is expired)"
+        );
+    }
+
+    // ── method / path / cmd ───────────────────────────────────────────────────
+
+    #[test]
+    fn wrong_method_rejects() {
+        // Mutation anchor: removing method check admits GET command tokens.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let token = mint_cmd_jwt(&target, 300, serde_json::json!({"method": "GET"}));
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected)
+        );
+    }
+
+    #[test]
+    fn wrong_path_rejects() {
+        // Mutation anchor: removing path check admits tokens for other endpoints.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let token = mint_cmd_jwt(&target, 300, serde_json::json!({"path": "/api/other"}));
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected)
+        );
+    }
+
+    #[test]
+    fn wrong_cmd_value_rejects() {
+        // Mutation anchor: removing cmd check admits other command type tokens.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let token = mint_cmd_jwt(&target, 300, serde_json::json!({"cmd": "reconnect"}));
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected)
+        );
+    }
+
+    // ── target_pubkey / body agreement ───────────────────────────────────────
+
+    #[test]
+    fn body_target_mismatch_rejects_as_authorization_denied() {
+        // Mutation anchor: removing the target==body check lets attackers
+        // disconnect a different pubkey than they signed.
+        let cv = test_command_verifier();
+        let signed_target = target_key();
+        let body_target = target_key(); // different
+        let now = Utc::now();
+        let token = mint_cmd_jwt(&signed_target, 300, serde_json::json!({}));
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &body_target, now),
+            Err(CommandError::AuthorizationDenied),
+            "target/body mismatch must be AuthorizationDenied"
+        );
+    }
+
+    // ── Authorization ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn unauthorized_sub_rejects_as_authorization_denied() {
+        // Mutation anchor: removing sub check lets any bearer of a valid JWT
+        // issue disconnect commands.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let token = mint_cmd_jwt(
+            &target,
+            300,
+            serde_json::json!({"sub": "not-admin@idp.example.com"}),
+        );
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::AuthorizationDenied),
+            "unauthorized sub must be AuthorizationDenied"
+        );
+    }
+
+    // ── until ceiling ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn until_exceeds_ceiling_returns_correct_error() {
+        // Mutation anchor: removing ceiling check allows unbounded deny duration.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let far_future = now_ts() + 10 * 365 * 24 * 3600;
+        let token = mint_cmd_jwt(&target, 0, serde_json::json!({"until": far_future}));
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::UntilExceedsCeiling),
+            "until beyond ceiling must be UntilExceedsCeiling"
+        );
+    }
+
+    // ── jti is the LAST step ─────────────────────────────────────────────────
+
+    #[test]
+    fn jti_replay_rejected_after_first_success() {
+        // Mutation anchor: moving jti before auth checks would burn the jti
+        // on a bad-auth token; replay would be indistinguishable from a new call.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let jti = uuid::Uuid::new_v4().to_string();
+        let token = mint_cmd_jwt(&target, 300, serde_json::json!({"jti": jti}));
+        assert!(cv.verify_at(&token, METHOD, PATH, &target, now).is_ok());
+        assert_eq!(
+            cv.verify_at(&token, METHOD, PATH, &target, now),
+            Err(CommandError::AuthorizationDenied),
+            "replayed jti must be AuthorizationDenied"
+        );
+    }
+
+    // ── 503 does NOT burn the jti ─────────────────────────────────────────────
+
+    #[test]
+    fn capacity_503_does_not_burn_jti_retry_succeeds_after_slot_freed() {
+        // Mutation anchor: if jti were recorded before the capacity check, a
+        // retry after freeing capacity would be spuriously rejected as replay.
+        // The spec guarantees: 503 leaves the command replayable.
+        //
+        // Setup: capacity=1, first command fills the slot.
+        // Step 1: second command with jti_b → 503 (capacity full).
+        // Step 2: "expire" the first entry by using a future `now` that is
+        //   past target_a's until; lazy eviction fires on the next mutation.
+        // Step 3: retry with the same jti_b → must succeed (jti was NOT burned).
+        use crate::nip_fi::verifier::{AssertionKeySet, StaticIssuerKeySource};
+
+        let future = Utc::now() + Duration::seconds(3600);
+        let key_set = AssertionKeySet::new(ISS.to_owned(), 1, test_jwks_cmd(), future)
+            .expect("valid key set");
+        let mut registry = IssuerRegistry::new();
+        registry.insert(test_issuer_policy());
+        // capacity = 1: one slot
+        let deny_map = NipFiDenyMap::new(
+            1,
+            vec![IssuerCapacity {
+                issuer: ISS.to_owned(),
+                capacity: 1,
+            }],
+        );
+        let cv = CommandVerifier::new(
+            registry,
+            StaticIssuerKeySource::new([key_set]),
+            vec![test_command_policy()],
+            deny_map,
+        );
+
+        let target_a = target_key();
+        let target_b = target_key();
+        let t0 = Utc::now();
+
+        // Fill the single slot with target_a.  Use until_offset_secs=3 so the
+        // deny entry expires at t0+3s, well before t1.
+        let token_a = mint_cmd_jwt(&target_a, 3, serde_json::json!({}));
+        assert!(cv.verify_at(&token_a, METHOD, PATH, &target_a, t0).is_ok());
+
+        // target_b → 503 (capacity full); jti_b is NOT burned.
+        let jti_b = uuid::Uuid::new_v4().to_string();
+        let token_b = mint_cmd_jwt(&target_b, 300, serde_json::json!({"jti": jti_b}));
+        assert_eq!(
+            cv.verify_at(&token_b, METHOD, PATH, &target_b, t0),
+            Err(CommandError::DenySetFull),
+            "must be DenySetFull (503)"
+        );
+
+        // Advance `now` to t0+5s: target_a's entry (until=t0+3) is expired.
+        // Lazy eviction fires on the next mutation inside verify_at, freeing
+        // the slot.  token_b is still within command age (iat=t0, max=30s).
+        let t1 = t0 + Duration::seconds(5);
+
+        // Retry with the SAME jti_b at t1.  Lazy eviction removes target_a's
+        // entry, freeing the slot.
+        // Must succeed: 503 must NOT have burned jti_b.
+        assert!(
+            cv.verify_at(&token_b, METHOD, PATH, &target_b, t1).is_ok(),
+            "retry with same jti after slot freed must succeed — 503 must NOT burn the jti"
+        );
     }
 }

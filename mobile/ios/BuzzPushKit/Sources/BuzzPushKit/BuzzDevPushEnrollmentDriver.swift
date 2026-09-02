@@ -580,6 +580,7 @@ public final class BuzzDevPushEnrollmentDriver {
         gatewayOrigin: gatewayOrigin,
         relayOrigin: relayOrigin.text,
         relayPubkey: relayPubkey,
+        endpoint: endpoint,
         endpointHash: endpointHash,
         appProfile: Self.appProfile,
         expiresAt: expiresAt,
@@ -667,6 +668,7 @@ public final class BuzzDevPushEnrollmentDriver {
         gatewayOrigin: gatewayOrigin,
         relayOrigin: pending.relayOrigin,
         relayPubkey: pending.relayPubkey,
+        endpoint: pending.endpoint,
         endpointHash: pending.endpointHash,
         appProfile: pending.appProfile,
         expiresAt: pending.expiresAt,
@@ -705,6 +707,7 @@ public final class BuzzDevPushEnrollmentDriver {
       gatewayOrigin: gatewayOrigin,
       relayOrigin: pending.relayOrigin,
       relayPubkey: pending.relayPubkey,
+      endpoint: pending.endpoint,
       endpointHash: pending.endpointHash,
       appProfile: pending.appProfile,
       expiresAt: pending.expiresAt,
@@ -800,8 +803,8 @@ public final class BuzzDevPushEnrollmentDriver {
       )
     else { return false }
     let nowSeconds = Int64(now().timeIntervalSince1970)
-    let endpoint = Self.lowercaseHex(deviceToken)
-    let endpointHash = Self.lowercaseHex(Data(SHA256.hash(data: deviceToken)))
+    let currentEndpoint = Self.lowercaseHex(deviceToken)
+    let currentEndpointHash = Self.lowercaseHex(Data(SHA256.hash(data: deviceToken)))
     var handles = [String: CleanupInstallation]()
     func mergeHandle(_ handle: String, endpointEpoch: Int64, keyId: String) -> Bool {
       if let existing = handles[handle] {
@@ -828,8 +831,18 @@ public final class BuzzDevPushEnrollmentDriver {
       var pending = state.pendingEnrollments[index]
       if pending.expiresAt <= nowSeconds { continue }
       if pending.gatewayInstallationHandle == nil {
-        guard pending.endpointHash == endpointHash,
-          let challengeId = pending.challengeId,
+        let replayEndpoint: String
+        if let protectedEndpoint = pending.endpoint {
+          guard Self.endpointHash(protectedEndpoint) == pending.endpointHash else { return false }
+          replayEndpoint = protectedEndpoint
+        } else if pending.endpointHash == currentEndpointHash {
+          replayEndpoint = currentEndpoint
+        } else {
+          // Pre-endpoint journals cannot be replayed after token rotation. They
+          // have no known handle to revoke, so this cleanup item is terminal.
+          continue
+        }
+        guard let challengeId = pending.challengeId,
           let challengeUUID = UUID(uuidString: challengeId),
           challengeId == challengeUUID.uuidString.lowercased(),
           let challenge = pending.challenge,
@@ -839,7 +852,7 @@ public final class BuzzDevPushEnrollmentDriver {
         do {
           let installation = try await oldDriver.enrollInstallation(
             challenge: Challenge(id: challengeUUID, value: challenge),
-            endpoint: endpoint,
+            endpoint: replayEndpoint,
             expiresAt: pending.expiresAt,
             attestation: BuzzDevAttestation(keyId: keyId, attestation: attestation)
           )
@@ -1123,6 +1136,30 @@ public final class BuzzDevPushEnrollmentDriver {
 
   private static func lowercaseHex(_ data: Data) -> String {
     data.map { String(format: "%02x", $0) }.joined()
+  }
+
+  private static func endpointHash(_ endpoint: String) -> String? {
+    let utf8 = Array(endpoint.utf8)
+    guard !utf8.isEmpty, utf8.count <= 512, utf8.count.isMultiple(of: 2) else {
+      return nil
+    }
+    var bytes = [UInt8]()
+    bytes.reserveCapacity(utf8.count / 2)
+    for index in stride(from: 0, to: utf8.count, by: 2) {
+      guard let high = hexNibble(utf8[index]), let low = hexNibble(utf8[index + 1]) else {
+        return nil
+      }
+      bytes.append(high << 4 | low)
+    }
+    return lowercaseHex(Data(SHA256.hash(data: Data(bytes))))
+  }
+
+  private static func hexNibble(_ byte: UInt8) -> UInt8? {
+    switch byte {
+    case 48...57: byte - 48
+    case 97...102: byte - 87
+    default: nil
+    }
   }
 }
 

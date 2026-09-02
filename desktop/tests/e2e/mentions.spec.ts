@@ -416,12 +416,10 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
   expect(fullNpubs).toHaveLength(2);
   expect(new Set(fullNpubs).size).toBe(2);
 
-  await managedRow
-    .getByRole("button", { name: "Automatically mention carl", exact: true })
-    .click();
+  await managedRow.getByRole("button", { name: "Mention carl" }).click();
   await expect(
     page.getByTestId(`composer-address-lock-${managedPubkey}`),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(
     page.getByTestId(`composer-address-lock-${relayPubkey}`),
   ).toHaveCount(0);
@@ -430,21 +428,18 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
   await expect
     .poll(() => readOutgoingMentionPubkeys(page, "@carl local"))
     .toEqual([managedPubkey]);
-  await expect(input).toHaveText("@carl ");
+  await expect(input).toHaveText("");
 
-  await page.getByTestId(`composer-address-lock-${managedPubkey}`).click();
   await input.fill("@carl");
   const reopenedDropdown = autocomplete(page);
   await expect(reopenedDropdown).toBeVisible();
   const reopenedRelayRow = reopenedDropdown.getByTestId(
     `mention-suggestion-${relayPubkey}`,
   );
-  await reopenedRelayRow
-    .getByRole("button", { name: "Automatically mention carl", exact: true })
-    .click();
+  await reopenedRelayRow.getByRole("button", { name: "Mention carl" }).click();
   await expect(
     page.getByTestId(`composer-address-lock-${relayPubkey}`),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(
     page.getByTestId(`composer-address-lock-${managedPubkey}`),
   ).toHaveCount(0);
@@ -1195,6 +1190,84 @@ test("typing an unregistered @token before existing text is left alone", async (
   await expect(input).toHaveText("hello @zzq world");
 });
 
+test("wrapped channel references keep the icon on the first composer line", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const input = page.getByTestId("message-input");
+  await page.getByTestId("message-input-scroll").evaluate((element) => {
+    element.style.width = "74px";
+  });
+  await input.fill("#all-replies");
+
+  const channelChip = input.locator(".inline-chip-icon-channel", {
+    hasText: "all-replies",
+  });
+  await expect(channelChip).toBeVisible();
+  // CSSOM exposes pseudo-element styles but not their rendered box.
+  const cdp = await page.context().newCDPSession(page);
+  const { root } = await cdp.send("DOM.getDocument", {
+    depth: -1,
+    pierce: true,
+  });
+  const { nodeId } = await cdp.send("DOM.querySelector", {
+    nodeId: root.nodeId,
+    selector: ".rich-text-composer .inline-chip-icon-channel",
+  });
+  const { node } = await cdp.send("DOM.describeNode", { nodeId, depth: 1 });
+  const before = node.pseudoElements?.find(
+    (pseudo) => pseudo.pseudoType === "before",
+  );
+  if (!before) {
+    throw new Error("Channel chip is missing its generated icon");
+  }
+  const iconBox = await cdp.send("DOM.getBoxModel", { nodeId: before.nodeId });
+  const iconTop = iconBox.model.border[1];
+  await cdp.detach();
+  const geometry = await channelChip.evaluate((element) => {
+    const textNode = element.firstChild;
+    if (!(textNode instanceof Text)) {
+      throw new Error("Channel chip is missing its decorated text node");
+    }
+    const textRange = document.createRange();
+    textRange.selectNodeContents(textNode);
+    const rects = (source: DOMRectList) =>
+      Array.from(source, (rect) => ({
+        left: rect.left,
+        top: rect.top,
+      }));
+    const iconStyle = getComputedStyle(element, "::before");
+    const tokenProbe = document.createElement("span");
+    tokenProbe.style.cssText =
+      "position:fixed;width:var(--inline-chip-padding-inline)";
+    element.append(tokenProbe);
+    const tokenPadding = tokenProbe.getBoundingClientRect().width;
+    tokenProbe.remove();
+    return {
+      chipRects: rects(element.getClientRects()),
+      iconPosition: iconStyle.position,
+      iconTransform: iconStyle.transform,
+      tokenPadding,
+      textRects: rects(textRange.getClientRects()),
+    };
+  });
+  expect(geometry.chipRects).toHaveLength(2);
+  expect(geometry.textRects).toHaveLength(2);
+  expect(geometry.iconPosition).toBe("static");
+  expect(geometry.iconTransform).toBe("none");
+  expect(
+    geometry.textRects[0].left - geometry.chipRects[0].left,
+  ).toBeGreaterThan(geometry.tokenPadding);
+  expect(geometry.textRects[1].left - geometry.chipRects[1].left).toBeCloseTo(
+    geometry.tokenPadding,
+    0,
+  );
+  expect(iconTop - geometry.textRects[0].top).toBeCloseTo(2.5, 0);
+});
+
 test("channel references keep caret movement through the channel name", async ({
   page,
 }) => {
@@ -1441,7 +1514,7 @@ test("managed relay-profile agents with member roles can be addressed explicitly
   await expect(charlieRow.getByText("agent")).toBeVisible();
   await charlieRow
     .getByRole("button", {
-      name: "Automatically mention charlie",
+      name: "Mention charlie",
       exact: true,
     })
     .click();
@@ -1450,12 +1523,7 @@ test("managed relay-profile agents with member roles can be addressed explicitly
   await expect(input.locator(".agent-mention-highlight")).toHaveText("charlie");
   await expect(
     page.getByTestId(`composer-address-lock-${TEST_IDENTITIES.charlie.pubkey}`),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("status").filter({
-      hasText: "Automatically mentioning charlie",
-    }),
-  ).toBeVisible();
+  ).toHaveCount(0);
 });
 
 test("other-owned agents without a shared channel are hidden from mentions", async ({
@@ -2957,7 +3025,7 @@ test("a managed non-member agent from a DM can be addressed explicitly", async (
   await expect(input.locator(".mention-chip")).toHaveCount(0);
   await charlieRow
     .getByRole("button", {
-      name: "Automatically mention charlie",
+      name: "Mention charlie",
       exact: true,
     })
     .click();
@@ -2966,7 +3034,7 @@ test("a managed non-member agent from a DM can be addressed explicitly", async (
   await expect(input.locator(".agent-mention-highlight")).toHaveText("charlie");
   await expect(
     page.getByTestId(`composer-address-lock-${TEST_IDENTITIES.charlie.pubkey}`),
-  ).toBeVisible();
+  ).toHaveCount(0);
 });
 
 test("global non-member people can be selected from channel mentions", async ({

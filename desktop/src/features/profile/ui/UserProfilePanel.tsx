@@ -190,14 +190,12 @@ export function UserProfilePanel({
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: true });
   const { instanceBuckets, linkedPersonaId, managedAgent } =
     useCanonicalManagedAgentProfile({
-      currentPubkey,
       managedAgents: managedAgentsQuery.data,
       personaId: persona?.id,
-      preferDirectManagedAgent: true,
-      preserveRequestedInstance,
       pubkey,
     });
   const resolvedPersonaFromSource = React.useMemo(() => {
+    if (pubkey && !managedAgent) return undefined;
     const personaId = linkedPersonaId ?? managedAgent?.personaId;
     if (personaId) {
       const refreshedPersona = personasQuery.data?.find(
@@ -207,7 +205,7 @@ export function UserProfilePanel({
         return refreshedPersona;
       }
     }
-    if (persona) {
+    if (!pubkey && persona) {
       return persona;
     }
     if (!managedAgent?.personaId) {
@@ -216,14 +214,15 @@ export function UserProfilePanel({
     return personasQuery.data?.find(
       (candidate) => candidate.id === managedAgent.personaId,
     );
-  }, [linkedPersonaId, managedAgent?.personaId, persona, personasQuery.data]);
+  }, [linkedPersonaId, managedAgent, persona, personasQuery.data, pubkey]);
   const profileIdentityKey =
-    managedAgent?.pubkey ?? pubkey ?? `persona:${persona?.id ?? "unknown"}`;
-  const resolvedPersona = useRetainedPersona(
+    pubkey ?? managedAgent?.pubkey ?? `persona:${persona?.id ?? "unknown"}`;
+  const retainedPersona = useRetainedPersona(
     resolvedPersonaFromSource,
     profileIdentityKey,
   );
-  const effectivePubkey = managedAgent?.pubkey ?? pubkey ?? null;
+  const resolvedPersona = pubkey && !managedAgent ? undefined : retainedPersona;
+  const effectivePubkey = pubkey ?? managedAgent?.pubkey ?? null;
   const pubkeyLower = effectivePubkey?.toLowerCase() ?? "";
 
   const profileQuery = useUserProfileQuery(effectivePubkey ?? undefined);
@@ -326,6 +325,7 @@ export function UserProfilePanel({
   const canOpenAgentLogs =
     isOwner === true && managedAgent?.backend.type === "local";
   const canInstantiateAgent =
+    !pubkey &&
     isOwner === true &&
     resolvedPersona !== undefined &&
     managedAgent === undefined;

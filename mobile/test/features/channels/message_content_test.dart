@@ -112,6 +112,28 @@ class _LoadingVoiceNotePlayer extends _FakeVoiceNotePlayer {
   }) async {}
 }
 
+class _RetryableVoiceNotePlayer extends _FakeVoiceNotePlayer {
+  _RetryableVoiceNotePlayer() {
+    _state = const VoiceNotePlaybackState(hasError: true);
+  }
+
+  int toggleCount = 0;
+
+  @override
+  Future<void> loadRemote(
+    String url, {
+    required Map<String, String> Function() headers,
+    required Duration fallbackDuration,
+  }) async {}
+
+  @override
+  Future<void> toggle() async {
+    toggleCount += 1;
+    _state = _state.copyWith(hasError: false, isPlaying: true);
+    notifyListeners();
+  }
+}
+
 Finder _imagePreview(String imageUrl) {
   return find.byKey(ValueKey('message-media-image-preview:$imageUrl'));
 }
@@ -982,6 +1004,49 @@ void main() {
         expect(find.byType(BuzzLoadingIndicator), findsOneWidget);
         expect(find.byType(CircularProgressIndicator), findsNothing);
         expect(find.bySemanticsLabel('Loading voice note'), findsOneWidget);
+      });
+
+      testWidgets('offers an accessible retry after a voice note fails', (
+        tester,
+      ) async {
+        const url = 'https://example.com/media/retry-voice-note.mp4';
+        final player = _RetryableVoiceNotePlayer();
+
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: '![audio]($url)',
+              tags: [
+                [
+                  'imeta',
+                  'url $url',
+                  'm video/mp4',
+                  'duration 3.0',
+                  'filename voice-note-retry.mp4',
+                ],
+              ],
+            ),
+            overrides: [
+              voiceNotePlayerFactoryProvider.overrideWithValue(() => player),
+            ],
+          ),
+        );
+        await tester.pump();
+
+        expect(find.text('Voice note unavailable'), findsOneWidget);
+        expect(find.byTooltip('Retry voice note'), findsOneWidget);
+        expect(find.bySemanticsLabel('Retry voice note'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('voice-note-retry-icon')),
+          findsOneWidget,
+        );
+
+        await tester.tap(find.byTooltip('Retry voice note'));
+        await tester.pump();
+
+        expect(player.toggleCount, 1);
+        expect(find.byTooltip('Pause voice note'), findsOneWidget);
+        expect(find.text('Voice note unavailable'), findsNothing);
       });
 
       testWidgets('renders an audio imeta attachment as a voice note card', (

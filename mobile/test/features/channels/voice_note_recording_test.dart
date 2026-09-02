@@ -3,7 +3,9 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
+import 'package:just_audio/just_audio.dart' as audio;
 import 'package:record/record.dart';
+import 'package:buzz/features/channels/voice_note_composer_recorder.dart';
 import 'package:buzz/features/channels/voice_note_recording.dart';
 
 class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
@@ -60,6 +62,77 @@ class _DelayedHttpClient extends http.BaseClient {
   Future<http.StreamedResponse> send(http.BaseRequest request) {
     sent.complete(request);
     return response.future;
+  }
+}
+
+class _SequencedHttpClient extends http.BaseClient {
+  final requests = <http.BaseRequest>[];
+  final responses = <Completer<http.StreamedResponse>>[];
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    requests.add(request);
+    final response = Completer<http.StreamedResponse>();
+    responses.add(response);
+    return response.future;
+  }
+}
+
+class _FakeAudioPlayerBackend implements VoiceNoteAudioPlayerBackend {
+  final positions = StreamController<Duration>.broadcast();
+  final durations = StreamController<Duration?>.broadcast();
+  final states = StreamController<audio.PlayerState>.broadcast();
+  final pathLoads = <Completer<Duration?>>[];
+  bool delayPathLoads = false;
+  bool _playing = false;
+  int playCount = 0;
+  final loadedPaths = <String>[];
+
+  @override
+  Stream<Duration> get positionStream => positions.stream;
+
+  @override
+  Stream<Duration?> get durationStream => durations.stream;
+
+  @override
+  Stream<audio.PlayerState> get playerStateStream => states.stream;
+
+  @override
+  bool get playing => _playing;
+
+  @override
+  Future<Duration?> setFilePath(String path) {
+    loadedPaths.add(path);
+    if (!delayPathLoads) return Future.value(const Duration(seconds: 7));
+    final load = Completer<Duration?>();
+    pathLoads.add(load);
+    return load.future.whenComplete(() => pathLoads.remove(load));
+  }
+
+  @override
+  Future<Duration?> setUrl(String url, {Map<String, String>? headers}) async =>
+      const Duration(seconds: 7);
+
+  @override
+  Future<void> play() async {
+    _playing = true;
+    playCount += 1;
+  }
+
+  @override
+  Future<void> pause() async => _playing = false;
+
+  @override
+  Future<void> seek(Duration position) async {}
+
+  @override
+  Future<void> setSpeed(double speed) async {}
+
+  @override
+  Future<void> dispose() async {
+    await positions.close();
+    await durations.close();
+    await states.close();
   }
 }
 
@@ -129,6 +202,23 @@ class _CoordinatedPlayer extends VoiceNotePlayerController {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test(
+    'dropped finalized recordings are deleted without surfacing errors',
+    () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-dropped-recording-test',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final recording = File('${directory.path}/recording.m4a');
+      await recording.writeAsBytes([1, 2, 3]);
+
+      await deleteDroppedVoiceNoteRecording(recording.path);
+      await deleteDroppedVoiceNoteRecording(recording.path);
+
+      expect(await recording.exists(), isFalse);
+    },
+  );
 
   test('cancellation fences delayed permission before native start', () async {
     final backend = _DelayedRecorderBackend();
@@ -253,6 +343,196 @@ void main() {
       await playback;
 
       expect(directory.listSync().whereType<File>(), isEmpty);
+    },
+  );
+
+  test(
+    'rapid remote toggles share one download and one auth generation',
+    () async {
+      final client = _SequencedHttpClient();
+      final audioPlayer = _FakeAudioPlayerBackend();
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-single-flight-test',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: VoiceNotePlaybackCoordinator(),
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+        player: audioPlayer,
+      );
+      addTearDown(player.dispose);
+      var authGeneration = 0;
+      await player.loadRemote(
+        'https://example.com/voice-note.mp4',
+        headers: () => {
+          'Authorization': 'Nostr signed-event-${authGeneration++}',
+        },
+        fallbackDuration: const Duration(seconds: 7),
+      );
+
+      final firstToggle = player.toggle();
+      final secondToggle = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(client.requests, hasLength(1));
+      expect(authGeneration, 1);
+      client.responses.single.complete(
+        http.StreamedResponse(Stream.value(<int>[1, 2, 3]), 200),
+      );
+      await Future.wait([firstToggle, secondToggle]);
+
+      expect(audioPlayer.loadedPaths, hasLength(1));
+      expect(audioPlayer.playCount, 1);
+    },
+  );
+
+  test('transient remote failure retries with fresh auth and plays', () async {
+    final client = _SequencedHttpClient();
+    final audioPlayer = _FakeAudioPlayerBackend();
+    final directory = await Directory.systemTemp.createTemp(
+      'voice-note-retry-test',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    final player = DeviceVoiceNotePlayerController(
+      coordinator: VoiceNotePlaybackCoordinator(),
+      client: client,
+      temporaryDirectory: () async => directory,
+      requiresAuthenticatedLocalFile: true,
+      player: audioPlayer,
+    );
+    addTearDown(player.dispose);
+    var authGeneration = 0;
+    await player.loadRemote(
+      'https://example.com/voice-note.mp4',
+      headers: () => {
+        'Authorization': 'Nostr signed-event-${authGeneration++}',
+      },
+      fallbackDuration: const Duration(seconds: 7),
+    );
+
+    final firstToggle = player.toggle();
+    await Future<void>.delayed(Duration.zero);
+    client.responses.single.complete(
+      http.StreamedResponse(Stream<List<int>>.empty(), 503),
+    );
+    await firstToggle;
+    expect(player.state.hasError, isTrue);
+    expect(client.requests, hasLength(1));
+    expect(audioPlayer.playCount, 0);
+
+    final retry = player.toggle();
+    await Future<void>.delayed(Duration.zero);
+    expect(client.requests, hasLength(2));
+    expect(
+      client.requests.last.headers['Authorization'],
+      'Nostr signed-event-1',
+    );
+    client.responses.last.complete(
+      http.StreamedResponse(Stream.value(<int>[4, 5, 6]), 200),
+    );
+    await retry;
+
+    expect(authGeneration, 2);
+    expect(player.state.hasError, isFalse);
+    expect(audioPlayer.playCount, 1);
+  });
+
+  test(
+    'pause aborts a rapid-toggle download without temporary residue',
+    () async {
+      final client = _SequencedHttpClient();
+      final audioPlayer = _FakeAudioPlayerBackend();
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-pause-test',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: VoiceNotePlaybackCoordinator(),
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+        player: audioPlayer,
+      );
+      addTearDown(player.dispose);
+      await player.loadRemote(
+        'https://example.com/voice-note.mp4',
+        headers: () => const {},
+        fallbackDuration: const Duration(seconds: 7),
+      );
+
+      final firstToggle = player.toggle();
+      final secondToggle = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      final request = client.requests.single as http.AbortableStreamedRequest;
+      await player.pause();
+      await request.abortTrigger;
+      client.responses.single.completeError(
+        http.RequestAbortedException(request.url),
+      );
+      await Future.wait([firstToggle, secondToggle]);
+
+      expect(client.requests, hasLength(1));
+      expect(audioPlayer.loadedPaths, isEmpty);
+      expect(audioPlayer.playCount, 0);
+      expect(directory.listSync().whereType<File>(), isEmpty);
+    },
+  );
+
+  test(
+    'source replacement aborts the owned download without stale playback',
+    () async {
+      final client = _SequencedHttpClient();
+      final audioPlayer = _FakeAudioPlayerBackend()..delayPathLoads = true;
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-source-replacement-test',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: VoiceNotePlaybackCoordinator(),
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+        player: audioPlayer,
+      );
+      addTearDown(player.dispose);
+      await player.loadRemote(
+        'https://example.com/first.mp4',
+        headers: () => const {},
+        fallbackDuration: const Duration(seconds: 7),
+      );
+
+      final playback = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      client.responses.single.complete(
+        http.StreamedResponse(Stream.value(<int>[1, 2, 3]), 200),
+      );
+      while (audioPlayer.pathLoads.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      final staleFile = File(audioPlayer.loadedPaths.single);
+      expect(await staleFile.exists(), isTrue);
+
+      final replacement = player.loadLocal(
+        '${directory.path}/replacement.m4a',
+        fallbackDuration: const Duration(seconds: 8),
+      );
+      await Future<void>.delayed(Duration.zero);
+      audioPlayer.pathLoads.first.complete(const Duration(seconds: 7));
+      await playback;
+      while (await staleFile.exists()) {
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      expect(audioPlayer.playCount, 0);
+      expect(player.state.duration, const Duration(seconds: 8));
+      expect(player.state.isLoading, isTrue);
+
+      audioPlayer.pathLoads.last.complete(const Duration(seconds: 8));
+      await replacement;
+      expect(player.state.duration, const Duration(seconds: 8));
+      expect(player.state.isLoading, isFalse);
     },
   );
 

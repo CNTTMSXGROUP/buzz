@@ -131,31 +131,46 @@ class VoiceNoteAttachment extends HookConsumerWidget {
         children: [
           SizedBox.square(
             dimension: 40,
-            child: IconButton.filledTonal(
-              key: const ValueKey('voice-note-play-pause'),
-              tooltip: state.isPlaying ? 'Pause voice note' : 'Play voice note',
-              onPressed: state.hasError
-                  ? null
-                  : () {
-                      unawaited(HapticFeedback.selectionClick());
-                      unawaited(player.toggle());
-                    },
-              style: IconButton.styleFrom(
-                minimumSize: const Size.square(40),
-                maximumSize: const Size.square(40),
-                padding: EdgeInsets.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            child: Semantics(
+              button: true,
+              label: state.hasError && isRemote ? 'Retry voice note' : null,
+              child: IconButton.filledTonal(
+                key: const ValueKey('voice-note-play-pause'),
+                tooltip: state.hasError && isRemote
+                    ? 'Retry voice note'
+                    : state.isPlaying
+                    ? 'Pause voice note'
+                    : 'Play voice note',
+                onPressed: state.hasError && !isRemote
+                    ? null
+                    : () {
+                        unawaited(HapticFeedback.selectionClick());
+                        unawaited(player.toggle());
+                      },
+                style: IconButton.styleFrom(
+                  minimumSize: const Size.square(40),
+                  maximumSize: const Size.square(40),
+                  padding: EdgeInsets.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                icon: state.isLoading
+                    ? BuzzLoadingIndicator(
+                        size: 18,
+                        color: context.colors.onSecondaryContainer,
+                        semanticLabel: 'Loading voice note',
+                      )
+                    : state.hasError && isRemote
+                    ? Icon(
+                        LucideIcons.refreshCcw,
+                        key: const ValueKey('voice-note-retry-icon'),
+                        size: 18,
+                        color: context.colors.onSecondaryContainer,
+                      )
+                    : VoiceNotePlayPauseIcon(
+                        isPlaying: state.isPlaying,
+                        color: context.colors.onSecondaryContainer,
+                      ),
               ),
-              icon: state.isLoading
-                  ? BuzzLoadingIndicator(
-                      size: 18,
-                      color: context.colors.onSecondaryContainer,
-                      semanticLabel: 'Loading voice note',
-                    )
-                  : VoiceNotePlayPauseIcon(
-                      isPlaying: state.isPlaying,
-                      color: context.colors.onSecondaryContainer,
-                    ),
             ),
           ),
           const SizedBox(width: Grid.xxs),

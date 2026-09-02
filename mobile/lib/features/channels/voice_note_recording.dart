@@ -354,18 +354,86 @@ final voiceNotePlayerFactoryProvider =
       );
     });
 
+/// Minimal audio backend contract used by the voice-note playback controller.
+abstract interface class VoiceNoteAudioPlayerBackend {
+  Stream<Duration> get positionStream;
+
+  Stream<Duration?> get durationStream;
+
+  Stream<audio.PlayerState> get playerStateStream;
+
+  bool get playing;
+
+  Future<Duration?> setFilePath(String path);
+
+  Future<Duration?> setUrl(String url, {Map<String, String>? headers});
+
+  Future<void> play();
+
+  Future<void> pause();
+
+  Future<void> seek(Duration position);
+
+  Future<void> setSpeed(double speed);
+
+  Future<void> dispose();
+}
+
+class _DeviceVoiceNoteAudioPlayerBackend
+    implements VoiceNoteAudioPlayerBackend {
+  _DeviceVoiceNoteAudioPlayerBackend()
+    : _player = audio.AudioPlayer(useProxyForRequestHeaders: false);
+
+  final audio.AudioPlayer _player;
+
+  @override
+  Stream<Duration> get positionStream => _player.positionStream;
+
+  @override
+  Stream<Duration?> get durationStream => _player.durationStream;
+
+  @override
+  Stream<audio.PlayerState> get playerStateStream => _player.playerStateStream;
+
+  @override
+  bool get playing => _player.playing;
+
+  @override
+  Future<Duration?> setFilePath(String path) => _player.setFilePath(path);
+
+  @override
+  Future<Duration?> setUrl(String url, {Map<String, String>? headers}) =>
+      _player.setUrl(url, headers: headers);
+
+  @override
+  Future<void> play() => _player.play();
+
+  @override
+  Future<void> pause() => _player.pause();
+
+  @override
+  Future<void> seek(Duration position) => _player.seek(position);
+
+  @override
+  Future<void> setSpeed(double speed) => _player.setSpeed(speed);
+
+  @override
+  Future<void> dispose() => _player.dispose();
+}
+
 class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   DeviceVoiceNotePlayerController({
     required VoiceNotePlaybackCoordinator coordinator,
     required http.Client client,
     Future<Directory> Function()? temporaryDirectory,
     bool? requiresAuthenticatedLocalFile,
+    VoiceNoteAudioPlayerBackend? player,
   }) : _coordinator = coordinator,
        _client = client,
        _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory,
        _requiresAuthenticatedLocalFile =
            requiresAuthenticatedLocalFile ?? Platform.isIOS,
-       _player = audio.AudioPlayer(useProxyForRequestHeaders: false) {
+       _player = player ?? _DeviceVoiceNoteAudioPlayerBackend() {
     _subscriptions.add(
       _player.positionStream.listen((position) {
         _update(_state.copyWith(position: position));
@@ -405,7 +473,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   final VoiceNotePlaybackCoordinator _coordinator;
   final http.Client _client;
   final Future<Directory> Function() _temporaryDirectory;
-  final audio.AudioPlayer _player;
+  final VoiceNoteAudioPlayerBackend _player;
   final bool _requiresAuthenticatedLocalFile;
   final List<StreamSubscription<Object?>> _subscriptions = [];
   VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
@@ -416,8 +484,10 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   })?
   _pendingRemote;
   Completer<void>? _downloadAbort;
+  Future<void>? _toggleOperation;
   File? _downloadingRemoteFile;
   File? _remoteFile;
+  int _sourceGeneration = 0;
   bool _disposed = false;
 
   Future<void> _stopAndRewindCompletedPlayback() async {
@@ -429,11 +499,14 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   VoiceNotePlaybackState get state => _state;
 
   @override
-  Future<void> loadLocal(String path, {required Duration fallbackDuration}) =>
-      _load(
-        () => _player.setFilePath(path),
-        fallbackDuration: fallbackDuration,
-      );
+  Future<void> loadLocal(String path, {required Duration fallbackDuration}) {
+    _replaceSource();
+    return _load(
+      () => _player.setFilePath(path),
+      fallbackDuration: fallbackDuration,
+      sourceGeneration: _sourceGeneration,
+    );
+  }
 
   @override
   Future<void> loadRemote(
@@ -441,11 +514,12 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     required Map<String, String> Function() headers,
     required Duration fallbackDuration,
   }) {
+    _replaceSource();
     if (!_requiresAuthenticatedLocalFile) {
-      _pendingRemote = null;
       return _load(
         () => _player.setUrl(url, headers: headers()),
         fallbackDuration: fallbackDuration,
+        sourceGeneration: _sourceGeneration,
       );
     }
     _pendingRemote = (
@@ -457,9 +531,22 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     return Future.value();
   }
 
+  void _replaceSource() {
+    _sourceGeneration += 1;
+    _pendingRemote = null;
+    final remoteFile = _remoteFile;
+    _remoteFile = null;
+    unawaited(_deleteRemoteFile(remoteFile));
+    final activeDownloadAbort = _downloadAbort;
+    if (activeDownloadAbort != null && !activeDownloadAbort.isCompleted) {
+      activeDownloadAbort.complete();
+    }
+  }
+
   Future<Duration?> _loadPendingRemote() async {
     final remote = _pendingRemote;
     if (remote == null) return null;
+    final sourceGeneration = _sourceGeneration;
     final uri = Uri.parse(remote.url);
     final requestAbort = Completer<void>();
     _downloadAbort = requestAbort;
@@ -485,7 +572,11 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
       );
       _downloadingRemoteFile = file;
       await response.stream.pipe(file.openWrite());
-      if (_disposed || !_coordinator.ownsPlayback(this)) return null;
+      if (_disposed ||
+          sourceGeneration != _sourceGeneration ||
+          !_coordinator.ownsPlayback(this)) {
+        return null;
+      }
       await _deleteRemoteFile(_remoteFile);
       _remoteFile = file;
       _downloadingRemoteFile = null;
@@ -516,12 +607,14 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   Future<void> _load(
     Future<Duration?> Function() load, {
     required Duration fallbackDuration,
+    required int sourceGeneration,
   }) async {
     _update(
       VoiceNotePlaybackState(duration: fallbackDuration, isLoading: true),
     );
     try {
       final duration = await load();
+      if (_disposed || sourceGeneration != _sourceGeneration) return;
       _update(
         _state.copyWith(
           duration: duration ?? fallbackDuration,
@@ -530,26 +623,45 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         ),
       );
     } catch (_) {
+      if (_disposed || sourceGeneration != _sourceGeneration) return;
       _coordinator.release(this);
       _update(_state.copyWith(isLoading: false, hasError: true));
     }
   }
 
   @override
-  Future<void> toggle() async {
-    if (_state.hasError || _state.isLoading) return;
+  Future<void> toggle() {
+    final activeToggle = _toggleOperation;
+    if (activeToggle != null) return activeToggle;
+    final operation = _toggle();
+    _toggleOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_toggleOperation, operation)) _toggleOperation = null;
+    });
+  }
+
+  Future<void> _toggle() async {
+    if (_state.isLoading) return;
     if (_player.playing) {
       await pause();
     } else {
+      final remote = _pendingRemote;
+      if (_state.hasError && remote == null) return;
+      if (_state.hasError) {
+        _update(_state.copyWith(hasError: false));
+      }
       final ownsPlayback = await _coordinator.activate(this);
       if (!ownsPlayback || _disposed) return;
-      final remote = _pendingRemote;
       if (remote != null) {
+        final sourceGeneration = _sourceGeneration;
         await _load(
           _loadPendingRemote,
           fallbackDuration: remote.fallbackDuration,
+          sourceGeneration: sourceGeneration,
         );
-        if (_pendingRemote != null) return;
+        if (sourceGeneration != _sourceGeneration || _pendingRemote != null) {
+          return;
+        }
       }
       if (_coordinator.ownsPlayback(this) && !_disposed && !_state.hasError) {
         await _player.play();
@@ -581,6 +693,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   @override
   void dispose() {
     _disposed = true;
+    _sourceGeneration += 1;
     _coordinator.release(this);
     final activeDownloadAbort = _downloadAbort;
     if (activeDownloadAbort != null && !activeDownloadAbort.isCompleted) {

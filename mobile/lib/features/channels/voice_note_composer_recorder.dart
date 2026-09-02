@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -74,7 +75,11 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       unawaited(HapticFeedback.mediumImpact());
       try {
         final recording = await recorder.stop();
-        if (context.mounted) onRecorded(recording);
+        if (context.mounted) {
+          onRecorded(recording);
+        } else {
+          await deleteDroppedVoiceNoteRecording(recording.file.path);
+        }
       } catch (_) {
         if (context.mounted) {
           error.value = 'Buzz could not finish the voice note.';
@@ -216,6 +221,16 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
         ),
       ],
     );
+  }
+}
+
+/// Best-effort deletion for a finalized recording the composer cannot retain.
+Future<void> deleteDroppedVoiceNoteRecording(String path) async {
+  try {
+    final file = File(path);
+    if (await file.exists()) await file.delete();
+  } catch (_) {
+    // Best-effort cleanup must not escape an already unmounted recorder.
   }
 }
 

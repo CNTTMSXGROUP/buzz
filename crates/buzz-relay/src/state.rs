@@ -1404,7 +1404,13 @@ type NipFiComponents = (
 fn build_nip_fi_components(config: &crate::config::Config) -> NipFiComponents {
     use buzz_auth::{FederatedAssertionVerifier, HttpJwksFetcher, NipFiMode, ProductionJwksSource};
 
-    if matches!(config.nip_fi.mode, NipFiMode::Off) {
+    if matches!(
+        config.nip_fi.mode,
+        NipFiMode::Off | NipFiMode::DenyProtected
+    ) {
+        // Off and DenyProtected carry no JWKS config; no verifier needed.
+        // DenyProtected always returns 503 at the gate — the verifier is never
+        // consulted — so constructing one would be both wasteful and noisy.
         return (None, None);
     }
 
@@ -1741,6 +1747,7 @@ pub(crate) mod tests {
         let conn_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let bp = Arc::new(AtomicU8::new(0));
 
@@ -1755,6 +1762,7 @@ pub(crate) mod tests {
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx: tx.clone(),
             ctrl_tx,
+            terminal_ctrl_tx,
             cancel: cancel.clone(),
             backpressure_count: Arc::clone(&bp),
             grace_limit: 3,

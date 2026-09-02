@@ -334,21 +334,6 @@ async fn nip11_or_ws_handler(
         return Json(nip11_document(&state, raw_host).await).into_response();
     }
 
-    // NIP-FI assertion check at upgrade — before tenant lookup and before the
-    // WebSocket handshake. Running pre-lookup means a denied request pays zero
-    // DB cost and the gate is reachable in tests without a live community.
-    // [FI-TRACE-TRANSPORT-CLOSED]
-    let nip_fi_assertion = {
-        use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
-        let mode = state.config.nip_fi.mode;
-        let verifier = state.nip_fi_verifier.as_deref();
-        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
-            NipFiUpgradeOutcome::NotRequired => None,
-            NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
-            NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
-        }
-    };
-
     // Row zero: bind the connection to its community from the request host
     // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
     // connection. The host is the authoritative selector; an unmapped host or a
@@ -371,6 +356,36 @@ async fn nip11_or_ws_handler(
     };
 
     let max_frame_bytes = state.config.max_frame_bytes;
+
+    // NIP-FI assertion check at upgrade — gated to genuine WebSocket upgrade
+    // requests (requests carrying `Upgrade: websocket`) so plain browser GET /
+    // and NIP-11 fallback requests are never intercepted by the enforcement
+    // gate. Keying on the `Upgrade` header (not on `Accept`) means an HTML
+    // Accept header on a real WS upgrade is still gated correctly.
+    //
+    // This pre-check runs BEFORE `WebSocketUpgrade::from_request` so that the
+    // denial response is returned on the raw HTTP connection, not inside the
+    // upgrade callback. Running pre-community-active-check means a denied
+    // upgrade pays zero DB cost. [FI-TRACE-TRANSPORT-CLOSED]
+    let nip_fi_assertion = {
+        let is_ws_upgrade = headers
+            .get(axum::http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+        if is_ws_upgrade {
+            use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
+            let mode = state.config.nip_fi.mode;
+            let verifier = state.nip_fi_verifier.as_deref();
+            match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+                NipFiUpgradeOutcome::NotRequired => None,
+                NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
+                NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
+            }
+        } else {
+            None
+        }
+    };
 
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
@@ -413,7 +428,7 @@ async fn nip11_or_ws_handler(
                     }
                 }
             }
-            // Not a WS request and not asking for nostr+json — serve NIP-11 as fallback.
+            // Not a WS upgrade request — serve NIP-11 as fallback.
             Json(nip11_document(&state, raw_host).await).into_response()
         }
     }
@@ -569,6 +584,11 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+
+    // Env vars are process-global — serialize tests that mutate them to prevent
+    // cross-test races. Shared with `nip_fi_config::tests::ENV_LOCK` in the
+    // same process-global address space; both guard the same NIP-FI env vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct ScriptedReadinessEvaluator {
         evaluations: Mutex<VecDeque<ReadinessEvaluation>>,
@@ -1436,9 +1456,10 @@ mod tests {
 
         // Clear NIP-FI env vars so `Config::from_env()` sees clean off-mode
         // defaults; we overwrite the entire `nip_fi` field afterwards.
+        // Hold ENV_LOCK for the duration so we don't race nip_fi_config tests.
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         std::env::remove_var("BUZZ_NIP_FI_MODE");
         std::env::remove_var("BUZZ_NIP_FI_ISSUERS");
-        std::env::remove_var("BUZZ_NIP_FI_MAX_ASSERTION_AGE_SECS");
         std::env::remove_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS");
 
         let mut config = crate::config::Config::from_env().expect("default config loads");
@@ -1578,6 +1599,82 @@ mod tests {
             status,
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "audio WebSocket upgrade with token but no verifier must be denied 503 in enforce mode"
+        );
+    }
+
+    // ── B4: non-upgrade document requests bypass the NIP-FI gate ─────────────
+    //
+    // A plain browser GET / or a NIP-11 content-negotiated request must reach
+    // the NIP-11 fallback path, never the enforcement gate. The gate fires only
+    // on genuine WebSocket upgrades (Connection/Upgrade headers present).
+    //
+    // Mutation evidence:
+    //   A) Move the NIP-FI gate back before the WebSocket check → plain GET
+    //      returns 401/503 instead of the NIP-11/fallback response → panics.
+    //   B) Key the gate on the Accept header → a WS request with Accept:
+    //      text/html bypasses it → the 401/503 test below returns 101 → panics.
+
+    /// Drive a plain (non-WS) GET request through the built router. Returns
+    /// the HTTP status and, for NIP-11 responses, validates the JSON content.
+    async fn nip_fi_non_upgrade_status(
+        state: Arc<AppState>,
+        path: &str,
+        accept: Option<&str>,
+    ) -> axum::http::StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut builder = Request::get(path).header(axum::http::header::HOST, "relay.example");
+        if let Some(accept_value) = accept {
+            builder = builder.header("Accept", accept_value);
+        }
+        let req = builder.body(Body::empty()).expect("request");
+        build_router(state)
+            .oneshot(req)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn nip_fi_enforce_plain_get_serves_nip11_not_401() {
+        let state = nip_fi_enforce_state().await;
+        // A plain GET / without WS upgrade headers is not a WebSocket upgrade.
+        // In enforce mode the NIP-FI gate must NOT intercept it — the response
+        // must be the NIP-11 JSON fallback (200), not a denial (401/403/503).
+        let status = nip_fi_non_upgrade_status(state, "/", None).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "plain GET / in enforce mode must fall through to NIP-11 (200), not be gated (401/503)"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip_fi_enforce_nip11_content_negotiation_serves_200_not_401() {
+        let state = nip_fi_enforce_state().await;
+        // application/nostr+json short-circuits before the WS check; the
+        // NIP-FI gate must never intercept it regardless of mode.
+        let status = nip_fi_non_upgrade_status(state, "/", Some("application/nostr+json")).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "NIP-11 content-negotiated GET in enforce mode must return 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip_fi_enforce_ws_upgrade_with_html_accept_is_gated_401() {
+        let state = nip_fi_enforce_state().await;
+        // A genuine WS upgrade request that also carries Accept: text/html
+        // must still be gated. The gate must NOT key on Accept — it must key
+        // on the Connection/Upgrade headers that make it a real WS upgrade.
+        let status = nip_fi_gate_status(state, "/", Some("Accept"), Some("text/html")).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "WS upgrade with Accept: text/html in enforce mode must still be denied 401"
         );
     }
 }

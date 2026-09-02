@@ -77,6 +77,15 @@ pub struct ConnectionState {
     /// Separate channel with priority drain — if this channel fills too,
     /// the connection is closed (writer is completely stalled).
     pub ctrl_tx: mpsc::Sender<WsMessage>,
+    /// Dedicated one-slot sender for the terminal NIP-FI denial frame.
+    ///
+    /// Because only one terminal event fires per connection lifetime (either key
+    /// pairing mismatch or session expiry, never both), this channel is always
+    /// available when the denial is enqueued — it cannot be saturated by ordinary
+    /// control traffic. The send_loop drains it in its cancel branch ahead of
+    /// `Close`, guaranteeing the denial frame is delivered even when `ctrl_tx`
+    /// (capacity 8) is full. [FI-INV-05, FI-TRACE-LEASE-BOUND]
+    pub terminal_ctrl_tx: mpsc::Sender<WsMessage>,
     /// Token used to signal graceful shutdown of this connection's tasks.
     pub cancel: CancellationToken,
     /// Consecutive buffer-full events. Cancel only after `grace_limit`.
@@ -135,7 +144,6 @@ impl ConnectionState {
     }
 }
 
-/// Entry point for a new WebSocket connection.
 /// Compute the NIP-FI session deadline from a verified assertion and the
 /// configured `max_connection_lifetime`.
 ///
@@ -249,6 +257,10 @@ async fn handle_active_connection(
     // even when the data buffer is full.
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
 
+    // Dedicated one-slot channel for the terminal NIP-FI denial frame.
+    // Cannot be saturated by ordinary traffic — only one terminal event fires.
+    let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+
     // Dedicated restart-close channel carries a flush acknowledgement. Keeping
     // ordinary control frames unchanged avoids coupling heartbeat/ban traffic
     // to graceful-shutdown delivery tracking.
@@ -286,6 +298,7 @@ async fn handle_active_connection(
         subscriptions: Arc::clone(&subscriptions),
         send_tx: tx.clone(),
         ctrl_tx: ctrl_tx.clone(),
+        terminal_ctrl_tx,
         cancel: cancel.clone(),
         backpressure_count: Arc::clone(&backpressure_count),
         grace_limit: state.config.slow_client_grace_limit,
@@ -334,6 +347,7 @@ async fn handle_active_connection(
         ws_send,
         rx,
         ctrl_rx,
+        terminal_ctrl_rx,
         restart_rx,
         send_cancel,
         disconnect_reason,
@@ -373,13 +387,13 @@ async fn handle_active_connection(
     // NIP-FI session-lifetime enforcement task.
     //
     // Fires at `session_deadline`, queues the exact Nostr text for
-    // `authorization_denied` on `ctrl_tx` (priority channel, ahead of the Close
-    // the send loop emits on cancel), then cancels. No in-band renewal.
-    // [FI-TRACE-LEASE-BOUND]
+    // `authorization_denied` on the dedicated terminal channel (always
+    // available — capacity 1, only one terminal event per connection),
+    // then cancels. No in-band renewal. [FI-TRACE-LEASE-BOUND]
     let nip_fi_expiry_task = conn.session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
-            conn.ctrl_tx.clone(),
+            conn.terminal_ctrl_tx.clone(),
             cancel.clone(),
             crate::nip_fi_session::NipFiWsRoute::Root,
         )
@@ -435,6 +449,7 @@ async fn handle_active_connection(
     drop(permit);
 }
 
+/// Send WebSocket messages in priority order: control frames before data frames.
 ///
 /// Control frames (Pong, Close) are drained first on every iteration,
 /// giving them priority over data frames. If the underlying socket writer
@@ -444,6 +459,7 @@ async fn send_loop(
     ws_send: futures_util::stream::SplitSink<WebSocket, WsMessage>,
     data_rx: mpsc::Receiver<WsMessage>,
     ctrl_rx: mpsc::Receiver<WsMessage>,
+    terminal_ctrl_rx: mpsc::Receiver<WsMessage>,
     restart_rx: mpsc::Receiver<RestartClose>,
     cancel: CancellationToken,
     disconnect_reason: watch::Receiver<Option<CommunityDisconnectReason>>,
@@ -452,6 +468,7 @@ async fn send_loop(
         ws_send,
         data_rx,
         ctrl_rx,
+        terminal_ctrl_rx,
         restart_rx,
         cancel,
         disconnect_reason,
@@ -463,6 +480,7 @@ async fn send_loop_inner<S>(
     mut ws_send: S,
     mut data_rx: mpsc::Receiver<WsMessage>,
     mut ctrl_rx: mpsc::Receiver<WsMessage>,
+    mut terminal_ctrl_rx: mpsc::Receiver<WsMessage>,
     mut restart_rx: mpsc::Receiver<RestartClose>,
     cancel: CancellationToken,
     disconnect_reason: watch::Receiver<Option<CommunityDisconnectReason>>,
@@ -494,6 +512,18 @@ async fn send_loop_inner<S>(
                 break;
             }
             _ = cancel.cancelled() => {
+                // Drain the terminal NIP-FI denial frame first (if any), then
+                // ordinary control frames, before writing Close. The terminal
+                // channel has capacity 1 and is written before cancel() fires,
+                // so it is always available when denial is enqueued — even when
+                // ctrl_rx (capacity 8) is full. This preserves the required
+                // "restricted: authorization denied" frame to the client in all
+                // queue-full scenarios.
+                while let Ok(terminal_msg) = terminal_ctrl_rx.try_recv() {
+                    if ws_send.send(terminal_msg).await.is_err() {
+                        return;
+                    }
+                }
                 // Drain any queued control frames before closing. A ban
                 // disconnect queues its `OK false "blocked: …"` reason frame on
                 // ctrl and then cancels; without this drain the biased branch
@@ -779,6 +809,7 @@ pub(crate) mod tests {
     ) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
         let (send_tx, send_rx) = mpsc::channel(4);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(4);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
         let conn = ConnectionState {
             conn_id: Uuid::new_v4(),
             tenant: TenantContext::resolved(
@@ -790,6 +821,7 @@ pub(crate) mod tests {
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
@@ -1008,6 +1040,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             CancellationToken::new(),
             ordinary_disconnect_reason(),
@@ -1037,6 +1070,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             CancellationToken::new(),
             ordinary_disconnect_reason(),
@@ -1071,6 +1105,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             CancellationToken::new(),
             ordinary_disconnect_reason(),
@@ -1103,6 +1138,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             CancellationToken::new(),
             ordinary_disconnect_reason(),
@@ -1140,6 +1176,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             CancellationToken::new(),
             ordinary_disconnect_reason(),
@@ -1165,6 +1202,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             cancel,
             deleted_community_disconnect_reason(),
@@ -1195,6 +1233,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             cancel,
             ordinary_disconnect_reason(),
@@ -1229,6 +1268,7 @@ pub(crate) mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            mpsc::channel(1).1,
             restart_rx,
             cancel,
             ordinary_disconnect_reason(),

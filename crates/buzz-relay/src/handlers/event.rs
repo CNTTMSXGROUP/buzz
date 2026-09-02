@@ -1391,6 +1391,7 @@ mod tests {
 
         let (send_tx, mut send_rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
         let conn = Arc::new(crate::connection::ConnectionState {
             conn_id: Uuid::new_v4(),
             tenant: buzz_core::TenantContext::resolved(community_b, "b.example"),
@@ -1407,6 +1408,7 @@ mod tests {
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,

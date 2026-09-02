@@ -2,14 +2,14 @@
 //! warm/refresh.
 //!
 //! All env-var parsing lives here so `config.rs` stays focused on the top-level
-//! `Config` struct. This module is `pub(super)` — only `config.rs` constructs
-//! it, and the relay reads it as `config.nip_fi`.
+//! `Config` struct. This module is `pub` — `config.rs` constructs it, and the
+//! relay reads it as `config.nip_fi`.
 //!
 //! # Environment variables
 //!
 //! | Variable | Required | Description |
 //! |---|---|---|
-//! | `BUZZ_NIP_FI_MODE` | No | `enforce` (default), `deny_protected`, or `off`. |
+//! | `BUZZ_NIP_FI_MODE` | No | `off` (default), `enforce`, or `deny_protected`. |
 //! | `BUZZ_NIP_FI_ISSUERS` | If enforce | JSON array of issuer configs (see [`IssuerEnvConfig`]). |
 //! | `BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS` | If enforce | Per-partition limit on session lifetime. |
 //!
@@ -322,12 +322,6 @@ impl NipFiRelayConfig {
     pub fn is_enforce(&self) -> bool {
         matches!(self.mode, NipFiMode::Enforce)
     }
-
-    /// Returns `true` when protected routes require assertion (Enforce or
-    /// DenyProtected means assertion is required / always denied).
-    pub fn requires_assertion(&self) -> bool {
-        !matches!(self.mode, NipFiMode::Off)
-    }
 }
 
 #[cfg(test)]
@@ -428,71 +422,59 @@ mod tests {
 
     // ── session-deadline three-term bound ─────────────────────────────────────
 
-    /// The `session_deadline` computation satisfies the spec's three-term min:
+    /// The `compute_session_deadline` function satisfies the spec's three-term min:
     ///
     ///   session_deadline = min(
-    ///       connection_time + max_connection_lifetime_seconds,
-    ///       min(authority_deadlines),      // = min(exp, iat+max_age, key_snapshot_hard_deadline)
-    ///       key_snapshot_hard_deadline     // already in authority_deadlines
+    ///       upstream_authority_deadline(),             // = min(authority_deadlines)
+    ///       connection_time + max_connection_lifetime  // partitions, never shortens
     ///   )
     ///
-    /// This test exercises the deadline selection logic independently of the
-    /// full WebSocket stack by using `NipFiRelayConfig::max_connection_lifetime`
-    /// and simulating the deadline computation in isolation.
+    /// Each scenario sets one term as the strictly-earliest deadline and asserts
+    /// `compute_session_deadline` returns that term. Mutation evidence: replacing
+    /// `upstream.min(partition)` with `upstream` alone makes Scenario D panic.
     #[test]
     fn session_deadline_three_term_min_selects_earliest() {
+        use crate::connection::compute_session_deadline;
         use chrono::{Duration, Utc};
 
         let now = Utc::now();
 
-        // Term 1: authority_deadlines = min(exp, iat+max_age, key_snapshot_hard).
-        // We simulate three scenarios to cover each term winning.
-
-        // Scenario A: exp is earliest.
+        // Scenario A: exp is earliest (upstream wins over partition).
         {
             let exp = now + Duration::seconds(100);
             let iat_plus_max_age = now + Duration::seconds(200);
             let key_hard = now + Duration::seconds(300);
-            let lifetime = now + Duration::seconds(400);
-            let upstream = [exp, iat_plus_max_age, key_hard]
-                .iter()
-                .copied()
-                .min()
-                .unwrap();
-            let deadline = upstream.min(lifetime);
+            let max_lifetime = std::time::Duration::from_secs(400);
+            let assertion =
+                buzz_auth::VerifiedAssertion::for_test(None, vec![exp, iat_plus_max_age, key_hard]);
+            let deadline = compute_session_deadline(&assertion, now, Some(max_lifetime));
             assert_eq!(deadline, exp, "exp is earliest → deadline = exp");
         }
 
-        // Scenario B: iat+max_age is earliest.
+        // Scenario B: iat+max_age is earliest (upstream wins over partition).
         {
             let exp = now + Duration::seconds(300);
             let iat_plus_max_age = now + Duration::seconds(100);
             let key_hard = now + Duration::seconds(200);
-            let lifetime = now + Duration::seconds(400);
-            let upstream = [exp, iat_plus_max_age, key_hard]
-                .iter()
-                .copied()
-                .min()
-                .unwrap();
-            let deadline = upstream.min(lifetime);
+            let max_lifetime = std::time::Duration::from_secs(400);
+            let assertion =
+                buzz_auth::VerifiedAssertion::for_test(None, vec![exp, iat_plus_max_age, key_hard]);
+            let deadline = compute_session_deadline(&assertion, now, Some(max_lifetime));
             assert_eq!(
                 deadline, iat_plus_max_age,
                 "iat+max_age is earliest → deadline = iat+max_age"
             );
         }
 
-        // Scenario C: key_snapshot_hard_deadline is earliest.
+        // Scenario C: key_snapshot_hard_deadline is earliest (upstream wins over partition).
         {
             let exp = now + Duration::seconds(400);
             let iat_plus_max_age = now + Duration::seconds(300);
             let key_hard = now + Duration::seconds(100);
-            let lifetime = now + Duration::seconds(200);
-            let upstream = [exp, iat_plus_max_age, key_hard]
-                .iter()
-                .copied()
-                .min()
-                .unwrap();
-            let deadline = upstream.min(lifetime);
+            let max_lifetime = std::time::Duration::from_secs(200);
+            let assertion =
+                buzz_auth::VerifiedAssertion::for_test(None, vec![exp, iat_plus_max_age, key_hard]);
+            let deadline = compute_session_deadline(&assertion, now, Some(max_lifetime));
             assert_eq!(
                 deadline, key_hard,
                 "key_snapshot_hard_deadline is earliest → deadline = key_hard"
@@ -504,16 +486,14 @@ mod tests {
             let exp = now + Duration::seconds(400);
             let iat_plus_max_age = now + Duration::seconds(300);
             let key_hard = now + Duration::seconds(200);
-            let lifetime = now + Duration::seconds(100);
-            let upstream = [exp, iat_plus_max_age, key_hard]
-                .iter()
-                .copied()
-                .min()
-                .unwrap();
-            let deadline = upstream.min(lifetime);
+            let max_lifetime = std::time::Duration::from_secs(100);
+            let assertion =
+                buzz_auth::VerifiedAssertion::for_test(None, vec![exp, iat_plus_max_age, key_hard]);
+            let deadline = compute_session_deadline(&assertion, now, Some(max_lifetime));
+            let expected_partition = now + Duration::seconds(100);
             assert_eq!(
-                deadline, lifetime,
-                "max_connection_lifetime partition is earliest → deadline = lifetime"
+                deadline, expected_partition,
+                "max_connection_lifetime partition is earliest → deadline = partition"
             );
         }
     }
@@ -522,20 +502,18 @@ mod tests {
     /// upstream authority deadline without further shortening.
     #[test]
     fn session_deadline_no_lifetime_uses_upstream_only() {
+        use crate::connection::compute_session_deadline;
         use chrono::{Duration, Utc};
 
         let now = Utc::now();
         let exp = now + Duration::seconds(600);
         let iat_plus_max_age = now + Duration::seconds(3600);
         let key_hard = now + Duration::seconds(86400);
-        let upstream = [exp, iat_plus_max_age, key_hard]
-            .iter()
-            .copied()
-            .min()
-            .unwrap();
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(None, vec![exp, iat_plus_max_age, key_hard]);
 
-        // No lifetime partition configured → deadline = upstream.
-        let deadline: chrono::DateTime<Utc> = upstream; // no further min
+        // No lifetime partition configured → deadline = upstream = min(authority_deadlines).
+        let deadline = compute_session_deadline(&assertion, now, None);
         assert_eq!(
             deadline, exp,
             "no lifetime → deadline = min(authority_deadlines) = exp"

@@ -295,6 +295,17 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
+            // B2: Fence admission against an already-expired NIP-FI session.
+            // The expiry task may have cancelled the token between the time
+            // this handler was dispatched and now (asynchronous gap). Admitting
+            // a cancelled connection would publish AuthState::Authenticated and
+            // allow a buffered EVENT/REQ to dispatch on an expired session.
+            // Check here — at the single point where authentication is finalised
+            // — and drop silently if cancelled; the expiry task's denial frame
+            // and Close are already queued in the terminal channel.
+            if conn.cancel.is_cancelled() {
+                return;
+            }
             *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
             state
                 .conn_manager
@@ -446,6 +457,7 @@ mod tests {
         let challenge = "test-challenge-A".to_string();
         let (send_tx, mut send_rx) = mpsc::channel::<WsMessage>(8);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, mut terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
 
         let conn = Arc::new(crate::connection::ConnectionState {
@@ -461,6 +473,7 @@ mod tests {
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,
+            terminal_ctrl_tx,
             cancel: cancel.clone(),
             backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             grace_limit: 3,
@@ -490,13 +503,18 @@ mod tests {
             matches!(*conn.auth_state.read().await, AuthState::Failed),
             "auth_state must be Failed after pairing mismatch"
         );
-        let ctrl_frame = ctrl_rx
+        let ctrl_frame = terminal_ctrl_rx
             .try_recv()
-            .expect("ctrl channel must contain the denial notice frame");
-        // Queue must hold exactly one frame — no duplicate denial.
+            .expect("terminal channel must contain the denial notice frame");
+        // Terminal queue must hold exactly one frame — no duplicate denial.
+        assert!(
+            terminal_ctrl_rx.try_recv().is_err(),
+            "terminal channel must hold exactly one frame after pairing mismatch"
+        );
+        // ctrl_tx (ordinary queue) must be empty — denial goes to terminal only.
         assert!(
             ctrl_rx.try_recv().is_err(),
-            "ctrl channel must hold exactly one frame after pairing mismatch"
+            "ordinary ctrl channel must be empty after pairing denial (frame goes to terminal)"
         );
         assert!(
             send_rx.try_recv().is_err(),
@@ -511,10 +529,94 @@ mod tests {
                 assert_eq!(
                     text,
                     expected_notice,
-                    "ctrl frame must be byte-identical to RelayMessage::notice(\"restricted: authorization denied\")"
+                    "terminal frame must be byte-identical to RelayMessage::notice(\"restricted: authorization denied\")"
                 );
             }
-            other => panic!("ctrl frame must be Text(NOTICE); got {other:?}"),
+            other => panic!("terminal frame must be Text(NOTICE); got {other:?}"),
         }
+    }
+
+    // ── B2: Cancelled connection is never admitted to Authenticated state ──────
+    //
+    // The B2 fence at the admission boundary (`if conn.cancel.is_cancelled() {
+    // return; }`) prevents committing `AuthState::Authenticated` after the NIP-FI
+    // expiry task has cancelled the connection in the async gap between dispatch
+    // and admission.
+    //
+    // This test pre-cancels the token and confirms that after `handle_auth` the
+    // connection is NOT `Authenticated`. The mechanism varies: on the test
+    // lazy-DB path, the ban check also denies (DbError path) — but the invariant
+    // holds regardless of which guard fires first.
+    //
+    // Mutation evidence:
+    //   Removing the B2 fence is only observable in the narrow async window where
+    //   the ban gate succeeds AND cancel fires after it. In the unit-test context
+    //   the DB gate fires first; in a real deployment the B2 fence is the guard
+    //   for that window. The test asserts the invariant (never Authenticated when
+    //   cancelled) and documents the expected runtime behavior.
+    #[tokio::test]
+    async fn b2_pre_cancelled_connection_never_becomes_authenticated() {
+        use chrono::{Duration, Utc};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        // Use the same key for both assertion and NIP-42 event (no pairing mismatch).
+        // The cancel token is pre-cancelled to simulate the B2 window.
+        let key = Keys::generate();
+        let assertion = buzz_auth::VerifiedAssertion::for_test(
+            Some(key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let challenge = "test-challenge-B2".to_string();
+        let (send_tx, _send_rx) = mpsc::channel::<WsMessage>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+
+        // Pre-cancel the token — simulates the expiry task having already fired.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                "test.local".to_string(),
+            ),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(AuthState::Pending {
+                challenge: challenge.clone(),
+            }),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: Some(assertion),
+            session_deadline: None,
+        });
+
+        let state = auth_test_state().await;
+        let relay_url = "ws://test.local";
+        let auth_event = EventBuilder::new(Kind::Authentication, "")
+            .tag(Tag::parse(["relay", relay_url]).unwrap())
+            .tag(Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+
+        handle_auth(auth_event, Arc::clone(&conn), state).await;
+
+        // Regardless of the path taken (B2 fence, DB error, etc.), the
+        // connection MUST NOT be in Authenticated state when it was already
+        // cancelled before handle_auth ran.
+        assert!(
+            !matches!(*conn.auth_state.read().await, AuthState::Authenticated(_)),
+            "B2: a pre-cancelled connection must never reach AuthState::Authenticated"
+        );
     }
 }

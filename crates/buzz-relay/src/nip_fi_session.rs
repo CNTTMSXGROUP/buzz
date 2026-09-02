@@ -105,8 +105,10 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
                 "NIP-FI key pairing mismatch — closing connection"
             );
             *conn.auth_state.write().await = crate::connection::AuthState::Failed;
+            // Use the dedicated terminal channel — guaranteed one free slot even
+            // when ctrl_tx (capacity 8) is saturated by ordinary control traffic.
             let _ = conn
-                .ctrl_tx
+                .terminal_ctrl_tx
                 .try_send(authorization_denied_frame(NipFiWsRoute::Root));
             conn.cancel.cancel();
         }
@@ -154,19 +156,24 @@ pub(crate) fn authorization_denied_frame(route: NipFiWsRoute) -> WsMessage {
 /// Spawn the NIP-FI session-lifetime enforcement task for either route.
 ///
 /// At `deadline`, the task (in this exact order):
-/// 1. Enqueues [`authorization_denied_frame(route)`] on `ctrl_tx`.
+/// 1. Enqueues [`authorization_denied_frame(route)`] on `terminal_ctrl_tx`
+///    (the dedicated one-slot channel, always available at expiry).
 /// 2. Increments `buzz_nip_fi_lease_expirations_total` and warns with route.
 /// 3. Calls `cancel.cancel()` — **unconditional**, regardless of queue success.
 ///
-/// The queue-then-cancel ordering is contractual: the send loop's cancellation
-/// branch drains `ctrl_rx` before writing `Close`, so the observable wire order
-/// is the route-specific denial frame followed by `Close`.
+/// Using `terminal_ctrl_tx` instead of the ordinary `ctrl_tx` (capacity 8)
+/// ensures the denial frame is delivered even when the control queue is
+/// saturated with ordinary traffic (Pong, roster updates, etc.).
+///
+/// The queue-then-cancel ordering is contractual: the send loop drains
+/// `terminal_ctrl_rx` before `ctrl_rx` before writing `Close`, so the
+/// observable wire order is the route-specific denial frame followed by `Close`.
 ///
 /// Equality at deadline is expired; already-expired deadlines fire immediately.
 /// No in-band renewal is added. [FI-TRACE-LEASE-BOUND]
 pub(crate) fn spawn_nip_fi_expiry_task(
     deadline: chrono::DateTime<chrono::Utc>,
-    ctrl_tx: mpsc::Sender<WsMessage>,
+    terminal_ctrl_tx: mpsc::Sender<WsMessage>,
     cancel: CancellationToken,
     route: NipFiWsRoute,
 ) -> tokio::task::JoinHandle<()> {
@@ -182,9 +189,9 @@ pub(crate) fn spawn_nip_fi_expiry_task(
         };
         tokio::select! {
             _ = tokio::time::sleep(remaining) => {
-                // 1. Queue denial frame BEFORE cancel so the send loop drains
-                //    it ahead of the Close it emits on cancellation.
-                let _ = ctrl_tx.try_send(authorization_denied_frame(route));
+                // 1. Queue denial frame on the dedicated terminal channel BEFORE
+                //    cancel so the send loop delivers it ahead of Close.
+                let _ = terminal_ctrl_tx.try_send(authorization_denied_frame(route));
                 // 2. Metric + warning (no private assertion fields).
                 metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
                 warn!(
@@ -197,4 +204,152 @@ pub(crate) fn spawn_nip_fi_expiry_task(
             _ = cancel.cancelled() => {}
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use nostr::Keys;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    // ── B3: terminal denial frame survives saturated ctrl_tx ──────────────────
+    //
+    // Root pairing and expiry both write the denial frame to `terminal_ctrl_tx`
+    // (capacity 1) instead of `ctrl_tx` (capacity 8). These tests saturate
+    // ctrl_tx completely, then fire the denial path and assert the frame arrives
+    // on the terminal channel regardless.
+    //
+    // Mutation evidence:
+    //   A) Switch `enforce_nip_fi_key_pairing` back to `ctrl_tx.try_send` →
+    //      terminal_rx is empty → recv assertion panics.
+    //   B) Switch `spawn_nip_fi_expiry_task` back to `ctrl_tx.try_send` →
+    //      terminal_rx is empty → recv assertion panics.
+
+    #[tokio::test]
+    async fn b3_root_pairing_denial_delivered_when_ctrl_queue_saturated() {
+        let keys = Keys::generate();
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(Some(keys.public_key()), vec![deadline]);
+
+        let (send_tx, _send_rx) = mpsc::channel(4);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+
+        // Saturate ctrl_tx to capacity 8.
+        for i in 0..8u8 {
+            ctrl_tx
+                .try_send(WsMessage::Text(format!("ordinary-{i}").into()))
+                .expect("ctrl_tx has capacity 8");
+        }
+        assert!(
+            ctrl_tx
+                .try_send(WsMessage::Text("overflow".into()))
+                .is_err(),
+            "ctrl_tx must be full before the test exercises the denial path"
+        );
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(
+                buzz_core::CommunityId::from_uuid(Uuid::nil()),
+                "test.local".to_string(),
+            ),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(crate::connection::AuthState::Pending {
+                challenge: "test-challenge".to_string(),
+            }),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: Some(assertion),
+            session_deadline: None,
+        });
+
+        // Use a different key as the proven pubkey → forced mismatch.
+        let wrong_pubkey = Keys::generate().public_key();
+        let outcome = enforce_nip_fi_key_pairing(
+            conn.nip_fi_assertion.as_ref(),
+            wrong_pubkey,
+            PairingDenialTarget::Root(conn.as_ref()),
+        )
+        .await;
+
+        assert_eq!(outcome, PairingOutcome::Denied, "mismatch must be Denied");
+        assert!(
+            conn.cancel.is_cancelled(),
+            "cancel must be called on denial"
+        );
+
+        // Terminal channel must have the denial frame despite ctrl_tx being full.
+        let frame = terminal_rx
+            .try_recv()
+            .expect("denial frame must arrive on terminal channel even when ctrl_tx is full");
+        match frame {
+            WsMessage::Text(t) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&t).expect("denial frame is valid JSON");
+                assert!(
+                    v.get(1)
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.contains("authorization denied"))
+                        .unwrap_or(false),
+                    "root denial frame must contain 'authorization denied': {t}"
+                );
+            }
+            other => panic!("expected Text denial frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn b3_expiry_denial_delivered_when_ctrl_queue_saturated() {
+        // Saturate a separate ctrl channel to prove the expiry task doesn't
+        // depend on it being available.
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        for i in 0..8u8 {
+            ctrl_tx
+                .try_send(WsMessage::Text(format!("ordinary-{i}").into()))
+                .expect("ctrl_tx has capacity 8");
+        }
+        drop(ctrl_tx); // expiry task never touches ctrl_tx; drop proves it
+
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let cancel = CancellationToken::new();
+        let already_expired = Utc::now() - chrono::Duration::seconds(1);
+
+        let handle = spawn_nip_fi_expiry_task(
+            already_expired,
+            terminal_tx,
+            cancel.clone(),
+            NipFiWsRoute::Root,
+        );
+        handle.await.expect("expiry task must complete");
+
+        assert!(
+            cancel.is_cancelled(),
+            "cancel must be called by expiry task"
+        );
+
+        // Terminal channel must have the denial frame.
+        let frame = terminal_rx
+            .try_recv()
+            .expect("expiry denial frame must be in terminal channel");
+        match frame {
+            WsMessage::Text(t) => {
+                assert!(
+                    t.contains("authorization denied"),
+                    "expiry denial frame must contain 'authorization denied': {t}"
+                );
+            }
+            other => panic!("expected Text denial frame, got {other:?}"),
+        }
+    }
 }

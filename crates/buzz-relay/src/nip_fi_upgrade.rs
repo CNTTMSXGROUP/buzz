@@ -35,7 +35,12 @@ pub(crate) enum NipFiUpgradeOutcome {
 /// - `Admitted(assertion)` when the token is present, valid, and passes.
 /// - `Denied(response)` with the exact NIP-FI HTTP denial contract otherwise.
 ///
-/// The `DenyProtected` mode always returns `Denied(authorization_denied)`.
+/// The `DenyProtected` mode always returns `Denied(authorization_unavailable)`
+/// (503), not `Denied(authorization_denied)` (403). This is intentional:
+/// `DenyProtected` is operator-declared repair mode — the client's evidence may
+/// be valid but authorization is temporarily unavailable — so "authorization
+/// denied" would be false. "authorization unavailable, retry after repair" is
+/// the accurate and correct signal. [FI-TRACE-DENIAL-ORACLE]
 pub(crate) fn check_nip_fi_at_upgrade<S: IssuerKeySource>(
     headers: &HeaderMap,
     verifier: Option<&FederatedAssertionVerifier<S>>,
@@ -454,5 +459,42 @@ mod tests {
             matches!(outcome, NipFiUpgradeOutcome::NotRequired),
             "Off mode must not require assertion — OSS default must not regress"
         );
+    }
+
+    // DenyProtected → 503 authorization_unavailable.
+    //
+    // DenyProtected is operator-declared repair mode. The relay denies all
+    // upgrade attempts with `authorization_unavailable` (503), not
+    // `authorization_denied` (403), because the client's evidence may be valid
+    // but the authorization service is temporarily offline. A client retrying
+    // after repair should succeed; "denied" is false and would suppress retries.
+    //
+    // Mutation evidence:
+    //   A) Change `DenyProtected` handler to use `AuthorizationDenied` →
+    //      status assertion panics (expected 503, got 403).
+    //   B) Body assertion: change the body text → panics.
+    #[test]
+    fn deny_protected_returns_503_authorization_unavailable() {
+        let headers = HeaderMap::new();
+        let outcome = check_nip_fi_at_upgrade(
+            &headers,
+            None::<&buzz_auth::FederatedAssertionVerifier<buzz_auth::ProductionJwksSource>>,
+            buzz_auth::NipFiMode::DenyProtected,
+        );
+        match outcome {
+            NipFiUpgradeOutcome::Denied(resp) => {
+                assert_eq!(
+                    resp.status(),
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "DenyProtected must deny with 503 (authorization_unavailable), not 403"
+                );
+                assert_eq!(
+                    body_bytes(resp),
+                    b"authorization unavailable\n",
+                    "DenyProtected body must be 'authorization unavailable\\n' [FI-TRACE-DENIAL-ORACLE]"
+                );
+            }
+            _ => panic!("DenyProtected must return Denied(503), not NotRequired or Admitted"),
+        }
     }
 }

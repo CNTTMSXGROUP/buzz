@@ -325,6 +325,28 @@ pub(crate) async fn handle_active_audio_connection(
         )
     });
 
+    // B1: Reject already-expired sessions at pairing time, before any persisting
+    // side effect (relay membership, room join, roster events). A session whose
+    // deadline is at or before now will fire the expiry task immediately, but
+    // we stop here so no membership/room writes ever occur for a dead lease.
+    if let Some(deadline) = audio_session_deadline {
+        if chrono::Utc::now() >= deadline {
+            warn!(
+                channel_id = %channel_id,
+                pubkey = %pubkey_hex,
+                "NIP-FI session deadline already expired at pairing — rejecting audio admission"
+            );
+            use futures_util::SinkExt as _;
+            let _ = ws_send
+                .send(crate::nip_fi_session::authorization_denied_frame(
+                    crate::nip_fi_session::NipFiWsRoute::Audio,
+                ))
+                .await;
+            cancel.cancel();
+            return;
+        }
+    }
+
     if crate::api::relay_members::enforce_relay_membership(
         &state,
         tenant.community(),
@@ -798,11 +820,16 @@ pub(crate) async fn handle_active_audio_connection(
     let (data_tx, data_rx) = mpsc::channel::<WsMessage>(16);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
 
+    // Dedicated one-slot channel for the terminal NIP-FI denial frame.
+    // Cannot be saturated by ordinary traffic — only one terminal event fires.
+    let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+
     let send_cancel = cancel.child_token();
     let send_task = tokio::spawn(send_loop(
         ws_send,
         data_rx,
         ctrl_rx,
+        terminal_ctrl_rx,
         send_cancel,
         disconnect_reason,
     ));
@@ -823,14 +850,15 @@ pub(crate) async fn handle_active_audio_connection(
 
     // NIP-FI session-lifetime enforcement task — shared constructor from
     // nip_fi_session. Fires at `audio_session_deadline`, enqueues the exact
-    // restricted JSON frame on ctrl_tx (priority, ahead of Close), then cancels.
-    // Queue-then-cancel ordering matches the root path; the audio send_loop's
-    // cancellation drain picks up the frame before writing Close.
+    // restricted JSON frame on the dedicated terminal channel (always available —
+    // capacity 1, only one terminal event fires per connection), then cancels.
+    // Queue-then-cancel ordering matches the root path; the audio send_loop
+    // drains the terminal channel before ctrl_rx before writing Close.
     // No in-band renewal. [FI-TRACE-LEASE-BOUND]
     let nip_fi_audio_expiry_task = audio_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
-            ctrl_tx.clone(),
+            terminal_ctrl_tx,
             cancel.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         )
@@ -1248,6 +1276,7 @@ pub(crate) async fn send_loop<S>(
     mut ws_send: S,
     mut data_rx: mpsc::Receiver<WsMessage>,
     mut ctrl_rx: mpsc::Receiver<WsMessage>,
+    mut terminal_ctrl_rx: mpsc::Receiver<WsMessage>,
     cancel: CancellationToken,
     disconnect_reason: watch::Receiver<Option<crate::state::CommunityDisconnectReason>>,
 ) where
@@ -1264,12 +1293,19 @@ pub(crate) async fn send_loop<S>(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                // Drain queued control frames before closing — mirrors the root
-                // relay send_loop idiom. The NIP-FI expiry task queues the
-                // `restricted: authorization denied` frame on ctrl_tx BEFORE
-                // cancelling; without this drain the biased branch sends Close
-                // first and the client never sees the required denial frame.
-                // (The top-of-loop drain does not run again after we break.)
+                // Drain the terminal NIP-FI denial frame first (if any), then
+                // ordinary control frames, before closing. Mirrors the root
+                // relay send_loop idiom. The terminal channel has capacity 1
+                // and is written before cancel() fires, so it is always
+                // available when denial is enqueued — even when ctrl_rx
+                // (capacity 8) is full. Without this drain the biased cancel
+                // branch sends Close first and the client never sees the
+                // required denial frame.
+                while let Ok(terminal_msg) = terminal_ctrl_rx.try_recv() {
+                    if ws_send.send(terminal_msg).await.is_err() {
+                        return;
+                    }
+                }
                 while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
                     if ws_send.send(ctrl_msg).await.is_err() {
                         return;
@@ -1775,7 +1811,15 @@ mod tests {
             messages: Arc::clone(&messages),
         };
 
-        send_loop(sink, data_rx, ctrl_rx, cancel, disconnect_reason).await;
+        send_loop(
+            sink,
+            data_rx,
+            ctrl_rx,
+            mpsc::channel(1).1,
+            cancel,
+            disconnect_reason,
+        )
+        .await;
 
         let messages = messages.lock().expect("mock sink poisoned");
         assert_eq!(messages.len(), 1);
@@ -2041,6 +2085,188 @@ mod tests {
         let _ = server.await;
     }
 
+    // ── B1: Audio already-expired deadline rejects at pairing, before admission ─
+    //
+    // When the NIP-FI session deadline is already past at pairing time (the
+    // assertion's authority deadlines are all in the past), `handle_active_audio_connection`
+    // must send the canonical `restricted` denial frame and close the connection
+    // before writing any relay-membership, room-join, or roster side effect.
+    //
+    // This test gives the handler the same key in both the assertion and the
+    // NIP-42 event so pairing succeeds, but sets an already-expired deadline.
+    // The B1 gate fires between the pairing check and `enforce_relay_membership`.
+    //
+    // Mutation evidence:
+    //   A) Delete the B1 already-expired check → the B1 restricted frame is
+    //      not sent before admission; the membership gate fires next. Since the
+    //      test's lazy DB rejects membership, the frame text changes from
+    //      "restricted: authorization denied" to "restricted: not a relay member"
+    //      → the byte assertion panics.
+    //   B) Change the sent frame text → byte assertion panics.
+    //   C) Omit `cancel.cancel()` in the B1 branch → cancel assertion panics.
+
+    #[tokio::test]
+    async fn b1_already_expired_session_denied_at_pairing_before_admission() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let key = nostr::Keys::generate();
+
+        // Assertion: same key for both assertion and NIP-42 event → pairing passes.
+        // But the deadline is 2 seconds in the past → B1 fires.
+        let expired_deadline = Utc::now() - Duration::seconds(2);
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![expired_deadline]);
+
+        let state = audio_test_state().await;
+
+        let tenant = buzz_core::tenant::TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+            "test.local".to_string(),
+        );
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = conn_cancel.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_inner =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    uuid::Uuid::new_v4(),
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect client");
+
+        // Receive the challenge.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("challenge timeout")
+            .expect("challenge message")
+            .expect("challenge ws message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("challenge field")
+            .to_string();
+
+        // Sign the auth message with the SAME key as the assertion — pairing passes.
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+
+        let auth_msg = serde_json::json!({
+            "type": "auth",
+            "event": auth_event,
+        })
+        .to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("send auth msg");
+
+        // The B1 gate must send the exact canonical restricted JSON frame.
+        // This is byte-identical to the pairing-mismatch frame — same production
+        // `authorization_denied_frame(NipFiWsRoute::Audio)` path.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+            .await
+            .expect("restricted frame timeout")
+            .expect("frame")
+            .expect("ws frame");
+
+        let expected_restricted = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                assert_eq!(
+                    t.as_str(),
+                    expected_restricted.as_str(),
+                    "B1: expired session must produce exact canonical restricted JSON before close"
+                );
+            }
+            other => panic!("B1: expected Text(restricted JSON); got {other:?}"),
+        }
+
+        // Connection must close after the B1 denial.
+        let close = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("close timeout");
+        assert!(
+            matches!(
+                close,
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | Some(Err(_)) | None
+            ),
+            "B1: connection must close after expired-session denial; got {close:?}"
+        );
+
+        // The cancel token must be cancelled — omitting cancel.cancel() in the
+        // B1 branch makes this assertion fail even when the socket still drops.
+        assert!(
+            cancel_for_assert.is_cancelled(),
+            "B1: conn_cancel must be cancelled after expired-session denial at pairing"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
     // ── Witness C: Audio expiry through shared constructor + real audio writer ──
     //
     // Drives BOTH production seams:
@@ -2106,6 +2332,7 @@ mod tests {
 
         let (_data_tx, data_rx) = mpsc::channel::<WsMessage>(4);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_tx, terminal_rx) = mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
         let (disconnect_tx, disconnect_rx) = watch::channel(None);
         drop(disconnect_tx); // plain Close(None)
@@ -2116,6 +2343,7 @@ mod tests {
             sink,
             data_rx,
             ctrl_rx,
+            terminal_rx,
             send_cancel,
             disconnect_rx,
         ));
@@ -2123,15 +2351,16 @@ mod tests {
 
         // Step 2: invoke the shared expiry constructor with an already-expired
         // deadline. Queue-then-cancel is synchronous: the send loop's cancellation
-        // branch drains the queued frame before writing Close.
+        // branch drains the terminal frame before writing Close.
         let already_expired = chrono::Utc::now() - chrono::Duration::seconds(1);
         let expiry_handle = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             already_expired,
-            ctrl_tx,
+            terminal_tx,
             cancel.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         );
         expiry_handle.await.expect("expiry task must complete");
+        drop(ctrl_tx); // satisfy the unused-variable lint
 
         // Step 3: await the writer and assert exact two-frame sequence.
         tokio::time::timeout(std::time::Duration::from_secs(2), send_handle)

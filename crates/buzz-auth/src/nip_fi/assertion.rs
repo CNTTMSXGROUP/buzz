@@ -212,10 +212,20 @@ impl VerifiedAssertion {
     /// Test-only factory for building `VerifiedAssertion` fixtures without
     /// going through the full JWT/JWKS verification path. NOT available in
     /// production builds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `authority_deadlines` is empty — an empty set violates the
+    /// non-empty invariant that `upstream_authority_deadline()` relies on.
     pub fn for_test(
         asserted_key: Option<PublicKey>,
         authority_deadlines: Vec<DateTime<Utc>>,
     ) -> Self {
+        assert!(
+            !authority_deadlines.is_empty(),
+            "VerifiedAssertion::for_test: authority_deadlines must be non-empty \
+             (upstream_authority_deadline() panics on empty)"
+        );
         use super::config::{AssertionPolicyId, TransportContractId};
         Self {
             identity: FederatedIdentity {

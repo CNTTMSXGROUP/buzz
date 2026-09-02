@@ -394,6 +394,41 @@ impl ConnectionManager {
         closed
     }
 
+    /// Close all live connections whose proven pubkey equals `pubkey`,
+    /// **across all communities**.
+    ///
+    /// Used by the NIP-FI admin disconnect API: the deny is issuer-global across
+    /// all communities served by this relay under that issuer, so the close scan
+    /// must not be fenced to a single community.  [FI-TRACE-DENY-SET]
+    ///
+    /// Sends an `authorization_denied` NOTICE on the control channel before
+    /// cancelling, so the client receives the denial reason.  A full control
+    /// buffer still gets the close via cancel; the frame delivery is best-effort.
+    ///
+    /// Returns the number of connections closed.
+    pub fn disconnect_nip_fi(&self, pubkey: &[u8]) -> usize {
+        use buzz_auth::DenialClass;
+        let denied_notice =
+            crate::protocol::RelayMessage::notice(DenialClass::AuthorizationDenied.nostr_text());
+        let mut closed = 0usize;
+        for entry in self.connections.iter() {
+            let matches = entry
+                .authenticated_pubkey
+                .read()
+                .ok()
+                .and_then(|v| v.as_ref().map(|stored| stored.as_slice() == pubkey))
+                .unwrap_or(false);
+            if matches {
+                let _ = entry
+                    .ctrl_tx
+                    .try_send(WsMessage::Text(denied_notice.clone().into()));
+                entry.cancel.cancel();
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     /// Closes every live connection with a `1012 Service Restart` close frame.
     ///
     /// This is the original, all-at-once drain, retained as the default path
@@ -772,6 +807,21 @@ pub struct AppState {
     /// byte-identically to a relay without the mesh. Access via
     /// [`AppState::mesh`].
     pub mesh: Arc<std::sync::OnceLock<crate::mesh_boot::MeshHandle>>,
+
+    // ── NIP-FI command API (S4) ────────────────────────────────────────────
+    /// Shared in-memory deny set for NIP-FI.  Absent when mode is `Off`.
+    ///
+    /// Written by the admin disconnect endpoint; read at WS admission (S4 item
+    /// 4) and HTTP admission (S5).  The `Arc` allows sharing without cloning.
+    pub nip_fi_deny_map: Option<Arc<buzz_auth::NipFiDenyMap>>,
+
+    /// Command JWT verifier for the NIP-FI admin disconnect endpoint.
+    ///
+    /// `None` when mode is `Off` (no command API is reachable).  When
+    /// `Some`, the verifier owns a reference to `nip_fi_deny_map` so the
+    /// atomic jti-reservation + deny-entry insertion happens inside `verify()`.
+    pub nip_fi_command_verifier:
+        Option<Arc<buzz_auth::CommandVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
 }
 
 impl AppState {
@@ -948,6 +998,12 @@ impl AppState {
             // `crates/buzz-test-client` once those land).
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
+            // NIP-FI deny map and command verifier are initialized lazily by
+            // `build_nip_fi_command_components` in `api::nip_fi`, called from
+            // `main.rs` after startup validation.  `None` is safe before that
+            // call: the endpoint returns 503 when the verifier is absent.
+            nip_fi_deny_map: None,
+            nip_fi_command_verifier: None,
         };
         (
             state,

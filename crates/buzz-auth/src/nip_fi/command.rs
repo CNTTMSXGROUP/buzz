@@ -44,7 +44,7 @@ pub const MAX_COMMAND_AGE_SECONDS: u64 = 60;
 /// These supplement the base [`IssuerPolicy`]: `maximum_command_age` and the
 /// set of authorized issuer principals (the `sub` values allowed to send
 /// commands).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandIssuerPolicy {
     issuer: String,
     /// `0 < maximum_command_age_seconds <= 60`.

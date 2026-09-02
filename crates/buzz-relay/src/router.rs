@@ -122,6 +122,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::invites::accept_policy),
         )
         .route("/api/invites/claim", post(api::invites::claim_invite))
+        // NIP-FI admin command API — authenticated by signed command JWT,
+        // NOT by NIP-98.  Self-contained auth inside the handler.
+        .route("/api/nip-fi/disconnect", post(api::nip_fi::disconnect))
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
         .route("/moderation/reports", get(api::bridge::moderation_reports))
         .route("/moderation/audit", get(api::bridge::moderation_audit))

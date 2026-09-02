@@ -519,7 +519,7 @@ export function runMergeLaneHookSuite({
     // Use timer bed so the 2s click debounce does not fire unexpectedly.
     // retryReconnectPublish cancels the debounce and calls startCycle directly,
     // so no timer needs to be fired after the reconnect — just drain microtasks.
-    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+    const { restore: restoreTimers } = makeHookTimerBed();
     const origDateNow = Date.now;
     Date.now = () => 100 * 1_000;
 

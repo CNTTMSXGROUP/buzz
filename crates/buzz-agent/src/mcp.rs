@@ -35,6 +35,49 @@ pub struct ResultBudget {
     pub text: usize,
 }
 
+fn without_builtin_skills(
+    skills: Vec<goose_sdk_types::custom_requests::SourceEntry>,
+) -> Vec<goose_sdk_types::custom_requests::SourceEntry> {
+    use goose_sdk_types::custom_requests::SourceType;
+
+    skills
+        .into_iter()
+        .filter(|skill| skill.source_type != SourceType::BuiltinSkill)
+        .collect()
+}
+
+#[cfg(test)]
+mod skill_filter_tests {
+    use super::without_builtin_skills;
+    use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
+
+    fn entry(name: &str, source_type: SourceType) -> SourceEntry {
+        SourceEntry {
+            source_type,
+            name: name.to_owned(),
+            description: String::new(),
+            content: String::new(),
+            path: format!("/tmp/{name}"),
+            global: false,
+            writable: false,
+            supporting_files: Vec::new(),
+            properties: Default::default(),
+        }
+    }
+
+    #[test]
+    fn builtin_skills_are_removed_at_the_discovery_boundary() {
+        let filtered = without_builtin_skills(vec![
+            entry("widget-maker", SourceType::Skill),
+            entry("web-search", SourceType::BuiltinSkill),
+        ]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "widget-maker");
+        assert_eq!(filtered[0].source_type, SourceType::Skill);
+    }
+}
+
 fn discover_skills(
     working_dir: &std::path::Path,
 ) -> Vec<goose_sdk_types::custom_requests::SourceEntry> {
@@ -84,7 +127,7 @@ fn discover_skills(
             for diagnostic in discovery.diagnostics {
                 tracing::warn!(path = %diagnostic.path.display(), error = diagnostic.message, "skill ignored");
             }
-            discovery.skills
+            without_builtin_skills(discovery.skills)
         }
         Err(error) => {
             tracing::warn!(%error, "skill discovery failed");

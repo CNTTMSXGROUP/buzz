@@ -171,6 +171,10 @@ class MainActivity : FlutterFragmentActivity() {
         ageSignalsManager: AgeSignalsManager,
         result: MethodChannel.Result,
     ) {
+        if (pendingAgeSignalResult != null) {
+            result.error("age_signal_in_flight", "An age signal request is already active.", null)
+            return
+        }
         ageSignalRequestGeneration += 1
         val generation = ageSignalRequestGeneration
         pendingAgeSignalResult = result
@@ -214,11 +218,9 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     private fun cancelAgeSignalRequest(result: MethodChannel.Result) {
-        ageSignalRequestGeneration += 1
-        val pending = pendingAgeSignalResult
-        pendingAgeSignalResult = null
-        pending?.error("age_signal_cancelled", "The age signal request was cancelled.", null)
-        result.success(null)
+        // Play age-signals 0.0.4 exposes non-cancellable Tasks. Retain the
+        // original single flight rather than allowing an overlapping prompt.
+        result.success(false)
     }
 
     private fun replyWithAgeSignal(

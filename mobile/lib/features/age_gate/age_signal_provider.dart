@@ -16,15 +16,16 @@ typedef AgeSignalRequest = Future<Map<Object?, Object?>?> Function();
 
 /// Waits before retrying a failed native age-signal request.
 typedef AgeSignalDelay = Future<void> Function(Duration duration);
-typedef AgeSignalCancel = Future<void> Function();
+typedef AgeSignalCancel = Future<bool> Function();
 
 Future<Map<Object?, Object?>?> _requestPlatformAgeSignal() =>
     ageSignalChannel.invokeMapMethod<Object?, Object?>('requestAgeSignal');
 
 Future<void> _delayAgeSignalRetry(Duration duration) =>
     Future<void>.delayed(duration);
-Future<void> _cancelPlatformAgeSignal() =>
-    ageSignalChannel.invokeMethod<void>('cancelAgeSignalRequest');
+Future<bool> _cancelPlatformAgeSignal() async =>
+    await ageSignalChannel.invokeMethod<bool>('cancelAgeSignalRequest') ??
+    false;
 
 bool shouldBlockForAgeSignal(Map<Object?, Object?> response) {
   if (response.length != 2 ||
@@ -184,14 +185,17 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
   }
 
   Future<void> _retireNativeRequest() async {
+    var retired = false;
     try {
-      await _cancelSignal();
+      retired = await _cancelSignal();
     } on MissingPluginException {
       // Stay gated if cancellation cannot be acknowledged.
     } on PlatformException {
       // Stay gated if cancellation cannot be acknowledged.
     } finally {
-      _nativeRequestInFlight = null;
+      if (retired) {
+        _nativeRequestInFlight = null;
+      }
     }
   }
 }

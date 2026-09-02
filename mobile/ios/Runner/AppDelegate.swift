@@ -251,7 +251,7 @@ import os.log
   ) {
     if call.method == "cancelAgeSignalRequest" {
       cancelAgeSignalRequest()
-      result(nil)
+      result(true)
       return
     }
     guard call.method == "requestAgeSignal" else {

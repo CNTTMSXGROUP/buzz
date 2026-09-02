@@ -130,7 +130,7 @@ void main() {
             delays += 1;
           },
           requestTimeout: const Duration(milliseconds: 1),
-          cancelSignal: () async {},
+          cancelSignal: () async => false,
         ),
       );
       final container = ProviderContainer();
@@ -160,7 +160,7 @@ void main() {
           response.complete({'status': 'signal', 'ageUpper': 17});
         },
         requestTimeout: const Duration(milliseconds: 1),
-        cancelSignal: () async {},
+        cancelSignal: () async => false,
       ),
     );
     final container = ProviderContainer();
@@ -188,6 +188,7 @@ void main() {
         delay: (_) async {},
         cancelSignal: () async {
           cancellations += 1;
+          return true;
         },
         requestTimeout: const Duration(milliseconds: 1),
       ),
@@ -202,6 +203,29 @@ void main() {
     expect(container.read(provider), AgeSignalState.allowed);
     expect(requests, 2);
     expect(cancellations, 1);
+  });
+
+  test('an uncancellable stalled request remains the single flight', () async {
+    var requests = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () {
+          requests += 1;
+          return Completer<Map<Object?, Object?>?>().future;
+        },
+        delay: (_) async {},
+        cancelSignal: () async => false,
+        requestTimeout: const Duration(milliseconds: 1),
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+    await container.read(provider.notifier).request();
+
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+    expect(requests, 1);
   });
 
   test('keeps a missing native channel gated and retryable', () async {

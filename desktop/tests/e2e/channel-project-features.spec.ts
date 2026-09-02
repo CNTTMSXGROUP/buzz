@@ -278,7 +278,7 @@ test("existing channel project data infers features with separate Projects navig
   await expect
     .poll(async () => (await acceptedProjectEvents(page)).length)
     .toBe(0);
-  await expect(page.getByTestId("open-projects-view")).toHaveCount(0);
+  await expect(page.getByTestId("open-projects-view")).toBeVisible();
   const projectsSection = page.getByTestId("sidebar-projects-section");
   await expect(projectsSection).toBeVisible();
 

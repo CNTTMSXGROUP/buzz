@@ -1,4 +1,4 @@
-import { Activity, Bot, Inbox, Zap } from "lucide-react";
+import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { FeatureGate } from "@/shared/features";
@@ -41,8 +41,10 @@ type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
   onSelectHome: () => void;
+  onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;
+  projectsOverviewActive: boolean;
   selectedView: SidebarSelectedView;
 };
 
@@ -89,8 +91,10 @@ export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
   onSelectHome,
+  onSelectProjects,
   onSelectPulse,
   onSelectWorkflows,
+  projectsOverviewActive,
   selectedView,
 }: AppSidebarPrimaryMenuProps) {
   return (
@@ -134,6 +138,18 @@ export function AppSidebarPrimaryMenu({
             </SidebarMenuButton>
           </SidebarMenuItem>
         </FeatureGate>
+        <SidebarMenuItem>
+          <SidebarMenuButton
+            data-testid="open-projects-view"
+            isActive={selectedView === "projects" && projectsOverviewActive}
+            onClick={onSelectProjects}
+            tooltip="Projects"
+            type="button"
+          >
+            <Folders className="h-4 w-4" />
+            <SidebarMenuLabel>Projects</SidebarMenuLabel>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
         <SidebarMenuItem>
           <SidebarMenuButton
             className="data-[active=true]:font-normal"

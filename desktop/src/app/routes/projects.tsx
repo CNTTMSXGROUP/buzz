@@ -1,7 +1,21 @@
-import { createFileRoute, redirect } from "@tanstack/react-router";
+import * as React from "react";
+import { createFileRoute } from "@tanstack/react-router";
+
+import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
+
+const ProjectsScreen = React.lazy(async () => {
+  const module = await import("@/features/projects/ui/ProjectsScreen");
+  return { default: module.ProjectsScreen };
+});
 
 export const Route = createFileRoute("/projects")({
-  beforeLoad: () => {
-    throw redirect({ to: "/" });
-  },
+  component: ProjectsRouteComponent,
 });
+
+function ProjectsRouteComponent() {
+  return (
+    <React.Suspense fallback={<ViewLoadingFallback kind="projects" />}>
+      <ProjectsScreen />
+    </React.Suspense>
+  );
+}

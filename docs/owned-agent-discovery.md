@@ -35,3 +35,13 @@ mention-routing change; discovery alone does not authorize a message.
 NIP-OA time conditions are not wall-clock expiry (see `docs/nips/NIP-OA.md`). Relay
 membership and policy reads remain separate snapshots, not an atomic publication
 transaction. Independent security review is required before landing.
+
+## Presentation preserves evidence
+
+Policy-only agents carry `status: "unknown"` through IPC. Discovery supplies no
+liveness evidence: Pulse and Projects omit the status dot rather than inventing
+offline or active presence, and active-agent lookups require positive evidence.
+Channel and profile activity projections preserve unknown rather than claiming a
+deployed observer; local managed runtime status still takes precedence.
+Authenticated `ownerPubkey` is retained by New Message, member-add, and search
+candidates even when no user-search profile duplicates the relay result.

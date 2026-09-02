@@ -147,7 +147,8 @@ fn relay_agent_from_managed_policy(agent_pubkey: &str, event: &Event) -> Option<
         channels: Vec::new(),
         channel_ids: Vec::new(),
         capabilities: Vec::new(),
-        status: "offline".to_string(),
+        // Ownership/policy proves discovery, not conversational liveness.
+        status: "unknown".to_string(),
         respond_to: Some(content.respond_to),
         respond_to_allowlist: content.respond_to_allowlist,
     })

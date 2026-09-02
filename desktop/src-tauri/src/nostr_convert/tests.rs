@@ -437,6 +437,11 @@ fn managed_agent_directory_accepts_only_the_verified_owner_policy() {
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].pubkey, agent_pubkey);
     assert_eq!(agents[0].name, "Codex");
+    assert_eq!(agents[0].status, "unknown");
+    assert_eq!(
+        serde_json::to_value(&agents[0]).unwrap()["status"],
+        "unknown"
+    );
     assert_eq!(
         agents[0].respond_to,
         Some(crate::managed_agents::RespondTo::Allowlist)

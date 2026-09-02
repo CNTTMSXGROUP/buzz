@@ -663,6 +663,7 @@ pub fn run() {
             project_canvas_package::get_project_canvas_updates,
             project_canvas_package::activate_project_canvas_package,
             project_canvas_package::commit_project_canvas_package,
+            project_canvas_package::publish_project_canvas_avatars,
             project_canvas_package::release_project_canvas_package,
             project_canvas_package::get_project_canvas_source,
             project_canvas_package::open_project_canvas_source,

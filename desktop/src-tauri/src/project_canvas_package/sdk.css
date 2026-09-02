@@ -49,6 +49,7 @@
   flex: none;
   justify-content: center;
   overflow: hidden;
+  position: relative;
   vertical-align: middle;
 }
 
@@ -78,9 +79,15 @@
   width: 36px;
 }
 
+/* Stacked over the initials rather than beside them: the picture is present
+   from the first paint but only covers the fallback once it has decoded, so a
+   person whose avatar is still loading — or was never published — shows
+   initials instead of an empty box. */
 .buzz-avatar-image {
   height: 100%;
+  inset: 0;
   object-fit: cover;
+  position: absolute;
   width: 100%;
 }
 

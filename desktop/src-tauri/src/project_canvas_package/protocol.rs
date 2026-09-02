@@ -3,8 +3,10 @@ use tauri::http::{self, Method, StatusCode};
 
 use super::{
     manifest::{mime_type, validate_relative_path, MAX_FILE_BYTES},
-    ActiveLoad, ProjectCanvasRuntime,
+    normalized_pubkey, ActiveLoad, ProjectCanvasRuntime,
 };
+
+const PEOPLE_READ_CAPABILITY: &str = "project.people.read";
 
 pub(super) const DOCUMENT_CSP: &str = "default-src 'none'; script-src 'self' buzz-canvas: http://buzz-canvas.localhost; style-src 'self' buzz-canvas: http://buzz-canvas.localhost; img-src 'self' buzz-canvas: http://buzz-canvas.localhost data: blob:; media-src 'self' buzz-canvas: http://buzz-canvas.localhost blob:; font-src 'self' buzz-canvas: http://buzz-canvas.localhost; connect-src 'none'; webrtc 'block'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; worker-src 'none'; frame-ancestors tauri: http://tauri.localhost http://localhost:*";
 pub(super) const PERMISSIONS_POLICY: &str = "accelerometer=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), publickey-credentials-get=(), screen-wake-lock=(), usb=()";
@@ -85,9 +87,43 @@ pub(super) fn route(
             "text/css; charset=utf-8",
             include_str!("sdk.css").as_bytes().to_vec(),
         )),
+        ["__buzz", "avatar", pubkey] => serve_avatar(runtime, &load, pubkey),
         ["package", rest @ ..] if !rest.is_empty() => serve_package_file(&load, rest),
         _ => Err((StatusCode::NOT_FOUND, "not found".to_string())),
     }
+}
+
+/// Serves an avatar the host published for this frame's project.
+///
+/// The bytes never enter the RPC port, so a people lookup stays inside its
+/// message ceiling however many faces it carries, and each image is fetched
+/// only when a widget actually renders it. Nothing here reaches the network: a
+/// pubkey the host has not published is a 404, which the SDK leaves as
+/// initials.
+///
+/// The project comes from the load, never from the request, so a frame can
+/// only ever read avatars published for the project it is bound to.
+fn serve_avatar(
+    runtime: &ProjectCanvasRuntime,
+    load: &ActiveLoad,
+    pubkey: &str,
+) -> Result<(&'static str, Vec<u8>), (StatusCode, String)> {
+    if !load
+        .granted_capabilities
+        .iter()
+        .any(|capability| capability == PEOPLE_READ_CAPABILITY)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("project canvas package was not granted {PEOPLE_READ_CAPABILITY}"),
+        ));
+    }
+    let pubkey = normalized_pubkey(pubkey).map_err(bad_request)?;
+    let avatar = runtime
+        .avatar(&load.binding, &pubkey)
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+    Ok((avatar.content_type, avatar.bytes.as_ref().clone()))
 }
 
 fn shell() -> Vec<u8> {

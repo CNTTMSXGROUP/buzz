@@ -95,6 +95,13 @@ impl ProjectBinding {
             && self.project_key == other.project_key
     }
 
+    /// Key for in-memory state scoped to this project, agreeing exactly with
+    /// [`Self::matches`]. Every component is a hash or hex, so the key carries
+    /// no raw community id or `d` tag.
+    pub(super) fn cache_key(&self) -> String {
+        format!("{}/{}/{}", self.community_key, self.owner, self.project_key)
+    }
+
     fn project_root(&self, canvas_root: &Path) -> PathBuf {
         canvas_root
             .join(&self.community_key)

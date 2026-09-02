@@ -5,17 +5,29 @@ import {
   downscaleAvatarDataUrl,
 } from "@/shared/lib/avatarDownscale";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+// Type-only: this module stays free of the Tauri IPC surface so its rules can
+// be unit-tested under plain Node.
+import type { ProjectCanvasAvatarUpload } from "./projectCanvasCommands";
 
 /**
- * Avatar delivery policy for sandboxed Project Canvas frames.
+ * Avatar delivery for sandboxed Project Canvas frames.
  *
- * A canvas frame cannot reach the network, so the host fetches avatars itself
- * and hands them to widgets as `data:` URLs inside the RPC payload. Two
- * ceilings apply and they are not independent: each image is re-encoded small
- * enough to be worth sending, and the *sum* across a response has to stay
- * inside `PROJECT_CANVAS_MAX_PORT_MESSAGE_BYTES` (64 KiB), or the host replies
- * with a `too-large` error and the widget loses the whole result — display
- * names included, not just the pictures.
+ * A canvas frame cannot reach the network, so the host fetches every avatar
+ * itself. There are two ways to get one to a widget:
+ *
+ * 1. **Publish the bytes** and let the frame load
+ *    `__buzz/avatar/<pubkey>`. The picture never touches an RPC message, so
+ *    no per-response ceiling applies and a channel can show every member's
+ *    real face. This is the path {@link toCanvasAvatarUploads} feeds.
+ * 2. **Inline a `data:` URL** in the RPC payload. Still supported, because
+ *    widgets written before the route existed read `avatarDataUrl` directly —
+ *    but it is charged against `PROJECT_CANVAS_MAX_PORT_MESSAGE_BYTES`
+ *    (64 KiB) for the whole response, so the ceilings below apply. Overrun it
+ *    and the host replies `too-large` and the widget loses the entire result,
+ *    display names included.
+ *
+ * The host does both: it publishes, and it inlines as many as the budget
+ * allows. A widget on either path renders a real avatar.
  */
 
 /**
@@ -54,6 +66,40 @@ export async function fetchCanvasAvatarDataUrl(
     maxDataUrlLength: CANVAS_AVATAR_MAX_DATA_URL_LENGTH,
     pixelSize: CANVAS_AVATAR_PIXEL_SIZE,
   });
+}
+
+/**
+ * Splits a base64 data URL into the media type and payload the publish command
+ * takes. Returns null for anything that is not one, so a URL-encoded or
+ * otherwise unexpected data URL is skipped rather than sent as garbage.
+ */
+export function splitAvatarDataUrl(
+  dataUrl: string,
+): { contentType: string; data: string } | null {
+  const separator = dataUrl.indexOf(";base64,");
+  if (!dataUrl.startsWith("data:image/") || separator < 0) return null;
+  const contentType = dataUrl.slice("data:".length, separator);
+  const data = dataUrl.slice(separator + ";base64,".length);
+  if (!contentType || !data) return null;
+  return { contentType, data };
+}
+
+/**
+ * Turns fetched avatars into the batch the publish command takes.
+ *
+ * Entries with no picture, or whose data URL cannot be split, are skipped
+ * rather than failing the batch — the backend rejects a malformed batch
+ * wholesale, and one odd avatar must not cost the rest their pictures.
+ */
+export function toCanvasAvatarUploads(
+  avatars: ReadonlyArray<{ dataUrl: string | null; pubkey: string }>,
+): ProjectCanvasAvatarUpload[] {
+  const uploads: ProjectCanvasAvatarUpload[] = [];
+  for (const { dataUrl, pubkey } of avatars) {
+    const parts = dataUrl ? splitAvatarDataUrl(dataUrl) : null;
+    if (parts) uploads.push({ ...parts, pubkey });
+  }
+  return uploads;
 }
 
 /**

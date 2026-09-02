@@ -31,9 +31,14 @@ import { ProjectChannelResourcesView } from "./ProjectChannelResourcesView";
 import {
   fetchCanvasAvatarDataUrl,
   selectAvatarsWithinBudget,
+  toCanvasAvatarUploads,
 } from "./project-canvas/canvasAvatars";
 import { ProjectCanvasSurface } from "./project-canvas/ProjectCanvasSurface";
 import type { ProjectCanvasOpenTarget } from "./project-canvas/projectCanvasBroker";
+import {
+  publishProjectCanvasAvatars,
+  type ProjectCanvasPackageRequest,
+} from "./project-canvas/projectCanvasCommands";
 import type { ProjectCanvasSnapshots } from "./project-canvas/projectCanvasProtocol";
 import { useProjectCanvasBroker } from "./project-canvas/useProjectCanvasBroker";
 import {
@@ -55,7 +60,15 @@ const MAX_CANVAS_MEMBER_PROFILES = 128;
 const MAX_CANVAS_PEOPLE_PER_CHANNEL = 5;
 const MAX_CANVAS_REPOSITORIES = 64;
 const MAX_CANVAS_REVIEWS = 32;
+/** Avatars inlined into the channel snapshot, bounded by the RPC ceiling. */
 const MAX_CANVAS_AVATARS = 8;
+/**
+ * Avatars fetched and published for frames to load by pubkey. Published
+ * pictures cost nothing in the snapshot, so this is bounded by fetch volume
+ * rather than by message size, and it stays inside the backend's
+ * per-project store.
+ */
+const MAX_CANVAS_PUBLISHED_AVATARS = 32;
 
 function boundedCanvasText(value: string, maxLength: number): string {
   return value.slice(0, maxLength);
@@ -216,6 +229,13 @@ export function ProjectChannelHome({
   const canvasProfilesQuery = useUsersBatchQuery(canvasProfilePubkeys, {
     enabled: canvasProfilePubkeys.length > 0,
   });
+  const canvasRequest = React.useMemo<ProjectCanvasPackageRequest | null>(
+    () =>
+      activeCommunity?.id && project.projectAddress
+        ? { communityId: activeCommunity.id, projectId: project.projectAddress }
+        : null,
+    [activeCommunity?.id, project.projectAddress],
+  );
   const canvasAvatarCandidates = React.useMemo(
     () =>
       canvasProfilePubkeys
@@ -225,14 +245,36 @@ export function ProjectChannelHome({
           const snapshotUrl = getAvatarSnapshotUrl(avatarUrl);
           return snapshotUrl ? [{ pubkey, snapshotUrl }] : [];
         })
-        .slice(0, MAX_CANVAS_AVATARS),
+        .slice(0, MAX_CANVAS_PUBLISHED_AVATARS),
     [canvasProfilePubkeys, canvasProfilesQuery.data],
   );
   const canvasAvatarQueries = useQueries({
     queries: canvasAvatarCandidates.map(({ pubkey, snapshotUrl }) => ({
+      enabled: canvasRequest !== null,
       gcTime: 10 * 60_000,
-      queryFn: () => fetchCanvasAvatarDataUrl(snapshotUrl),
-      queryKey: ["project-canvas-avatar", pubkey, snapshotUrl],
+      queryFn: async () => {
+        const dataUrl = await fetchCanvasAvatarDataUrl(snapshotUrl);
+        // Publish before resolving. Resolving is what updates the snapshot,
+        // and the snapshot update is what re-renders the widget — so the bytes
+        // are registered before any frame can request them, whichever order
+        // the frame and the fetch happened to complete in.
+        if (dataUrl && canvasRequest) {
+          await publishProjectCanvasAvatars(
+            canvasRequest,
+            toCanvasAvatarUploads([{ dataUrl, pubkey }]),
+          );
+        }
+        return dataUrl;
+      },
+      // Scoped to the project: a cached hit from another project would report
+      // an avatar as published that was never published for this one.
+      queryKey: [
+        "project-canvas-avatar",
+        canvasRequest?.communityId ?? null,
+        canvasRequest?.projectId ?? null,
+        pubkey,
+        snapshotUrl,
+      ],
       staleTime: 10 * 60_000,
     })),
   });
@@ -410,6 +452,7 @@ export function ProjectChannelHome({
     [goChannel, goProfile, selectView],
   );
   const canvasBroker = useProjectCanvasBroker({
+    canvasRequest,
     identityPubkey: identityQuery.data?.pubkey,
     issues: {
       data: channelFeatures.issuesQuery.data,

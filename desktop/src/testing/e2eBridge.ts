@@ -14444,6 +14444,7 @@ export function maybeInstallE2eTauriMocks() {
         }
         return null;
       }
+      case "publish_project_canvas_avatars":
       case "open_project_canvas_source":
         return null;
       // ── Local-save archive ──────────────────────────────────────────────

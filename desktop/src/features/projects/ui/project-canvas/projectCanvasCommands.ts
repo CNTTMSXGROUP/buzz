@@ -28,6 +28,31 @@ export async function requestProjectCanvasPackage(
   return parsePackageDescriptor(response);
 }
 
+/** One avatar's bytes, addressed by the pubkey its frame will request. */
+export type ProjectCanvasAvatarUpload = {
+  contentType: string;
+  /** Standard base64 of the image bytes, without the data-URL prefix. */
+  data: string;
+  pubkey: string;
+};
+
+/**
+ * Publishes avatar bytes for a project's canvas frames to serve from
+ * `__buzz/avatar/<pubkey>`.
+ *
+ * Frames cannot reach the network, so this is how a real picture gets to a
+ * widget without being base64'd into an RPC message and charged against its
+ * 64 KiB ceiling. The backend keys the bytes by project rather than by load,
+ * so publishing before or after a frame exists both work.
+ */
+export async function publishProjectCanvasAvatars(
+  request: ProjectCanvasPackageRequest,
+  avatars: ProjectCanvasAvatarUpload[],
+): Promise<void> {
+  if (avatars.length === 0) return;
+  await invokeTauri("publish_project_canvas_avatars", { avatars, request });
+}
+
 export async function releaseProjectCanvasPackage(
   loadId: string,
 ): Promise<void> {

@@ -257,6 +257,29 @@
     return node;
   }
 
+  const PUBKEY_PATTERN = /^[0-9a-f]{64}$/;
+
+  /**
+   * Resolves where an avatar's picture comes from, if anywhere.
+   *
+   * A `pubkey` uses the host's avatar route, which the frame fetches like any
+   * ordinary image — so the picture costs nothing in the RPC payload that
+   * carried the person's row. `avatarUrl` stays supported for data URLs the
+   * host inlined directly, and is what a widget written before the route
+   * existed keeps using.
+   *
+   * The path is relative, so it resolves against the frame's document URL;
+   * `base-uri 'none'` in the canvas CSP means a package cannot repoint it.
+   */
+  function avatarImageSrc(options) {
+    const pubkey = String(options.pubkey || "").toLowerCase();
+    if (PUBKEY_PATTERN.test(pubkey)) return `./__buzz/avatar/${pubkey}`;
+    return typeof options.avatarUrl === "string" &&
+      options.avatarUrl.startsWith("data:image/")
+      ? options.avatarUrl
+      : null;
+  }
+
   function avatar(props) {
     const options = props || {};
     const name = String(options.name || "");
@@ -269,20 +292,26 @@
     node.dataset.shape = options.agent ? "squircle" : "circle";
     node.setAttribute("role", "img");
     node.setAttribute("aria-label", name || "Unknown person");
-    const avatarUrl =
-      typeof options.avatarUrl === "string" &&
-      options.avatarUrl.startsWith("data:image/")
-        ? options.avatarUrl
-        : null;
-    if (avatarUrl) {
-      const image = el("img", "buzz-avatar-image");
-      image.src = avatarUrl;
-      image.alt = "";
-      node.append(image);
-    } else {
-      node.dataset.tone = String(toneFor(name));
-      node.append(el("span", "buzz-avatar-fallback", initialsFor(name) || "?"));
-    }
+    node.dataset.tone = String(toneFor(name));
+    node.append(el("span", "buzz-avatar-fallback", initialsFor(name) || "?"));
+    const src = avatarImageSrc(options);
+    if (!src) return node;
+    // The picture is stacked over the initials (see `.buzz-avatar-image`) and
+    // dropped if it fails. The route 404s for anyone the host has no avatar
+    // for, which is ordinary rather than an error, so that case has to leave
+    // the initials showing instead of a broken-image glyph.
+    const image = el("img", "buzz-avatar-image");
+    image.alt = "";
+    image.decoding = "async";
+    image.addEventListener(
+      "error",
+      () => {
+        image.remove();
+      },
+      { once: true },
+    );
+    image.src = src;
+    node.append(image);
     return node;
   }
 
@@ -328,6 +357,7 @@
         avatar({
           agent: Boolean(review.authorIsAgent),
           avatarUrl: review.authorAvatarUrl || null,
+          pubkey: review.authorPubkey || null,
           name: review.authorName,
           size: "xs",
         }),
@@ -365,6 +395,7 @@
             agent: Boolean(person.isAgent),
             avatarUrl: person.avatarDataUrl || null,
             name: person.displayName || person.pubkey || "",
+            pubkey: person.pubkey || null,
             size: "xs",
           }),
         );

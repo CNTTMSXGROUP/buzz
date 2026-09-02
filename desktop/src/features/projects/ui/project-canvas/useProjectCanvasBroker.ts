@@ -14,7 +14,12 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
   fetchCanvasAvatarDataUrl,
   selectAvatarsWithinBudget,
+  toCanvasAvatarUploads,
 } from "./canvasAvatars";
+import {
+  publishProjectCanvasAvatars,
+  type ProjectCanvasPackageRequest,
+} from "./projectCanvasCommands";
 import type { Repository } from "@/features/projects/hooks";
 import type { ProjectIssue } from "@/features/projects/projectIssues.mjs";
 import type { ProjectPullRequest } from "@/features/projects/projectPullRequests.mjs";
@@ -105,6 +110,7 @@ type WorkQueryState<T> = {
 };
 
 export function useProjectCanvasBroker({
+  canvasRequest,
   identityPubkey,
   issues,
   onOpenTarget,
@@ -113,6 +119,7 @@ export function useProjectCanvasBroker({
   reviews,
   snapshots,
 }: {
+  canvasRequest: ProjectCanvasPackageRequest | null;
   identityPubkey: string | undefined;
   issues: WorkQueryState<ProjectIssue>;
   onOpenTarget: (target: ProjectCanvasOpenTarget) => void;
@@ -128,6 +135,8 @@ export function useProjectCanvasBroker({
   const openDmMutation = useOpenDmMutation();
 
   const avatarCacheRef = React.useRef(new Map<string, string>());
+  const canvasRequestRef = React.useRef(canvasRequest);
+  canvasRequestRef.current = canvasRequest;
   const issuesRef = React.useRef<ProjectIssue[]>([]);
   issuesRef.current = issues.data ?? [];
   const identityRef = React.useRef(identityPubkey);
@@ -168,9 +177,30 @@ export function useProjectCanvasBroker({
           };
         }),
       );
-      // Every row travels in one RPC message. Without a combined ceiling a
-      // handful of avatars overruns it and the frame gets a `too-large` error
-      // instead of the lookup — losing the names too, not just the pictures.
+      // Publish every avatar before returning, so the frame can load the ones
+      // the budget below drops from `./__buzz/avatar/<pubkey>` instead. A
+      // failure here costs only those pictures — the inlined ones still
+      // arrive, and the next lookup republishes from the same cache.
+      const request = canvasRequestRef.current;
+      if (request) {
+        try {
+          await publishProjectCanvasAvatars(
+            request,
+            toCanvasAvatarUploads(
+              rows.map((row) => ({
+                dataUrl: row.avatarDataUrl,
+                pubkey: row.pubkey,
+              })),
+            ),
+          );
+        } catch {
+          // Falls back to the inlined avatars and initials.
+        }
+      }
+      // Inlined rows all travel in one RPC message. Without a combined ceiling
+      // a handful of avatars overruns it and the frame gets a `too-large`
+      // error instead of the lookup — losing the names too, not just the
+      // pictures.
       const budgeted = selectAvatarsWithinBudget(
         rows.map((row) => row.avatarDataUrl),
       );

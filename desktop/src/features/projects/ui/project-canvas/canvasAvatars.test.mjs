@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   CANVAS_AVATAR_TOTAL_DATA_URL_BUDGET,
   selectAvatarsWithinBudget,
+  splitAvatarDataUrl,
+  toCanvasAvatarUploads,
 } from "./canvasAvatars.ts";
 import { PROJECT_CANVAS_MAX_PORT_MESSAGE_BYTES } from "./projectCanvasProtocol.ts";
 
@@ -71,4 +73,66 @@ test("the result is index-aligned with its input so rows can be zipped back", ()
   const rows = [avatar(100), null, avatar(100)];
 
   assert.equal(selectAvatarsWithinBudget(rows).length, rows.length);
+});
+
+// --- Publishing ------------------------------------------------------------
+// Published avatars leave the RPC payload entirely: the frame loads them from
+// `__buzz/avatar/<pubkey>`. These bind the split the backend's decoder expects.
+
+test("a base64 data url splits into the media type and payload", () => {
+  assert.deepEqual(splitAvatarDataUrl("data:image/webp;base64,QUJD"), {
+    contentType: "image/webp",
+    data: "QUJD",
+  });
+});
+
+test("anything that is not a base64 image data url yields null", () => {
+  // A percent-encoded data URL carries no base64 payload; forwarding its text
+  // as `data` would have the backend reject the whole batch.
+  assert.equal(splitAvatarDataUrl("data:image/svg+xml,%3Csvg%2F%3E"), null);
+  assert.equal(splitAvatarDataUrl("data:text/plain;base64,QUJD"), null);
+  assert.equal(splitAvatarDataUrl("https://example.test/a.png"), null);
+  assert.equal(splitAvatarDataUrl("data:image/png;base64,"), null);
+  assert.equal(splitAvatarDataUrl(""), null);
+});
+
+test("uploads carry the pubkey the frame will request the avatar by", () => {
+  assert.deepEqual(
+    toCanvasAvatarUploads([
+      { dataUrl: "data:image/webp;base64,QUJD", pubkey: "ab".repeat(32) },
+    ]),
+    [
+      {
+        contentType: "image/webp",
+        data: "QUJD",
+        pubkey: "ab".repeat(32),
+      },
+    ],
+  );
+});
+
+test("people without a usable avatar are skipped, not sent as null", () => {
+  // The backend rejects a malformed batch wholesale, so one unusable entry
+  // must not cost everyone else their picture.
+  const uploads = toCanvasAvatarUploads([
+    { dataUrl: null, pubkey: "aa".repeat(32) },
+    { dataUrl: "https://example.test/a.png", pubkey: "bb".repeat(32) },
+    { dataUrl: "data:image/png;base64,QUJD", pubkey: "cc".repeat(32) },
+  ]);
+
+  assert.deepEqual(
+    uploads.map((upload) => upload.pubkey),
+    ["cc".repeat(32)],
+  );
+});
+
+test("an avatar too large to inline can still be published", () => {
+  // The whole point of the route: the budget drops this one from the RPC
+  // payload, and it still reaches the widget as a published image.
+  const big = avatar(CANVAS_AVATAR_TOTAL_DATA_URL_BUDGET + 1_000);
+  assert.deepEqual(selectAvatarsWithinBudget([big]), [null]);
+  assert.equal(
+    toCanvasAvatarUploads([{ dataUrl: big, pubkey: "dd".repeat(32) }]).length,
+    1,
+  );
 });

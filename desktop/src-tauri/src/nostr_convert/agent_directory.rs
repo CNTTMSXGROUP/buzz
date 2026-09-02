@@ -47,6 +47,19 @@ fn relay_agents_from_legacy_events(events: &[Event]) -> Vec<RelayAgentInfo> {
             let value = agents_from_events(std::slice::from_ref(event));
             let mut agent: RelayAgentInfo =
                 serde_json::from_value(value.get("agents")?.as_array()?.first()?.clone()).ok()?;
+            // The generic converter defaults missing status to offline for
+            // compatibility. Discovery must retain only explicit, known runtime
+            // evidence from this verified latest event, never that fallback.
+            agent.status = serde_json::from_str::<serde_json::Value>(&event.content)
+                .ok()
+                .and_then(|content| {
+                    content
+                        .get("status")?
+                        .as_str()
+                        .filter(|status| matches!(*status, "online" | "away" | "offline"))
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
             // Legacy directory entries are not authenticated managed-policy
             // coordinates, so they must not drive the live 30177 watcher.
             agent.owner_pubkey = None;
@@ -71,11 +84,15 @@ pub fn relay_agents_from_directory_events(
             .into_iter()
             .map(|agent| (agent.pubkey.clone(), agent))
             .collect();
-    for agent_pubkey in verified_policies.keys() {
-        agents.remove(agent_pubkey);
-    }
     for (agent_pubkey, event) in verified_policies {
-        if let Some(agent) = relay_agent_from_managed_policy(&agent_pubkey, event) {
+        // Remove even when policy parsing fails: invalid latest policy must not
+        // revive runtime permissions. Only verified runtime liveness survives
+        // a valid policy overlay; ownership, permissions and membership do not.
+        let runtime = agents.remove(&agent_pubkey);
+        if let Some(mut agent) = relay_agent_from_managed_policy(&agent_pubkey, event) {
+            if let Some(runtime) = runtime {
+                agent.status = runtime.status;
+            }
             agents.insert(agent_pubkey, agent);
         }
     }

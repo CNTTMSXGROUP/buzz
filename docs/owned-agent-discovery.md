@@ -31,6 +31,9 @@ mention-routing change; discovery alone does not authorize a message.
   canonical conditions and signed-event time, wrong-owner policy, invalid latest
   policy, forged and stale membership.
 - `nostr_convert/tests.rs`: signed conversion fixtures and OSS compatibility.
+- `nostr_convert/runtime_policy_tests.rs`: known signed runtime status survives
+  policy overlay; absent/unrecognized status, policy-only discovery, and an
+  invalid or status-less latest runtime cannot fabricate or revive availability.
 
 NIP-OA time conditions are not wall-clock expiry (see `docs/nips/NIP-OA.md`). Relay
 membership and policy reads remain separate snapshots, not an atomic publication
@@ -38,9 +41,17 @@ transaction. Independent security review is required before landing.
 
 ## Presentation preserves evidence
 
-Policy-only agents carry `status: "unknown"` through IPC. Discovery supplies no
-liveness evidence: Pulse and Projects omit the status dot rather than inventing
-offline or active presence, and active-agent lookups require positive evidence.
+Policy-only agents carry `status: "unknown"` through IPC. When the same agent has
+an independently verified latest kind 10100 runtime record, its explicit
+`online`, `away`, or `offline` status survives the owner-policy overlay. Missing
+or unrecognized runtime status remains unknown, not the generic converter's
+legacy offline default. Policy still controls ownership and permissions; claimed
+runtime membership is not restored. An invalid latest policy still excludes the
+agent rather than falling back to runtime permissions.
+
+Discovery alone supplies no liveness evidence: Pulse and Projects omit the status
+dot rather than inventing offline or active presence, and active-agent lookups
+require positive evidence.
 Channel and profile activity projections preserve unknown rather than claiming a
 deployed observer; local managed runtime status still takes precedence.
 Authenticated `ownerPubkey` is retained by New Message, member-add, and search

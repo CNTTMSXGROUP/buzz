@@ -3,6 +3,9 @@
 use super::*;
 use nostr::{EventBuilder, Keys, Kind, Tag};
 
+#[path = "runtime_policy_tests.rs"]
+mod runtime_policy_tests;
+
 /// Build a signed event for testing with the given kind, content, and tags.
 fn ev(kind: u16, content: &str, tags: Vec<Vec<&str>>) -> Event {
     let keys = Keys::generate();

@@ -8,12 +8,12 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
-    response::Json,
+    response::{IntoResponse, Json, Response},
 };
 use base64::Engine;
 use serde_json::Value;
 
-use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
+use buzz_auth::{LimitType, Nip98ReplayGuard, NipFiMode, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
@@ -745,16 +745,25 @@ pub async fn submit_event(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
+    // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory —
+    // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
+    // [NIP-FI.md:547-567, FI-TRACE-HTTP-INGRESS]
+    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    // POST /events carries an authorization-relevant body (the event determines
+    // resource, effect, and state change), so a payload tag is required in
+    // NIP-FI enforce mode. [NIP-FI.md:579-597]
+    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
         signed_created_at,
-    } = verify_bridge_auth(
+    } = verify_bridge_auth_with_options(
         &headers,
         "POST",
         &url,
         Some(&body),
-        state.config.require_auth_token,
+        state.config.require_auth_token || nip_fi_active,
+        nip_fi_enforce,
     )
     .map_err(|e| e.into_response())?;
 
@@ -1044,16 +1053,24 @@ pub async fn query_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
+    // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
+    // [NIP-FI.md:547-567, FI-TRACE-HTTP-INGRESS]
+    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    // POST /query carries an authorization-relevant body (filter selects the
+    // resources returned), so a payload tag is required in enforce mode.
+    // [NIP-FI.md:579-597]
+    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
         signed_created_at,
-    } = verify_bridge_auth(
+    } = verify_bridge_auth_with_options(
         &headers,
         "POST",
         &url,
         Some(&body),
-        state.config.require_auth_token,
+        state.config.require_auth_token || nip_fi_active,
+        nip_fi_enforce,
     )
     .map_err(|e| e.into_response())?;
 
@@ -1596,16 +1613,24 @@ pub async fn count_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
+    // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
+    // [NIP-FI.md:547-567, FI-TRACE-HTTP-INGRESS]
+    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    // POST /count carries an authorization-relevant body (filter selects what
+    // is counted), so a payload tag is required in enforce mode.
+    // [NIP-FI.md:579-597]
+    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
         signed_created_at,
-    } = verify_bridge_auth(
+    } = verify_bridge_auth_with_options(
         &headers,
         "POST",
         &url,
         Some(&body),
-        state.config.require_auth_token,
+        state.config.require_auth_token || nip_fi_active,
+        nip_fi_enforce,
     )
     .map_err(|e| e.into_response())?;
 
@@ -2384,7 +2409,7 @@ async fn authorize_moderation_read(
     headers: &HeaderMap,
     path: &str,
     raw_query: Option<&str>,
-) -> Result<TenantContext, (StatusCode, Json<Value>)> {
+) -> Result<TenantContext, Response> {
     let raw_host = headers
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -2396,6 +2421,7 @@ async fn authorize_moderation_read(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
             )
+            .into_response()
         })?;
 
     let path_with_query = match raw_query {
@@ -2407,8 +2433,17 @@ async fn authorize_moderation_read(
         pubkey,
         event_id_bytes,
         ..
-    } = verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
-    check_nip98_replay(state, &tenant, event_id_bytes).await?;
+    } = verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)
+        .map_err(|e| e.into_response())?;
+
+    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
+    if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(state, headers, &pubkey) {
+        return Err(resp);
+    }
+
+    check_nip98_replay(state, &tenant, event_id_bytes)
+        .await
+        .map_err(|e| e.into_response())?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     crate::handlers::moderation_authz::authorize_moderation_action(
@@ -2425,6 +2460,7 @@ async fn authorize_moderation_read(
             StatusCode::FORBIDDEN,
             "restricted: moderator access required",
         )
+        .into_response()
     })?;
 
     Ok(tenant)
@@ -2453,15 +2489,19 @@ pub async fn moderation_reports(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(q): Query<ModerationReadQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let tenant = authorize_moderation_read(
+) -> Response {
+    let tenant = match authorize_moderation_read(
         &state,
         &headers,
         "/moderation/reports",
         raw_query.as_deref(),
     )
-    .await?;
-    let rows = state
+    .await
+    {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    match state
         .db
         .list_moderation_reports(
             tenant.community(),
@@ -2469,8 +2509,10 @@ pub async fn moderation_reports(
             clamp_limit(q.limit),
         )
         .await
-        .map_err(|e| internal_error(&format!("list reports: {e}")))?;
-    Ok(Json(Value::Array(rows.iter().map(report_json).collect())))
+    {
+        Ok(rows) => Json(Value::Array(rows.iter().map(report_json).collect())).into_response(),
+        Err(e) => internal_error(&format!("list reports: {e}")).into_response(),
+    }
 }
 
 /// `GET /moderation/audit` — the moderation audit log (NIP-98 + mod-authz).
@@ -2479,31 +2521,46 @@ pub async fn moderation_audit(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(q): Query<ModerationReadQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let tenant =
-        authorize_moderation_read(&state, &headers, "/moderation/audit", raw_query.as_deref())
-            .await?;
-    let rows = state
+) -> Response {
+    let tenant = match authorize_moderation_read(
+        &state,
+        &headers,
+        "/moderation/audit",
+        raw_query.as_deref(),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    match state
         .db
         .list_moderation_actions(tenant.community(), clamp_limit(q.limit))
         .await
-        .map_err(|e| internal_error(&format!("list actions: {e}")))?;
-    Ok(Json(Value::Array(rows.iter().map(action_json).collect())))
+    {
+        Ok(rows) => Json(Value::Array(rows.iter().map(action_json).collect())).into_response(),
+        Err(e) => internal_error(&format!("list actions: {e}")).into_response(),
+    }
 }
 
 /// `GET /moderation/restricted` — currently banned/timed-out members.
 pub async fn moderation_restricted(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Response {
     let tenant =
-        authorize_moderation_read(&state, &headers, "/moderation/restricted", None).await?;
-    let rows = state
+        match authorize_moderation_read(&state, &headers, "/moderation/restricted", None).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+    match state
         .db
         .list_community_restrictions(tenant.community())
         .await
-        .map_err(|e| internal_error(&format!("list restrictions: {e}")))?;
-    Ok(Json(Value::Array(rows.iter().map(ban_json).collect())))
+    {
+        Ok(rows) => Json(Value::Array(rows.iter().map(ban_json).collect())).into_response(),
+        Err(e) => internal_error(&format!("list restrictions: {e}")).into_response(),
+    }
 }
 
 fn report_json(r: &buzz_db::moderation::ReportRecord) -> Value {
@@ -4265,6 +4322,427 @@ mod postgres_tests {
         assert!(
             log.contains(&pubkey_hex[..16]),
             "attribution line must carry the pubkey;\nlog:\n{log}"
+        );
+    }
+
+    // ── NIP-FI production-seam tests (F4) ────────────────────────────────────
+    //
+    // These tests drive real HTTP requests through the axum router with NIP-FI
+    // in Enforce mode and a valid NIP-98 event but NO assertion header.  Each
+    // test must go red if the `check_nip_fi_http_on_state` call is deleted or
+    // inverted at the corresponding production call site.
+    //
+    // Falsifiability: a request with valid NIP-98 + no assertion in Enforce
+    // mode → NIP-FI gate fires → 401 (MissingEvidence). If the gate is removed,
+    // the request proceeds past NIP-FI to community lookup → succeeds (community
+    // is provisioned) → further processing → some other status (200, 400, etc.)
+    // that is NOT 401.  The assert_eq fires.
+    //
+    // Why `#[ignore = "requires Postgres"]`: the handlers call bind_community
+    // before the NIP-FI gate; the community must exist for the NIP-98 URL to
+    // match. All four protected surfaces need Postgres for the NIP-FI seam test
+    // to be exercised (vs. bailing at community lookup with 404 before NIP-FI).
+    //
+    // ## Route inventory (fail-closed classification)
+    //
+    // Every authenticated HTTP route on this relay is listed here with its
+    // NIP-FI classification. Adding a new authenticated route MUST come with
+    // a corresponding update to this inventory and either (a) a seam test
+    // proving the gate fires, or (b) an explicit exemption with justification.
+    //
+    // PROTECTED — NIP-FI gate required, seam test below:
+    //   POST /events        (bridge — submit_event)
+    //   POST /query         (bridge — query_events)
+    //   POST /count         (bridge — count_events)
+    //   POST /gifs/search   (gifs — search)
+    //   POST /gifs/share    (gifs — share)
+    //   GET  /workflows/{id}/runs             (workflows — workflow_runs)
+    //   GET  /workflows/{id}/runs/{id}/approvals  (workflows — run_approvals)
+    //   GET  /moderation/reports              (bridge — moderation_reports)
+    //   GET  /moderation/audit                (bridge — moderation_audit)
+    //   GET  /moderation/restricted           (bridge — moderation_restricted)
+    //   PUT  /upload / /media/upload          (media — upload_blob; covered by media.rs seam test)
+    //   git  info/refs, upload-pack, receive-pack  (git transport; covered by git/transport.rs)
+    //   POST /api/invites   (invites — mint_invite; NIP-98 mint requires admin key)
+    //
+    // EXEMPT — explicitly excluded, reason given:
+    //   GET  /              (WebSocket upgrade + NIP-11 info; WS door is governed by WS-NIP-FI)
+    //   GET  /info          (NIP-11 relay info; public)
+    //   GET  /.well-known/nostr.json  (NIP-05; public)
+    //   GET  /health, /_liveness, /_readiness  (K8s probes; public, no NIP-98)
+    //   POST /api/invites/claim   (pre-membership enrollment door; NIP-FI.md intent: identity not yet issued)
+    //   POST /api/invites/accept-policy  (pre-membership policy gate; no NIP-98 principal)
+    //   GET  /api/join-policy, /api/join-policy/terms, /api/join-policy/privacy  (public docs)
+    //   POST /hooks/{id}    (webhook trigger; secret-header auth, no NIP-98 principal)
+    //   GET  /huddle/{id}/audio  (WS upgrade; governed by WS-NIP-FI)
+    //   POST /_mesh/demo/echo  (testbed-only probe; no auth)
+    //   /operator/**        (operator admin plane; keypair-in-config auth, distinct from user/member NIP-98)
+    //   /api/admin/**       (admin SPA backend; operator-credential gated, separate admin transport)
+    //   /media/{sha256}     (blob GET/HEAD; public read, no NIP-98)
+
+    /// Build an AppState with NIP-FI in Enforce mode for production-seam tests.
+    ///
+    /// Sets `nip_fi.mode = Enforce` while leaving `nip_fi_verifier = None`
+    /// (startup race: no issuers configured → verifier not built).  This is
+    /// sufficient for the seam test because the NIP-FI gate fires with 401
+    /// (MissingEvidence) when the assertion header is absent, BEFORE any
+    /// verifier lookup.  `require_auth_token = true` forces real NIP-98.
+    ///
+    /// Returns `None` when local Postgres is not reachable.
+    async fn nip_fi_enforce_test_state() -> Option<Arc<crate::state::AppState>> {
+        let mut config = crate::config::Config::from_env().ok()?;
+        config.database_url = crate::test_support::database_url();
+        config.redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        config.relay_url = "wss://nip-fi-test.local".to_string();
+        config.require_auth_token = true;
+        config.require_relay_membership = false;
+        config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+        // No issuers configured → nip_fi_verifier = None (startup-race path).
+        // The seam test fires before verifier is needed (missing assertion → 401).
+
+        let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+            .await
+            .ok()?;
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .ok()?;
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .ok()?,
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
+
+        let (mut state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        Some(Arc::new(state))
+    }
+
+    /// Sign a NIP-98 event for a given URL and method, returning a valid
+    /// `Authorization: Nostr <base64>` header map.
+    fn make_nip98_headers(keys: &Keys, url: &str, method: &str) -> axum::http::HeaderMap {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        let tags = vec![
+            Tag::parse(["u", url]).expect("u tag"),
+            Tag::parse(["method", method]).expect("method tag"),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign NIP-98 event");
+        let event_json = serde_json::to_string(&event).expect("serialize NIP-98 event");
+        let value = format!("Nostr {}", BASE64.encode(event_json.as_bytes()));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            value.parse().expect("valid header"),
+        );
+        headers
+    }
+
+    /// Drive a single oneshot request through the full relay router and return
+    /// the HTTP status.
+    async fn oneshot_request(
+        state: Arc<crate::state::AppState>,
+        method: &str,
+        uri: &str,
+        host: &str,
+        headers: axum::http::HeaderMap,
+        body: &[u8],
+    ) -> axum::http::StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", host);
+        for (name, value) in &headers {
+            builder = builder.header(name, value);
+        }
+        crate::router::build_router(state)
+            .oneshot(
+                builder
+                    .body(Body::from(body.to_vec()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot")
+            .status()
+    }
+
+    // ── F4: bridge POST /events — enforce mode, no assertion → 401 ──────────
+    //
+    // Falsifying mutation: delete the `check_nip_fi_http_on_state` call in
+    // `submit_event` (bridge.rs). The NIP-98 is valid; without the gate the
+    // request reaches ingest → returns 200 or a different non-401 status.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_bridge_events_no_assertion_is_401() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+        let host = format!("nip-fi-seam-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        let keys = Keys::generate();
+        let url = format!("wss://nip-fi-test.local/events");
+        let auth_headers = make_nip98_headers(&keys, &url, "POST");
+
+        let status = rt.block_on(oneshot_request(
+            state,
+            "POST",
+            "/events",
+            &host,
+            auth_headers,
+            b"{}",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI enforce mode: POST /events with valid NIP-98 + no assertion MUST deny 401 \
+             [FI-TRACE-HTTP-INGRESS]; if this fails the check_nip_fi_http_on_state gate was \
+             removed from submit_event"
+        );
+    }
+
+    // ── F4: bridge POST /query — enforce mode, no assertion → 401 ───────────
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_bridge_query_no_assertion_is_401() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+        let host = format!("nip-fi-seam-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        let keys = Keys::generate();
+        let url = format!("wss://nip-fi-test.local/query");
+        let auth_headers = make_nip98_headers(&keys, &url, "POST");
+
+        let status = rt.block_on(oneshot_request(
+            state,
+            "POST",
+            "/query",
+            &host,
+            auth_headers,
+            b"[]",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI enforce mode: POST /query with valid NIP-98 + no assertion MUST deny 401 \
+             [FI-TRACE-HTTP-INGRESS]; if this fails the check_nip_fi_http_on_state gate was \
+             removed from query_events"
+        );
+    }
+
+    // ── F4: bridge POST /count — enforce mode, no assertion → 401 ───────────
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_bridge_count_no_assertion_is_401() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+        let host = format!("nip-fi-seam-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        let keys = Keys::generate();
+        let url = format!("wss://nip-fi-test.local/count");
+        let auth_headers = make_nip98_headers(&keys, &url, "POST");
+
+        let status = rt.block_on(oneshot_request(
+            state,
+            "POST",
+            "/count",
+            &host,
+            auth_headers,
+            b"[]",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI enforce mode: POST /count with valid NIP-98 + no assertion MUST deny 401 \
+             [FI-TRACE-HTTP-INGRESS]; if this fails the check_nip_fi_http_on_state gate was \
+             removed from count_events"
+        );
+    }
+
+    // ── F4: moderation GET — enforce mode, no assertion → 401 ───────────────
+    //
+    // Shared witness for all three moderation routes: they share
+    // `authorize_moderation_read` which calls `check_nip_fi_http_on_state`.
+    // This test covers the shared call site; the other two routes are covered
+    // transitively.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_moderation_reports_no_assertion_is_401() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+        let host = format!("nip-fi-seam-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        let keys = Keys::generate();
+        let url = "wss://nip-fi-test.local/moderation/reports";
+        let auth_headers = make_nip98_headers(&keys, url, "GET");
+
+        let status = rt.block_on(oneshot_request(
+            state,
+            "GET",
+            "/moderation/reports",
+            &host,
+            auth_headers,
+            b"",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI enforce mode: GET /moderation/reports with valid NIP-98 + no assertion MUST \
+             deny 401 [FI-TRACE-HTTP-INGRESS]; if this fails the check_nip_fi_http_on_state gate \
+             was removed from authorize_moderation_read"
+        );
+    }
+
+    // ── F4: GIF search — enforce mode, no assertion → 401 ───────────────────
+    //
+    // Shared witness for both GIF routes (search + share both go through
+    // `authenticate` which calls `check_nip_fi_http_on_state`).
+    //
+    // Falsifying mutation: delete the NIP-FI check from `gifs::authenticate`.
+    // Without the gate, the request proceeds to Klipy config check → 404
+    // (GIF search not configured in the test state). 404 ≠ 401.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_gif_search_no_assertion_is_401() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+        let host = format!("nip-fi-seam-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        let keys = Keys::generate();
+        let url = format!("wss://nip-fi-test.local{}", crate::api::gifs::SEARCH_PATH);
+        let auth_headers = make_nip98_headers(&keys, &url, "POST");
+
+        let status = rt.block_on(oneshot_request(
+            state,
+            "POST",
+            crate::api::gifs::SEARCH_PATH,
+            &host,
+            auth_headers,
+            b"{}",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI enforce mode: POST {} with valid NIP-98 + no assertion MUST deny 401 \
+             [FI-TRACE-HTTP-INGRESS]; if this fails the check_nip_fi_http_on_state gate was \
+             removed from gifs::authenticate",
+            crate::api::gifs::SEARCH_PATH
+        );
+    }
+
+    // ── F4: workflow runs — enforce mode, no assertion → 401 ────────────────
+    //
+    // Shared witness for both workflow routes (`authorize_workflow_read`
+    // calls `check_nip_fi_http_on_state`).
+    //
+    // Falsifying mutation: delete the NIP-FI check from
+    // `authorize_workflow_read`. The request proceeds to workflow lookup →
+    // 404 (no workflow with the test UUID). 404 ≠ 401.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_workflow_runs_no_assertion_is_401() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+        let host = format!("nip-fi-seam-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        let workflow_id = uuid::Uuid::new_v4();
+        let keys = Keys::generate();
+        let path = format!("/workflows/{workflow_id}/runs");
+        let url = format!("wss://nip-fi-test.local{path}");
+        let auth_headers = make_nip98_headers(&keys, &url, "GET");
+
+        let status = rt.block_on(oneshot_request(
+            state,
+            "GET",
+            &path,
+            &host,
+            auth_headers,
+            b"",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI enforce mode: GET {path} with valid NIP-98 + no assertion MUST deny 401 \
+             [FI-TRACE-HTTP-INGRESS]; if this fails the check_nip_fi_http_on_state gate was \
+             removed from authorize_workflow_read"
         );
     }
 }

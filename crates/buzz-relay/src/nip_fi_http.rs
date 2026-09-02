@@ -49,40 +49,48 @@ use buzz_auth::{
     DenialClass, FederatedAssertionVerifier, IssuerKeySource, NipFiMode, VerifiedAssertion,
     CLIENT_ATTACHED_HEADER,
 };
+use chrono::{DateTime, Utc};
 use nostr::PublicKey;
 
 // ── Deny-map seam (S4 stub) ───────────────────────────────────────────────────
 
 /// Narrow interface consumed by HTTP enforcement.  S4 (Duncan) will provide
-/// the real implementation; until then, `FailClosedStubDenyMap` stubs it
+/// the real implementation; until then, `AlwaysAdmitStubDenyMap` stubs it
 /// fail-open (admits unconditionally).
 ///
-/// When S4 is ready, the integration commit replaces the stub with a real
-/// implementation.  The S5 call site (`check_nip_fi_http`) is unchanged.
+/// Signature mirrors `NipFiDenyMap::is_denied` from S4 so integration is a
+/// one-liner: replace `AlwaysAdmitStubDenyMap` with the shared map.
+///
+/// `(issuer, pubkey, now)` are required because the deny set is issuer-
+/// scoped per `NIP-FI.md:584-587`.  Passing only pubkey would collide
+/// across issuers — a deny for `(iss-A, k)` must not block `(iss-B, k)`.
 ///
 /// Sealed: only implementations in this crate are accepted.
 pub(crate) trait HttpDenyMap: sealed::Sealed {
-    /// Returns `true` when the pubkey is actively denied (now < until).
-    /// An unavailable backing store MUST return `true` (fail-closed) unless
-    /// an explicit availability guarantee is established.
-    fn is_denied(&self, pubkey: &PublicKey) -> bool;
+    /// Returns `true` when `(issuer, pubkey)` has an active deny entry at
+    /// `now` (`now < until`).  A poisoned or unavailable backing store MUST
+    /// return `false` (admits) only when an explicit availability guarantee is
+    /// established; the S4 real map currently admits on poisoned lock.  The
+    /// S4 integration commit is expected to resolve the fail-closed story
+    /// before S5 merges; the interface contract here is the agreed shape.
+    fn is_denied(&self, issuer: &str, pubkey: &PublicKey, now: DateTime<Utc>) -> bool;
 }
 
 pub(crate) mod sealed {
     pub(crate) trait Sealed {}
 }
 
-/// Fail-closed stub: never denies.  Used until S4 provides the real map.
+/// Stub deny map that always admits.  Used until S4 provides the real map.
 ///
-/// **Invariant**: this stub is fail-open by design for the stub phase only.
-/// The comment is the record of that explicit decision.  A separate S4
-/// `DenyMapFull` path that returns `503` is wired at the S4 seam, not here.
-pub(crate) struct FailClosedStubDenyMap;
-impl sealed::Sealed for FailClosedStubDenyMap {}
-impl HttpDenyMap for FailClosedStubDenyMap {
-    /// Always admits: the deny map is not yet wired (S4).  When S4 lands,
-    /// replace this impl with a real lookup.
-    fn is_denied(&self, _pubkey: &PublicKey) -> bool {
+/// Name is explicit: this is **fail-open**, not fail-closed.  The stub phase
+/// is intentional — deny-map enforcement defers to S4 landing.  The name
+/// `AlwaysAdmitStubDenyMap` prevents a future integrator from assuming this
+/// stub is safe for production use.
+pub(crate) struct AlwaysAdmitStubDenyMap;
+impl sealed::Sealed for AlwaysAdmitStubDenyMap {}
+impl HttpDenyMap for AlwaysAdmitStubDenyMap {
+    /// Always admits: the deny map is not yet wired (S4 pending).
+    fn is_denied(&self, _issuer: &str, _pubkey: &PublicKey, _now: DateTime<Utc>) -> bool {
         false
     }
 }
@@ -183,8 +191,11 @@ pub(crate) fn check_nip_fi_http<S: IssuerKeySource, D: HttpDenyMap>(
         }
     }
 
-    // Deny-map check: pubkey must not be in an active deny window. [FI-INV-14]
-    if deny_map.is_denied(proven_pubkey) {
+    // Deny-map check: (iss, pubkey) must not be in an active deny window.
+    // The issuer comes from the already-verified assertion; `now` is used by
+    // the real map for TTL comparison.  [FI-INV-14] [NIP-FI.md:584-587]
+    let issuer = assertion.identity().issuer();
+    if deny_map.is_denied(issuer, proven_pubkey, Utc::now()) {
         metrics::counter!(
             "buzz_auth_failures_total",
             "reason" => "nip_fi_http_denied_pubkey"
@@ -282,7 +293,7 @@ pub(crate) fn check_nip_fi_http_on_state(
         proven_pubkey,
         verifier,
         mode,
-        &FailClosedStubDenyMap,
+        &AlwaysAdmitStubDenyMap,
     )
 }
 
@@ -313,6 +324,7 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use buzz_auth::{NipFiMode, ProductionJwksSource};
+    use chrono::Utc;
 
     // Helper: read the body bytes synchronously (tests only).
     fn body_bytes(resp: Response<Body>) -> Vec<u8> {
@@ -510,7 +522,7 @@ mod tests {
             &pubkey,
             None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
             NipFiMode::Off,
-            &FailClosedStubDenyMap,
+            &AlwaysAdmitStubDenyMap,
         );
         assert!(
             matches!(outcome, NipFiHttpOutcome::Admitted(None)),
@@ -533,7 +545,7 @@ mod tests {
             &pubkey,
             None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
             NipFiMode::DenyProtected,
-            &FailClosedStubDenyMap,
+            &AlwaysAdmitStubDenyMap,
         );
         match outcome {
             NipFiHttpOutcome::Denied(resp) => {
@@ -559,7 +571,7 @@ mod tests {
             &pubkey,
             None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
             NipFiMode::Enforce,
-            &FailClosedStubDenyMap,
+            &AlwaysAdmitStubDenyMap,
         );
         // Missing header → MissingEvidence before verifier check.
         match outcome {
@@ -590,7 +602,7 @@ mod tests {
             &pubkey,
             None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
             NipFiMode::Enforce,
-            &FailClosedStubDenyMap,
+            &AlwaysAdmitStubDenyMap,
         );
         match outcome {
             NipFiHttpOutcome::Denied(resp) => {
@@ -613,7 +625,7 @@ mod tests {
     fn stub_deny_map_never_denies() {
         let pubkey = any_pubkey();
         assert!(
-            !FailClosedStubDenyMap.is_denied(&pubkey),
+            !AlwaysAdmitStubDenyMap.is_denied("https://idp.example.com", &pubkey, Utc::now()),
             "stub deny map MUST admit unconditionally until S4 provides the real map"
         );
     }

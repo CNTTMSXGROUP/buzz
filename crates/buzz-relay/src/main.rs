@@ -527,7 +527,7 @@ async fn main() -> anyhow::Result<()> {
                 let now = tokio::time::Instant::now();
                 for (issuer, interval, last) in &mut intervals {
                     if now >= *last + std::time::Duration::from_secs(*interval) {
-                        if let None = refresh_source.get_snapshot(issuer).await {
+                        if refresh_source.get_snapshot(issuer).await.is_none() {
                             warn!(
                                 %issuer,
                                 "NIP-FI: background JWKS refresh returned no snapshot"

@@ -117,6 +117,7 @@ public enum BuzzDevPushEnrollmentError: Error, LocalizedError, Equatable {
   case appAttestUnsupported
   case invalidAppAttestKeyId
   case generationExhausted
+  case retiredGatewayCleanupIncomplete
 
   public var errorDescription: String? {
     switch self {
@@ -138,6 +139,8 @@ public enum BuzzDevPushEnrollmentError: Error, LocalizedError, Equatable {
       return "The App Attest key identifier is missing or invalid."
     case .generationExhausted:
       return "The development push grant generation cannot advance further."
+    case .retiredGatewayCleanupIncomplete:
+      return "A retired push gateway installation could not be revoked yet."
     }
   }
 }
@@ -423,9 +426,8 @@ public final class BuzzDevPushEnrollmentDriver {
     deviceToken: Data,
     relayURL: URL
   ) async throws -> BuzzPushEndpointGrantRecord {
-    let record = try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
-    await cleanStaleGateways(deviceToken: deviceToken)
-    return record
+    try await cleanStaleGateways(deviceToken: deviceToken)
+    return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
   }
 
   private func enrollCurrent(
@@ -753,11 +755,13 @@ public final class BuzzDevPushEnrollmentDriver {
     return record
   }
 
-  private func cleanStaleGateways(deviceToken: Data) async {
-    guard let states = try? store.gatewayCleanupStates() else { return }
+  private func cleanStaleGateways(deviceToken: Data) async throws {
+    let states = try store.gatewayCleanupStates()
     for var state in states where state.gatewayOrigin != gatewayOrigin {
-      guard await cleanStaleGateway(&state, deviceToken: deviceToken) else { continue }
-      try? store.removeGatewayCleanupState(gatewayOrigin: state.gatewayOrigin)
+      guard await cleanStaleGateway(&state, deviceToken: deviceToken) else {
+        throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
+      }
+      try store.removeGatewayCleanupState(gatewayOrigin: state.gatewayOrigin)
     }
   }
 

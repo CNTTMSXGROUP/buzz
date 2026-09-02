@@ -500,19 +500,6 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
   func testFailedStaleGatewayRevocationKeepsCleanupJournal() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
-    let current = BuzzPushEndpointGrantRecord(
-      gatewayOrigin: Self.gatewayOrigin,
-      relayOrigin: "wss://relay.example",
-      relayPubkey: Self.relayPubkey,
-      gatewayInstallationHandle: Self.installationHandle,
-      installationId: Self.installationId,
-      endpointGrant: "current-grant",
-      endpointHash: endpointHash,
-      appProfile: "buzz-ios-dogfood",
-      endpointEpoch: 1,
-      generation: 1,
-      expiresAt: Self.expiresAt
-    )
     let stale = BuzzPushEndpointGrantRecord(
       gatewayOrigin: "http://old-gateway.example",
       relayOrigin: "wss://relay.example",
@@ -526,26 +513,30 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       generation: 1,
       expiresAt: Self.expiresAt
     )
-    let store = MemoryGrantStore(records: [current, stale])
-    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    let store = MemoryGrantStore(records: [stale])
+    let appAttest = RecordingAppAttest()
+    let driver = try makeDriver(store: store, appAttest: appAttest)
     URLProtocolStub.handler = { request in
-      if request.url?.absoluteString == "https://relay.example/" {
-        return Self.response(
-          request,
-          status: 200,
-          json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
-        )
-      }
+      XCTAssertNotEqual(request.url?.absoluteString, "https://relay.example/")
       return Self.response(request, status: 503, json: ["error": "unavailable"])
     }
 
-    _ = try await driver.enroll(
-      deviceToken: Data((1...32).map(UInt8.init)),
-      relayURL: Self.relayURL
-    )
+    do {
+      _ = try await driver.enroll(
+        deviceToken: Data((1...32).map(UInt8.init)),
+        relayURL: Self.relayURL
+      )
+      XCTFail("Expected retired gateway cleanup to block replacement enrollment")
+    } catch {
+      XCTAssertEqual(
+        error as? BuzzDevPushEnrollmentError,
+        .retiredGatewayCleanupIncomplete
+      )
+    }
 
-    XCTAssertEqual(store.saved, [current])
+    XCTAssertTrue(store.saved.isEmpty)
     XCTAssertEqual(try XCTUnwrap(store.cleanup.first).grants, [stale])
+    XCTAssertTrue(appAttest.preparedAttestations.isEmpty)
   }
 
   func testRealAppAttestFailsLoudlyWhenUnsupported() async throws {
@@ -1397,12 +1388,15 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
 
 private final class RecordingAppAttest: BuzzDevAppAttesting {
   var clientData: [Data] = []
+  var preparedAttestations: [BuzzDevAttestation] = []
 
   func prepareAttestation() async throws -> BuzzDevAttestation {
-    BuzzDevAttestation(
+    let prepared = BuzzDevAttestation(
       keyId: BuzzDevPushEnrollmentDriverTests.keyId,
       attestation: BuzzDevPushEnrollmentDriverTests.attestation
     )
+    preparedAttestations.append(prepared)
+    return prepared
   }
 
   func attestation(

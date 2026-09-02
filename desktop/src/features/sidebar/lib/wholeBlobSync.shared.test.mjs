@@ -765,20 +765,19 @@ test("P2b decrypt gap: watermark advances synchronously; lastRemoteHead advances
     liveCallback = cb;
     return Promise.resolve(async () => {});
   });
-  let fetchCalls = 0;
-  mock.method(relayClient, "fetchEvents", () => {
-    fetchCalls++;
-    if (fetchCalls === 1) return Promise.resolve([]); // bootstrap: absent
-    // Pre-publish fetch: same live event, now decryptable
-    return Promise.resolve([
+  // Pre-publish fetch returns the same live event, now treated as decryptable
+  // by the Tauri mock (good-cipher). fetchOwnBlobBeforePublish sees the 300-head,
+  // remoteAdvancedSince({300,"live-evt"},{0,""}) = true → adopt; no publish.
+  mock.method(relayClient, "fetchEvents", () =>
+    Promise.resolve([
       {
         pubkey: "pk-p2b",
         content: "good-cipher",
         created_at: 300,
         id: "live-evt",
       },
-    ]);
-  });
+    ]),
+  );
   const publishCalls = [];
   mock.method(relayClient, "publishEvent", (...args) => {
     publishCalls.push(args);

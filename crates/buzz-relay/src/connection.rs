@@ -91,7 +91,7 @@ pub struct ConnectionState {
     /// `None` means the relay is in `Off` mode — no assertion is required.
     /// When `Some`, the NIP-42 key pairing check uses this to enforce that
     /// `assertion.asserted_key() == nip42_pubkey` unconditionally (S3 invariant:
-    /// no flag reads — S2 deletes `require_attested_key`). [FI-INV-05]
+    /// no flag reads — S2 deleted `require_attested_key`). [FI-INV-05]
     pub nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
 
     /// The UTC deadline after which this connection's NIP-FI lease expires.

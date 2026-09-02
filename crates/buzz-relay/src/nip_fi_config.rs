@@ -53,8 +53,8 @@ const MAX_CONNECTION_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 ///   }
 /// ]
 /// ```
-/// Any `require_attested_key` field in the JSON is silently ignored by serde
-/// (no `deny_unknown_fields`). S3 forces it true for every issuer; S2 removes the knob.
+/// The `require_attested_key` field is not part of this schema; S2 removed it
+/// from buzz-auth. S3 enforces key pairing structurally for every issuer.
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct IssuerEnvConfig {
     /// Exact `iss` value.
@@ -290,13 +290,6 @@ fn build_issuer(entry: &IssuerEnvConfig) -> Result<(IssuerPolicy, IssuerJwksConf
         token_class,
         FreshnessClass::OfflineJwt,
         algorithms,
-        // S3 structurally forces this true — the spec makes `nostr_pubkey` a
-        // REQUIRED claim and `FI-INV-05` mandates unconditional key pairing.
-        // The `require_attested_key` field in the issuer JSON config is ignored;
-        // S2 removes the knob entirely from buzz-auth. Hard-wiring true here
-        // ensures any assertion without `nostr_pubkey` is rejected by the
-        // verifier before it reaches the upgrade gate.
-        true, // require_attested_key — S3 enforces structurally; S2 removes the knob
         entry.skew_seconds,
         entry.maximum_assertion_age_seconds,
         None, // offline-jwt: no status age

@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::handlers::side_effects::{publish_nip43_member_added, publish_nip43_membership_list};
+use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
 use buzz_core::invite::{
     hash_v2_code, validate_v2_code, DEFAULT_INVITE_TTL_SECS, MAX_INVITE_TTL_SECS, MAX_INVITE_USES,
     MIN_INVITE_TTL_SECS, V2_PREFIX,
@@ -285,9 +286,42 @@ pub async fn mint_invite(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (tenant, pubkey) = authenticate(&state, &headers, "/api/invites", &body).await?;
+) -> axum::response::Response {
+    // NIP-FI gate wraps the entire handler so the denial is emitted as exact
+    // text/plain bytes. [FI-TRACE-AUTHORITY-UNIFORM]
+    mint_invite_checked(state, headers, body).await
+}
 
+async fn mint_invite_checked(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let (tenant, pubkey) = match authenticate(&state, &headers, "/api/invites", &body).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    // NIP-FI: enforce assertion+NIP-98 pairing before authz checks.
+    // [FI-TRACE-AUTHORITY-UNIFORM]
+    if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(&state, &headers, &pubkey) {
+        return resp;
+    }
+
+    match mint_invite_inner(&state, body, tenant, pubkey).await {
+        Ok(json) => json.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn mint_invite_inner(
+    state: &AppState,
+    body: axum::body::Bytes,
+    tenant: buzz_core::TenantContext,
+    pubkey: nostr::PublicKey,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Authz mirrors kind:9030 (add member): owner or admin only.
     let sender_hex = pubkey.to_hex();
     let member = state

@@ -322,6 +322,38 @@ pub async fn upload_blob(
     auth: AuthenticatedUpload,
     headers: HeaderMap,
     body: axum::body::Body,
+) -> axum::response::Response {
+    use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
+
+    // NIP-FI: enforce assertion+NIP-98 pairing before any body processing.
+    // The auth extractor has already verified Blossom auth and membership;
+    // NIP-FI is the federation-identity layer on top. [FI-TRACE-AUTHORITY-UNIFORM]
+    if let NipFiHttpOutcome::Denied(resp) =
+        check_nip_fi_http_on_state(&state, &headers, &auth.auth_event.pubkey)
+    {
+        return resp;
+    }
+
+    upload_blob_inner(state, auth, headers, body).await
+}
+
+async fn upload_blob_inner(
+    state: Arc<AppState>,
+    auth: AuthenticatedUpload,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    upload_blob_result(state, auth, headers, body)
+        .await
+        .into_response()
+}
+
+async fn upload_blob_result(
+    state: Arc<AppState>,
+    auth: AuthenticatedUpload,
+    headers: HeaderMap,
+    body: axum::body::Body,
 ) -> Result<Json<BlobDescriptor>, MediaError> {
     let attribution = upload_attribution(&state, &auth, &headers).await;
 

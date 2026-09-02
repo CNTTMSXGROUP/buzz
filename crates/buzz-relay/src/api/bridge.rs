@@ -17,6 +17,7 @@ use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
+use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
 use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
@@ -723,7 +724,8 @@ pub async fn submit_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response, axum::response::Response> {
+    use axum::response::IntoResponse as _;
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped write, identical to the WS door in `router.rs`.
     // Unmapped host or lookup failure fails closed with a generic 404 — never a
@@ -739,6 +741,7 @@ pub async fn submit_event(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
             )
+            .into_response()
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
@@ -752,7 +755,15 @@ pub async fn submit_event(
         &url,
         Some(&body),
         state.config.require_auth_token,
-    )?;
+    )
+    .map_err(|e| e.into_response())?;
+
+    // NIP-FI: enforce assertion+NIP-98 pairing before handing to the ingest
+    // pipeline. [FI-TRACE-AUTHORITY-UNIFORM]
+    if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(&state, &headers, &pubkey) {
+        return Err(resp);
+    }
+
     let pubkey_hex = pubkey.to_hex();
 
     // Everything after auth — admission, replay, membership, parse, ingest —
@@ -820,7 +831,7 @@ pub async fn submit_event(
         }
     }
 
-    outcome.into_response()
+    Ok(outcome.into_response().into_response())
 }
 
 /// Log-context outcome for a single [`submit_event`] call.
@@ -1011,7 +1022,8 @@ pub async fn query_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response, axum::response::Response> {
+    use axum::response::IntoResponse as _;
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped read, identical to the WS door in `router.rs`.
     // An unmapped host or lookup failure fails closed with a generic 404 — never
@@ -1028,6 +1040,7 @@ pub async fn query_events(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
             )
+            .into_response()
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
@@ -1041,7 +1054,14 @@ pub async fn query_events(
         &url,
         Some(&body),
         state.config.require_auth_token,
-    )?;
+    )
+    .map_err(|e| e.into_response())?;
+
+    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
+    if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(&state, &headers, &pubkey) {
+        return Err(resp);
+    }
+
     let pubkey_hex = pubkey.to_hex();
 
     // Admission, replay, membership, and filter execution all run inside the
@@ -1080,7 +1100,7 @@ pub async fn query_events(
             );
         }
     }
-    result
+    Ok(result.into_response())
 }
 
 /// Filter execution for [`query_events`], run once NIP-98 auth succeeds.
@@ -1555,7 +1575,8 @@ pub async fn count_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<axum::response::Response, axum::response::Response> {
+    use axum::response::IntoResponse as _;
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped read, identical to the WS door in `router.rs`
     // and `query_events`/`submit_event` above. Fail-closed; never a default
@@ -1571,6 +1592,7 @@ pub async fn count_events(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
             )
+            .into_response()
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
@@ -1584,7 +1606,14 @@ pub async fn count_events(
         &url,
         Some(&body),
         state.config.require_auth_token,
-    )?;
+    )
+    .map_err(|e| e.into_response())?;
+
+    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
+    if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(&state, &headers, &pubkey) {
+        return Err(resp);
+    }
+
     let pubkey_hex = pubkey.to_hex();
 
     // Admission, replay, membership, and count execution all run inside the
@@ -1621,7 +1650,7 @@ pub async fn count_events(
             );
         }
     }
-    result
+    Ok(result.into_response())
 }
 
 /// Filter execution for [`count_events`], run once NIP-98 auth succeeds.

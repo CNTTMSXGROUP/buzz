@@ -162,11 +162,14 @@ export type TranscriptItem =
        */
       options?: Array<{ optionId: string; kind: string; label?: string }>;
       /**
-       * Monotonically increasing token incremented on every `control_result`
-       * with a non-`sent` delivery status. The `PermissionDecisionButtons`
-       * component keys its re-enable effect on this value, so a second failure
-       * after a retry (same boolean value would not re-trigger the effect)
-       * still re-enables the buttons. `undefined` when no failure has occurred.
+       * Monotonically increasing token incremented on every authoritative
+       * `control_result` delivery failure (`no_active_turn`, `channel_closed`,
+       * `no_channel`). The transient `channel_full` status does NOT increment
+       * this token — the retransmit orchestrator handles that status
+       * automatically. The `PermissionDecisionButtons` component keys its
+       * re-enable effect on this value, so a second failure after a retry
+       * (same boolean value would not re-trigger the effect) still re-enables
+       * the buttons. `undefined` when no failure has occurred.
        */
       deliveryFailed?: number;
     } & TranscriptItemIdentity)

@@ -71,9 +71,12 @@ function defaultOptionLabel(kind: string): string {
  * Renders the agent's exact options as labeled buttons; a click sends the
  * `permission_decision` control event (fire-and-forget).
  *
- * On send failure (relay reject or non-`sent` delivery status), buttons are
- * re-enabled so the user can retry. The harness's 300 s fail-closed timeout
- * is the backstop for permanently lost frames.
+ * On authoritative delivery failure (`no_active_turn`, `channel_closed`,
+ * `no_channel`), buttons are re-enabled so the user can retry. The transient
+ * `channel_full` status does NOT re-enable buttons — the retransmit
+ * orchestrator handles that status automatically and keeps resending. The
+ * harness's 300 s fail-closed timeout is the backstop for permanently lost
+ * frames.
  */
 function PermissionDecisionButtons({
   agentPubkey,

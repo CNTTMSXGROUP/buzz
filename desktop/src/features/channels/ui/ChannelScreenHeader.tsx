@@ -1,4 +1,4 @@
-import { LogIn, SquareTerminal } from "lucide-react";
+import { LogIn, SquareTerminal, Store } from "lucide-react";
 import type * as React from "react";
 
 import { ChatHeader } from "@/features/chat/ui/ChatHeader";
@@ -9,6 +9,7 @@ import { getDmParticipantPreview } from "@/features/channels/lib/dmParticipantDi
 import { ChannelGlyph } from "@/features/channels/ui/ChannelGlyph";
 import { ChannelHeaderStatusBadge } from "@/features/channels/ui/ChannelHeaderStatusBadge";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
+import { useMarketChannel } from "@/features/market/lib/MarketChannelContext";
 import {
   DEFAULT_HOVER_PROFILE_STATUS_GEOMETRY,
   ProfileAvatarWithStatus,
@@ -16,6 +17,7 @@ import {
 } from "@/features/profile/ui/ProfileAvatarWithStatus";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { Button } from "@/shared/ui/button";
+import { Badge } from "@/shared/ui/badge";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
@@ -70,6 +72,7 @@ export function ChannelScreenHeader({
   onManageChannel,
   onToggleMembers,
 }: ChannelScreenHeaderProps) {
+  const marketProjection = useMarketChannel();
   const isGroupDm =
     activeChannel?.channelType === "dm" &&
     activeDmHeaderParticipants.length > 1;
@@ -143,9 +146,15 @@ export function ChannelScreenHeader({
       chromeWrapperRef={chromeWrapperRef}
       actions={actions}
       channelType={activeChannel?.channelType}
-      description={getChannelDescription(activeChannel)}
+      description={
+        marketProjection
+          ? marketProjection.scenario.summary
+          : getChannelDescription(activeChannel)
+      }
       leadingContent={
-        activeChannel?.channelType === "dm" ? (
+        marketProjection ? (
+          <Store className="h-4 w-4 translate-y-px text-muted-foreground" />
+        ) : activeChannel?.channelType === "dm" ? (
           isGroupDm ? (
             <DmHeaderParticipantStack
               participants={activeDmHeaderParticipants}
@@ -194,11 +203,17 @@ export function ChannelScreenHeader({
         ) : undefined
       }
       statusBadge={
-        <ChannelHeaderStatusBadge
-          ephemeralDisplay={activeChannelEphemeralDisplay}
-        />
+        marketProjection ? (
+          <Badge data-testid="market-header-status" variant="outline">
+            {marketProjection.scenario.status}
+          </Badge>
+        ) : (
+          <ChannelHeaderStatusBadge
+            ephemeralDisplay={activeChannelEphemeralDisplay}
+          />
+        )
       }
-      title={activeChannelTitle}
+      title={marketProjection?.scenario.title ?? activeChannelTitle}
       transparentChrome={transparentChrome}
       visibility={activeChannel?.visibility}
     />

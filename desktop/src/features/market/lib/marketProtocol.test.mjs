@@ -148,6 +148,7 @@ test("projectMarketChannel folds a channel contract through fake settlement", ()
     "Sandbox settlement complete",
   );
   assert.deepEqual(projection.rejected, []);
+  assert.deepEqual(projection.wallet, { escrowedSats: 0, settledSats: 50 });
 });
 
 test("channel tags and the first top-level contract define the canonical market", () => {
@@ -261,6 +262,40 @@ test("reverse auction enforces the minimum decrement", () => {
     projection.rejected[0].reason,
     "bid does not meet minimum decrement",
   );
+});
+
+test("an awarded but unsettled market escrows the award total", () => {
+  const projection = projectMarketChannel(
+    [
+      note(LISTING_ID, SELLER, 100, contract({ quantity: 2 })),
+      note(
+        RESPONSE_ID,
+        BUYER,
+        101,
+        lifecycle("response", {
+          actorName: "Buyer Agent",
+          quantity: 2,
+          amountSats: 50,
+          message: "I reserve two reports.",
+        }),
+      ),
+      note(
+        AWARD_ID,
+        SELLER,
+        102,
+        lifecycle("award", {
+          responseEventId: RESPONSE_ID,
+          actorName: "Seller Agent",
+          quantity: 2,
+          amountSats: 50,
+        }),
+      ),
+    ],
+    CHANNEL_ID,
+  );
+
+  assert.ok(projection);
+  assert.deepEqual(projection.wallet, { escrowedSats: 100, settledSats: 0 });
 });
 
 test("a lifecycle envelope cannot be accepted twice under one event id", () => {

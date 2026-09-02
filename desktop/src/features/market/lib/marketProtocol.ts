@@ -102,6 +102,14 @@ export type MarketProjection = {
   listingEventId: string;
   scenario: MarketScenario;
   rejected: Array<{ eventId: string; reason: string }>;
+  wallet: MarketWallet;
+};
+
+export type MarketWallet = {
+  /** Awarded but not yet settled, in fake sats. */
+  escrowedSats: number;
+  /** Total released by signed settlements, in fake sats. */
+  settledSats: number;
 };
 
 export function parseMarketEnvelope(content: string): MarketEnvelope | null {
@@ -511,6 +519,13 @@ export function projectMarketChannel(
     : awards.size > 0
       ? "Awarded"
       : "Open";
+  let escrowedSats = 0;
+  let settledSats = 0;
+  for (const award of awards.values()) {
+    const total = award.envelope.amountSats * award.envelope.quantity;
+    if (settlements.has(award.note.id)) settledSats += total;
+    else escrowedSats += total;
+  }
 
   return {
     channelId,
@@ -518,6 +533,7 @@ export function projectMarketChannel(
     contractAuthorPubkey: listingEntry.note.pubkey,
     listingEventId,
     rejected,
+    wallet: { escrowedSats, settledSats },
     scenario: {
       id: scenarioId,
       eyebrow: `${listing.listing.direction === "offer" ? "Offer" : "Request"} · ${listing.listing.mechanism.replace("-", " ")} · ${quantity === "unlimited" ? "unlimited" : "finite"}`,

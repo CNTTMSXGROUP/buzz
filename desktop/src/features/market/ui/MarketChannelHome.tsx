@@ -1,10 +1,16 @@
+import * as React from "react";
 import type { ComponentProps } from "react";
 
 import { ChannelScreen } from "@/features/channels/ui/ChannelScreen";
 import { MarketChannelProvider } from "@/features/market/lib/MarketChannelContext";
 import { useMarketChannelProjection } from "@/features/market/lib/useMarketChannels";
 import type { MarketAnnouncement } from "@/features/market/lib/marketProtocol";
+import { AgentWalletPanel } from "@/features/market/ui/AgentWalletPanel";
 import type { Channel } from "@/shared/api/types";
+import { cn } from "@/shared/lib/cn";
+import { Button } from "@/shared/ui/button";
+import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
+import { useOptionalSidebar } from "@/shared/ui/sidebar";
 
 export function MarketChannelHome({
   activeChannel,
@@ -15,12 +21,50 @@ export function MarketChannelHome({
   announcement: MarketAnnouncement;
 }) {
   const projection = useMarketChannelProjection(activeChannel, announcement);
+  const sidebar = useOptionalSidebar();
+  const [walletOpen, setWalletOpen] = React.useState(true);
   if (!projection)
     return <ChannelScreen activeChannel={activeChannel} {...screenProps} />;
 
+  const walletToggle = (
+    <Button
+      aria-label={walletOpen ? "Hide agent wallet" : "Show agent wallet"}
+      aria-pressed={walletOpen}
+      className="h-7 w-7 text-sidebar-foreground hover:bg-sidebar-accent"
+      data-testid="market-wallet-toggle"
+      onClick={() => setWalletOpen((open) => !open)}
+      size="icon"
+      title={walletOpen ? "Hide agent wallet" : "Show agent wallet"}
+      type="button"
+      variant="ghost"
+    >
+      <DrawerPanelIcon
+        className="-scale-x-100"
+        side={walletOpen ? "left" : "right"}
+        testId="market-wallet-toggle-icon"
+      />
+    </Button>
+  );
+
   return (
     <MarketChannelProvider projection={projection}>
-      <ChannelScreen activeChannel={activeChannel} {...screenProps} />
+      <div
+        className={cn(
+          "relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-sidebar pb-2 pr-2 pt-px",
+          sidebar?.open === false && "pl-2",
+        )}
+        data-buzz-context-detached="true"
+        data-testid="market-channel-home"
+      >
+        <div className="ml-px flex min-h-0 min-w-60 flex-1 flex-col overflow-hidden rounded-2xl bg-background">
+          <ChannelScreen
+            {...screenProps}
+            activeChannel={activeChannel}
+            headerEndActions={walletToggle}
+          />
+        </div>
+        <AgentWalletPanel open={walletOpen} projection={projection} />
+      </div>
     </MarketChannelProvider>
   );
 }

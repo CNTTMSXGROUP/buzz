@@ -1,67 +1,35 @@
 import { CircleCheck, Radio, WalletCards, Zap } from "lucide-react";
 import type * as React from "react";
 
-import type { MarketScenarioId } from "@/features/market/lib/marketPrototypeData";
+import type { MarketProjection } from "@/features/market/lib/marketProtocol";
 import { ProjectContextRail } from "@/features/projects/ui/ProjectContextRail";
 import { ProjectHomeColumn } from "@/features/projects/ui/ProjectHomeColumn";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
 import { SIDEBAR_WIDTH_MIN } from "@/shared/layout/sidebarLayout";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 
 const MARKET_WALLET_WIDTH_KEY = "buzz.desktop.market-wallet-width";
 
-const WALLET_DETAILS: Record<
-  MarketScenarioId,
-  {
-    account: string;
-    balance: string;
-    balanceAmount: string;
-    settlement: string;
-  }
-> = {
-  finite: {
-    account: "escrow1report…13c8",
-    balance: "Funded for 3 reports",
-    balanceAmount: "150",
-    settlement: "1 paid · 2 reserved",
-  },
-  unlimited: {
-    account: "wallet1mapper…c241",
-    balance: "Available for settlement",
-    balanceAmount: "80",
-    settlement: "760 sats paid",
-  },
-  auction: {
-    account: "escrow1strings…9f10",
-    balance: "Auction reserve funded",
-    balanceAmount: "600",
-    settlement: "Held until award",
-  },
-  tender: {
-    account: "escrow1tender…1b73",
-    balance: "Tender reward funded",
-    balanceAmount: "2,000",
-    settlement: "Held during selection",
-  },
-  awarded: {
-    account: "escrow1tender…1b73",
-    balance: "Award held in escrow",
-    balanceAmount: "1,750",
-    settlement: "Release on signed receipt",
-  },
-};
-
 export function AgentWalletPanel({
   open,
-  scenarioId,
+  projection,
 }: {
   open: boolean;
-  scenarioId: MarketScenarioId;
+  projection: MarketProjection;
 }) {
   const width = useThreadPanelWidth(undefined, {
     minWidthPx: SIDEBAR_WIDTH_MIN,
     sessionKey: MARKET_WALLET_WIDTH_KEY,
   });
-  const wallet = WALLET_DETAILS[scenarioId];
+  const { wallet } = projection;
+  const settlement =
+    wallet.settledSats > 0 && wallet.escrowedSats > 0
+      ? `${wallet.settledSats} sats paid · ${wallet.escrowedSats} escrowed`
+      : wallet.settledSats > 0
+        ? `${wallet.settledSats} fake sats released on signed receipts`
+        : wallet.escrowedSats > 0
+          ? "Held until fulfillment is settled"
+          : "No awards yet · nothing escrowed";
 
   return (
     <ProjectContextRail
@@ -94,16 +62,18 @@ export function AgentWalletPanel({
                 className="absolute -right-6 -top-8 h-24 w-24 rounded-full border-[14px] border-sidebar-foreground/[0.035]"
               />
               <div className="relative flex items-center gap-2 text-xs text-sidebar-foreground/60">
-                <Zap className="h-3.5 w-3.5" /> Sandbox balance
+                <Zap className="h-3.5 w-3.5" /> Sandbox escrow
               </div>
               <p className="relative mt-3 flex items-baseline gap-1.5">
                 <span className="text-2xl font-semibold tracking-tight">
-                  {wallet.balanceAmount}
+                  {wallet.escrowedSats}
                 </span>
                 <span className="text-xs text-sidebar-foreground/60">sats</span>
               </p>
               <p className="relative mt-1 text-xs text-sidebar-foreground/60">
-                {wallet.balance}
+                {wallet.escrowedSats > 0
+                  ? "Awarded and held for settlement"
+                  : "Nothing currently escrowed"}
               </p>
             </section>
 
@@ -113,7 +83,7 @@ export function AgentWalletPanel({
                 <p className="text-sm font-medium">Settlement protected</p>
               </div>
               <p className="mt-2 text-xs leading-5 text-sidebar-foreground/60">
-                {wallet.settlement}
+                {settlement}
               </p>
             </section>
 
@@ -125,9 +95,9 @@ export function AgentWalletPanel({
               />
               <WalletValue
                 icon={WalletCards}
-                label="Wallet account"
+                label="Contract account"
                 mono
-                value={wallet.account}
+                value={`escrow:${truncatePubkey(projection.listingEventId)}`}
               />
             </dl>
           </div>

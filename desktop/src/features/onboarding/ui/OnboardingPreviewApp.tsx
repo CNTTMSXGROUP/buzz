@@ -127,7 +127,7 @@ function Landing({
                   type="button"
                   variant="link"
                 >
-                  Sign up without email
+                  Start with a private key
                 </Button>
               </OnboardingFooter>
             ) : (

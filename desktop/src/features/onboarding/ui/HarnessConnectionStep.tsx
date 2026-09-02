@@ -307,21 +307,16 @@ export function HarnessConnectionPreview({
 
 const CONNECTION_METHOD_CHOICES = [
   {
-    description:
-      "Simpler setup — use the harness and models included with your AI subscription",
     icon: CreditCard,
     label: "Log in with a subscription",
     method: "subscription",
   },
   {
-    description:
-      "More flexibility — choose a compatible harness, provider, and model",
     icon: KeyRound,
     label: "Use an API key",
     method: "api",
   },
 ] as const satisfies ReadonlyArray<{
-  description: string;
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   method: HarnessConnectionMethod;
@@ -363,25 +358,22 @@ export function HarnessConnectionMethodPreview({
 
         <div className="-mx-2 mt-6 flex w-[calc(100%+1rem)] flex-1 flex-col gap-2">
           {CONNECTION_METHOD_CHOICES.map(
-            ({ description, icon: MethodIcon, label, method }) => (
+            ({ icon: MethodIcon, label, method }) => (
               <Button
-                className="group h-auto min-h-20 w-full justify-start gap-3 whitespace-normal rounded-xl px-2 py-3 text-left text-sm text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
+                className="group h-auto min-h-14 w-full justify-start gap-3 rounded-xl px-2 py-2 text-left text-sm text-foreground shadow-none hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-foreground/20"
                 data-testid={`onboarding-preview-harness-method-${method}`}
                 key={method}
                 onClick={() => onSelect(method)}
                 type="button"
                 variant="ghost"
               >
-                <span className="flex size-8 shrink-0 items-start justify-start pt-0.5">
+                <span className="flex size-8 shrink-0 items-center justify-start">
                   <MethodIcon aria-hidden className="!size-6" />
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block font-medium">{label}</span>
-                  <span className="mt-1 block max-w-[390px] text-sm font-normal leading-5 text-foreground/70">
-                    {description}
-                  </span>
                 </span>
-                <span className="ml-auto flex size-10 shrink-0 items-start justify-end pt-1">
+                <span className="ml-auto flex size-10 shrink-0 items-center justify-end">
                   <ChevronRight
                     aria-hidden
                     className="size-4 text-muted-foreground transition-colors duration-150 ease-out group-hover:text-foreground motion-reduce:transition-none"

@@ -2,6 +2,8 @@ import AVFoundation
 import Flutter
 
 enum VoiceNotePackager {
+    static let videoEnvelopeTimeout: TimeInterval = 30
+
     static func package(
         sourcePath: String,
         result: @escaping FlutterResult
@@ -102,9 +104,30 @@ enum VoiceNotePackager {
             writer.startSession(atSourceTime: .zero)
 
             let queue = DispatchQueue(label: "xyz.block.buzz.voice-note-envelope")
+            var completed = false
+            func complete(_ trackResult: Result<URL, Error>) {
+                guard !completed else { return }
+                completed = true
+                if case .failure = trackResult {
+                    writer.cancelWriting()
+                    try? FileManager.default.removeItem(at: outputURL)
+                }
+                completion(trackResult)
+            }
+            queue.asyncAfter(deadline: .now() + videoEnvelopeTimeout) {
+                complete(
+                    .failure(
+                        NSError(
+                            domain: "BuzzVoiceNote",
+                            code: 9,
+                            userInfo: [NSLocalizedDescriptionKey: "Video envelope generation timed out."]
+                        )
+                    )
+                )
+            }
             var appendedFrames = false
             input.requestMediaDataWhenReady(on: queue) {
-                guard !appendedFrames, input.isReadyForMoreMediaData else { return }
+                guard !completed, !appendedFrames, input.isReadyForMoreMediaData else { return }
                 appendedFrames = true
                 guard
                     let pool = adaptor.pixelBufferPool,
@@ -112,9 +135,7 @@ enum VoiceNotePackager {
                     adaptor.append(buffer, withPresentationTime: .zero),
                     adaptor.append(buffer, withPresentationTime: duration)
                 else {
-                    writer.cancelWriting()
-                    try? FileManager.default.removeItem(at: outputURL)
-                    completion(
+                    complete(
                         .failure(
                             writer.error
                                 ?? NSError(
@@ -129,20 +150,21 @@ enum VoiceNotePackager {
                 input.markAsFinished()
                 writer.endSession(atSourceTime: duration)
                 writer.finishWriting {
-                    if writer.status == .completed {
-                        completion(.success(outputURL))
-                    } else {
-                        try? FileManager.default.removeItem(at: outputURL)
-                        completion(
-                            .failure(
-                                writer.error
-                                    ?? NSError(
-                                        domain: "BuzzVoiceNote",
-                                        code: 4,
-                                        userInfo: [NSLocalizedDescriptionKey: "Unable to finish the video envelope."]
-                                    )
+                    queue.async {
+                        if writer.status == .completed {
+                            complete(.success(outputURL))
+                        } else {
+                            complete(
+                                .failure(
+                                    writer.error
+                                        ?? NSError(
+                                            domain: "BuzzVoiceNote",
+                                            code: 4,
+                                            userInfo: [NSLocalizedDescriptionKey: "Unable to finish the video envelope."]
+                                        )
+                                )
                             )
-                        )
+                        }
                     }
                 }
             }

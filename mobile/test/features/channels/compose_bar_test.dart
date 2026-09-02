@@ -4809,6 +4809,47 @@ void main() {
       );
     });
 
+    testWidgets('community switch cancels pending voice-note startup', (
+      tester,
+    ) async {
+      final signer = nostr.Keys.generate();
+      final recorder = _DelayedVoiceNoteRecorder();
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: _testUploadService(signer.nsec),
+          currentPubkey: signer.public,
+          relayConfig: () => _SwitchableRelayConfigNotifier(
+            RelayConfig(baseUrl: 'https://relay.example', nsec: signer.nsec),
+          ),
+          voiceNoteRecorderFactory: () => recorder,
+          onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+        ),
+      );
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Voice note'));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('voice-note-recorder')), findsOneWidget);
+
+      final container = ProviderScope.containerOf(
+        tester.element(find.byType(ComposeBar)),
+      );
+      container
+          .read(relayConfigProvider.notifier)
+          .update(baseUrl: 'https://other.example', nsec: signer.nsec);
+      expect(
+        container.read(relayConfigProvider).baseUrl,
+        'https://other.example',
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
+      expect(recorder.cancelled, isTrue);
+      recorder.startup.complete();
+      await tester.pumpAndSettle();
+      expect(recorder.started, isFalse);
+      expect(recorder.disposed, isTrue);
+    });
+
     testWidgets('disables Stop while voice-note startup is pending', (
       tester,
     ) async {

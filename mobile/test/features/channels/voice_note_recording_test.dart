@@ -92,6 +92,7 @@ class _FakeAudioPlayerBackend implements VoiceNoteAudioPlayerBackend {
   int pauseCount = 0;
   final loadedPaths = <String>[];
   final loadedUrls = <String>[];
+  final loadedUrlHeaders = <Map<String, String>?>[];
 
   @override
   Stream<Duration> get positionStream => positions.stream;
@@ -117,6 +118,7 @@ class _FakeAudioPlayerBackend implements VoiceNoteAudioPlayerBackend {
   @override
   Future<Duration?> setUrl(String url, {Map<String, String>? headers}) {
     loadedUrls.add(url);
+    loadedUrlHeaders.add(headers == null ? null : Map.of(headers));
     if (!delayUrlLoads) return Future.value(const Duration(seconds: 7));
     final load = Completer<Duration?>();
     urlLoads.add(load);
@@ -431,6 +433,79 @@ void main() {
     },
   );
 
+  test(
+    'oversized remote download aborts and leaves no temporary file',
+    () async {
+      final client = _SequencedHttpClient();
+      final audioPlayer = _FakeAudioPlayerBackend();
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-download-limit-test',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: VoiceNotePlaybackCoordinator(),
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+        maxDownloadBytes: 3,
+        player: audioPlayer,
+      );
+      addTearDown(player.dispose);
+      await player.loadRemote(
+        'https://example.com/voice-note.mp4',
+        headers: () => const {},
+        fallbackDuration: const Duration(seconds: 7),
+      );
+
+      final playback = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      final request = client.requests.single as http.AbortableStreamedRequest;
+      client.responses.single.complete(
+        http.StreamedResponse(Stream.value(<int>[1, 2, 3, 4]), 200),
+      );
+      await request.abortTrigger;
+      await playback;
+
+      expect(player.state.hasError, isTrue);
+      expect(audioPlayer.loadedPaths, isEmpty);
+      expect(audioPlayer.playCount, 0);
+      expect(directory.listSync().whereType<File>(), isEmpty);
+    },
+  );
+
+  test('stalled response times out and remains retryable', () async {
+    final client = _SequencedHttpClient();
+    final audioPlayer = _FakeAudioPlayerBackend();
+    final player = DeviceVoiceNotePlayerController(
+      coordinator: VoiceNotePlaybackCoordinator(),
+      client: client,
+      requiresAuthenticatedLocalFile: true,
+      downloadTimeout: Duration.zero,
+      player: audioPlayer,
+    );
+    addTearDown(player.dispose);
+    await player.loadRemote(
+      'https://example.com/voice-note.mp4',
+      headers: () => const {},
+      fallbackDuration: const Duration(seconds: 7),
+    );
+
+    await player.toggle();
+
+    expect(player.state.hasError, isTrue);
+    expect(client.requests, hasLength(1));
+    expect(audioPlayer.playCount, 0);
+    final retry = player.toggle();
+    await Future<void>.delayed(Duration.zero);
+    expect(client.requests, hasLength(2));
+    client.responses.last.completeError(
+      http.RequestAbortedException(client.requests.last.url),
+    );
+    await retry;
+  });
+
   test('transient remote failure retries with fresh auth and plays', () async {
     final client = _SequencedHttpClient();
     final audioPlayer = _FakeAudioPlayerBackend();
@@ -607,6 +682,38 @@ void main() {
     expect(audioPlayer.playing, isFalse);
   });
 
+  test('Android defers remote auth until playback starts', () async {
+    final audioPlayer = _FakeAudioPlayerBackend();
+    final player = DeviceVoiceNotePlayerController(
+      coordinator: VoiceNotePlaybackCoordinator(),
+      client: _SequencedHttpClient(),
+      requiresAuthenticatedLocalFile: false,
+      player: audioPlayer,
+    );
+    addTearDown(player.dispose);
+    var authGeneration = 0;
+
+    await player.loadRemote(
+      'https://example.com/voice-note.mp4',
+      headers: () => {
+        'Authorization': 'Nostr signed-event-${authGeneration++}',
+      },
+      fallbackDuration: const Duration(seconds: 7),
+    );
+
+    expect(authGeneration, 0);
+    expect(audioPlayer.loadedUrls, isEmpty);
+
+    await player.toggle();
+
+    expect(authGeneration, 1);
+    expect(
+      audioPlayer.loadedUrlHeaders.single?['Authorization'],
+      'Nostr signed-event-0',
+    );
+    expect(audioPlayer.playCount, 1);
+  });
+
   test('Android remote failure retains the source for retry', () async {
     final audioPlayer = _FakeAudioPlayerBackend()..delayUrlLoads = true;
     final player = DeviceVoiceNotePlayerController(
@@ -625,16 +732,33 @@ void main() {
       },
       fallbackDuration: const Duration(seconds: 7),
     );
-    await Future<void>.delayed(Duration.zero);
-    audioPlayer.urlLoads.single.completeError(StateError('network failed'));
     await initialLoad;
 
-    expect(player.state.hasError, isTrue);
+    expect(player.state.hasError, isFalse);
+    expect(audioPlayer.loadedUrls, isEmpty);
+    expect(authGeneration, 0);
+
+    final firstPlay = player.toggle();
+    await Future<void>.delayed(Duration.zero);
     expect(audioPlayer.loadedUrls, hasLength(1));
+    expect(
+      audioPlayer.loadedUrlHeaders.single?['Authorization'],
+      'Nostr signed-event-0',
+    );
+    audioPlayer.urlLoads.single.completeError(StateError('network failed'));
+    await firstPlay;
+
+    expect(player.state.hasError, isTrue);
+    expect(authGeneration, 1);
+    expect(audioPlayer.playCount, 0);
 
     final retry = player.toggle();
     await Future<void>.delayed(Duration.zero);
     expect(audioPlayer.loadedUrls, hasLength(2));
+    expect(
+      audioPlayer.loadedUrlHeaders.last?['Authorization'],
+      'Nostr signed-event-1',
+    );
     expect(authGeneration, 2);
     audioPlayer.urlLoads.single.complete(const Duration(seconds: 7));
     await retry;

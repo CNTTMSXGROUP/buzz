@@ -4,14 +4,29 @@ class _ComposerVoiceNote {
   const _ComposerVoiceNote({
     required this.start,
     required this.onKeyboardHidden,
-    required this.isPreparing,
-    required this.recorder,
-  });
+    required this.onDraftIdentityChanged,
+    required ValueNotifier<bool> isPreparing,
+    required ValueNotifier<bool> isRecording,
+    required ValueChanged<VoiceNoteRecording> onRecorded,
+  }) : _isPreparing = isPreparing,
+       _isRecording = isRecording,
+       _onRecorded = onRecorded;
 
   final VoidCallback start;
   final VoidCallback onKeyboardHidden;
-  final bool isPreparing;
-  final Widget? recorder;
+  final VoidCallback onDraftIdentityChanged;
+  final ValueNotifier<bool> _isPreparing;
+  final ValueNotifier<bool> _isRecording;
+  final ValueChanged<VoiceNoteRecording> _onRecorded;
+
+  bool get isPreparing => _isPreparing.value;
+  bool get isRecording => _isRecording.value;
+  Widget? get recorder => isRecording
+      ? VoiceNoteComposerRecorder(
+          onCancel: () => _isRecording.value = false,
+          onRecorded: _onRecorded,
+        )
+      : null;
 }
 
 bool _voiceNoteFullWidth(
@@ -19,7 +34,7 @@ bool _voiceNoteFullWidth(
   List<_PendingAttachment> attachments,
 ) =>
     voiceNote.isPreparing ||
-    voiceNote.recorder != null ||
+    voiceNote.isRecording ||
     attachments.any((item) => item.kind == _PendingAttachmentKind.voiceNote);
 
 _ComposerVoiceNote _useComposerVoiceNote({
@@ -35,6 +50,11 @@ _ComposerVoiceNote _useComposerVoiceNote({
 }) {
   final isPreparing = useState(false);
   final isRecording = useState(false);
+
+  final resetForDraftIdentityChange = useCallback(() {
+    isPreparing.value = false;
+    isRecording.value = false;
+  }, [isPreparing, isRecording]);
 
   void beginRecording() {
     if (!isPreparing.value) return;
@@ -80,12 +100,9 @@ _ComposerVoiceNote _useComposerVoiceNote({
   return _ComposerVoiceNote(
     start: start,
     onKeyboardHidden: beginRecording,
-    isPreparing: isPreparing.value,
-    recorder: isRecording.value
-        ? VoiceNoteComposerRecorder(
-            onCancel: () => isRecording.value = false,
-            onRecorded: complete,
-          )
-        : null,
+    onDraftIdentityChanged: resetForDraftIdentityChange,
+    isPreparing: isPreparing,
+    isRecording: isRecording,
+    onRecorded: complete,
   );
 }

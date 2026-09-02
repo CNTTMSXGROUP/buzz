@@ -8,6 +8,10 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testVoiceNoteEnvelopeGenerationHasBoundedDeadline() {
+    XCTAssertEqual(VoiceNotePackager.videoEnvelopeTimeout, 30)
+  }
+
   func testPushAuthorizationStatusNamesCoverDisplayPermissionStates() {
     XCTAssertEqual(AppDelegate.pushAuthorizationStatusName(.notDetermined), "notDetermined")
     XCTAssertEqual(AppDelegate.pushAuthorizationStatusName(.denied), "denied")

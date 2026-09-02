@@ -102,6 +102,7 @@ class ComposeBar extends HookConsumerWidget {
       attachmentSurface: attachmentSurface,
       uploadError: uploadError,
       iosAttachmentPopover: iosAttachmentPopover,
+      onDraftIdentityChanged: voiceNote.onDraftIdentityChanged,
     );
     final clipboardHasImage = useState(false);
     final hasAttachments = attachments.value.isNotEmpty;

@@ -13,6 +13,8 @@ import 'package:record/record.dart';
 import '../../shared/relay/media_image.dart';
 
 const voiceNoteMaxDuration = Duration(minutes: 5);
+const voiceNoteDownloadTimeout = Duration(seconds: 30);
+const voiceNoteMaxDownloadBytes = 32 * 1024 * 1024;
 const voiceNotePlaybackRates = <double>[1, 1.5, 2, 0.5];
 final voiceNoteRouteObserver = RouteObserver<ModalRoute<void>>();
 
@@ -427,12 +429,16 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     required http.Client client,
     Future<Directory> Function()? temporaryDirectory,
     bool? requiresAuthenticatedLocalFile,
+    Duration downloadTimeout = voiceNoteDownloadTimeout,
+    int maxDownloadBytes = voiceNoteMaxDownloadBytes,
     VoiceNoteAudioPlayerBackend? player,
   }) : _coordinator = coordinator,
        _client = client,
        _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory,
        _requiresAuthenticatedLocalFile =
            requiresAuthenticatedLocalFile ?? Platform.isIOS,
+       _downloadTimeout = downloadTimeout,
+       _maxDownloadBytes = maxDownloadBytes,
        _player = player ?? _DeviceVoiceNoteAudioPlayerBackend() {
     _subscriptions.add(
       _player.positionStream.listen((position) {
@@ -475,6 +481,8 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   final Future<Directory> Function() _temporaryDirectory;
   final VoiceNoteAudioPlayerBackend _player;
   final bool _requiresAuthenticatedLocalFile;
+  final Duration _downloadTimeout;
+  final int _maxDownloadBytes;
   final List<StreamSubscription<Object?>> _subscriptions = [];
   VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
   ({
@@ -523,22 +531,6 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
       fallbackDuration: fallbackDuration,
     );
     _pendingRemote = remote;
-    if (!_requiresAuthenticatedLocalFile) {
-      final sourceGeneration = _sourceGeneration;
-      final loading = _load(
-        () => _player.setUrl(remote.url, headers: remote.headers()),
-        fallbackDuration: fallbackDuration,
-        sourceGeneration: sourceGeneration,
-      );
-      return loading.whenComplete(() {
-        if (!_disposed &&
-            sourceGeneration == _sourceGeneration &&
-            !_state.hasError &&
-            identical(_pendingRemote, remote)) {
-          _pendingRemote = null;
-        }
-      });
-    }
     _update(VoiceNotePlaybackState(duration: fallbackDuration));
     return Future.value();
   }
@@ -570,13 +562,26 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         uri,
         abortTrigger: requestAbort.future,
       )..headers.addAll(remote.headers());
-      final response = await _client.send(request);
+      final response = await _client
+          .send(request)
+          .timeout(
+            _downloadTimeout,
+            onTimeout: () {
+              if (!requestAbort.isCompleted) requestAbort.complete();
+              throw TimeoutException('Voice note download timed out');
+            },
+          );
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        await response.stream.drain<void>();
+        if (!requestAbort.isCompleted) requestAbort.complete();
         throw HttpException(
           'Voice note download failed (${response.statusCode})',
           uri: uri,
         );
+      }
+      if (response.contentLength case final contentLength?
+          when contentLength > _maxDownloadBytes) {
+        if (!requestAbort.isCompleted) requestAbort.complete();
+        throw HttpException('Voice note download is too large', uri: uri);
       }
       final directory = await _temporaryDirectory();
       file = File(
@@ -584,7 +589,24 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         'buzz-voice-note-${DateTime.now().microsecondsSinceEpoch}.mp4',
       );
       _downloadingRemoteFile = file;
-      await response.stream.pipe(file.openWrite());
+      var downloadedBytes = 0;
+      await response.stream
+          .map((chunk) {
+            downloadedBytes += chunk.length;
+            if (downloadedBytes > _maxDownloadBytes) {
+              if (!requestAbort.isCompleted) requestAbort.complete();
+              throw HttpException('Voice note download is too large', uri: uri);
+            }
+            return chunk;
+          })
+          .pipe(file.openWrite())
+          .timeout(
+            _downloadTimeout,
+            onTimeout: () {
+              if (!requestAbort.isCompleted) requestAbort.complete();
+              throw TimeoutException('Voice note download timed out');
+            },
+          );
       if (_disposed ||
           sourceGeneration != _sourceGeneration ||
           !_coordinator.ownsPlayback(this)) {

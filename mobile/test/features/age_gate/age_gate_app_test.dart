@@ -4,6 +4,7 @@ import 'package:buzz/app.dart';
 import 'package:buzz/features/age_gate/age_restriction_page.dart';
 import 'package:buzz/features/age_gate/age_signal_push_bootstrap.dart';
 import 'package:buzz/features/age_gate/age_signal_provider.dart';
+import 'package:buzz/features/channels/unread_badge/unread_badge_provider.dart';
 import 'package:buzz/features/home/home_page.dart';
 import 'package:buzz/shared/auth/auth.dart';
 import 'package:buzz/shared/relay/relay.dart';
@@ -16,10 +17,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  const appBadgeChannel = MethodChannel('app_badge_plus');
 
   tearDown(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(ageSignalChannel, null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(appBadgeChannel, null);
   });
 
   test('backs off repeated snapshot transition failures', () {
@@ -48,6 +52,50 @@ void main() {
 
     expect(find.byType(AgeRestrictionPage), findsOneWidget);
     expect(find.byType(HomePage), findsNothing);
+  });
+
+  testWidgets('clears the app badge until age access is allowed', (
+    tester,
+  ) async {
+    final badgeCounts = <int>[];
+    final ageSignal = _MutableAgeSignalNotifier();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(appBadgeChannel, (call) async {
+          if (call.method == 'updateBadge') {
+            badgeCounts.add(
+              (call.arguments as Map<Object?, Object?>)['count']! as int,
+            );
+          }
+          return null;
+        });
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          authProvider.overrideWith(() => _UnauthenticatedAuthNotifier()),
+          ageSignalProvider.overrideWith(() => ageSignal),
+          unreadBadgeProvider.overrideWithValue(
+            const UnreadBadgeState(highPriorityCount: 7),
+          ),
+          savedPrefsProvider.overrideWithValue(prefs),
+        ],
+        child: const App(),
+      ),
+    );
+    await tester.pump();
+
+    expect(badgeCounts, isNotEmpty);
+    expect(badgeCounts.last, 0);
+
+    ageSignal.setState(AgeSignalState.allowed);
+    await tester.pump();
+    expect(badgeCounts.last, 7);
+
+    ageSignal.setState(AgeSignalState.retryableFailure);
+    await tester.pump();
+    expect(badgeCounts.last, 0);
   });
 
   testWidgets('keeps app content unmounted until the signal resolves', (
@@ -330,6 +378,23 @@ class _AuthenticatedAuthNotifier extends AuthNotifier {
   Future<AuthState> build() async {
     return const AuthState(status: AuthStatus.authenticated);
   }
+}
+
+class _UnauthenticatedAuthNotifier extends AuthNotifier {
+  @override
+  Future<AuthState> build() async {
+    return const AuthState(status: AuthStatus.unauthenticated);
+  }
+}
+
+class _MutableAgeSignalNotifier extends AgeSignalNotifier {
+  @override
+  AgeSignalState build() => AgeSignalState.checking;
+
+  @override
+  Future<void> request() async {}
+
+  void setState(AgeSignalState next) => state = next;
 }
 
 class _BlockingAgeSignalNotifier extends AgeSignalNotifier {

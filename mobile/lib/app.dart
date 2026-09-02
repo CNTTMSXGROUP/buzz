@@ -365,6 +365,8 @@ class App extends HookConsumerWidget {
     useEffect(() {
       if (ageSignalState == AgeSignalState.allowed) {
         applyBadge(ref.read(unreadBadgeProvider));
+      } else {
+        AppBadgePlus.updateBadge(0);
       }
       return null;
     }, [ageSignalState]);

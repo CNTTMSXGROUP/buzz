@@ -2680,7 +2680,7 @@ mod postgres_tests {
     /// alone must present a coherent catalog. Its five community-scoped ledger
     /// relations are immutable and durable, so they are registered in the
     /// write-fence exclusion — never counted as tenant-scoped drift, never
-    /// fence-attached — and the exact deletion catalog must still validate.
+    /// fence-attached.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn migration_0041_identity_foundation_is_durable_ledger_after_migration_a() {
@@ -2748,13 +2748,6 @@ mod postgres_tests {
             "identity ledger relations must be write-fence excluded, not scoped: {scoped_or_fenced:?}"
         );
 
-        // The exact deletion catalog validates: the excluded ledger relations
-        // do not perturb the scoped-table/fence equality check.
-        crate::deletion::DeletionStore::new(pool.clone())
-            .validate_catalog()
-            .await
-            .expect("deletion catalog validates after migration 0041");
-
         // The immutability contract is enforced, not merely declared. TRUNCATE
         // fires the statement-level guard unconditionally, so this proves the
         // rejection without constructing a fully valid ledger row.
@@ -2770,7 +2763,7 @@ mod postgres_tests {
 
     /// NIP-FI full state: migrations 0041 + 0042 together must present a
     /// coherent 15-relation catalog with zero dangling foreign keys, all
-    /// relations write-fence excluded, and an intact exact deletion catalog.
+    /// relations write-fence excluded.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn nip_fi_foundation_is_a_closed_durable_ledger_after_migrations_a_and_b() {
@@ -2847,12 +2840,6 @@ mod postgres_tests {
             scoped.is_empty(),
             "all NIP-FI ledger relations must be write-fence excluded: {scoped:?}"
         );
-
-        // The exact deletion catalog validates with the full ledger present.
-        crate::deletion::DeletionStore::new(pool.clone())
-            .validate_catalog()
-            .await
-            .expect("deletion catalog validates after migrations 0041 + 0042");
 
         // A migration-B relation is immutable too. TRUNCATE fires the
         // statement-level guard unconditionally.

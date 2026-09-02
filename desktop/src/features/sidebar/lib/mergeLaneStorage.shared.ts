@@ -197,7 +197,7 @@ export function readOutboxWithMeta<S>(
   pubkey: string,
   relayUrl: string,
   parse: (json: unknown) => S | null,
-  merge: (a: S, b: S) => S,
+  merge: (a: S, b: S, preservedKey?: string) => S,
   defaultStore: S,
   bound: (s: S, preservedKey?: string) => S,
 ): OutboxWithMeta<S> | null {
@@ -227,8 +227,11 @@ export function readOutboxWithMeta<S>(
   }
   // Fold all records and apply the capacity bound with the selected key so the
   // clicked channel is never evicted during the outbox read itself.
+  // bestKey is threaded through every per-record merge so that no intermediate
+  // merge — even across two durable records totaling 501 entries — evicts the
+  // reserved click before the final defensive bound.
   const merged = records.reduce<S>(
-    (acc, r) => merge(acc, r.store),
+    (acc, r) => merge(acc, r.store, bestKey),
     defaultStore,
   );
   return { store: bound(merged, bestKey), preservedKey: bestKey };

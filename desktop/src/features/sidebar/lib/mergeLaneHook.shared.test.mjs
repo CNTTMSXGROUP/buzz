@@ -507,11 +507,14 @@ export function runMergeLaneHookSuite({
     remoteHead.kind = 30078;
 
     const publishCalls = [];
-    let fetchCalls = 0;
-    relayClient.fetchEvents = async () => {
-      fetchCalls++;
-      return fetchCalls === 1 ? [remoteHead] : [];
-    };
+    // Always return remoteHead so both the reconnect-callback fetch
+    // (fetchRemote*) AND the subsequent pre-publish fetch inside doPublish()
+    // see the 500-entry remote — together with the 500-entry pending store
+    // that is 501 entries, triggering the capacity-bound merge that evicts
+    // the clicked channel when pendingPreservedKey is reset.
+    // Without the fix (hook reverts to publish*(pending)), pendingPreservedKey
+    // is cleared before doPublish runs, so the 501-entry merge evicts the click.
+    relayClient.fetchEvents = async () => [remoteHead];
     relayClient.publishEvent = async (evt) => {
       publishCalls.push(evt);
     };
@@ -531,7 +534,7 @@ export function runMergeLaneHookSuite({
 
     let hook = null;
     try {
-      // Mount and let bootstrap settle
+      // Mount and let bootstrap settle (bootstrap fetch applies the remote head)
       await act(async () => {
         hook = renderHook(() => useHook(pubkey, relayUrl));
         for (let i = 0; i < 20; i++) await Promise.resolve();
@@ -543,11 +546,12 @@ export function runMergeLaneHookSuite({
       // Trigger the registered reconnect callback (exercises the real production seam).
       // The callback: fetchRemote*() → retryReconnect*Publish() → startCycle() → doPublish().
       // retryReconnectPublish cancels the debounce and drives the cycle directly.
+      // doPublish then calls fetchRemote* again for the pre-publish merge, getting
+      // remoteHead (500 entries) → 501-entry mergeWithRemote → evicts click without key.
       assert.ok(
         typeof reconnect.cb === "function",
         "subscribeToReconnects must register a callback",
       );
-      fetchCalls = 0;
       publishCalls.length = 0;
       await act(async () => {
         // Drive the reconnect callback's async chain: fetchRemote → retryReconnect.
@@ -569,7 +573,8 @@ export function runMergeLaneHookSuite({
       assert.ok(
         clickedId in published.channels,
         `clicked channel "${clickedId}" must survive 501-entry merge after reconnect — ` +
-          `reverting hook to publish*(pending) resets pendingPreservedKey and fails this`,
+          `reverting hook reconnect from retryReconnect*Publish() to publish*(pending) ` +
+          `resets pendingPreservedKey before doPublish runs and fails this`,
       );
 
       hook.unmount();
@@ -585,16 +590,22 @@ export function runMergeLaneHookSuite({
 
   // P3 restart: after a quit the prior window's outbox record is foreign (the
   // session nonce is gone). Bootstrap must recover the preservedKey from the
-  // foreign record and forward it to publishStars/publishMutes. Without the fix
-  // (readOutboxPreservedKey only finding own records), preservedKey is undefined
-  // and the 501-entry pre-publish merge evicts the clicked channel.
+  // foreign record and forward it to publishStars/publishMutes.
+  //
+  // This test uses TWO foreign records so it exercises both the per-record fold
+  // eviction (mutation c) and the isOwn-filter / bootstrap-forward mutations.
+  // Without bestKey threaded through the readOutboxWithMeta reduce, folding
+  // record 1 (500 entries) into record 2 (1 entry) totals 501 and evicts the
+  // click before the final bound can protect it.
   //
   // Failing mutations:
   // (a) Revert to readOutboxPreservedKey (isOwn filter): returns undefined for
   //     the foreign record → publish with no key → clicked channel evicted.
   // (b) Drop bootstrap's preservedKey forward (publish(outbox, undefined)):
   //     same eviction even if key was recovered.
-  test(`${label}: P3 restart — foreign-nonce outbox with preservedKey is recovered on bootstrap; clicked channel survives 501-entry merge`, async () => {
+  // (c) Remove bestKey from per-record reduce in readOutboxWithMeta:
+  //     fold evicts click at record-2 merge before final bound runs.
+  test(`${label}: P3 restart — multi-record foreign-nonce outbox; preservedKey threads fold and bootstrap; clicked channel survives 501-entry merge`, async () => {
     const { act, cleanup, renderHook } = await import("@testing-library/react");
     const { relayClient } = await import("@/shared/api/relayClient");
 
@@ -604,18 +615,57 @@ export function runMergeLaneHookSuite({
     const pubkey = `pk-p3-restart-${label}`;
     const encodedRelay = encodeURIComponent(relayUrl);
 
-    // Local: clicked channel (oldest updatedAt=1) + 499 others at updatedAt=100
-    const localChannels = {
+    // Record 1 (foreign, carries preservedKey):
+    //   clicked channel (oldest updatedAt=1) + 499 base entries at updatedAt=100
+    const record1Channels = {
       [clickedId]: { [entryValueField]: true, updatedAt: 1, rev: 1 },
     };
     for (let i = 0; i < MAX - 1; i++) {
-      localChannels[`ch-rs-${i}`] = {
+      record1Channels[`ch-rs-${i}`] = {
         [entryValueField]: false,
         updatedAt: 100,
         rev: 0,
       };
     }
-    // Remote: same 499 + one fresh channel → merged = 501
+    // Record 2 (foreign, no preservedKey): one additional entry.
+    // Folding record1 (500) + record2 (1 new) = 501 without bestKey → click evicted.
+    const record2Channels = {
+      [`ch-rs-extra-${label}`]: {
+        [entryValueField]: false,
+        updatedAt: 100,
+        rev: 0,
+      },
+    };
+
+    // Seed local store (matches record1 so bootstrap sees the clicked channel)
+    window.localStorage.setItem(
+      storageKey(pubkey, relayUrl),
+      JSON.stringify({ version: 1, channels: record1Channels }),
+    );
+
+    // Seed TWO FOREIGN-NONCE outbox envelopes (models two prior window records after quit).
+    // Neither nonce matches this window's outboxWindowNonce(); both are foreign.
+    // Only record 1 carries preservedKey (max queuedAt → selected as bestKey).
+    const foreignKey1 = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:foreign-nonce-xyz:0000`;
+    window.localStorage.setItem(
+      foreignKey1,
+      JSON.stringify({
+        store: { version: 1, channels: record1Channels },
+        queuedAt: 1000,
+        preservedKey: clickedId,
+      }),
+    );
+    const foreignKey2 = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:foreign-nonce-abc:0001`;
+    window.localStorage.setItem(
+      foreignKey2,
+      JSON.stringify({
+        store: { version: 1, channels: record2Channels },
+        queuedAt: 900,
+        // No preservedKey — second window did not click
+      }),
+    );
+
+    // Remote: same 499 base + one new → merged with resumed outbox = 501
     const remoteChannels = {};
     for (let i = 0; i < MAX - 1; i++) {
       remoteChannels[`ch-rs-${i}`] = {
@@ -629,23 +679,6 @@ export function runMergeLaneHookSuite({
       updatedAt: 100,
       rev: 0,
     };
-
-    // Seed local store
-    window.localStorage.setItem(
-      storageKey(pubkey, relayUrl),
-      JSON.stringify({ version: 1, channels: localChannels }),
-    );
-
-    // Seed a FOREIGN-NONCE outbox envelope (models the prior window's record after quit).
-    // The nonce "foreign-nonce-xyz" won't match this window's outboxWindowNonce(),
-    // so enumerateOutbox finds it as a non-own record. The envelope carries preservedKey.
-    const foreignKey = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:foreign-nonce-xyz:0000`;
-    const foreignEnvelope = JSON.stringify({
-      store: { version: 1, channels: localChannels },
-      queuedAt: 1000,
-      preservedKey: clickedId,
-    });
-    window.localStorage.setItem(foreignKey, foreignEnvelope);
 
     const restore = stubRelay(relayClient);
     const tauri = installEchoTauri(pubkey);
@@ -702,7 +735,8 @@ export function runMergeLaneHookSuite({
       assert.ok(
         clickedId in published.channels,
         `clicked channel "${clickedId}" must survive 501-entry merge after restart — ` +
-          `readOutboxPreservedKey with isOwn filter returns undefined for foreign record and fails this`,
+          `readOutboxPreservedKey with isOwn filter returns undefined for foreign record and fails this; ` +
+          `also fails when bestKey is dropped from per-record fold in readOutboxWithMeta`,
       );
 
       hook.unmount();

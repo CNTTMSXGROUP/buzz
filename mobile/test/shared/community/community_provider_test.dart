@@ -496,6 +496,37 @@ void main() {
     );
 
     test(
+      'age restriction persists all disabled communities in one write',
+      () async {
+        container = createContainer();
+        final first = Community.create(
+          name: 'First',
+          relayUrl: 'https://first.example.com',
+        ).copyWith(pushNotificationsEnabled: true);
+        final second = Community.create(
+          name: 'Second',
+          relayUrl: 'https://second.example.com',
+        ).copyWith(pushNotificationsEnabled: true);
+        await communityStorage.save(first);
+        await communityStorage.save(second);
+        await container.read(communityListProvider.future);
+        final writesBefore = fakeSecure.writeCount('buzz_communities');
+
+        await container
+            .read(communityListProvider.notifier)
+            .enforceAgeRestrictionOnPush();
+
+        final stored = await communityStorage.loadAll();
+        expect(stored, hasLength(2));
+        expect(
+          stored.every((community) => !community.pushNotificationsEnabled),
+          isTrue,
+        );
+        expect(fakeSecure.writeCount('buzz_communities') - writesBefore, 1);
+      },
+    );
+
+    test(
       'age restriction fences a stale authenticated snapshot export',
       () async {
         final staleWriteStarted = Completer<void>();

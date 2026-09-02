@@ -36,6 +36,7 @@ struct BuzzPushPresentationCacheTests {
 
     #expect(!initial.requiresDiscard(since: initial))
     #expect(active.requiresDiscard(since: initial))
+    #expect(BuzzAgeRestrictionFence.unavailable.requiresDiscard(since: initial))
     #expect(settled.requiresDiscard(since: initial))
     #expect(!settled.requiresDiscard(since: settled))
   }

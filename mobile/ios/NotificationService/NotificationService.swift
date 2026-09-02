@@ -43,15 +43,15 @@ final class NotificationService: UNNotificationServiceExtension {
     restrictionFenceAtStart = Self.loadRestrictionFence(
       appGroupIdentifier: appGroupIdentifier
     )
+    restrictedFallbackContent = Self.restrictedFallback(from: request.content)
     guard let content = request.content.mutableCopy() as? UNMutableNotificationContent else {
-      contentHandler(request.content)
+      finish(request.content)
       return
     }
     bestAttemptContent = content
     var cleanUserInfo = content.userInfo
     cleanUserInfo.removeValue(forKey: BuzzPushNavigationTarget.userInfoKey)
     content.userInfo = cleanUserInfo
-    restrictedFallbackContent = Self.restrictedFallback(from: content)
 
     resolver.resolve { [weak self] resolution in
       guard let self else { return }
@@ -135,7 +135,7 @@ final class NotificationService: UNNotificationServiceExtension {
       let container = FileManager.default.containerURL(
         forSecurityApplicationGroupIdentifier: appGroupIdentifier
       )
-    else { return .initial }
+    else { return .unavailable }
     return BuzzAgeRestrictionFenceStore(containerURL: container).current()
   }
 

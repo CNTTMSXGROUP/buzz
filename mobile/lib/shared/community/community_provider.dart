@@ -648,12 +648,16 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
           pushNotificationsEnabled: false,
           pushSubscriptionState: pushState,
         );
-        await storage.save(updated);
         updatedList[index] = updated;
         changed = true;
       }
 
-      if (changed) state = AsyncData(updatedList);
+      if (changed) {
+        // Persist the complete restricted state in one secure-storage write so
+        // termination can never leave later communities push-enabled.
+        await storage.saveAll(updatedList);
+        state = AsyncData(updatedList);
+      }
       // A failed native clear is retried on the next restricted launch/resume.
       await syncCommunitySnapshot(ref, updatedList);
     });

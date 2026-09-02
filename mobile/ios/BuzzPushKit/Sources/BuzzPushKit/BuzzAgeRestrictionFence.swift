@@ -20,6 +20,12 @@ public struct BuzzAgeRestrictionFence: Codable, Equatable, Sendable {
     isFencing: false
   )
 
+  /// Fail-closed value used when the shared fence cannot be read.
+  public static let unavailable = BuzzAgeRestrictionFence(
+    token: "unavailable",
+    isFencing: true
+  )
+
   /// Whether an extension started under [earlier] must discard its result.
   public func requiresDiscard(since earlier: BuzzAgeRestrictionFence) -> Bool {
     isFencing || token != earlier.token
@@ -83,7 +89,7 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
     guard let data = try? Data(contentsOf: fileURL),
       let fence = try? JSONDecoder().decode(BuzzAgeRestrictionFence.self, from: data)
     else {
-      return BuzzAgeRestrictionFence(token: "invalid", isFencing: true)
+      return .unavailable
     }
     return fence
   }

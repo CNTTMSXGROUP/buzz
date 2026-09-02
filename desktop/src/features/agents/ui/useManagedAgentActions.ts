@@ -328,7 +328,7 @@ export function useManagedAgentActions() {
         agent,
         channels,
         deleteManagedAgent: deleteMutation.mutateAsync,
-        presenceLookup: managedPresenceQuery.data,
+        getAvailability,
         relayAgents: relayAgentsQuery.data ?? [],
       });
       if (result.cancelled) return;

@@ -592,3 +592,153 @@ test("hover profile preserves unknown availability and announces only establishe
   await expectUnknown();
   await expect(popover).toBeVisible();
 });
+
+for (const scenario of [
+  "failed-online",
+  "disconnected-online",
+  "failed-offline",
+  "offline",
+] as const) {
+  test(`profile deletion respects ${scenario} and preserves the record on shutdown failure`, async ({
+    page,
+  }) => {
+    await installMockBridge(page, {
+      managedAgents: [
+        {
+          pubkey: LOCAL,
+          name: "Deletion fixture",
+          status: "deployed",
+          backend: { type: "provider", id: "fixture", config: {} },
+          channelNames: ["agents"],
+        },
+      ],
+    });
+    await page.goto("/#/agents");
+    await expect(
+      page.getByRole("button", { name: "Deletion fixture agent profile" }),
+    ).toBeVisible();
+    await page.evaluate(
+      async ({ pubkey, warm }) => {
+        const w = window as typeof window & {
+          __DELETE_FAIL_PRESENCE__?: boolean;
+          __DELETE_FAIL_SHUTDOWN__?: boolean;
+          __DELETE_EFFECTS__?: string[];
+          __TAURI_INTERNALS__: {
+            invoke: (
+              command: string,
+              payload: unknown,
+              options: unknown,
+            ) => Promise<unknown>;
+          };
+        };
+        const original = w.__TAURI_INTERNALS__.invoke.bind(
+          w.__TAURI_INTERNALS__,
+        );
+        w.__DELETE_EFFECTS__ = [];
+        w.__DELETE_FAIL_SHUTDOWN__ = true;
+        w.__TAURI_INTERNALS__.invoke = async (command, payload, options) => {
+          if (command === "list_managed_agents") {
+            const rows = (await original(command, payload, options)) as Array<{
+              pubkey: string;
+              backend_agent_id: string | null;
+            }>;
+            return rows.map((row) =>
+              row.pubkey === pubkey
+                ? { ...row, backend_agent_id: "fixture-receipt" }
+                : row,
+            );
+          }
+          if (command === "get_presence") {
+            if (w.__DELETE_FAIL_PRESENCE__)
+              throw "relay unreachable: request timed out";
+            return { [pubkey]: warm };
+          }
+          if (
+            command === "send_channel_message" &&
+            (payload as { content?: string })?.content === "!shutdown"
+          ) {
+            w.__DELETE_EFFECTS__?.push("shutdown");
+            if (w.__DELETE_FAIL_SHUTDOWN__) throw "shutdown refused";
+          }
+          if (command === "delete_managed_agent")
+            w.__DELETE_EFFECTS__?.push("delete");
+          if (command === "remove_channel_member")
+            w.__DELETE_EFFECTS__?.push("remove-member");
+          return original(command, payload, options);
+        };
+        await window.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries({
+          queryKey: ["managed-agents"],
+        });
+        await window.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries({
+          queryKey: ["presence", pubkey],
+          exact: true,
+        });
+      },
+      {
+        pubkey: LOCAL,
+        warm: scenario.endsWith("offline") ? "offline" : "online",
+      },
+    );
+    await page
+      .getByRole("button", { name: "Deletion fixture agent profile" })
+      .click();
+    await expect(
+      page.getByTestId("user-profile-presence-badge"),
+    ).toHaveAttribute(
+      "aria-label",
+      scenario.endsWith("offline") ? "Offline" : "Online",
+    );
+    if (scenario.startsWith("failed")) {
+      await page.evaluate(async (pubkey) => {
+        (
+          window as typeof window & { __DELETE_FAIL_PRESENCE__?: boolean }
+        ).__DELETE_FAIL_PRESENCE__ = true;
+        await window.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries({
+          queryKey: ["presence", pubkey],
+          exact: true,
+        });
+      }, LOCAL);
+    } else if (scenario.startsWith("disconnected")) {
+      await page.evaluate(() =>
+        window.__BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?.("disconnected"),
+      );
+    }
+    if (scenario !== "offline")
+      await expect(page.getByTestId("user-profile-presence-badge")).toHaveCount(
+        0,
+      );
+    await page.getByTestId("user-profile-delete-agent-row").click();
+    const dialog = page.getByTestId("agent-delete-confirm-dialog");
+    await expect(dialog).toContainText("not its remote deployment");
+    await expect(dialog).toContainText("A failed request cancels deletion");
+    await expect(dialog).not.toContainText("This agent is offline");
+    await page.getByTestId("agent-delete-confirm-action").click();
+    const effects = () =>
+      page.evaluate(
+        () =>
+          (window as typeof window & { __DELETE_EFFECTS__?: string[] })
+            .__DELETE_EFFECTS__ ?? [],
+      );
+    if (scenario === "offline") {
+      await expect.poll(effects).toEqual(["delete", "remove-member"]);
+      await expect(page.getByTestId("user-profile-panel")).toHaveCount(0);
+    } else {
+      await expect.poll(effects).toEqual(["shutdown"]);
+      await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+      // Retry the same user action without healing presence. A successful
+      // request permits the explicitly confirmed local deletion, not a claim
+      // of remote termination. No membership write precedes it.
+      await page.evaluate(() => {
+        (
+          window as typeof window & { __DELETE_FAIL_SHUTDOWN__?: boolean }
+        ).__DELETE_FAIL_SHUTDOWN__ = false;
+      });
+      await page.getByTestId("user-profile-delete-agent-row").click();
+      await page.getByTestId("agent-delete-confirm-action").click();
+      await expect
+        .poll(effects)
+        .toEqual(["shutdown", "shutdown", "delete", "remove-member"]);
+      await expect(page.getByTestId("user-profile-panel")).toHaveCount(0);
+    }
+  });
+}

@@ -210,7 +210,11 @@ with a TypeScript lookup table or an id comparison in a component.
    actions retain their separate routing. Current exact-key Online/Away presence
    suppresses Start for an inactive local record without granting Stop authority;
    list/profile/member startup guards must not interpret Offline as proof of safe
-   startup. See
+   startup. Deletion also consumes that same exact-key availability reader:
+   unknown requests shutdown when a channel exists, request failure retains the
+   record, and only established Offline keeps the intentional no-request path.
+   Unqueried persona siblings are unknown. No presence state grants deletion or
+   Stop authority; native local stop-before-remove remains independent. See
    [the availability contract](../../../../docs/agent-availability.md).
 14. **Thinking effort has two surfaces: a local-only WRITE control and a
    read-only two-facts DISPLAY.** The write control is `EffortPickerField`

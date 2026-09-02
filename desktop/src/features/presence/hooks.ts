@@ -45,7 +45,8 @@ function normalizePubkeys(pubkeys: string[]) {
     .sort();
 }
 
-function presenceQueryKey(pubkeys: string[]) {
+/** Canonical normalized key shared by observers and action-time readers. */
+export function presenceQueryKey(pubkeys: string[]) {
   return ["presence", ...normalizePubkeys(pubkeys)] as const;
 }
 

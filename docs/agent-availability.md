@@ -3,7 +3,9 @@
 Availability means conversational presence on the relay, not process health.
 A retained deployment receipt, PID, or `running` record cannot turn an agent's
 availability dot green. A successful presence snapshot with no entry means
-Offline. A pending/failed read or disconnected relay means unknown, including
+Offline **only for an identity included in that snapshot’s requested keys**.
+An unqueried identity is unknown, never implicitly Offline. An initial pending
+read, failed read, or disconnected relay means unknown, including
 when the cache previously contained Online. Online and Away require presence.
 
 Agents cards and profiles share the existing presence query and live subscription;
@@ -32,6 +34,42 @@ distributed singleton lock: missing, expired, failed or disconnected presence
 cannot certify that starting another body is safe. Existing relay query/live
 subscription freshness remains authoritative; no separate heartbeat or cache
 is introduced. Runtime details remain accessible through the card/profile.
+
+
+## Lifecycle decision authority
+
+Presence does not grant management authority. Backend type, deployment receipt,
+local/pair ownership and the existing owner gates still decide which operations
+are offered and where they route. All presence-dependent decisions use the same
+surface-owned reader, not raw query data. The reader checks the canonical query
+cache and current relay connection at invocation, including after asynchronous
+channel discovery and between persona siblings. Display observers refresh on
+query data/status and connection changes (without the warning-banner debounce).
+A successful cached snapshot remains usable during an in-flight background
+refetch under the existing query policy; a settled error revokes it even though
+TanStack retains the old data. A live single-author update cannot heal a failed
+aggregate. This is not a new freshness cache or a distributed lock.
+
+For deletion of a provider agent with a deployment receipt:
+
+| Availability / route | Before local record deletion |
+| --- | --- |
+| Online or Away, channel available | Await a shutdown request; warn it does not confirm termination. |
+| Unknown, channel available | Also await shutdown; explicitly identify unknown availability in the action confirmation, never claim Offline. |
+| Established Offline | Preserve intentional offline removal without a shutdown request; warn the remote deployment may still exist. |
+| No channel | No shutdown route; warn the remote deployment may still run, without claiming it will. |
+
+A shutdown request failure propagates and leaves the management record and
+channel memberships intact for retry; it is not silently converted into force
+removal. A successful request still requires the existing orphan confirmation
+(or the profile’s already-accepted equivalent) before forced **local record**
+deletion. The profile confirmation describes this policy without asserting the
+current availability or promising remote deletion. Cancelling after a request
+retains the record; it cannot unsend the request. Channel removal follows record
+deletion. Local deletion does not consult presence and still delegates to the
+native stop-before-remove boundary. Custom-persona native cascade continues to
+refuse provider-deployed targets; built-in persona instance removal uses these
+same per-instance rules, treating unqueried siblings as unknown.
 
 
 ## Regression evidence
@@ -72,3 +110,13 @@ availability use `__BUZZ_E2E_EMIT_MOCK_PRESENCE__` to seed the snapshot and emit
 kind 20001 with the agent as author. Updating a directory row or posting a chat
 message is not presence. Mock browser tests do not certify native relay TTL,
 provider termination, or substrate health.
+
+- `managedAgentDeletionAvailability.test.mjs`: mounted production Agents and
+  profile deletion hooks through safe mock IPC, including failed/disconnected
+  cached Online **and Offline**, pending, genuine missing/Offline, Online/Away,
+  channel-discovery suspension, unqueried persona siblings, successful in-flight
+  refetch, shutdown failure/ordering/cancel, no-channel and local delegation.
+- `agent-availability.spec.ts`: real profile Delete dialog/action with failed or
+  disconnected cached Online and failed cached Offline. A rejected shutdown
+  retains the record; retry orders shutdown → deletion → membership removal.
+  Genuine Offline preserves no-request deletion. All destructive IPC is mocked.

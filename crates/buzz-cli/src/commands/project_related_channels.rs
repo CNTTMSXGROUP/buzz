@@ -90,6 +90,7 @@ fn verify_related_channels_snapshot(
     event: &Event,
     relay_self: &str,
     project_coordinate: &str,
+    project_event_id: &str,
 ) -> Result<Vec<Uuid>, CliError> {
     if event.pubkey.to_hex() != relay_self {
         return Err(CliError::Other(
@@ -101,11 +102,13 @@ fn verify_related_channels_snapshot(
             "Project related-channel snapshot signature is invalid: {error}"
         ))
     })?;
-    parse_project_related_channels_snapshot(event, project_coordinate).map_err(|error| {
-        CliError::Other(format!(
-            "Project related-channel snapshot is invalid: {error}"
-        ))
-    })
+    parse_project_related_channels_snapshot(event, project_coordinate, project_event_id).map_err(
+        |error| {
+            CliError::Other(format!(
+                "Project related-channel snapshot is invalid: {error}"
+            ))
+        },
+    )
 }
 
 fn canonical_channel_uuid(value: &str) -> Option<Uuid> {
@@ -170,10 +173,10 @@ fn legacy_related_channels(
         .collect())
 }
 
-async fn fetch_legacy_related_channels(
+async fn fetch_current_project(
     client: &BuzzClient,
     project: &ProjectRelatedChannelCoordinate,
-) -> Result<Vec<Uuid>, CliError> {
+) -> Result<(Event, Vec<Uuid>), CliError> {
     let filter = serde_json::json!({
         "kinds": [KIND_PROJECT],
         "authors": [project.owner.to_hex()],
@@ -185,7 +188,10 @@ async fn fetch_legacy_related_channels(
         .map_err(|error| CliError::Other(format!("invalid Project query response: {error}")))?;
     match events.as_slice() {
         [] => Err(CliError::Other("Project not found".into())),
-        [event] => legacy_related_channels(event, project),
+        [event] => {
+            let channels = legacy_related_channels(event, project)?;
+            Ok((event.clone(), channels))
+        }
         _ => Err(CliError::Other(
             "relay returned multiple current Project events".into(),
         )),
@@ -208,6 +214,7 @@ async fn fetch_related_channels(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| CliError::Other("relay info document is missing `self`".into()))?;
     let relay_self = normalize_relay_self_hex(relay_self)?;
+    let (project_event, legacy_channels) = fetch_current_project(client, &project).await?;
     let snapshot_d = buzz_core::project_related_channels::project_related_channels_snapshot_d(
         &project.coordinate,
     );
@@ -226,15 +233,19 @@ async fn fetch_related_channels(
         ));
     }
     let Some(event) = events.first() else {
-        let channels = fetch_legacy_related_channels(client, &project).await?;
         return Ok(serde_json::json!({
             "project": project.coordinate,
             "snapshot_found": false,
             "source": "project_metadata",
-            "related_channels": channels.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+            "related_channels": legacy_channels.iter().map(Uuid::to_string).collect::<Vec<_>>(),
         }));
     };
-    let channels = verify_related_channels_snapshot(event, &relay_self, &project.coordinate)?;
+    let channels = verify_related_channels_snapshot(
+        event,
+        &relay_self,
+        &project.coordinate,
+        &project_event.id.to_hex(),
+    )?;
     Ok(serde_json::json!({
         "project": project.coordinate,
         "snapshot_found": true,
@@ -374,19 +385,34 @@ mod tests {
         let relay = Keys::generate();
         let project = format!("30621:{}:project", Keys::generate().public_key().to_hex());
         let channel = Uuid::parse_str(CHANNEL).unwrap();
-        let snapshot = build_project_related_channels_snapshot(&project, [channel], 1)
-            .unwrap()
-            .sign_with_keys(&relay)
-            .unwrap();
+        let project_event_id = "11".repeat(32);
+        let snapshot =
+            build_project_related_channels_snapshot(&project, &project_event_id, [channel], 1)
+                .unwrap()
+                .sign_with_keys(&relay)
+                .unwrap();
         assert_eq!(
-            verify_related_channels_snapshot(&snapshot, &relay.public_key().to_hex(), &project)
-                .unwrap(),
+            verify_related_channels_snapshot(
+                &snapshot,
+                &relay.public_key().to_hex(),
+                &project,
+                &project_event_id,
+            )
+            .unwrap(),
             [channel]
         );
         assert!(verify_related_channels_snapshot(
             &snapshot,
             &Keys::generate().public_key().to_hex(),
-            &project
+            &project,
+            &project_event_id,
+        )
+        .is_err());
+        assert!(verify_related_channels_snapshot(
+            &snapshot,
+            &relay.public_key().to_hex(),
+            &project,
+            &"22".repeat(32),
         )
         .is_err());
     }
@@ -428,12 +454,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let relay_self = relay.public_key().to_hex();
+        let has_project = project_event.is_some();
         let mut bodies = vec![
             serde_json::json!({ "self": relay_self }).to_string(),
-            serde_json::to_string(&snapshot.into_iter().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_string(&project_event.into_iter().collect::<Vec<_>>()).unwrap(),
         ];
-        if let Some(project_event) = project_event {
-            bodies.push(serde_json::to_string(&[project_event]).unwrap());
+        if has_project {
+            bodies.push(serde_json::to_string(&snapshot.into_iter().collect::<Vec<_>>()).unwrap());
         }
         let captured_filters = Arc::new(Mutex::new(Vec::new()));
         let captured = captured_filters.clone();
@@ -467,20 +494,32 @@ mod tests {
     #[tokio::test]
     async fn related_channels_reads_trusted_snapshot_by_d_and_relay_author() {
         let relay = Keys::generate();
-        let project = format!("30621:{}:project", Keys::generate().public_key().to_hex());
-        let channel = Uuid::parse_str(CHANNEL).unwrap();
-        let snapshot = build_project_related_channels_snapshot(&project, [channel], 1)
-            .unwrap()
-            .sign_with_keys(&relay)
+        let owner = Keys::generate();
+        let project = format!("30621:{}:project", owner.public_key().to_hex());
+        let project_event = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "")
+            .tag(Tag::parse(["d", "project"]).unwrap())
+            .sign_with_keys(&owner)
             .unwrap();
+        let channel = Uuid::parse_str(CHANNEL).unwrap();
+        let snapshot = build_project_related_channels_snapshot(
+            &project,
+            &project_event.id.to_hex(),
+            [channel],
+            1,
+        )
+        .unwrap()
+        .sign_with_keys(&relay)
+        .unwrap();
 
-        let (result, filters) = run_snapshot_read(Some(snapshot), None, &relay, &project).await;
+        let (result, filters) =
+            run_snapshot_read(Some(snapshot), Some(project_event), &relay, &project).await;
         let value = result.unwrap();
         assert_eq!(value["snapshot_found"], true);
         assert_eq!(value["source"], "relay_snapshot");
         assert_eq!(value["related_channels"], serde_json::json!([CHANNEL]));
-        assert_eq!(filters.len(), 1);
-        let filter = &filters[0];
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0][0]["kinds"], serde_json::json!([KIND_PROJECT]));
+        let filter = &filters[1];
         assert_eq!(filter[0]["kinds"], serde_json::json!([30623]));
         assert_eq!(
             filter[0]["authors"],
@@ -519,12 +558,56 @@ mod tests {
         assert_eq!(value["source"], "project_metadata");
         assert_eq!(value["related_channels"], serde_json::json!([CHANNEL]));
         assert_eq!(filters.len(), 2);
-        assert_eq!(filters[1][0]["kinds"], serde_json::json!([KIND_PROJECT]));
+        assert_eq!(filters[0][0]["kinds"], serde_json::json!([KIND_PROJECT]));
         assert_eq!(
-            filters[1][0]["authors"],
+            filters[0][0]["authors"],
             serde_json::json!([owner.public_key().to_hex()])
         );
-        assert_eq!(filters[1][0]["#d"], serde_json::json!(["project"]));
-        assert_eq!(filters[1][0]["limit"], 2);
+        assert_eq!(filters[0][0]["#d"], serde_json::json!(["project"]));
+        assert_eq!(filters[0][0]["limit"], 2);
+        assert_eq!(filters[1][0]["kinds"], serde_json::json!([30623]));
+    }
+
+    #[tokio::test]
+    async fn related_channels_fail_closed_without_a_live_project() {
+        let relay = Keys::generate();
+        let owner = Keys::generate();
+        let project = format!("30621:{}:project", owner.public_key().to_hex());
+        let (result, filters) = run_snapshot_read(None, None, &relay, &project).await;
+
+        assert!(matches!(result, Err(CliError::Other(message)) if message == "Project not found"));
+        assert_eq!(
+            filters.len(),
+            1,
+            "snapshot must not be read without a live Project"
+        );
+    }
+
+    #[tokio::test]
+    async fn related_channels_reject_a_snapshot_for_an_old_project_head() {
+        let relay = Keys::generate();
+        let owner = Keys::generate();
+        let project = format!("30621:{}:project", owner.public_key().to_hex());
+        let live_project = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "")
+            .tag(Tag::parse(["d", "project"]).unwrap())
+            .sign_with_keys(&owner)
+            .unwrap();
+        let snapshot = build_project_related_channels_snapshot(
+            &project,
+            &"11".repeat(32),
+            [Uuid::parse_str(CHANNEL).unwrap()],
+            1,
+        )
+        .unwrap()
+        .sign_with_keys(&relay)
+        .unwrap();
+
+        let (result, _) =
+            run_snapshot_read(Some(snapshot), Some(live_project), &relay, &project).await;
+        assert!(matches!(
+            result,
+            Err(CliError::Other(message))
+                if message.contains("does not match the current Project head")
+        ));
     }
 }

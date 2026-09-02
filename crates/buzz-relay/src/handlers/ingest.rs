@@ -564,6 +564,7 @@ fn sign_project_related_channels_snapshot(
     }
     let builder = buzz_sdk::build_project_related_channels_snapshot(
         &plan.project_coordinate,
+        &plan.project_event_id,
         plan.entries.iter().copied(),
         plan.created_at,
     )
@@ -699,7 +700,6 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // so a project's state is never channel-scoped.
             | KIND_PROJECT
             | KIND_PROJECT_RELATED_CHANNEL
-            | KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT
             // Community moderation commands (9040–9044): community-global
             // direct commands, same model as the NIP-43 9030-series. A stray
             // `h` tag must never channel-scope them (pinned contract —
@@ -3162,12 +3162,14 @@ async fn ingest_event_inner(
         let outcome = buzz_db::project_related_channels::apply_project_related_channel_command(
             &state.db,
             tenant.community(),
-            &event,
-            relay_pubkey.as_slice(),
-            project_owner.as_slice(),
-            &command.project_d,
-            command.channel_id,
-            change,
+            buzz_db::project_related_channels::ApplyProjectRelatedChannelCommand {
+                event: &event,
+                relay_pubkey: relay_pubkey.as_slice(),
+                project_owner: project_owner.as_slice(),
+                project_d: &command.project_d,
+                channel_id: command.channel_id,
+                change,
+            },
         )
         .await
         .map_err(|error| IngestError::Internal(format!("error: {error}")))?;
@@ -5590,7 +5592,6 @@ mod postgres_tests {
         );
         assert!(is_global_only_kind(KIND_PROJECT_RELATED_CHANNEL));
         assert!(!requires_h_channel_scope(KIND_PROJECT_RELATED_CHANNEL));
-        assert!(is_global_only_kind(KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT));
         assert!(buzz_core::kind::is_relay_only_kind(
             KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT
         ));

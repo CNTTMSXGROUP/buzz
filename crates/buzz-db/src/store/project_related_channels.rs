@@ -28,12 +28,30 @@ pub struct ProjectRelatedChannelsSnapshotPlan {
     pub project_coordinate: String,
     /// Deterministic snapshot `d` tag.
     pub snapshot_d: String,
+    /// Exact live kind:30621 event this projection describes.
+    pub project_event_id: String,
     /// Sorted, bounded effective present relations.
     pub entries: Vec<Uuid>,
     /// Whether effective membership exceeded the bounded snapshot projection.
     pub truncated: bool,
     /// Timestamp that will dominate the previous relay snapshot head.
     pub created_at: u64,
+}
+
+/// Inputs for one related-channel command application.
+pub struct ApplyProjectRelatedChannelCommand<'a> {
+    /// Signed kind:47010 command event.
+    pub event: &'a Event,
+    /// Stable relay identity used to sign the derived snapshot.
+    pub relay_pubkey: &'a [u8],
+    /// Project owner public key from the command coordinate.
+    pub project_owner: &'a [u8],
+    /// Project `d` identifier from the command coordinate.
+    pub project_d: &'a str,
+    /// Related channel targeted by the command.
+    pub channel_id: Uuid,
+    /// Desired relation transition.
+    pub change: ProjectRelatedChannelChange,
 }
 
 /// Open Project mutation transaction awaiting one relay-signed snapshot.
@@ -201,9 +219,10 @@ fn validate_snapshot_event(
             "Project related-channel snapshot envelope does not match its prepared mutation".into(),
         ));
     }
-    let mut expected = Vec::with_capacity(plan.entries.len() + 2);
+    let mut expected = Vec::with_capacity(plan.entries.len() + 3);
     expected.push(vec!["d".to_owned(), plan.snapshot_d.clone()]);
     expected.push(vec!["a".to_owned(), plan.project_coordinate.clone()]);
+    expected.push(vec!["e".to_owned(), plan.project_event_id.clone()]);
     for channel_id in &plan.entries {
         expected.push(vec!["c".to_owned(), channel_id.to_string()]);
     }
@@ -315,7 +334,6 @@ async fn snapshot_plan(
     let latest: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
         "SELECT created_at FROM events \
          WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
-           AND deleted_at IS NULL \
          ORDER BY created_at DESC, id ASC LIMIT 1",
     )
     .bind(community_id.as_uuid())
@@ -334,6 +352,7 @@ async fn snapshot_plan(
     Ok(ProjectRelatedChannelsSnapshotPlan {
         project_coordinate,
         snapshot_d,
+        project_event_id: hex::encode(&head.event_id),
         entries,
         truncated,
         created_at,
@@ -345,9 +364,10 @@ async fn active_target_membership(
     community_id: CommunityId,
     channel_id: Uuid,
     actor: &[u8],
-) -> Result<Option<bool>> {
+) -> Result<Option<(bool, bool)>> {
     let row = sqlx::query(
         "SELECT c.archived_at IS NULL AND c.deleted_at IS NULL AS active, \
+                c.channel_type = 'dm' AS is_dm, \
                 EXISTS(SELECT 1 FROM channel_members cm \
                        WHERE cm.community_id = c.community_id AND cm.channel_id = c.id \
                          AND cm.pubkey = $3 AND cm.removed_at IS NULL) AS member \
@@ -360,8 +380,9 @@ async fn active_target_membership(
     .await?;
     row.map(|row| {
         let active: bool = row.try_get("active")?;
+        let is_dm: bool = row.try_get("is_dm")?;
         let member: bool = row.try_get("member")?;
-        Ok(active && member)
+        Ok((active && member, is_dm))
     })
     .transpose()
 }
@@ -370,13 +391,16 @@ async fn active_target_membership(
 pub async fn apply_project_related_channel_command(
     db: &Db,
     community_id: CommunityId,
-    event: &Event,
-    relay_pubkey: &[u8],
-    project_owner: &[u8],
-    project_d: &str,
-    channel_id: Uuid,
-    change: ProjectRelatedChannelChange,
+    command: ApplyProjectRelatedChannelCommand<'_>,
 ) -> Result<ApplyProjectRelatedChannelOutcome> {
+    let ApplyProjectRelatedChannelCommand {
+        event,
+        relay_pubkey,
+        project_owner,
+        project_d,
+        channel_id,
+        change,
+    } = command;
     let mut tx = db.begin_transaction().await?;
     crate::replaceable::acquire_parameterized_event_lock(
         &mut tx,
@@ -404,7 +428,7 @@ pub async fn apply_project_related_channel_command(
         tx.rollback().await?;
         return Ok(ApplyProjectRelatedChannelOutcome::ProjectNotFound);
     };
-    if head.home_channel_id == Some(channel_id) {
+    if change == ProjectRelatedChannelChange::Add && head.home_channel_id == Some(channel_id) {
         tx.rollback().await?;
         return Ok(ApplyProjectRelatedChannelOutcome::InvalidTarget(
             "Project home channel cannot also be a related channel",
@@ -466,24 +490,6 @@ pub async fn apply_project_related_channel_command(
         return Ok(ApplyProjectRelatedChannelOutcome::Unauthorized);
     }
 
-    if change == ProjectRelatedChannelChange::Add {
-        match active_target_membership(&mut tx, community_id, channel_id, actor.as_slice()).await? {
-            Some(true) => {}
-            Some(false) => {
-                tx.rollback().await?;
-                return Ok(ApplyProjectRelatedChannelOutcome::InvalidTarget(
-                    "target channel must be active and the actor must be a member",
-                ));
-            }
-            None => {
-                tx.rollback().await?;
-                return Ok(ApplyProjectRelatedChannelOutcome::InvalidTarget(
-                    "target channel not found in this community",
-                ));
-            }
-        }
-    }
-
     let present = override_presence(&mut tx, community_id, project_owner, project_d, channel_id)
         .await?
         .unwrap_or_else(|| inherited_presence(&head, channel_id));
@@ -497,6 +503,27 @@ pub async fn apply_project_related_channel_command(
         return Ok(ApplyProjectRelatedChannelOutcome::Noop);
     }
     if change == ProjectRelatedChannelChange::Add {
+        match active_target_membership(&mut tx, community_id, channel_id, actor.as_slice()).await? {
+            Some((_, true)) => {
+                tx.rollback().await?;
+                return Ok(ApplyProjectRelatedChannelOutcome::InvalidTarget(
+                    "DM channels cannot be related to Projects",
+                ));
+            }
+            Some((true, false)) => {}
+            Some((false, false)) => {
+                tx.rollback().await?;
+                return Ok(ApplyProjectRelatedChannelOutcome::InvalidTarget(
+                    "target channel must be active and the actor must be a member",
+                ));
+            }
+            None => {
+                tx.rollback().await?;
+                return Ok(ApplyProjectRelatedChannelOutcome::InvalidTarget(
+                    "target channel not found in this community",
+                ));
+            }
+        }
         let (entries, _) =
             effective_snapshot_entries(&mut tx, community_id, project_owner, project_d, &head)
                 .await?;
@@ -634,6 +661,32 @@ mod postgres_tests {
         (Db::from_pool(pool), CommunityId::from_uuid(community_uuid))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_project_related_channel_command(
+        db: &Db,
+        community_id: CommunityId,
+        event: &Event,
+        relay_pubkey: &[u8],
+        project_owner: &[u8],
+        project_d: &str,
+        channel_id: Uuid,
+        change: ProjectRelatedChannelChange,
+    ) -> Result<ApplyProjectRelatedChannelOutcome> {
+        super::apply_project_related_channel_command(
+            db,
+            community_id,
+            ApplyProjectRelatedChannelCommand {
+                event,
+                relay_pubkey,
+                project_owner,
+                project_d,
+                channel_id,
+                change,
+            },
+        )
+        .await
+    }
+
     fn command_event(
         actor: &Keys,
         project_owner: &[u8],
@@ -663,6 +716,7 @@ mod postgres_tests {
         let mut tags = vec![
             Tag::parse(["d", plan.snapshot_d.as_str()]).expect("snapshot d"),
             Tag::parse(["a", plan.project_coordinate.as_str()]).expect("Project coordinate"),
+            Tag::parse(["e", plan.project_event_id.as_str()]).expect("Project head"),
         ];
         for channel_id in &plan.entries {
             tags.push(Tag::parse(["c", channel_id.to_string().as_str()]).expect("snapshot entry"));
@@ -874,11 +928,11 @@ mod postgres_tests {
             project_owner,
             actor,
             relay,
-            home: _,
+            home,
             target,
             legacy_target: _,
             project_d,
-            project: _,
+            project,
         } = make_project_fixture().await;
         let owner_bytes = project_owner.public_key().to_bytes();
         let relay_bytes = relay.public_key().to_bytes();
@@ -886,10 +940,157 @@ mod postgres_tests {
             "{KIND_PROJECT}:{}:{project_d}",
             hex::encode(owner_bytes.as_slice())
         );
-        let (_, initial_snapshot_tags) = live_snapshot(&db, community, &relay, &project_coordinate)
-            .await
-            .expect("initial Project snapshot");
+        let project_with_latent_home = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "")
+            .tags(vec![
+                Tag::parse(["d", &project_d]).expect("d tag"),
+                Tag::parse(["buzz-channel", &home.id.to_string()]).expect("home tag"),
+                Tag::parse(["buzz-related-channel", &home.id.to_string()])
+                    .expect("latent home relation"),
+            ])
+            .custom_created_at(nostr::Timestamp::from(project.created_at.as_secs() + 1))
+            .sign_with_keys(&project_owner)
+            .expect("sign Project with latent home relation");
+        commit_project_replacement(
+            &db,
+            community,
+            &project_with_latent_home,
+            &project_d,
+            &relay,
+        )
+        .await;
+        let (initial_snapshot_id, initial_snapshot_tags) =
+            live_snapshot(&db, community, &relay, &project_coordinate)
+                .await
+                .expect("initial Project snapshot");
         assert!(snapshot_entries(&initial_snapshot_tags).is_empty());
+        let deleted_snapshot_created_at: i64 = sqlx::query_scalar(
+            "UPDATE events \
+             SET created_at = NOW() + INTERVAL '1 day', deleted_at = NOW() \
+             WHERE community_id = $1 AND id = $2 \
+             RETURNING FLOOR(EXTRACT(EPOCH FROM created_at))::bigint",
+        )
+        .bind(community.as_uuid())
+        .bind(initial_snapshot_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("soft-delete a future-dated prior snapshot");
+
+        let remove_home = command_event(
+            &actor,
+            owner_bytes.as_slice(),
+            &project_d,
+            home.id,
+            "remove",
+        );
+        let outcome = apply_project_related_channel_command(
+            &db,
+            community,
+            &remove_home,
+            relay_bytes.as_slice(),
+            owner_bytes.as_slice(),
+            &project_d,
+            home.id,
+            ProjectRelatedChannelChange::Remove,
+        )
+        .await
+        .expect("remove latent home-channel relation");
+        let ApplyProjectRelatedChannelOutcome::Applied(prepared) = outcome else {
+            panic!("expected latent home-channel relation removal");
+        };
+        assert_eq!(
+            prepared.snapshot().created_at,
+            deleted_snapshot_created_at as u64 + 1,
+            "new snapshots must outrank deleted snapshot history"
+        );
+        let snapshot = snapshot_event(prepared.snapshot(), &relay);
+        prepared
+            .commit_with_snapshot(&snapshot)
+            .await
+            .expect("commit latent home-channel removal");
+        let add_home = command_event(&actor, owner_bytes.as_slice(), &project_d, home.id, "add");
+        assert!(matches!(
+            apply_project_related_channel_command(
+                &db,
+                community,
+                &add_home,
+                relay_bytes.as_slice(),
+                owner_bytes.as_slice(),
+                &project_d,
+                home.id,
+                ProjectRelatedChannelChange::Add,
+            )
+            .await
+            .expect("adding the Project home as related is invalid"),
+            ApplyProjectRelatedChannelOutcome::InvalidTarget(
+                "Project home channel cannot also be a related channel"
+            )
+        ));
+
+        let dm = db
+            .create_channel(
+                community,
+                &format!("project-dm-target-{}", Uuid::new_v4().simple()),
+                ChannelType::Dm,
+                ChannelVisibility::Private,
+                None,
+                owner_bytes.as_slice(),
+                None,
+            )
+            .await
+            .expect("create DM target");
+        db.add_member(
+            community,
+            dm.id,
+            actor.public_key().to_bytes().as_slice(),
+            MemberRole::Member,
+            Some(owner_bytes.as_slice()),
+        )
+        .await
+        .expect("add actor to DM target");
+        let add_dm = command_event(&actor, owner_bytes.as_slice(), &project_d, dm.id, "add");
+        assert!(matches!(
+            apply_project_related_channel_command(
+                &db,
+                community,
+                &add_dm,
+                relay_bytes.as_slice(),
+                owner_bytes.as_slice(),
+                &project_d,
+                dm.id,
+                ProjectRelatedChannelChange::Add,
+            )
+            .await
+            .expect("reject DM relation"),
+            ApplyProjectRelatedChannelOutcome::InvalidTarget(
+                "DM channels cannot be related to Projects"
+            )
+        ));
+        let project_with_latent_dm = EventBuilder::new(Kind::Custom(KIND_PROJECT as u16), "")
+            .tags(vec![
+                Tag::parse(["d", &project_d]).expect("d tag"),
+                Tag::parse(["buzz-channel", &home.id.to_string()]).expect("home tag"),
+                Tag::parse(["buzz-related-channel", &dm.id.to_string()])
+                    .expect("latent DM relation"),
+            ])
+            .custom_created_at(nostr::Timestamp::from(project.created_at.as_secs() + 2))
+            .sign_with_keys(&project_owner)
+            .expect("sign Project with latent DM relation");
+        commit_project_replacement(&db, community, &project_with_latent_dm, &project_d, &relay)
+            .await;
+        let remove_dm = command_event(&actor, owner_bytes.as_slice(), &project_d, dm.id, "remove");
+        let outcome = apply_project_related_channel_command(
+            &db,
+            community,
+            &remove_dm,
+            relay_bytes.as_slice(),
+            owner_bytes.as_slice(),
+            &project_d,
+            dm.id,
+            ProjectRelatedChannelChange::Remove,
+        )
+        .await
+        .expect("remove latent DM relation");
+        commit_applied(outcome, &relay).await;
 
         let add = command_event(&actor, owner_bytes.as_slice(), &project_d, target.id, "add");
         let outcome = apply_project_related_channel_command(
@@ -951,6 +1152,16 @@ mod postgres_tests {
         ));
 
         let no_op_add = command_event(&actor, owner_bytes.as_slice(), &project_d, target.id, "add");
+        sqlx::query(
+            "UPDATE channel_members SET removed_at = NOW() \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(community.as_uuid())
+        .bind(target.id)
+        .bind(actor.public_key().to_bytes().as_slice())
+        .execute(&db.pool)
+        .await
+        .expect("remove actor from already-related target");
         assert!(matches!(
             apply_project_related_channel_command(
                 &db,
@@ -963,7 +1174,7 @@ mod postgres_tests {
                 ProjectRelatedChannelChange::Add,
             )
             .await
-            .expect("no-op add"),
+            .expect("no-op add after target membership loss"),
             ApplyProjectRelatedChannelOutcome::Noop
         ));
         assert!(

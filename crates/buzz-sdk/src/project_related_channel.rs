@@ -3,7 +3,7 @@
 use buzz_core::kind::{
     KIND_PROJECT, KIND_PROJECT_RELATED_CHANNEL, KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT,
 };
-use nostr::{Event, EventBuilder, Kind, PublicKey, Tag};
+use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, Tag};
 use uuid::Uuid;
 
 use crate::SdkError;
@@ -97,6 +97,23 @@ fn parse_project_coordinate_parts(value: &str) -> Result<(PublicKey, String), Sd
     let owner = PublicKey::from_hex(owner)
         .map_err(|_| SdkError::InvalidInput("Project coordinate owner is invalid".into()))?;
     Ok((owner, project_d.to_owned()))
+}
+
+fn canonical_event_id(value: &str) -> Result<String, SdkError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(SdkError::InvalidInput(
+            "Project event id must be 64 lowercase hex characters".into(),
+        ));
+    }
+    EventId::from_hex(value)
+        .map(|event_id| event_id.to_hex())
+        .map_err(|_| {
+            SdkError::InvalidInput("Project event id must be 64 lowercase hex characters".into())
+        })
 }
 
 /// Parse and validate a complete related-channel command envelope.
@@ -237,10 +254,12 @@ pub fn build_project_related_channel_command(
 /// Entries are sorted by channel UUID and encoded as `c=[channel]`.
 pub fn build_project_related_channels_snapshot(
     project_coordinate: &str,
+    project_event_id: &str,
     entries: impl IntoIterator<Item = Uuid>,
     created_at: u64,
 ) -> Result<EventBuilder, SdkError> {
     let _ = ProjectRelatedChannelCoordinate::parse(project_coordinate)?;
+    let project_event_id = canonical_event_id(project_event_id)?;
     let mut entries: Vec<_> = entries.into_iter().collect();
     entries.sort_unstable();
     if entries.len() > PROJECT_RELATED_CHANNELS_SNAPSHOT_CAP {
@@ -258,13 +277,17 @@ pub fn build_project_related_channels_snapshot(
     let snapshot_d = buzz_core::project_related_channels::project_related_channels_snapshot_d(
         project_coordinate,
     );
-    let mut tags = Vec::with_capacity(entries.len() + 2);
+    let mut tags = Vec::with_capacity(entries.len() + 3);
     tags.push(
         Tag::parse(["d", snapshot_d.as_str()])
             .map_err(|error| SdkError::InvalidTag(error.to_string()))?,
     );
     tags.push(
         Tag::parse(["a", project_coordinate])
+            .map_err(|error| SdkError::InvalidTag(error.to_string()))?,
+    );
+    tags.push(
+        Tag::parse(["e", project_event_id.as_str()])
             .map_err(|error| SdkError::InvalidTag(error.to_string()))?,
     );
     for channel_id in entries {
@@ -285,12 +308,15 @@ pub fn build_project_related_channels_snapshot(
 /// Parse one relay-derived related-channel snapshot for `project_coordinate`.
 ///
 /// The snapshot envelope is deliberately canonical: one deterministic `d`,
-/// one matching `a`, then strictly sorted two-element `c` channel tags.
+/// one matching `a`, one exact Project-head `e`, then strictly sorted
+/// two-element `c` channel tags.
 pub fn parse_project_related_channels_snapshot(
     event: &Event,
     project_coordinate: &str,
+    project_event_id: &str,
 ) -> Result<Vec<Uuid>, SdkError> {
     let _ = ProjectRelatedChannelCoordinate::parse(project_coordinate)?;
+    let project_event_id = canonical_event_id(project_event_id)?;
     if u32::from(event.kind.as_u16()) != KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT {
         return Err(SdkError::InvalidInput(format!(
             "expected kind {KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT}"
@@ -316,15 +342,20 @@ pub fn parse_project_related_channels_snapshot(
             "Project related-channel snapshot has an invalid a tag".into(),
         ));
     }
-    if tags.len().saturating_sub(2) > PROJECT_RELATED_CHANNELS_SNAPSHOT_CAP {
+    if !matches!(tags.get(2), Some([name, value]) if name == "e" && value == &project_event_id) {
+        return Err(SdkError::InvalidInput(
+            "Project related-channel snapshot does not match the current Project head".into(),
+        ));
+    }
+    if tags.len().saturating_sub(3) > PROJECT_RELATED_CHANNELS_SNAPSHOT_CAP {
         return Err(SdkError::InvalidInput(format!(
             "Project related-channel snapshot exceeds {} entries",
             PROJECT_RELATED_CHANNELS_SNAPSHOT_CAP
         )));
     }
 
-    let mut channels = Vec::with_capacity(tags.len().saturating_sub(2));
-    for tag in tags.into_iter().skip(2) {
+    let mut channels = Vec::with_capacity(tags.len().saturating_sub(3));
+    for tag in tags.into_iter().skip(3) {
         let [name, raw] = tag else {
             return Err(SdkError::InvalidInput(
                 "Project related-channel snapshot c tag must have exactly two elements".into(),
@@ -422,10 +453,12 @@ mod tests {
     fn snapshot_builder_sorts_channels_and_derives_coordinate() {
         let keys = Keys::generate();
         let project_coordinate = coordinate(&keys);
+        let project_event_id = "11".repeat(32);
         let channel_a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("channel a");
         let channel_b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("channel b");
         let event = build_project_related_channels_snapshot(
             &project_coordinate,
+            &project_event_id,
             [channel_b, channel_a],
             123,
         )
@@ -446,12 +479,30 @@ mod tests {
         );
         assert_eq!(tags[1][0], "a");
         assert_eq!(tags[1][1], project_coordinate);
-        assert_eq!(tags[2], vec!["c".to_owned(), channel_a.to_string()]);
-        assert_eq!(tags[3], vec!["c".to_owned(), channel_b.to_string()]);
+        assert_eq!(tags[2], vec!["e".to_owned(), project_event_id.clone()]);
+        assert_eq!(tags[3], vec!["c".to_owned(), channel_a.to_string()]);
+        assert_eq!(tags[4], vec!["c".to_owned(), channel_b.to_string()]);
         assert_eq!(
-            parse_project_related_channels_snapshot(&event, &project_coordinate)
+            parse_project_related_channels_snapshot(
+                &event,
+                &project_coordinate,
+                &project_event_id,
+            )
                 .expect("parse snapshot"),
             vec![channel_a, channel_b]
         );
+        assert!(parse_project_related_channels_snapshot(
+            &event,
+            &project_coordinate,
+            &"22".repeat(32),
+        )
+        .is_err());
+        assert!(build_project_related_channels_snapshot(
+            &project_coordinate,
+            &"AA".repeat(32),
+            [],
+            123,
+        )
+        .is_err());
     }
 }

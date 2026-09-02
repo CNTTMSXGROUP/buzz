@@ -66,6 +66,8 @@ function makeDefinitionOnlyState(definition, overrides = {}) {
     defReadOnly: false,
     inheritedSubmissionProvider: null,
     runtimes: [],
+    effortLevel: null,
+    effortTouched: { current: false },
     ...overrides,
   };
 }

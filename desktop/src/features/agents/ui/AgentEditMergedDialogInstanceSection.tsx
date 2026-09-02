@@ -129,6 +129,9 @@ export type AgentEditMergedISectionProps = {
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
   effortConfig: RuntimeConfigSurface | undefined;
+  /** Controlled pending effort selection (null = adapter default). */
+  effortValue: string | null;
+  onEffortChange: (level: string | null) => void;
 };
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -208,6 +211,8 @@ export function AgentEditMergedInstanceSection({
   systemPrompt,
   onSystemPromptChange,
   effortConfig,
+  effortValue,
+  onEffortChange,
 }: AgentEditMergedISectionProps) {
   const shouldReduceMotion = useReducedMotion();
   const advancedFieldsTransition = shouldReduceMotion
@@ -436,7 +441,13 @@ export function AgentEditMergedInstanceSection({
         </div>
       ) : null}
 
-      <EffortPickerField agent={inst} config={effortConfig} />
+      <EffortPickerField
+        agent={inst}
+        config={effortConfig}
+        disabled={isSaving}
+        value={effortValue}
+        onChange={onEffortChange}
+      />
 
       <AgentAiDefaultsNotice
         onEditDefaults={() => onAiDefaultsOpenChange(true)}

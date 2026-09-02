@@ -93,6 +93,10 @@ export type AgentEditSubmitState = {
   onValidate?: () => string | null;
   onOpenChange: (open: boolean) => void;
   onUpdated?: (agent: ManagedAgent) => void;
+  /** Controlled pending effort selection from the dialog (null = adapter default). */
+  effortLevel: string | null;
+  /** Ref tracking whether the user has made an explicit effort selection. */
+  effortTouched: React.RefObject<boolean>;
 };
 
 export type AgentEditSubmitHookReturn = {
@@ -271,11 +275,19 @@ export function useAgentEditMergedSubmit(
         const seed = seedAgentFormModel(s.ctx);
         const next = buildNextAgentFormModel(seed, s);
 
-        const { personaInput, agentInput, policySets } = emitAgentFormDiff(
-          seed,
-          next,
-          s.ctx,
-        );
+        const {
+          personaInput,
+          agentInput: rawAgentInput,
+          policySets,
+        } = emitAgentFormDiff(seed, next, s.ctx);
+
+        // Effort write: when touched, resolve and include in the locked update
+        // (atomic with any access-policy change — PR #4625 semantics).
+        let agentInput = rawAgentInput;
+        if (s.effortTouched.current && inst) {
+          agentInput = agentInput ?? { pubkey: inst.pubkey };
+          agentInput = { ...agentInput, effortLevel: s.effortLevel };
+        }
 
         const refetchStores = () => refetchAgentStores(queryClient, def, inst);
 

@@ -219,6 +219,10 @@ export function AgentEditMergedDialog({
   const [iIsCustomProviderEditing, setIIsCustomProviderEditing] =
     React.useState(false);
   const runtimeTouched = React.useRef(false);
+  // Effort picker is Save-gated: hold pending selection in dialog state.
+  // `effortTouched` distinguishes "user picked a value" from "seeded display".
+  const [effortLevel, setEffortLevel] = React.useState<string | null>(null);
+  const effortTouched = React.useRef(false);
 
   // Convenience: the active model/provider — D-state when a definition is present,
   // I-state when instance-only (no definition). Used for the D-section and for
@@ -315,6 +319,8 @@ export function AgentEditMergedDialog({
     setShowAdvancedFields(false);
     setIsAvatarUploadPending(false);
     runtimeTouched.current = false;
+    setEffortLevel(null);
+    effortTouched.current = false;
     autoSeededDefinitionRuntimeRef.current = null;
     // Capture the definition revision the form is baselined against.
     seededDefinitionUpdatedAtRef.current = def?.updatedAt ?? null;
@@ -548,6 +554,8 @@ export function AgentEditMergedDialog({
     onValidate,
     onOpenChange,
     onUpdated,
+    effortLevel,
+    effortTouched,
   } satisfies AgentEditSubmitState;
 
   const {
@@ -921,6 +929,16 @@ export function AgentEditMergedDialog({
                 systemPrompt={systemPrompt}
                 onSystemPromptChange={setSystemPrompt}
                 effortConfig={configSurfaceQuery.data}
+                effortValue={
+                  effortTouched.current
+                    ? effortLevel
+                    : (configSurfaceQuery.data?.normalized.thinkingEffort
+                        ?.value ?? null)
+                }
+                onEffortChange={(level) => {
+                  effortTouched.current = true;
+                  setEffortLevel(level);
+                }}
               />
             ) : null}
 

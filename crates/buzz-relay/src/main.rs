@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
@@ -1312,7 +1311,7 @@ async fn serve(
     });
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let shutdown_flag = Arc::clone(&state.shutting_down);
+    let shutdown_state = Arc::clone(&state);
     let drain_conn_manager = Arc::clone(&state.conn_manager);
     let drain_jitter_ms = state.config.drain_jitter_ms;
     let tx = shutdown_tx.clone();
@@ -1345,7 +1344,7 @@ async fn serve(
     // sleeps. Not implemented here. This comment records the plan only.
     let shutdown_handle = tokio::spawn(async move {
         shutdown_signal().await;
-        shutdown_flag.store(true, Ordering::Relaxed);
+        shutdown_state.begin_shutdown();
         info!("Shutdown signal received — readiness now returns 503");
         // 5s grace: let K8s stop routing new traffic before we close listeners.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2098,8 +2097,6 @@ mod tests {
         assert!(tick_count.load(std::sync::atomic::Ordering::Relaxed) <= 1);
     }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = connect_audit_pool(&DbConfig {
@@ -2157,6 +2154,14 @@ mod tests {
             .execute(&mut *holder)
             .await
             .expect("release audit advisory lock");
+    }
+
+    mod postgres_tests {
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
+            super::audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits().await;
+        }
     }
 
     #[test]

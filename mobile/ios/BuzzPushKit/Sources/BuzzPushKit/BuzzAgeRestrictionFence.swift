@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Cross-process generation fence for age-restricted notification delivery.
@@ -38,13 +39,22 @@ public struct BuzzAgeRestrictionFence: Codable, Equatable, Sendable {
 public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
   /// App-group file shared by Runner and the notification extension.
   public static let fileName = "age-restriction-fence.json"
+  private static let lockFileName = "age-restriction-fence.lock"
 
   private let fileURL: URL
+  private let lockFileURL: URL
+  private let beforeSettledWrite: (() -> Void)?
   private let lock = NSLock()
 
   /// Creates a fence store rooted in the app-group container.
-  public init(containerURL: URL) {
+  public convenience init(containerURL: URL) {
+    self.init(containerURL: containerURL, beforeSettledWrite: nil)
+  }
+
+  init(containerURL: URL, beforeSettledWrite: (() -> Void)?) {
     fileURL = containerURL.appendingPathComponent(Self.fileName)
+    lockFileURL = containerURL.appendingPathComponent(Self.lockFileName)
+    self.beforeSettledWrite = beforeSettledWrite
   }
 
   /// Returns the latest fence, failing closed when persisted data is absent or
@@ -53,7 +63,7 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
   public func current() -> BuzzAgeRestrictionFence {
     lock.lock()
     defer { lock.unlock() }
-    return loadLocked()
+    return (try? withProcessLock { loadLocked() }) ?? .unavailable
   }
 
   /// Starts a durable cleanup phase with a fresh generation token.
@@ -61,12 +71,14 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
   public func begin() throws -> BuzzAgeRestrictionFence {
     lock.lock()
     defer { lock.unlock() }
-    let fence = BuzzAgeRestrictionFence(
-      token: UUID().uuidString.lowercased(),
-      isFencing: true
-    )
-    try writeLocked(fence)
-    return fence
+    return try withProcessLock {
+      let fence = BuzzAgeRestrictionFence(
+        token: UUID().uuidString.lowercased(),
+        isFencing: true
+      )
+      try writeLocked(fence)
+      return fence
+    }
   }
 
   /// Rotates the durable fence before cleanup begins and settles it only after
@@ -105,16 +117,38 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
   public func settleIfFencing(expectedToken: String? = nil) throws -> BuzzAgeRestrictionFence {
     lock.lock()
     defer { lock.unlock() }
-    let current = loadLocked()
-    guard current.isFencing,
-      expectedToken == nil || current.token == expectedToken
-    else { return current }
-    let settled = BuzzAgeRestrictionFence(
-      token: UUID().uuidString.lowercased(),
-      isFencing: false
-    )
-    try writeLocked(settled)
-    return settled
+    return try withProcessLock {
+      let current = loadLocked()
+      guard current.isFencing,
+        expectedToken == nil || current.token == expectedToken
+      else { return current }
+      beforeSettledWrite?()
+      let settled = BuzzAgeRestrictionFence(
+        token: UUID().uuidString.lowercased(),
+        isFencing: false
+      )
+      try writeLocked(settled)
+      return settled
+    }
+  }
+
+  private func withProcessLock<T>(_ operation: () throws -> T) throws -> T {
+    let descriptor = open(lockFileURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard descriptor >= 0 else { throw currentPOSIXError() }
+    guard flock(descriptor, LOCK_EX) == 0 else {
+      let error = currentPOSIXError()
+      close(descriptor)
+      throw error
+    }
+    defer {
+      flock(descriptor, LOCK_UN)
+      close(descriptor)
+    }
+    return try operation()
+  }
+
+  private func currentPOSIXError() -> POSIXError {
+    POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
   }
 
   private func loadLocked() -> BuzzAgeRestrictionFence {

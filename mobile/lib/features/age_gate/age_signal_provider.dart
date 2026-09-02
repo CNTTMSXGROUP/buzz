@@ -11,6 +11,9 @@ const ageSignalRetryDelay = Duration(seconds: 1);
 /// Maximum time allowed for each native age-signal request attempt.
 const ageSignalRequestTimeout = Duration(seconds: 30);
 
+/// Maximum time allowed for native cancellation acknowledgement.
+const ageSignalCancellationTimeout = Duration(seconds: 5);
+
 /// Invokes the native age-signal request.
 typedef AgeSignalRequest = Future<Map<Object?, Object?>?> Function();
 
@@ -69,11 +72,13 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
     AgeSignalCancel? cancelSignal,
     AgeSignalRestart? restartSignal,
     Duration requestTimeout = ageSignalRequestTimeout,
+    Duration cancellationTimeout = ageSignalCancellationTimeout,
   }) : _requestSignal = requestSignal ?? _requestPlatformAgeSignal,
        _delay = delay ?? _delayAgeSignalRetry,
        _cancelSignal = cancelSignal ?? _cancelPlatformAgeSignal,
        _restartSignal = restartSignal ?? _restartForPlatformAgeSignal,
-       _requestTimeout = requestTimeout;
+       _requestTimeout = requestTimeout,
+       _cancellationTimeout = cancellationTimeout;
 
   static const _maxAttempts = 2;
 
@@ -82,6 +87,7 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
   final AgeSignalCancel _cancelSignal;
   final AgeSignalRestart _restartSignal;
   final Duration _requestTimeout;
+  final Duration _cancellationTimeout;
   bool _completed = false;
   bool _restartRequired = false;
   Future<void>? _requestInFlight;
@@ -198,11 +204,15 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
   Future<void> _retireNativeRequest() async {
     var retired = false;
     try {
-      retired = await _cancelSignal();
+      retired = await _cancelSignal().timeout(_cancellationTimeout);
+    } on TimeoutException {
+      // Stay gated if cancellation does not acknowledge within its deadline.
     } on MissingPluginException {
       // Stay gated if cancellation cannot be acknowledged.
     } on PlatformException {
       // Stay gated if cancellation cannot be acknowledged.
+    } on TypeError {
+      // Stay gated if the method channel returns a malformed acknowledgement.
     } finally {
       if (retired) {
         _nativeRequestInFlight = null;

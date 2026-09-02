@@ -157,6 +157,44 @@ struct BuzzPushPresentationCacheTests {
     #expect(!store.current().isFencing)
   }
 
+  @Test("Cross-process lock prevents an older settle from overwriting a newer fence")
+  func crossProcessLockSerializesSettleAndBegin() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let settleReachedWrite = DispatchSemaphore(value: 0)
+    let releaseSettle = DispatchSemaphore(value: 0)
+    let settleFinished = DispatchSemaphore(value: 0)
+    let beginFinished = DispatchSemaphore(value: 0)
+    let settlingStore = BuzzAgeRestrictionFenceStore(
+      containerURL: directory,
+      beforeSettledWrite: {
+        settleReachedWrite.signal()
+        releaseSettle.wait()
+      }
+    )
+    let beginningStore = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let active = try settlingStore.begin()
+
+    DispatchQueue.global().async {
+      _ = try? settlingStore.settleIfFencing(expectedToken: active.token)
+      settleFinished.signal()
+    }
+    #expect(settleReachedWrite.wait(timeout: .now() + 1) == .success)
+
+    DispatchQueue.global().async {
+      _ = try? beginningStore.begin()
+      beginFinished.signal()
+    }
+    #expect(beginFinished.wait(timeout: .now() + 0.05) == .timedOut)
+
+    releaseSettle.signal()
+    #expect(settleFinished.wait(timeout: .now() + 1) == .success)
+    #expect(beginFinished.wait(timeout: .now() + 1) == .success)
+    let newest = beginningStore.current()
+    #expect(newest.isFencing)
+    #expect(newest.token != active.token)
+  }
+
   @Test("Age restriction fence discards active and superseded resolutions")
   func ageRestrictionFenceDiscardPolicy() {
     let initial = BuzzAgeRestrictionFence.initial

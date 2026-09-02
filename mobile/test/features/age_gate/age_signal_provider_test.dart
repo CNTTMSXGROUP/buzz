@@ -233,6 +233,55 @@ void main() {
     expect(restarts, 1);
   });
 
+  test('a stalled cancellation still exposes the retry action', () async {
+    var cancellations = 0;
+    var restarts = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () => Completer<Map<Object?, Object?>?>().future,
+        delay: (_) async {},
+        cancelSignal: () {
+          cancellations += 1;
+          return Completer<bool>().future;
+        },
+        restartSignal: () async {
+          restarts += 1;
+        },
+        requestTimeout: const Duration(milliseconds: 1),
+        cancellationTimeout: const Duration(milliseconds: 1),
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+    await container.read(provider.notifier).request();
+
+    expect(cancellations, 1);
+    expect(restarts, 1);
+  });
+
+  test('a malformed cancellation still exposes the retry action', () async {
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () => Completer<Map<Object?, Object?>?>().future,
+        delay: (_) async {},
+        cancelSignal: () async {
+          final dynamic malformed = 'not-a-boolean';
+          return malformed;
+        },
+        requestTimeout: const Duration(milliseconds: 1),
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+  });
+
   test('keeps a missing native channel gated and retryable', () async {
     var requests = 0;
     final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(

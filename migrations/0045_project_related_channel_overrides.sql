@@ -11,3 +11,5 @@ CREATE TABLE project_related_channel_overrides (
     CONSTRAINT chk_project_related_channel_owner_len CHECK (LENGTH(project_owner) = 32),
     CONSTRAINT chk_project_related_channel_d_len CHECK (LENGTH(project_d) BETWEEN 1 AND 1024)
 );
+
+SELECT attach_community_write_fence('project_related_channel_overrides');

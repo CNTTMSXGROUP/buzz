@@ -706,6 +706,10 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("CREATE TABLE project_related_channel_overrides"));
+        assert!(migrations[44]
+            .sql
+            .as_str()
+            .contains("attach_community_write_fence('project_related_channel_overrides')"));
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
             .sql
@@ -1822,6 +1826,13 @@ mod postgres_tests {
             );
         }
         let mut expected_fences = migration.fence_attachments.clone();
+        let migration_0045: &str = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 45)
+            .expect("embedded migration 0045")
+            .sql
+            .as_ref();
+        expected_fences.extend(surface(migration_0045).fence_attachments);
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
         assert_eq!(

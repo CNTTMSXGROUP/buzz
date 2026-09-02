@@ -1754,6 +1754,7 @@ SELECT attach_community_write_fence('join_policy_acceptances');
 SELECT attach_community_write_fence('moderation_actions');
 SELECT attach_community_write_fence('moderation_reports');
 SELECT attach_community_write_fence('parameterized_event_watermarks');
+SELECT attach_community_write_fence('project_related_channel_overrides');
 SELECT attach_community_write_fence('pubkey_allowlist');
 SELECT attach_community_write_fence('push_leases');
 SELECT attach_community_write_fence('push_match_queue');
@@ -1907,4 +1908,3 @@ CREATE INDEX idx_relay_operator_audit_target
 
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('relay_operator_audit', 'deployment-global append-only roster mutation audit trail; no community_id intentionally');
-

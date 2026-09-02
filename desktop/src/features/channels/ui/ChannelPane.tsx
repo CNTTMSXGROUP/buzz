@@ -66,7 +66,7 @@ import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelec
 import { usePrepareDmSendChannel } from "@/features/channels/ui/usePrepareDmSendChannel";
 import { useChannelPaneMessages } from "@/features/channels/ui/useChannelPaneMessages";
 import { useRoutedMessageEdit } from "@/features/channels/ui/useRoutedMessageEdit";
-import { useMarketTimelineMessages } from "@/features/market/lib/marketTimeline"; import { MarketChannelIntro } from "@/features/market/ui/MarketChannelIntro"; import { useMarketObserver } from "@/features/market/ui/marketChannelComposer";
+import { useMarketChannel } from "@/features/market/lib/MarketChannelContext"; import { useMarketTimelineMessages } from "@/features/market/lib/marketTimeline"; import { MarketChannelIntro } from "@/features/market/ui/MarketChannelIntro"; import { useMarketObserver } from "@/features/market/ui/marketChannelComposer";
 import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
@@ -203,6 +203,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   );
   const [isMainDeferredEditPending, setMainDeferredEditPending] = React.useState(false);
   const isMarketObserver = useMarketObserver(agentPubkeys, currentPubkey);
+  const isMarketChannel = useMarketChannel() !== null;
   const marketTimelineMessages = useMarketTimelineMessages(messages);
   const isNonMemberView =
     activeChannel !== null &&
@@ -690,7 +691,7 @@ export const ChannelPane = React.memo(function ChannelPane({
               }
               threadUnreadCounts={threadUnreadCounts}
             />
-            {isNonMemberView ? (
+            {isNonMemberView && !isMarketChannel ? (
               <div
                 data-testid="join-banner"
                 className="flex items-center gap-3 border-t border-border/80 bg-card/50 px-5 py-3"
@@ -721,7 +722,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                   {isJoining ? "Joining..." : "Join to participate"}
                 </Button>
               </div>
-            ) : (
+            ) : isNonMemberView ? null : (
               <div
                 className="pointer-events-none absolute inset-x-0 bottom-0 z-40 isolate before:absolute before:inset-x-0 before:bottom-0 before:-z-10 before:h-24 before:bg-gradient-to-b before:from-transparent before:to-background before:content-[''] after:absolute after:inset-x-0 after:bottom-0 after:-z-10 after:h-12 after:bg-background after:content-['']"
                 data-testid="channel-composer-overlay"

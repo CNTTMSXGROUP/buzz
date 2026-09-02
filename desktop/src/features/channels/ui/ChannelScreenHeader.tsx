@@ -77,6 +77,7 @@ export function ChannelScreenHeader({
     activeDmHeaderParticipants.length > 1;
   const activeDmParticipant = activeDmHeaderParticipants[0] ?? null;
   const showJoinButton =
+    marketProjection === null &&
     activeChannel !== null &&
     !activeChannel.isMember &&
     activeChannel.visibility === "open" &&
@@ -84,20 +85,21 @@ export function ChannelScreenHeader({
     onJoinChannel;
 
   const terminalPanel = useTerminalPanel();
-  const terminalButton = activeChannel ? (
-    <Button
-      aria-label={
-        terminalPanel.mode === "closed" ? "Open Buzz Term" : "Hide Buzz Term"
-      }
-      onClick={toggleTerminalPanel}
-      size="icon"
-      title="Buzz Term (⌘J)"
-      type="button"
-      variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
-    >
-      <SquareTerminal />
-    </Button>
-  ) : null;
+  const terminalButton =
+    activeChannel && !marketProjection ? (
+      <Button
+        aria-label={
+          terminalPanel.mode === "closed" ? "Open Buzz Term" : "Hide Buzz Term"
+        }
+        onClick={toggleTerminalPanel}
+        size="icon"
+        title="Buzz Term (⌘J)"
+        type="button"
+        variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
+      >
+        <SquareTerminal />
+      </Button>
+    ) : null;
   const channelActions = activeChannel ? (
     showJoinButton ? (
       <div className="flex items-center gap-1">

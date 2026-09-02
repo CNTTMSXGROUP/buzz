@@ -18,10 +18,7 @@ function BidList({
 }) {
   const { goChannel } = useAppNavigation();
   return (
-    <section
-      className="mt-4 border-t border-border/70 pt-4"
-      data-testid="market-bid-list"
-    >
+    <section className="mt-4" data-testid="market-bid-list">
       <div className="mb-2 flex items-center justify-between gap-3">
         <h3 className="text-sm font-semibold">Bids</h3>
         <span className="text-xs text-muted-foreground">

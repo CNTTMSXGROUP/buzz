@@ -2,6 +2,8 @@ import * as React from "react";
 import type { ComponentProps } from "react";
 import { WalletCards } from "lucide-react";
 
+import { AppTopChromePortal } from "@/app/AppTopChromePortal";
+
 import { ChannelScreen } from "@/features/channels/ui/ChannelScreen";
 import { MarketChannelProvider } from "@/features/market/lib/MarketChannelContext";
 import { useMarketChannelProjection } from "@/features/market/lib/useMarketChannels";
@@ -27,19 +29,26 @@ export function MarketChannelHome({
     return <ChannelScreen activeChannel={activeChannel} {...screenProps} />;
 
   const walletToggle = (
-    <Button
-      aria-label={walletOpen ? "Hide agent wallet" : "Show agent wallet"}
-      aria-pressed={walletOpen}
-      className="h-8 w-8"
-      data-testid="market-wallet-toggle"
-      onClick={() => setWalletOpen((open) => !open)}
-      size="icon"
-      title={walletOpen ? "Hide agent wallet" : "Show agent wallet"}
-      type="button"
-      variant="ghost"
-    >
-      <WalletCards data-testid="market-wallet-toggle-icon" />
-    </Button>
+    <AppTopChromePortal>
+      <div
+        className="ml-auto flex shrink-0 items-center"
+        data-tauri-drag-region
+      >
+        <Button
+          aria-label={walletOpen ? "Hide agent wallet" : "Show agent wallet"}
+          aria-pressed={walletOpen}
+          className="h-7 w-7 rounded text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+          data-testid="market-wallet-toggle"
+          onClick={() => setWalletOpen((open) => !open)}
+          size="icon"
+          title={walletOpen ? "Hide agent wallet" : "Show agent wallet"}
+          type="button"
+          variant="ghost"
+        >
+          <WalletCards data-testid="market-wallet-toggle-icon" />
+        </Button>
+      </div>
+    </AppTopChromePortal>
   );
 
   return (
@@ -52,12 +61,9 @@ export function MarketChannelHome({
         data-buzz-context-detached="true"
         data-testid="market-channel-home"
       >
+        {walletToggle}
         <div className="ml-px flex min-h-0 min-w-60 flex-1 flex-col overflow-hidden rounded-2xl bg-background">
-          <ChannelScreen
-            {...screenProps}
-            activeChannel={activeChannel}
-            headerEndActions={walletToggle}
-          />
+          <ChannelScreen {...screenProps} activeChannel={activeChannel} />
         </div>
         <AgentWalletPanel open={walletOpen} projection={projection} />
       </div>

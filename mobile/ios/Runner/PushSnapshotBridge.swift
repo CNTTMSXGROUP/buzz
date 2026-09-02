@@ -79,13 +79,13 @@ final class BuzzPushSnapshotBridge {
             ]
           )
         }
-        try ageRestrictionFenceStore.begin()
-        try store.replaceCommunities([])
-        try BuzzPushKeychain.replace(
-          signingKeys: [:],
-          accessGroup: keychainAccessGroup
-        )
-        try ageRestrictionFenceStore.settleIfFencing()
+        try ageRestrictionFenceStore.performFencedCleanup {
+          try store.replaceCommunities([])
+          try BuzzPushKeychain.replace(
+            signingKeys: [:],
+            accessGroup: self.keychainAccessGroup
+          )
+        }
         DispatchQueue.main.async {
           let center = UNUserNotificationCenter.current()
           center.removeAllDeliveredNotifications()
@@ -167,15 +167,33 @@ final class BuzzPushSnapshotBridge {
         }
         let data = try JSONSerialization.data(withJSONObject: enriched, options: [.sortedKeys])
         let decoded = try JSONDecoder().decode([PushLeaseCommunity].self, from: data)
-        try store.replaceCommunities(decoded)
-        try BuzzPushKeychain.replace(
-          signingKeys: signingKeys,
-          accessGroup: keychainAccessGroup
-        )
-        if requiresStore {
-          // Only the acknowledged age-gate path may end a failed purge fence.
-          // An older best-effort export must never reopen notification access.
-          try ageRestrictionFenceStore?.settleIfFencing()
+        let replaceSnapshot = {
+          try store.replaceCommunities(decoded)
+          try BuzzPushKeychain.replace(
+            signingKeys: signingKeys,
+            accessGroup: self.keychainAccessGroup
+          )
+        }
+        if requiresStore && decoded.isEmpty {
+          guard let ageRestrictionFenceStore else {
+            throw NSError(
+              domain: "BuzzPushSnapshotBridge",
+              code: 2,
+              userInfo: [
+                NSLocalizedDescriptionKey: "The age-restriction fence store is unavailable."
+              ]
+            )
+          }
+          // Rotate the cross-process token before clearing the snapshot. An
+          // NSE that already loaded the prior state must discard its result.
+          try ageRestrictionFenceStore.performFencedCleanup(replaceSnapshot)
+        } else {
+          try replaceSnapshot()
+          if requiresStore {
+            // Only the acknowledged age-gate path may end a failed purge fence.
+            // An older best-effort export must never reopen notification access.
+            try ageRestrictionFenceStore?.settleIfFencing()
+          }
         }
         Self.complete(result, value: nil)
       } catch {

@@ -67,6 +67,15 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
     return fence
   }
 
+  /// Rotates the durable fence before cleanup begins and settles it only after
+  /// every cleanup write succeeds. A thrown cleanup leaves the fence active so
+  /// notification extensions continue to fail closed.
+  public func performFencedCleanup(_ cleanup: () throws -> Void) throws {
+    try begin()
+    try cleanup()
+    try settleIfFencing()
+  }
+
   /// Completes a cleanup phase with another generation change.
   @discardableResult
   public func settleIfFencing() throws -> BuzzAgeRestrictionFence {

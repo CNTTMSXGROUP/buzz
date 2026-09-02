@@ -28,6 +28,43 @@ struct BuzzPushPresentationCacheTests {
     #expect(reader.current() == second)
   }
 
+  @Test("Fenced cleanup rotates before work and settles only after success")
+  func fencedCleanupOrdersTransitions() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let reader = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let initial = reader.current()
+    var observedDuringCleanup: BuzzAgeRestrictionFence?
+
+    try writer.performFencedCleanup {
+      observedDuringCleanup = reader.current()
+    }
+
+    let active = try #require(observedDuringCleanup)
+    let settled = reader.current()
+    #expect(active.isFencing)
+    #expect(active.token != initial.token)
+    #expect(!settled.isFencing)
+    #expect(settled.token != active.token)
+  }
+
+  @Test("Failed fenced cleanup remains active")
+  func failedFencedCleanupRemainsActive() throws {
+    struct CleanupFailure: Error {}
+
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = BuzzAgeRestrictionFenceStore(containerURL: directory)
+
+    #expect(throws: CleanupFailure.self) {
+      try store.performFencedCleanup {
+        throw CleanupFailure()
+      }
+    }
+    #expect(store.current().isFencing)
+  }
+
   @Test("Age restriction fence discards active and superseded resolutions")
   func ageRestrictionFenceDiscardPolicy() {
     let initial = BuzzAgeRestrictionFence.initial

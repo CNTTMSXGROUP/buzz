@@ -201,6 +201,29 @@ void main() {
     expect(communities.builds, 2);
     expect(communities.cleanups, 1);
   });
+
+  testWidgets('retries failed restricted push cleanup without an app resume', (
+    tester,
+  ) async {
+    final communities = _RetryingCleanupCommunityListNotifier();
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          ageSignalProvider.overrideWith(() => _BlockingAgeSignalNotifier()),
+          communityListProvider.overrideWith(() => communities),
+          ageSignalPushSnapshotRetryWaitProvider.overrideWithValue(
+            (_) async {},
+          ),
+        ],
+        child: const AgeSignalPushBootstrap(child: SizedBox()),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(communities.cleanups, 2);
+  });
 }
 
 class _AuthenticatedAuthNotifier extends AuthNotifier {
@@ -242,5 +265,20 @@ class _RecoveringCommunityListNotifier extends CommunityListNotifier {
   @override
   Future<void> enforceAgeRestrictionOnPush() async {
     cleanups += 1;
+  }
+}
+
+class _RetryingCleanupCommunityListNotifier extends CommunityListNotifier {
+  int cleanups = 0;
+
+  @override
+  Future<List<Community>> build() async => const [];
+
+  @override
+  Future<void> enforceAgeRestrictionOnPush() async {
+    cleanups += 1;
+    if (cleanups == 1) {
+      throw StateError('injected restricted cleanup failure');
+    }
   }
 }

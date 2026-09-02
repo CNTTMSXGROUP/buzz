@@ -107,7 +107,10 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final communitiesReady = ref.watch(communityListProvider).hasValue;
+    final waitBeforeRetry = ref.watch(ageSignalPushSnapshotRetryWaitProvider);
     final resumeGeneration = useState(0);
+    final retryGeneration = useState(0);
+    final consecutiveFailures = useRef(0);
 
     useEffect(() {
       final listener = AppLifecycleListener(
@@ -121,19 +124,38 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
       return listener.dispose;
     }, const []);
 
-    useEffect(() {
-      if (communitiesReady) {
-        unawaited(
-          ref
-              .read(communityListProvider.notifier)
-              .enforceAgeRestrictionOnPush()
-              .catchError((Object error, StackTrace stackTrace) {
-                reportPushLeaseCleanupError(error, stackTrace);
-              }),
-        );
-      }
-      return null;
-    }, [communitiesReady, resumeGeneration.value]);
+    useEffect(
+      () {
+        var cancelled = false;
+        if (communitiesReady) {
+          unawaited(() async {
+            try {
+              await ref
+                  .read(communityListProvider.notifier)
+                  .enforceAgeRestrictionOnPush();
+              consecutiveFailures.value = 0;
+            } catch (error, stackTrace) {
+              reportPushLeaseCleanupError(error, stackTrace);
+              final delay = ageSignalPushSnapshotRetryDelay(
+                consecutiveFailures.value,
+              );
+              await waitBeforeRetry(delay);
+              if (!cancelled) {
+                consecutiveFailures.value += 1;
+                retryGeneration.value += 1;
+              }
+            }
+          }());
+        }
+        return () => cancelled = true;
+      },
+      [
+        communitiesReady,
+        waitBeforeRetry,
+        resumeGeneration.value,
+        retryGeneration.value,
+      ],
+    );
 
     return child;
   }

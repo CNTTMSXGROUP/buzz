@@ -358,10 +358,15 @@ async fn nip11_or_ws_handler(
     let max_frame_bytes = state.config.max_frame_bytes;
 
     // NIP-FI assertion check at upgrade — gated to genuine WebSocket upgrade
-    // requests (requests carrying `Upgrade: websocket`) so plain browser GET /
-    // and NIP-11 fallback requests are never intercepted by the enforcement
-    // gate. Keying on the `Upgrade` header (not on `Accept`) means an HTML
-    // Accept header on a real WS upgrade is still gated correctly.
+    // requests (requests carrying both `Upgrade: websocket` and a `Connection`
+    // header with the `Upgrade` token) so plain browser GET / and NIP-11
+    // fallback requests are never intercepted by the enforcement gate.
+    // Requiring both headers matches RFC 6455 §4.1 and avoids intercepting a
+    // request that carries only one header and would be rejected by Axum's
+    // WebSocketUpgrade extractor anyway.
+    //
+    // Keying on the header pair (not on `Accept`) means an HTML Accept header
+    // on a real WS upgrade is still gated correctly.
     //
     // This pre-check runs BEFORE `WebSocketUpgrade::from_request` so that the
     // denial response is returned on the raw HTTP connection, not inside the
@@ -372,7 +377,18 @@ async fn nip11_or_ws_handler(
             .get(axum::http::header::UPGRADE)
             .and_then(|v| v.to_str().ok())
             .map(|v| v.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && headers
+                .get(axum::http::header::CONNECTION)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    // Connection header is a comma-separated token list; per RFC 7230
+                    // each token is case-insensitive. A genuine WS upgrade carries
+                    // "Upgrade" (or "keep-alive, Upgrade") as a Connection token.
+                    v.split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+                })
+                .unwrap_or(false);
         if is_ws_upgrade {
             use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
             let mode = state.config.nip_fi.mode;
@@ -584,11 +600,6 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
-
-    // Env vars are process-global — serialize tests that mutate them to prevent
-    // cross-test races. Shared with `nip_fi_config::tests::ENV_LOCK` in the
-    // same process-global address space; both guard the same NIP-FI env vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct ScriptedReadinessEvaluator {
         evaluations: Mutex<VecDeque<ReadinessEvaluation>>,
@@ -1454,14 +1465,9 @@ mod tests {
         use crate::nip_fi_config::NipFiRelayConfig;
         use buzz_auth::{IssuerRegistry, NipFiMode};
 
-        // Clear NIP-FI env vars so `Config::from_env()` sees clean off-mode
-        // defaults; we overwrite the entire `nip_fi` field afterwards.
-        // Hold ENV_LOCK for the duration so we don't race nip_fi_config tests.
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        std::env::remove_var("BUZZ_NIP_FI_MODE");
-        std::env::remove_var("BUZZ_NIP_FI_ISSUERS");
-        std::env::remove_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS");
-
+        // Build config directly without env mutation — the nip_fi field is
+        // constructed explicitly below, so reading NIP-FI env vars is irrelevant
+        // and mutating them would race the config-module tests (separate statics).
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -1675,6 +1681,105 @@ mod tests {
             status,
             axum::http::StatusCode::UNAUTHORIZED,
             "WS upgrade with Accept: text/html in enforce mode must still be denied 401"
+        );
+    }
+
+    // ── B4 negative: single-header requests bypass the NIP-FI gate ───────────
+    //
+    // The gate fires ONLY when BOTH `Upgrade: websocket` AND a `Connection`
+    // header carrying the `upgrade` token are present. A request with only one
+    // of the two headers is not a valid WebSocket upgrade and must not be
+    // intercepted by the NIP-FI enforcement gate.
+    //
+    // Mutation evidence:
+    //   A) Change the gate to key on `Upgrade: websocket` alone (drop the
+    //      Connection check) → the Upgrade-only test gets denied 401 instead of
+    //      passing through → the assertion panics.
+    //   B) Change the gate to key on `Connection: Upgrade` alone (drop the
+    //      Upgrade check) → the Connection-only test gets denied 401 → panics.
+
+    /// Drive a request that carries exactly `Upgrade: websocket` but no
+    /// `Connection` header. Must not be gated — returns whatever the NIP-11
+    /// or HTTP handler produces (not 401/503 from the NIP-FI gate).
+    async fn nip_fi_upgrade_only_status(
+        state: Arc<AppState>,
+        path: &str,
+    ) -> axum::http::StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let req = Request::get(path)
+            .header(axum::http::header::HOST, "relay.example")
+            .header("Upgrade", "websocket")
+            // Deliberately omit Connection header.
+            .body(Body::empty())
+            .expect("request");
+        build_router(state)
+            .oneshot(req)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    /// Drive a request that carries `Connection: Upgrade` but no `Upgrade`
+    /// header. Must not be gated by the NIP-FI enforcement logic.
+    async fn nip_fi_connection_only_status(
+        state: Arc<AppState>,
+        path: &str,
+    ) -> axum::http::StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let req = Request::get(path)
+            .header(axum::http::header::HOST, "relay.example")
+            .header("Connection", "Upgrade")
+            // Deliberately omit Upgrade header.
+            .body(Body::empty())
+            .expect("request");
+        build_router(state)
+            .oneshot(req)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn b4_upgrade_only_no_connection_header_not_gated() {
+        let state = nip_fi_enforce_state().await;
+        // Upgrade: websocket present, Connection absent → not a valid WS
+        // upgrade handshake → must NOT be denied by the NIP-FI gate.
+        // The request falls through to the NIP-11 / HTTP handler, which
+        // returns 200 (NIP-11 JSON) or 426 (Upgrade Required) — not 401/503.
+        let status = nip_fi_upgrade_only_status(state, "/").await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "B4: Upgrade-only request (no Connection header) must not be denied 401 by NIP-FI gate"
+        );
+        assert_ne!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "B4: Upgrade-only request (no Connection header) must not be denied 503 by NIP-FI gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn b4_connection_upgrade_only_no_upgrade_header_not_gated() {
+        let state = nip_fi_enforce_state().await;
+        // Connection: Upgrade present, Upgrade absent → not a valid WS
+        // upgrade handshake → must NOT be denied by the NIP-FI gate.
+        let status = nip_fi_connection_only_status(state, "/").await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "B4: Connection-only request (no Upgrade header) must not be denied 401 by NIP-FI gate"
+        );
+        assert_ne!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "B4: Connection-only request (no Upgrade header) must not be denied 503 by NIP-FI gate"
         );
     }
 }

@@ -296,17 +296,21 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
             // B2: Fence admission against an already-expired NIP-FI session.
-            // The expiry task may have cancelled the token between the time
-            // this handler was dispatched and now (asynchronous gap). Admitting
-            // a cancelled connection would publish AuthState::Authenticated and
-            // allow a buffered EVENT/REQ to dispatch on an expired session.
-            // Check here — at the single point where authentication is finalised
-            // — and drop silently if cancelled; the expiry task's denial frame
-            // and Close are already queued in the terminal channel.
+            // Acquire the auth_state write lock FIRST so the cancel check and
+            // the state write are atomic with respect to the expiry task.
+            // The expiry task only calls cancel.cancel() — it never writes
+            // auth_state — so holding the write lock prevents a race between
+            // cancel() racing between check and commit here.
+            //
+            // Pattern: acquire lock → check cancel under lock → write or return.
+            // If cancelled: drop the guard and return; the expiry task's denial
+            // frame and Close are already queued in the terminal channel.
+            let mut auth_guard = conn.auth_state.write().await;
             if conn.cancel.is_cancelled() {
                 return;
             }
-            *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
+            *auth_guard = AuthState::Authenticated(auth_ctx);
+            drop(auth_guard);
             state
                 .conn_manager
                 .set_authenticated_pubkey(conn_id, pubkey.to_bytes().to_vec());

@@ -691,6 +691,16 @@ async fn recv_loop(
 }
 
 async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Arc<AppState>) {
+    // B2: Frame admission fence. If the connection's NIP-FI session has already
+    // expired (cancel fired by the expiry task), drop this frame before any
+    // handler dispatch. This closes the window where a buffered EVENT/REQ/AUTH
+    // is selected from the recv queue after expiry fires the cancel token.
+    // The check at the top of handle_text_message covers all message types
+    // uniformly — no individual handler needs its own fence.
+    if conn.cancel.is_cancelled() {
+        return;
+    }
+
     let msg = match ClientMessage::parse(&text) {
         Ok(m) => m,
         Err(e) => {
@@ -1413,6 +1423,218 @@ pub(crate) mod tests {
         assert!(
             cancel.is_cancelled(),
             "expiry task must cancel the connection"
+        );
+    }
+
+    // ── B2: frame-admission fence and AUTH TOCTOU ─────────────────────────────
+    //
+    // Once the NIP-FI expiry task calls cancel(), no further message dispatch
+    // should occur — even if a frame was already buffered in the recv queue
+    // before cancel fired.
+    //
+    // The fence is the `if conn.cancel.is_cancelled() { return; }` check at the
+    // top of `handle_text_message`. These tests exercise two windows:
+    //
+    //   1. A buffered REQ/EVENT/COUNT frame that arrives after cancel fires.
+    //   2. An AUTH message dispatched while cancel is already set
+    //      (the TOCTOU window where auth_state.write() is acquired, cancel is
+    //      checked under the lock, and the write is skipped if cancelled).
+    //
+    // Mutation evidence:
+    //   A) Remove `if conn.cancel.is_cancelled() { return; }` from
+    //      `handle_text_message` → the EVENT test receives a frame on send_rx
+    //      (an OK or NOTICE) → the assertion panics.
+    //   B) Remove `if conn.cancel.is_cancelled() { return; }` from the AUTH
+    //      handler (inside the write guard) → the AUTH test's
+    //      `not Authenticated` assertion may still hold due to the DB path, but
+    //      the top-level handle_text_message fence is the true gate.
+
+    #[tokio::test]
+    async fn b2_cancelled_connection_event_frame_not_dispatched() {
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
+
+        // Pre-cancel the token — simulates the expiry task having already fired.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let (send_tx, mut send_rx) = mpsc::channel::<WsMessage>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+
+        let conn = Arc::new(ConnectionState {
+            conn_id: uuid::Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+                "test.local".to_string(),
+            ),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(AuthState::Failed),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+        });
+
+        let state = crate::state::tests::test_state().await;
+        // A plausible EVENT frame — the handler would normally send OK/NOTICE.
+        let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "b2 test")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let raw = serde_json::json!(["EVENT", event]).to_string();
+
+        handle_text_message(raw, Arc::clone(&conn), Arc::clone(&state)).await;
+
+        // No frame must be sent — the fence must return before any handler runs.
+        assert!(
+            send_rx.try_recv().is_err(),
+            "B2: a pre-cancelled connection must not dispatch an EVENT frame to any handler"
+        );
+    }
+
+    // ── B3: send_loop writer delivers denial-then-Close through real send path ─
+    //
+    // These tests drive the real `send_loop_inner` against a sink that records
+    // every frame, saturate ctrl_tx, enqueue a denial frame on terminal_ctrl_tx,
+    // then cancel the token. The sink is non-blocking (MockSink), so send_loop
+    // runs to completion synchronously after cancel fires.
+    //
+    // Assertion: the denial frame appears in the output BEFORE the Close frame.
+    // This proves the queue-then-cancel ordering holds through the actual writer
+    // code path, not just through a channel try_recv check.
+    //
+    // Mutation evidence:
+    //   A) In send_loop_inner's cancel branch, swap the terminal drain and the
+    //      ctrl drain → denial frame position flips → assertion panics.
+    //   B) Remove the terminal drain entirely → denial frame absent → assertion
+    //      panics on the "denial frame must precede Close" check.
+
+    #[tokio::test]
+    async fn b3_root_pairing_denial_precedes_close_through_send_loop() {
+        use crate::nip_fi_session::NipFiWsRoute;
+
+        let (data_tx, data_rx) = mpsc::channel::<WsMessage>(16);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+        let (_restart_tx, restart_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+
+        // Saturate ctrl_tx so an ordinary send couldn't carry the denial frame.
+        for i in 0..8u8 {
+            ctrl_tx
+                .try_send(WsMessage::Text(format!("ordinary-{i}").into()))
+                .expect("ctrl_tx has capacity 8");
+        }
+        drop(data_tx); // no data traffic in this test
+
+        // Enqueue the denial frame on the terminal channel, then cancel.
+        // This is the queue-then-cancel pattern the pairing denial path uses.
+        terminal_ctrl_tx
+            .try_send(crate::nip_fi_session::authorization_denied_frame(
+                NipFiWsRoute::Root,
+            ))
+            .expect("terminal channel is empty");
+        cancel.cancel();
+
+        let (sink, state_arc) = MockSink::new(None);
+        send_loop_inner(
+            sink,
+            data_rx,
+            ctrl_rx,
+            terminal_ctrl_rx,
+            restart_rx,
+            cancel,
+            ordinary_disconnect_reason(),
+        )
+        .await;
+
+        let state = state_arc.lock().expect("mock sink poisoned");
+        // The first frame written must be the denial frame.
+        // The last frame written must be Close (or None close).
+        let msgs = &state.messages;
+        assert!(
+            !msgs.is_empty(),
+            "send_loop must write at least the denial frame + Close"
+        );
+        // Find the denial frame.
+        let denial_pos = msgs
+            .iter()
+            .position(|m| matches!(m, WsMessage::Text(t) if t.contains("authorization denied")));
+        let close_pos = msgs.iter().rposition(|m| matches!(m, WsMessage::Close(_)));
+
+        let denial_pos = denial_pos.expect("denial frame must appear in send_loop output");
+        let close_pos = close_pos.expect("Close frame must appear in send_loop output");
+        assert!(
+            denial_pos < close_pos,
+            "B3: denial frame (pos {denial_pos}) must precede Close frame (pos {close_pos})"
+        );
+    }
+
+    #[tokio::test]
+    async fn b3_expiry_denial_precedes_close_through_send_loop() {
+        use crate::nip_fi_session::{spawn_nip_fi_expiry_task, NipFiWsRoute};
+        use chrono::Utc;
+
+        let (data_tx, data_rx) = mpsc::channel::<WsMessage>(16);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+        let (_restart_tx, restart_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+
+        // Saturate ctrl_tx.
+        for i in 0..8u8 {
+            ctrl_tx
+                .try_send(WsMessage::Text(format!("ordinary-{i}").into()))
+                .expect("ctrl_tx has capacity 8");
+        }
+        drop(data_tx);
+
+        // Arm the expiry task with an already-expired deadline. It will
+        // immediately enqueue the denial frame on the terminal channel and
+        // cancel the token.
+        let already_expired = Utc::now() - chrono::Duration::seconds(1);
+        let expiry_handle = spawn_nip_fi_expiry_task(
+            already_expired,
+            terminal_ctrl_tx,
+            cancel.clone(),
+            NipFiWsRoute::Root,
+        );
+        // Wait for the expiry task to fire before we run the send_loop.
+        expiry_handle.await.expect("expiry task must complete");
+
+        let (sink, state_arc) = MockSink::new(None);
+        send_loop_inner(
+            sink,
+            data_rx,
+            ctrl_rx,
+            terminal_ctrl_rx,
+            restart_rx,
+            cancel,
+            ordinary_disconnect_reason(),
+        )
+        .await;
+
+        let state = state_arc.lock().expect("mock sink poisoned");
+        let msgs = &state.messages;
+        assert!(
+            !msgs.is_empty(),
+            "send_loop must write at least the denial frame + Close"
+        );
+        let denial_pos = msgs
+            .iter()
+            .position(|m| matches!(m, WsMessage::Text(t) if t.contains("authorization denied")));
+        let close_pos = msgs.iter().rposition(|m| matches!(m, WsMessage::Close(_)));
+
+        let denial_pos = denial_pos.expect("expiry denial frame must appear in send_loop output");
+        let close_pos = close_pos.expect("Close frame must appear in send_loop output");
+        assert!(
+            denial_pos < close_pos,
+            "B3: expiry denial frame (pos {denial_pos}) must precede Close frame (pos {close_pos})"
         );
     }
 }

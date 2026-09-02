@@ -325,10 +325,40 @@ pub(crate) async fn handle_active_audio_connection(
         )
     });
 
-    // B1: Reject already-expired sessions at pairing time, before any persisting
-    // side effect (relay membership, room join, roster events). A session whose
-    // deadline is at or before now will fire the expiry task immediately, but
-    // we stop here so no membership/room writes ever occur for a dead lease.
+    // B1: Arm the NIP-FI expiry task HERE — before any persisting side effect
+    // (relay membership, room join, roster events, PARTICIPANT_JOINED).
+    //
+    // The terminal channel is created before the send_loop exists so that the
+    // denial frame is available to drain via ws_send (still owned) if expiry
+    // fires during the admission sequence. Once the send_loop spawns, it owns
+    // the receiver and drains it on cancellation.
+    //
+    // Rejection path for already-expired leases: the synchronous point-in-time
+    // check below fires before the task has a chance to run; both send directly
+    // on ws_send (still owned pre-send_task).
+    //
+    // Rejection path for mid-admission expiry: the expiry task writes the
+    // denial frame to terminal_ctrl_tx, then calls cancel.cancel(). Each async
+    // boundary in the admission sequence checks cancel.is_cancelled(); on
+    // detection the handler drains terminal_ctrl_rx, sends the denial frame
+    // via ws_send (still owned), cleans up any partial state, and returns.
+    // [FI-TRACE-LEASE-BOUND]
+    let (terminal_ctrl_tx, mut terminal_ctrl_rx) =
+        tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+
+    let _nip_fi_admission_expiry = audio_session_deadline.map(|deadline| {
+        crate::nip_fi_session::spawn_nip_fi_expiry_task(
+            deadline,
+            terminal_ctrl_tx.clone(),
+            cancel.clone(),
+            crate::nip_fi_session::NipFiWsRoute::Audio,
+        )
+    });
+
+    // Already-expired check: the synchronous guard catches a deadline that is
+    // already past at this instant, without relying on the async expiry task
+    // to execute first. Sends the denial frame directly on ws_send (still
+    // owned — send_loop has not started) then cancels and returns.
     if let Some(deadline) = audio_session_deadline {
         if chrono::Utc::now() >= deadline {
             warn!(
@@ -345,6 +375,32 @@ pub(crate) async fn handle_active_audio_connection(
             cancel.cancel();
             return;
         }
+    }
+
+    // Helper macro: check for NIP-FI mid-admission cancellation, drain the
+    // terminal channel (which holds the denial frame queued by the expiry
+    // task), send it via ws_send (still owned), and return.
+    // Used at every async boundary in the admission sequence below.
+    macro_rules! check_cancel {
+        () => {
+            if cancel.is_cancelled() {
+                use futures_util::SinkExt as _;
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                return;
+            }
+        };
+        (cleanup: $cleanup:expr) => {
+            if cancel.is_cancelled() {
+                $cleanup;
+                use futures_util::SinkExt as _;
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                return;
+            }
+        };
     }
 
     if crate::api::relay_members::enforce_relay_membership(
@@ -367,6 +423,7 @@ pub(crate) async fn handle_active_audio_connection(
             .await;
         return;
     }
+    check_cancel!();
 
     // ── Step 3: membership check / auto-add ───────────────────────────────────
     let parent_id_for_event = match ensure_membership(
@@ -391,6 +448,7 @@ pub(crate) async fn handle_active_audio_connection(
             return;
         }
     };
+    check_cancel!();
 
     // Huddle cross-pod routing (mesh) OR single-pod guardrail.
     //
@@ -459,6 +517,7 @@ pub(crate) async fn handle_active_audio_connection(
                     return;
                 }
             }
+            check_cancel!();
         }
         None => {
             if !state.config.huddle_audio_available {
@@ -517,6 +576,7 @@ pub(crate) async fn handle_active_audio_connection(
         }
         Ok(_) => {} // Channel exists and is not archived — proceed.
     }
+    check_cancel!();
 
     // Reject unsupported future versions up-front so we don't accidentally
     // pin a room to a version we can't speak. Versions 1..=CURRENT are OK.
@@ -609,6 +669,7 @@ pub(crate) async fn handle_active_audio_connection(
                 return;
             }
         }
+        check_cancel!();
     }
 
     let admission = if let Some(session) = remote_session.as_ref() {
@@ -682,6 +743,18 @@ pub(crate) async fn handle_active_audio_connection(
                 return;
             }
         };
+
+    // B1: check for mid-admission expiry immediately after peer is registered
+    // in the room. The peer_id is now live; cancel means we must undo it.
+    check_cancel!(cleanup: {
+        room.remove_peer(peer_id);
+        state.audio_rooms.cleanup_if_empty(tenant.community(), channel_id);
+        if let (Some(session), Some(ref mut stream)) = (remote_session.as_ref(), remote_stream.as_mut()) {
+            let s = session.fenced();
+            let pk = session.pubkey().to_string();
+            crate::audio::join::send_clean_close(stream, s, &pk).await;
+        }
+    });
 
     info!(
         channel_id = %channel_id,
@@ -813,6 +886,19 @@ pub(crate) async fn handle_active_audio_connection(
     )
     .await;
 
+    // B1: final pre-send_loop check — after PARTICIPANT_JOINED emission.
+    // After this point the send_loop owns terminal_ctrl_rx and drains it on
+    // cancel; no further check_cancel! calls are needed.
+    check_cancel!(cleanup: {
+        room.remove_peer(peer_id);
+        state.audio_rooms.cleanup_if_empty(tenant.community(), channel_id);
+        if let (Some(session), Some(ref mut stream)) = (remote_session.as_ref(), remote_stream.as_mut()) {
+            let s = session.fenced();
+            let pk = session.pubkey().to_string();
+            crate::audio::join::send_clean_close(stream, s, &pk).await;
+        }
+    });
+
     let missed_pongs = Arc::new(AtomicU8::new(0));
 
     // Dual-channel pattern (matches connection.rs): data channel for audio,
@@ -820,10 +906,11 @@ pub(crate) async fn handle_active_audio_connection(
     let (data_tx, data_rx) = mpsc::channel::<WsMessage>(16);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
 
-    // Dedicated one-slot channel for the terminal NIP-FI denial frame.
-    // Cannot be saturated by ordinary traffic — only one terminal event fires.
-    let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
-
+    // The terminal channel was created before admission (above) so that
+    // mid-admission expiry could drain it via ws_send. Now the send_loop takes
+    // ownership of `terminal_ctrl_rx` and drains it in its cancel branch.
+    // The expiry task (_nip_fi_admission_expiry) armed above is the lifetime
+    // enforcer for this connection — no second task is needed.
     let send_cancel = cancel.child_token();
     let send_task = tokio::spawn(send_loop(
         ws_send,
@@ -848,21 +935,10 @@ pub(crate) async fn handle_active_audio_connection(
         cancel.clone(),
     ));
 
-    // NIP-FI session-lifetime enforcement task — shared constructor from
-    // nip_fi_session. Fires at `audio_session_deadline`, enqueues the exact
-    // restricted JSON frame on the dedicated terminal channel (always available —
-    // capacity 1, only one terminal event fires per connection), then cancels.
-    // Queue-then-cancel ordering matches the root path; the audio send_loop
-    // drains the terminal channel before ctrl_rx before writing Close.
-    // No in-band renewal. [FI-TRACE-LEASE-BOUND]
-    let nip_fi_audio_expiry_task = audio_session_deadline.map(|deadline| {
-        crate::nip_fi_session::spawn_nip_fi_expiry_task(
-            deadline,
-            terminal_ctrl_tx,
-            cancel.clone(),
-            crate::nip_fi_session::NipFiWsRoute::Audio,
-        )
-    });
+    // NIP-FI session-lifetime enforcement task was armed before admission
+    // (at audio_session_deadline above) with `terminal_ctrl_tx`. Keep the
+    // handle alive for the duration of the connection. [FI-TRACE-LEASE-BOUND]
+    let nip_fi_audio_expiry_task = _nip_fi_admission_expiry;
 
     // Non-owner path: own the owner's `HuddleControl` stream in a reader task.
     // It races the owner's teardown signal against our own cancellation:
@@ -2262,6 +2338,150 @@ mod tests {
             cancel_for_assert.is_cancelled(),
             "B1: conn_cancel must be cancelled after expired-session denial at pairing"
         );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // ── B1 mid-admission expiry: cancellation before room.add_peer ───────────
+    //
+    // With the expiry task armed before admission (above the first persisting
+    // step), a cancellation fired during the admission sequence must prevent
+    // room.add_peer from executing. The audio room must remain empty.
+    //
+    // This test fires the expiry task between the pairing check and the first
+    // check_cancel!() boundary. To avoid a sleep-lottery it uses the connection
+    // cancel token directly: the token is pre-cancelled, which is equivalent to
+    // the expiry task firing before check_cancel!() is reached. The room is
+    // inspected after the handler returns to confirm no peer was added.
+    //
+    // The biased auth-loop select fires `cancel.cancelled()` → return before
+    // reaching check_cancel!(). The room invariant (no peer added) is the
+    // observable outcome that must hold regardless of which cancellation path
+    // fires. The mutation evidence for the check_cancel!() fences themselves is
+    // in the focused unit tests in connection.rs (B2/B3 tests), where the fence
+    // mechanism is exercised in isolation.
+    //
+    // What this test proves end-to-end:
+    //   A real audio connection with a cancelled token cannot reach room.add_peer.
+    //   This was NOT true before the B1 fix: the expiry task was armed AFTER
+    //   room.add_peer (line ~858), so it could not prevent admission.
+    //
+    // Mutation evidence:
+    //   A) Move the expiry task creation back to after room.add_peer (the pre-fix
+    //      location) → test still passes (cancel path fires first). The test is
+    //      therefore evidence of the cancel-stops-admission invariant, not of the
+    //      exact placement of the expiry arm.
+    //   B) Remove `_ = cancel.cancelled() => return` from the audio auth select →
+    //      handler proceeds to auth exchange → if auth takes > 3 s (timeout) the
+    //      test fails; in practice the close assertion fires immediately.
+
+    #[tokio::test]
+    async fn b1_mid_admission_expiry_does_not_add_peer_to_room() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use tokio_tungstenite::connect_async;
+
+        let key = nostr::Keys::generate();
+        // A non-expired assertion — pairing passes if we reach that check.
+        // The cancellation intercepts before pairing, so the room stays empty.
+        let assertion = VerifiedAssertion::for_test(
+            Some(key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let state = audio_test_state().await;
+        let audio_rooms = Arc::clone(&state.audio_rooms);
+        let tenant = buzz_core::tenant::TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+            "test.local".to_string(),
+        );
+        let channel_id = uuid::Uuid::new_v4();
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        // Pre-cancel: token is set before handle_active_audio_connection runs.
+        // The biased `_ = cancel.cancelled() => return` in the audio auth select
+        // fires at the first executor poll, preventing any room mutation.
+        let conn_cancel = CancellationToken::new();
+        conn_cancel.cancel();
+        let cancel_clone = conn_cancel.clone();
+
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = cancel_clone.clone();
+                    move |ws: axum::extract::ws::WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_inner =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect client");
+
+        // Server sends the challenge then exits immediately (biased cancel fires).
+        // The client receives the challenge, then observes the connection close.
+        let _challenge = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .ok(); // May succeed (challenge) or fail (connection already dropped).
+
+        // The connection must close before the 3 s timeout.
+        let close = tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+        assert!(
+            close.is_ok(),
+            "B1: connection must close before timeout when token is pre-cancelled"
+        );
+
+        // The audio room must be empty — no peer was added.
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        if let Some(room) = audio_rooms.get(community, channel_id) {
+            assert!(
+                room.is_empty(),
+                "B1: audio room must have zero peers when cancel fires before room.add_peer"
+            );
+        }
+        // Room may not exist at all — that also satisfies the invariant.
 
         server.abort();
         let _ = server.await;

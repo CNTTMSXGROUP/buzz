@@ -24,39 +24,15 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
 
     let allRecords = try records()
     let allPending = try pendingEnrollments()
-    let staleRecords = allRecords.filter { $0.gatewayOrigin != gatewayOrigin }
-    let stalePending = allPending.filter { $0.gatewayOrigin != gatewayOrigin }
-    for origin in Set(staleRecords.map(\.gatewayOrigin) + stalePending.map(\.gatewayOrigin)) {
-      var state = try gatewayCleanupStates().first { $0.gatewayOrigin == origin }
-        ?? BuzzPushGatewayCleanupState(
-          gatewayOrigin: origin,
-          grants: [],
-          pendingEnrollments: []
-        )
-      for record in staleRecords where record.gatewayOrigin == origin {
-        state.grants.removeAll {
-          $0.relayOrigin == record.relayOrigin && $0.appProfile == record.appProfile
-        }
-        state.grants.append(record)
-      }
-      for pending in stalePending where pending.gatewayOrigin == origin {
-        state.pendingEnrollments.removeAll {
-          $0.relayOrigin == pending.relayOrigin && $0.appProfile == pending.appProfile
-        }
-        state.pendingEnrollments.append(pending)
-      }
-      // Persist cleanup authority before removing it from active state.
-      try saveGatewayCleanupState(state)
-    }
-    let retainedRecords = allRecords.filter { $0.gatewayOrigin == gatewayOrigin }
-    if retainedRecords.count != allRecords.count {
-      try replace(retainedRecords, account: Self.recordsAccount)
-    }
-
-    let retainedPending = allPending.filter { $0.gatewayOrigin == gatewayOrigin }
-    if retainedPending.count != allPending.count {
-      try replace(retainedPending, account: Self.pendingAccount)
-    }
+    try BuzzPushGatewayStateReset.run(
+      gatewayOrigin: gatewayOrigin,
+      records: allRecords,
+      pendingEnrollments: allPending,
+      cleanupStates: gatewayCleanupStates(),
+      saveCleanupState: saveGatewayCleanupState,
+      replaceRecords: { try self.replace($0, account: Self.recordsAccount) },
+      replacePendingEnrollments: { try self.replace($0, account: Self.pendingAccount) }
+    )
   }
 
   func records() throws -> [BuzzPushEndpointGrantRecord] {

@@ -22,6 +22,8 @@ public struct BuzzPushEndpointGrantRecord: Codable, Equatable, Sendable {
   /// Gateway installation authority. This is distinct from [installationId],
   /// which is the unlinkable per-relay-origin NIP-PL lease address.
   public let gatewayInstallationHandle: String?
+  /// App Attest key that authenticates mutations for the gateway installation.
+  public let appAttestKeyId: String
   public let installationId: String
   public let endpointGrant: String
   public let endpointHash: String
@@ -36,6 +38,7 @@ public struct BuzzPushEndpointGrantRecord: Codable, Equatable, Sendable {
     relayPubkey: String,
     relayMetadataPubkey: String? = nil,
     gatewayInstallationHandle: String? = nil,
+    appAttestKeyId: String,
     installationId: String,
     endpointGrant: String,
     endpointHash: String,
@@ -50,6 +53,7 @@ public struct BuzzPushEndpointGrantRecord: Codable, Equatable, Sendable {
     self.relayPubkey = relayPubkey
     self.relayMetadataPubkey = relayMetadataPubkey
     self.gatewayInstallationHandle = gatewayInstallationHandle
+    self.appAttestKeyId = appAttestKeyId
     self.installationId = installationId
     self.endpointGrant = endpointGrant
     self.endpointHash = endpointHash
@@ -149,7 +153,7 @@ protocol BuzzDevAppAttesting {
   func prepareAttestation() async throws -> BuzzDevAttestation
   func attestation(_ prepared: BuzzDevAttestation, clientData: Data) async throws
     -> BuzzDevAttestation
-  func assertion(clientData: Data) async throws -> String
+  func assertion(keyId: String, clientData: Data) async throws -> String
 }
 
 struct BuzzDevAttestation: Equatable {
@@ -323,12 +327,10 @@ struct BuzzDCAppAttestProvider: BuzzDevAppAttesting {
     )
   }
 
-  func assertion(clientData: Data) async throws -> String {
+  func assertion(keyId: String, clientData: Data) async throws -> String {
     precondition(!clientData.isEmpty, "Delegation client data must not be empty")
     try requireSupportedService()
-    guard let keyId = try keyIdStore.keyId(),
-      BuzzAppAttestKeyId.isValid(keyId)
-    else {
+    guard BuzzAppAttestKeyId.isValid(keyId) else {
       throw BuzzDevPushEnrollmentError.invalidAppAttestKeyId
     }
     let object = try await service.generateAssertion(
@@ -483,6 +485,7 @@ public final class BuzzDevPushEnrollmentDriver {
         relayPubkey: current.relayPubkey,
         relayMetadataPubkey: relayKeys.metadataPubkey,
         gatewayInstallationHandle: current.gatewayInstallationHandle,
+        appAttestKeyId: current.appAttestKeyId,
         installationId: current.installationId,
         endpointGrant: current.endpointGrant,
         endpointHash: current.endpointHash,
@@ -517,6 +520,7 @@ public final class BuzzDevPushEnrollmentDriver {
         relayPubkey: relayPubkey,
         relayMetadataPubkey: relayKeys.metadataPubkey,
         gatewayInstallationHandle: sharedGrant.gatewayInstallationHandle,
+        appAttestKeyId: sharedGrant.appAttestKeyId,
         installationId: try makeInstallationId(),
         endpointGrant: sharedGrant.endpointGrant,
         endpointHash: endpointHash,
@@ -574,7 +578,8 @@ public final class BuzzDevPushEnrollmentDriver {
         appProfile: Self.appProfile,
         expiresAt: expiresAt,
         installationId: try storedForOrigin?.installationId ?? makeInstallationId(),
-        gatewayInstallationHandle: existing.uuidString.lowercased()
+        gatewayInstallationHandle: existing.uuidString.lowercased(),
+        keyId: reusableInstallation.appAttestKeyId
       )
       try store.savePendingEnrollment(pending)
     } else {
@@ -721,7 +726,13 @@ public final class BuzzDevPushEnrollmentDriver {
       notBefore: nowSeconds,
       expiresAt: pending.expiresAt
     )
-    let assertion = try await appAttest.assertion(clientData: delegationClientData)
+    guard let appAttestKeyId = pending.keyId else {
+      throw BuzzDevPushEnrollmentError.invalidAppAttestKeyId
+    }
+    let assertion = try await appAttest.assertion(
+      keyId: appAttestKeyId,
+      clientData: delegationClientData
+    )
     let endpointGrant = try await delegate(
       challenge: delegationChallenge,
       installationHandle: installation,
@@ -738,6 +749,7 @@ public final class BuzzDevPushEnrollmentDriver {
       relayPubkey: relayPubkey,
       relayMetadataPubkey: relayKeys.metadataPubkey,
       gatewayInstallationHandle: installationHandle,
+      appAttestKeyId: appAttestKeyId,
       installationId: pending.installationId,
       endpointGrant: endpointGrant,
       endpointHash: endpointHash,
@@ -784,11 +796,27 @@ public final class BuzzDevPushEnrollmentDriver {
     let nowSeconds = Int64(now().timeIntervalSince1970)
     let endpoint = Self.lowercaseHex(deviceToken)
     let endpointHash = Self.lowercaseHex(Data(SHA256.hash(data: deviceToken)))
-    var handles = [String: Int64]()
+    var handles = [String: CleanupInstallation]()
+    func mergeHandle(_ handle: String, endpointEpoch: Int64, keyId: String) -> Bool {
+      if let existing = handles[handle] {
+        guard existing.keyId == keyId else { return false }
+        handles[handle] = CleanupInstallation(
+          endpointEpoch: max(existing.endpointEpoch, endpointEpoch),
+          keyId: keyId
+        )
+      } else {
+        handles[handle] = CleanupInstallation(endpointEpoch: endpointEpoch, keyId: keyId)
+      }
+      return true
+    }
     for grant in state.grants {
       if grant.expiresAt <= nowSeconds { continue }
       guard let handle = grant.gatewayInstallationHandle else { return false }
-      handles[handle] = max(handles[handle] ?? 0, grant.endpointEpoch)
+      guard mergeHandle(
+        handle,
+        endpointEpoch: grant.endpointEpoch,
+        keyId: grant.appAttestKeyId
+      ) else { return false }
     }
     for index in state.pendingEnrollments.indices {
       var pending = state.pendingEnrollments[index]
@@ -823,14 +851,19 @@ public final class BuzzDevPushEnrollmentDriver {
         }
       }
       guard let handle = pending.gatewayInstallationHandle else { return false }
-      handles[handle] = max(handles[handle] ?? 0, Self.endpointEpoch)
+      guard let keyId = pending.keyId,
+        mergeHandle(handle, endpointEpoch: Self.endpointEpoch, keyId: keyId)
+      else {
+        return false
+      }
     }
-    for (handleText, endpointEpoch) in handles {
+    for (handleText, installation) in handles {
       guard let handle = UUID(uuidString: handleText) else { return false }
       do {
         try await oldDriver.revokeInstallation(
           installationHandle: handle,
-          endpointEpoch: endpointEpoch
+          endpointEpoch: installation.endpointEpoch,
+          appAttestKeyId: installation.keyId
         )
       } catch BuzzDevPushEnrollmentError.unexpectedStatus(
         route: "v1/installations/revoke", _, actual: 404, _
@@ -933,7 +966,8 @@ public final class BuzzDevPushEnrollmentDriver {
 
   private func revokeInstallation(
     installationHandle: UUID,
-    endpointEpoch: Int64
+    endpointEpoch: Int64,
+    appAttestKeyId: String
   ) async throws {
     let (newEndpointEpoch, overflow) = endpointEpoch.addingReportingOverflow(1)
     guard !overflow else { throw BuzzDevPushEnrollmentError.generationExhausted }
@@ -946,7 +980,10 @@ public final class BuzzDevPushEnrollmentDriver {
       endpointEpoch: endpointEpoch,
       newEndpointEpoch: newEndpointEpoch
     )
-    let assertion = try await appAttest.assertion(clientData: clientData)
+    let assertion = try await appAttest.assertion(
+      keyId: appAttestKeyId,
+      clientData: clientData
+    )
     let response: MutationResponse = try await post(
       route: "v1/installations/revoke",
       expectedStatus: 200,
@@ -1178,6 +1215,10 @@ private struct RevokeInstallationRequest: Encodable {
 }
 private struct MutationResponse: Decodable {
   let status: String
+}
+private struct CleanupInstallation {
+  let endpointEpoch: Int64
+  let keyId: String
 }
 private struct RelayInformation: Decodable {
   struct Push: Decodable {

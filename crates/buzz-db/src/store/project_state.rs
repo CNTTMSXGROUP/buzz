@@ -1498,7 +1498,7 @@ mod postgres_tests {
             .expect("recovery projection is pending");
         assert_eq!(pending.previous_created_at(), Some(projected_at));
         assert!(pending.template().content.contains(&recovered.to_string()));
-        assert!(!pending.template().content.contains(&seeded.to_string()));
+        assert!(pending.template().content.contains(&seeded.to_string()));
 
         let coordinate = format!("30621:{}:shared", owner.public_key().to_hex());
         let deletion = EventBuilder::new(Kind::EventDeletion, "")

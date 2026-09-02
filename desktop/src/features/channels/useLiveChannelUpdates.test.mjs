@@ -33,6 +33,7 @@ after(() => dom.window.close());
 
 const CHANNEL_ID = "channel-a";
 const ROOT_ID = "a".repeat(64);
+const PARENT_ID = "1".repeat(64);
 const EXISTING_REPLY_ID = "b".repeat(64);
 const NEW_REPLY_ID = "c".repeat(64);
 const TOP_LEVEL_ID = "d".repeat(64);
@@ -129,6 +130,47 @@ test("non-broadcast replies stay out of channelMessagesKey and merge into an exi
     existingReply,
     reply,
   ]);
+
+  unmount();
+  client.clear();
+});
+
+test("nested non-broadcast replies use the root thread cache instead of the parent cache", async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  client.setQueryData(channelMessagesKey(CHANNEL_ID), [rootEvent()]);
+  const parentReply = directReplyEvent(PARENT_ID, 101, [], "parent-reply");
+  client.setQueryData(threadRepliesKey(CHANNEL_ID, ROOT_ID), [parentReply]);
+
+  const { callback, unmount } = await mountLiveUpdates(client);
+  const nestedReply = event(
+    NEW_REPLY_ID,
+    102,
+    [
+      ["h", CHANNEL_ID],
+      ["e", ROOT_ID, "", "root"],
+      ["e", PARENT_ID, "", "reply"],
+    ],
+    "nested-reply",
+  );
+
+  callback(nestedReply);
+
+  assert.deepEqual(client.getQueryData(channelMessagesKey(CHANNEL_ID)), [
+    rootEvent(),
+  ]);
+  assert.deepEqual(client.getQueryData(threadRepliesKey(CHANNEL_ID, ROOT_ID)), [
+    parentReply,
+    nestedReply,
+  ]);
+  assert.equal(
+    client.getQueryCache().find({
+      queryKey: threadRepliesKey(CHANNEL_ID, PARENT_ID),
+      exact: true,
+    }),
+    undefined,
+  );
 
   unmount();
   client.clear();

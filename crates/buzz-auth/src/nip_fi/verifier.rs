@@ -143,6 +143,15 @@ impl AssertionKeySet {
     pub(crate) fn hard_deadline(&self) -> chrono::DateTime<chrono::Utc> {
         self.hard_deadline
     }
+
+    /// The authenticated JWKS for this issuer snapshot.
+    ///
+    /// `pub(super)` so the command verifier in the same `nip_fi` module can
+    /// look up keys by `kid` without duplicating the key-selection logic.
+    /// External consumers cannot access key material through this path.
+    pub(super) fn jwks(&self) -> &JwkSet {
+        &self.jwks
+    }
 }
 
 impl fmt::Debug for AssertionKeySet {
@@ -566,10 +575,10 @@ impl VerifierError {
 }
 
 /// A minimally parsed JOSE header.
-struct ParsedHeader {
-    algorithm: Algorithm,
-    kid: String,
-    typ: Option<String>,
+pub(super) struct ParsedHeader {
+    pub(super) algorithm: Algorithm,
+    pub(super) kid: String,
+    pub(super) typ: Option<String>,
 }
 
 /// Reject any token that is not exactly three compact-JWS segments.
@@ -582,6 +591,33 @@ struct ParsedHeader {
 /// base64url — is validated separately by [`enforce_signature_shape`] after
 /// header parsing, so that no structurally malformed token can defer to the
 /// key-source lookup and masquerade as a 503 outage (NIP-FI.md:151-171).
+pub(super) fn enforce_compact_structure_pub(token: &str) -> Result<(), VerifierError> {
+    enforce_compact_structure(token)
+}
+pub(super) fn enforce_signature_shape_pub(token: &str) -> Result<(), VerifierError> {
+    enforce_signature_shape(token)
+}
+pub(super) fn parse_header_pub(token: &str) -> Result<ParsedHeader, VerifierError> {
+    parse_header(token)
+}
+pub(super) fn parse_unique_claims_pub(
+    token: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, VerifierError> {
+    parse_unique_claims(token)
+}
+pub(super) fn select_unique_jwk_pub<'a>(
+    jwks: &'a jsonwebtoken::jwk::JwkSet,
+    kid: &str,
+) -> Result<&'a jsonwebtoken::jwk::Jwk, VerifierError> {
+    select_unique_jwk(jwks, kid)
+}
+pub(super) fn validate_jwk_pub(
+    jwk: &jsonwebtoken::jwk::Jwk,
+    algorithm: jsonwebtoken::Algorithm,
+) -> Result<(), VerifierError> {
+    validate_jwk(jwk, algorithm)
+}
+
 fn enforce_compact_structure(token: &str) -> Result<(), VerifierError> {
     if token.split('.').count() == 3 {
         Ok(())

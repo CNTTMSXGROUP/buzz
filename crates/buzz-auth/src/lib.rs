@@ -47,13 +47,14 @@ pub use scope::{parse_scopes, Scope};
 
 pub use nip_fi::{
     validate_nip_fi_config, AssertionKeySet, AssertionPolicyId, CanonicalCapabilities,
-    ClientSubjectPosture, ConfidentialAssertion, DenialClass, FederatedAssertionVerifier,
-    FederatedIdentity, FederatedIdentityDiscovery, FreshnessClass, HttpJwksFetcher,
+    ClientSubjectPosture, CommandError, CommandIssuerPolicy, CommandPolicyError, CommandResult,
+    CommandVerifier, ConfidentialAssertion, DenialClass, DenySetFull, FederatedAssertionVerifier,
+    FederatedIdentity, FederatedIdentityDiscovery, FreshnessClass, HttpJwksFetcher, IssuerCapacity,
     IssuerJwksConfig, IssuerKeySource, IssuerPolicy, IssuerPolicyError, IssuerRegistry,
-    JwksFetchError, JwksFetcher, JwksSourceContract, NipFiMode, NipFiStartupError,
+    JwksFetchError, JwksFetcher, JwksSourceContract, NipFiDenyMap, NipFiMode, NipFiStartupError,
     ProductionJwksSource, RevalidationDependencies, SubjectClass, SubjectClassContract, TokenClass,
-    TransportContractId, VerifiedAssertion, VerifierError, CLIENT_ATTACHED_HEADER,
-    NOSTR_PUBKEY_CLAIM, OAUTH_CLIENT_ID_CLAIM,
+    TransportContractId, VerifiedAssertion, VerifierError, CLIENT_ATTACHED_HEADER, COMMAND_JWT_TYP,
+    MAX_COMMAND_AGE_SECONDS, NOSTR_PUBKEY_CLAIM, OAUTH_CLIENT_ID_CLAIM,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

@@ -4179,19 +4179,26 @@ function mockProjectCanvasPackageDescriptor(candidate = false) {
   const loadId = ${JSON.stringify(loadId)};
   const nonce = ${JSON.stringify(nonce)};
   const root = document.getElementById("canvas-root");
-  // Layout persistence is host state, so the shell only needs to report the
-  // layouts it was handed and post arrangements back. Controls live outside
-  // #canvas-root so its text stays the project name.
+  // Host owns layout persistence; controls live outside #canvas-root.
   const installLayoutControls = (port, layouts) => {
-    const stored = (layouts && layouts.e2e && layouts.e2e.widgets) || {};
-    const placed = stored["e2e-widget"];
+    const stored = (layouts && layouts.e2e) || {};
+    const placed = stored.widgets && stored.widgets["e2e-widget"];
+    const sized = stored.sizes && stored.sizes["e2e-widget"];
+    const DEFAULT_WIDTH = 240;
     let x = placed && typeof placed.x === "number" ? placed.x : 0;
+    let width = sized && typeof sized.width === "number" ? sized.width : DEFAULT_WIDTH;
     root.dataset.canvasLayouts = JSON.stringify(layouts || {});
     root.dataset.canvasWidgetX = String(x);
-    const save = (widgets) => {
+    root.dataset.canvasWidgetWidth = String(width);
+    const save = (widgets, sizes) => {
       root.dataset.canvasWidgetX = String(x);
-      port.postMessage({ dashboard: "e2e", loadId, nonce, pan: null, protocolVersion: 1, type: "canvas.layout", widgets });
+      root.dataset.canvasWidgetWidth = String(width);
+      port.postMessage({ dashboard: "e2e", loadId, nonce, pan: null, protocolVersion: 1, sizes, type: "canvas.layout", widgets });
     };
+    const overrides = () => [
+      x === 0 ? {} : { "e2e-widget": { x, y: 0 } },
+      width === DEFAULT_WIDTH ? {} : { "e2e-widget": { width, height: 144 } },
+    ];
     const control = (testId, label, left, onClick) => {
       const button = document.createElement("button");
       button.className = "layout-control";
@@ -4204,11 +4211,16 @@ function mockProjectCanvasPackageDescriptor(candidate = false) {
     };
     control("canvas-move-widget", "Move", "2px", () => {
       x += 24;
-      save({ "e2e-widget": { x, y: 0 } });
+      save(...overrides());
     });
-    control("canvas-reset-layout", "Reset", "56px", () => {
+    control("canvas-resize-widget", "Resize", "56px", () => {
+      width += 24;
+      save(...overrides());
+    });
+    control("canvas-reset-layout", "Reset", "124px", () => {
       x = 0;
-      save({});
+      width = DEFAULT_WIDTH;
+      save({}, {});
     });
   };
   const connect = (event) => {

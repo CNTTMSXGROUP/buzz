@@ -16,6 +16,7 @@ export const PROJECT_CANVAS_OPEN_RATE_LIMIT = 3;
 export const PROJECT_CANVAS_OPEN_RATE_WINDOW_MS = 10_000;
 export const PROJECT_CANVAS_MAX_LAYOUT_WIDGETS = 256;
 export const PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT = 100_000;
+export const PROJECT_CANVAS_LAYOUT_MIN_WIDGET_SIZE = 16;
 
 const MAX_IDENTIFIER_LENGTH = 1_024;
 const MAX_NONCE_LENGTH = 256;
@@ -186,13 +187,31 @@ const layoutPointSchema = z
 
 export type ProjectCanvasLayoutPoint = z.infer<typeof layoutPointSchema>;
 
+const layoutSizeDimensionSchema = z
+  .number()
+  .finite()
+  .gte(PROJECT_CANVAS_LAYOUT_MIN_WIDGET_SIZE)
+  .lte(PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT);
+
+const layoutSizeSchema = z
+  .object({
+    height: layoutSizeDimensionSchema,
+    width: layoutSizeDimensionSchema,
+  })
+  .strict();
+
+export type ProjectCanvasLayoutSize = z.infer<typeof layoutSizeSchema>;
+
 /**
  * A dashboard's user-arranged layout: only the widgets the user actually
- * moved, plus a pan offset when it differs from the package default. Untouched
- * widgets keep following the package, so a later revision can still move them.
+ * moved or resized, plus a pan offset when it differs from the package
+ * default. Position and size overrides are independent — resizing a widget
+ * must not pin its position — and untouched widgets keep following the
+ * package, so a later revision can still move or resize them.
  */
 export type ProjectCanvasDashboardLayout = {
   pan: ProjectCanvasLayoutPoint | null;
+  sizes: Record<string, ProjectCanvasLayoutSize>;
   widgets: Record<string, ProjectCanvasLayoutPoint>;
 };
 
@@ -257,6 +276,15 @@ const childMessageSchema = z.discriminatedUnion("type", [
       ...childBindingSchema,
       dashboard: z.string().min(1).max(128),
       pan: layoutPointSchema.nullable(),
+      // Optional so packages predating size persistence stay valid.
+      sizes: z
+        .record(widgetIdSchema, layoutSizeSchema)
+        .refine(
+          (sizes) =>
+            Object.keys(sizes).length <= PROJECT_CANVAS_MAX_LAYOUT_WIDGETS,
+          `A canvas layout carries at most ${PROJECT_CANVAS_MAX_LAYOUT_WIDGETS} widgets.`,
+        )
+        .optional(),
       type: z.literal("canvas.layout"),
       widgets: z
         .record(widgetIdSchema, layoutPointSchema)

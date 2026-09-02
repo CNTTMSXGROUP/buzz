@@ -357,7 +357,7 @@ test("live queries drive the dev widgets through the SDK", async () => {
     channelRow
       .querySelector("[data-buzz-component='avatar'] img")
       ?.getAttribute("src"),
-    "data:image/png;base64,AA==",
+    `./__buzz/avatar/${"a".repeat(64)}`,
   );
   channelRow.click();
   const open = harness.sent.find((message) => message.type === "canvas.open");
@@ -678,6 +678,7 @@ test("persisted layout overrides seed widget positions and canvas pan", async ()
       layouts: {
         dev: {
           pan: { x: -24, y: 48 },
+          sizes: { reviews: { height: 384, width: 528 } },
           widgets: { "active-channels": { x: 120, y: 96 } },
         },
       },
@@ -693,6 +694,16 @@ test("persisted layout overrides seed widget positions and canvas pan", async ()
   );
   // A widget with no override keeps following the package default.
   assert.equal(widgetArticle(document, "reviews").dataset.worldX, "384");
+
+  // Size overrides are independent of position overrides: the resized widget
+  // keeps its package position, the moved widget keeps its package size.
+  const resized = widgetArticle(document, "reviews");
+  assert.equal(resized.dataset.worldWidth, "528");
+  assert.equal(resized.dataset.worldHeight, "384");
+  assert.equal(resized.parentElement.style.width, "528px");
+  assert.equal(resized.parentElement.style.height, "384px");
+  assert.equal(moved.dataset.worldWidth, "336");
+  assert.equal(moved.parentElement.style.width, "336px");
 
   const canvas = document.querySelector(
     "[data-testid='project-widget-canvas']",
@@ -733,9 +744,81 @@ test("keyboard nudges send one debounced layout carrying only the moved widget",
     nonce: "nonce-1",
     pan: null,
     protocolVersion: 1,
+    sizes: {},
     type: "canvas.layout",
     widgets: { "active-channels": { x: 48, y: 24 } },
   });
+});
+
+test("keyboard resizes send one debounced layout carrying only the resized widget", async () => {
+  const harness = await createCanvasHarness();
+  const { document } = harness.dom.window;
+  harness.port.emit(initMessage(harness.fixtureData));
+
+  const handle = document.querySelector(
+    "[data-testid='project-canvas-widget-active-channels-resize']",
+  );
+  assert.equal(
+    handle.getAttribute("aria-label"),
+    "Resize Active channels widget",
+  );
+  for (const key of ["ArrowRight", "ArrowRight", "ArrowDown"]) {
+    handle.dispatchEvent(
+      new harness.dom.window.KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key,
+      }),
+    );
+  }
+  const article = widgetArticle(document, "active-channels");
+  assert.equal(article.dataset.worldWidth, "384");
+  assert.equal(article.dataset.worldHeight, "360");
+  assert.equal(article.parentElement.style.width, "384px");
+  assert.equal(article.parentElement.style.height, "360px");
+  // Resizing must not create a position override for the widget.
+  assert.equal(article.dataset.worldX, "0");
+  assert.deepEqual(layoutMessages(harness), [], "sends are debounced");
+
+  await flushLayoutSaves();
+  const saved = layoutMessages(harness);
+  assert.equal(saved.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved[0])), {
+    dashboard: "dev",
+    loadId: "load-1",
+    nonce: "nonce-1",
+    pan: null,
+    protocolVersion: 1,
+    sizes: { "active-channels": { height: 360, width: 384 } },
+    type: "canvas.layout",
+    widgets: {},
+  });
+});
+
+test("keyboard resizes clamp at the minimum widget size", async () => {
+  const harness = await createCanvasHarness();
+  const { document } = harness.dom.window;
+  harness.port.emit(initMessage(harness.fixtureData));
+
+  const handle = document.querySelector(
+    "[data-testid='project-canvas-widget-active-channels-resize']",
+  );
+  // active-channels starts at 336x336; 8 shift-shrinks would go negative.
+  for (let press = 0; press < 8; press += 1) {
+    for (const key of ["ArrowLeft", "ArrowUp"]) {
+      handle.dispatchEvent(
+        new harness.dom.window.KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          key,
+          shiftKey: true,
+        }),
+      );
+    }
+  }
+  const article = widgetArticle(document, "active-channels");
+  assert.equal(article.dataset.worldWidth, "192");
+  assert.equal(article.dataset.worldHeight, "144");
 });
 
 test("resetting the canvas restores defaults and clears the stored overrides", async () => {
@@ -746,6 +829,7 @@ test("resetting the canvas restores defaults and clears the stored overrides", a
       layouts: {
         dev: {
           pan: { x: -24, y: 48 },
+          sizes: { "active-channels": { height: 456, width: 480 } },
           widgets: { "active-channels": { x: 120, y: 96 } },
         },
       },
@@ -765,6 +849,10 @@ test("resetting the canvas restores defaults and clears the stored overrides", a
     article.parentElement.style.transform,
     "translate3d(0px, 0px, 0)",
   );
+  assert.equal(article.dataset.worldWidth, "336");
+  assert.equal(article.dataset.worldHeight, "336");
+  assert.equal(article.parentElement.style.width, "336px");
+  assert.equal(article.parentElement.style.height, "336px");
   const canvas = document.querySelector(
     "[data-testid='project-widget-canvas']",
   );
@@ -775,5 +863,6 @@ test("resetting the canvas restores defaults and clears the stored overrides", a
   const saved = layoutMessages(harness);
   assert.equal(saved.length, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(saved[0].widgets)), {});
+  assert.deepEqual(JSON.parse(JSON.stringify(saved[0].sizes)), {});
   assert.equal(saved[0].pan, null);
 });

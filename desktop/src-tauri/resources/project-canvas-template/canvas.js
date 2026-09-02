@@ -3,6 +3,9 @@
   const INTERACTIVE_SELECTOR =
     "a,button,input,label,select,textarea,video[controls],[role='button'],[data-no-drag]";
   const DEFAULT_PAN = { x: 24, y: 24 };
+  const GRID = 24;
+  const MIN_WIDGET_WIDTH = 192;
+  const MIN_WIDGET_HEIGHT = 144;
   const runtime = window.buzzCanvas;
   const root = document.getElementById("canvas-root");
   const widgetModules = Object.values(window.buzzCanvasWidgets || {});
@@ -34,6 +37,7 @@
     nonce: null,
     positions: new Map(),
     project: null,
+    sizes: new Map(),
     snapshots: null,
     translation: { ...DEFAULT_PAN },
   };
@@ -74,9 +78,12 @@
     const stored = storedLayout(message.layouts, state.dashboard.id);
     state.translation = sanitizePoint(stored?.pan) || { ...DEFAULT_PAN };
     state.positions.clear();
+    state.sizes.clear();
     for (const widget of state.dashboard.widgets) {
       const override = sanitizePoint(stored?.widgets?.[widget.id]);
       state.positions.set(widget.id, override || { ...widget.position });
+      const sizeOverride = sanitizeSize(stored?.sizes?.[widget.id]);
+      state.sizes.set(widget.id, sizeOverride || { ...widget.size });
     }
     renderCanvas();
     port.postMessage({
@@ -114,17 +121,41 @@
     return { x: point.x, y: point.y };
   }
 
+  function sanitizeSize(size) {
+    if (!size || typeof size !== "object") return null;
+    if (!Number.isFinite(size.width) || !Number.isFinite(size.height)) {
+      return null;
+    }
+    if (size.width < MIN_WIDGET_WIDTH || size.height < MIN_WIDGET_HEIGHT) {
+      return null;
+    }
+    return { width: size.width, height: size.height };
+  }
+
   // Persist only what the user changed: widgets still sitting on their package
-  // default are left out, so a later package revision can still move them.
+  // default are left out, so a later package revision can still move or
+  // resize them. Position and size overrides are independent for the same
+  // reason — resizing a widget must not pin where the package put it.
   function saveLayout() {
     if (!state.dashboard || !runtime.sdk?.layout) return;
     const widgets = {};
+    const sizes = {};
     for (const widget of state.dashboard.widgets) {
       const position = state.positions.get(widget.id);
       const fallback = sanitizePoint(widget.position) || { x: 0, y: 0 };
-      if (!position) continue;
-      if (position.x === fallback.x && position.y === fallback.y) continue;
-      widgets[widget.id] = { x: position.x, y: position.y };
+      if (
+        position &&
+        (position.x !== fallback.x || position.y !== fallback.y)
+      ) {
+        widgets[widget.id] = { x: position.x, y: position.y };
+      }
+      const size = state.sizes.get(widget.id);
+      if (
+        size &&
+        (size.width !== widget.size.width || size.height !== widget.size.height)
+      ) {
+        sizes[widget.id] = { width: size.width, height: size.height };
+      }
     }
     const pan = {
       x: Math.round(state.translation.x),
@@ -133,6 +164,7 @@
     runtime.sdk.layout.save({
       dashboard: state.dashboard.id,
       pan: pan.x === DEFAULT_PAN.x && pan.y === DEFAULT_PAN.y ? null : pan,
+      sizes,
       widgets,
     });
   }
@@ -216,10 +248,9 @@
 
   function renderWidgetGroup(widget) {
     const position = state.positions.get(widget.id);
+    const size = state.sizes.get(widget.id);
     const group = element("div", "widget-group");
     group.dataset.widgetId = widget.id;
-    group.style.width = `${widget.size.width}px`;
-    group.style.height = `${widget.size.height}px`;
     moveWidgetGroup(group, position);
 
     const article = element("article", "widget", {
@@ -236,11 +267,26 @@
     article.addEventListener("keydown", (event) => nudgeWidget(event, widget));
     if (!widget.hideHeader) article.append(renderWidgetHeader(widget));
     article.append(renderWidgetContent(widget));
-    group.append(article);
+    group.append(article, renderResizeHandle(widget));
+    applyWidgetSize(group, size);
 
     const companion = renderCompanion(widget);
     if (companion) group.append(companion);
     return group;
+  }
+
+  function renderResizeHandle(widget) {
+    const handle = element("button", "resize-handle", {
+      ariaLabel: `Resize ${widget.title} widget`,
+      testId: `project-canvas-widget-${widget.id}-resize`,
+      title: "Resize widget (drag or arrow keys)",
+      type: "button",
+    });
+    handle.addEventListener("pointerdown", (event) =>
+      startWidgetResize(event, widget),
+    );
+    handle.addEventListener("keydown", (event) => resizeWidget(event, widget));
+    return handle;
   }
 
   function renderWidgetHeader(widget) {
@@ -429,15 +475,87 @@
     saveLayout();
   }
 
+  function startWidgetResize(event, widget) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const group = event.currentTarget.parentElement;
+    const start = { x: event.clientX, y: event.clientY };
+    const origin = { ...state.sizes.get(widget.id) };
+    group.classList.add("active", "resizing");
+    trackPointer(
+      event,
+      (point) => {
+        const next = clampSize({
+          width: origin.width + point.x - start.x,
+          height: origin.height + point.y - start.y,
+        });
+        state.sizes.set(widget.id, next);
+        applyWidgetSize(group, next);
+      },
+      () => {
+        const snapped = snapSize(state.sizes.get(widget.id));
+        state.sizes.set(widget.id, snapped);
+        applyWidgetSize(group, snapped);
+        group.classList.remove("resizing");
+        saveLayout();
+      },
+    );
+  }
+
+  function resizeWidget(event, widget) {
+    const amount = event.shiftKey ? 48 : 24;
+    const delta = {
+      ArrowDown: { width: 0, height: amount },
+      ArrowLeft: { width: -amount, height: 0 },
+      ArrowRight: { width: amount, height: 0 },
+      ArrowUp: { width: 0, height: -amount },
+    }[event.key];
+    if (!delta) return;
+    event.preventDefault();
+    const current = state.sizes.get(widget.id);
+    const next = snapSize({
+      width: current.width + delta.width,
+      height: current.height + delta.height,
+    });
+    state.sizes.set(widget.id, next);
+    applyWidgetSize(event.currentTarget.parentElement, next);
+    saveLayout();
+  }
+
   function snapPoint(point) {
     return {
-      x: Math.round(point.x / 24) * 24,
-      y: Math.round(point.y / 24) * 24,
+      x: Math.round(point.x / GRID) * GRID,
+      y: Math.round(point.y / GRID) * GRID,
     };
+  }
+
+  // The minimums are grid multiples, so snapping then clamping stays on grid.
+  function clampSize(size) {
+    return {
+      width: Math.max(MIN_WIDGET_WIDTH, size.width),
+      height: Math.max(MIN_WIDGET_HEIGHT, size.height),
+    };
+  }
+
+  function snapSize(size) {
+    return clampSize({
+      width: Math.round(size.width / GRID) * GRID,
+      height: Math.round(size.height / GRID) * GRID,
+    });
   }
 
   function moveWidgetGroup(group, position) {
     group.style.transform = `translate3d(${position.x}px, ${position.y}px, 0)`;
+  }
+
+  function applyWidgetSize(group, size) {
+    group.style.width = `${size.width}px`;
+    group.style.height = `${size.height}px`;
+    const article = group.querySelector(".widget");
+    if (!article) return;
+    article.dataset.worldWidth = String(Math.round(size.width));
+    article.dataset.worldHeight = String(Math.round(size.height));
   }
 
   function updateWorldTransform(world) {
@@ -463,8 +581,9 @@
   }
 
   // Always reachable recovery: restores the package's pan and every widget
-  // position, then clears the stored overrides. Widget elements are moved in
-  // place rather than re-rendered so live subscriptions survive the reset.
+  // position and size, then clears the stored overrides. Widget elements are
+  // moved in place rather than re-rendered so live subscriptions survive the
+  // reset.
   function resetLayout() {
     state.translation = { ...DEFAULT_PAN };
     const groups = new Map(
@@ -476,9 +595,12 @@
     for (const widget of state.dashboard.widgets) {
       const position = sanitizePoint(widget.position) || { x: 0, y: 0 };
       state.positions.set(widget.id, position);
+      const size = { ...widget.size };
+      state.sizes.set(widget.id, size);
       const group = groups.get(widget.id);
       if (!group) continue;
       moveWidgetGroup(group, position);
+      applyWidgetSize(group, size);
       const article = group.querySelector(".widget");
       if (!article) continue;
       article.dataset.worldX = String(position.x);

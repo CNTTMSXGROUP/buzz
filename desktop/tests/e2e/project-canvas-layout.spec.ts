@@ -35,11 +35,15 @@ test("canvas widget layout survives a reload and is cleared by a reset", async (
   await expect(root).toHaveAttribute("data-canvas-ready", "true");
   await expect(root).toHaveAttribute("data-canvas-layouts", "{}");
   await expect(root).toHaveAttribute("data-canvas-widget-x", "0");
+  await expect(root).toHaveAttribute("data-canvas-widget-width", "240");
   expect(await storedLayoutKeys(page)).toEqual([]);
 
   await frame.getByTestId("canvas-move-widget").click();
   await frame.getByTestId("canvas-move-widget").click();
   await expect(root).toHaveAttribute("data-canvas-widget-x", "48");
+  await frame.getByTestId("canvas-resize-widget").click();
+  await frame.getByTestId("canvas-resize-widget").click();
+  await expect(root).toHaveAttribute("data-canvas-widget-width", "288");
   await expect
     .poll(() => storedLayoutKeys(page))
     .toEqual([expect.stringContaining("buzz.projectCanvasLayout.")]);
@@ -51,9 +55,11 @@ test("canvas widget layout survives a reload and is cleared by a reset", async (
   await expect(iframe).not.toHaveAttribute("src", activeSource ?? "");
   await expect(root).toHaveAttribute("data-canvas-ready", "true");
   await expect(root).toHaveAttribute("data-canvas-widget-x", "48");
+  await expect(root).toHaveAttribute("data-canvas-widget-width", "288");
 
   await frame.getByTestId("canvas-reset-layout").click();
   await expect(root).toHaveAttribute("data-canvas-widget-x", "0");
+  await expect(root).toHaveAttribute("data-canvas-widget-width", "240");
   await expect.poll(() => storedLayoutKeys(page)).toEqual([]);
 
   const resetSource = await iframe.getAttribute("src");
@@ -62,4 +68,5 @@ test("canvas widget layout survives a reload and is cleared by a reset", async (
   await expect(root).toHaveAttribute("data-canvas-ready", "true");
   await expect(root).toHaveAttribute("data-canvas-layouts", "{}");
   await expect(root).toHaveAttribute("data-canvas-widget-x", "0");
+  await expect(root).toHaveAttribute("data-canvas-widget-width", "240");
 });

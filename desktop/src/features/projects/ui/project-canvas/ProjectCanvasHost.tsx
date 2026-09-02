@@ -416,7 +416,11 @@ export function ProjectCanvasHost({
         communityId,
         projectId,
         message.dashboard,
-        { pan: message.pan, widgets: message.widgets },
+        {
+          pan: message.pan,
+          sizes: message.sizes ?? {},
+          widgets: message.widgets,
+        },
       );
     },
     [bindingKey, communityId, projectId],

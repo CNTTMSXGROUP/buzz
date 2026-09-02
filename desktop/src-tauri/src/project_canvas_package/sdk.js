@@ -160,6 +160,7 @@
 
   const LAYOUT_DEBOUNCE_MS = 300;
   const LAYOUT_COORDINATE_LIMIT = 100000;
+  const LAYOUT_MIN_WIDGET_SIZE = 16;
   const LAYOUT_MAX_WIDGETS = 256;
   let layoutTimer = 0;
   let layoutPending = null;
@@ -180,16 +181,34 @@
     return x === null || y === null ? null : { x, y };
   }
 
-  function layoutWidgets(value) {
-    const widgets = {};
-    if (!value || typeof value !== "object") return widgets;
+  // Clamped into the host's accepted range so a save can never produce an
+  // invalid port message (those count toward frame teardown).
+  function layoutDimension(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return null;
+    return Math.max(
+      LAYOUT_MIN_WIDGET_SIZE,
+      Math.min(LAYOUT_COORDINATE_LIMIT, numeric),
+    );
+  }
+
+  function layoutSize(value) {
+    if (!value || typeof value !== "object") return null;
+    const width = layoutDimension(value.width);
+    const height = layoutDimension(value.height);
+    return width === null || height === null ? null : { height, width };
+  }
+
+  function layoutOverrides(value, sanitize) {
+    const overrides = {};
+    if (!value || typeof value !== "object") return overrides;
     let count = 0;
-    for (const [widgetId, point] of Object.entries(value)) {
+    for (const [widgetId, entry] of Object.entries(value)) {
       if (count >= LAYOUT_MAX_WIDGETS) break;
       if (!/^[A-Za-z0-9._-]{1,128}$/.test(widgetId)) continue;
-      const sanitized = layoutPoint(point);
+      const sanitized = sanitize(entry);
       if (!sanitized) continue;
-      Object.defineProperty(widgets, widgetId, {
+      Object.defineProperty(overrides, widgetId, {
         configurable: true,
         enumerable: true,
         value: sanitized,
@@ -197,7 +216,7 @@
       });
       count += 1;
     }
-    return widgets;
+    return overrides;
   }
 
   function flushLayout() {
@@ -216,8 +235,9 @@
       layoutPending = {
         dashboard,
         pan: layoutPoint(options.pan),
+        sizes: layoutOverrides(options.sizes, layoutSize),
         type: "canvas.layout",
-        widgets: layoutWidgets(options.widgets),
+        widgets: layoutOverrides(options.widgets, layoutPoint),
       };
       clearTimeout(layoutTimer);
       layoutTimer = setTimeout(flushLayout, LAYOUT_DEBOUNCE_MS);

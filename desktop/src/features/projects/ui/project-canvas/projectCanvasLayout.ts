@@ -1,9 +1,11 @@
 import {
   PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT,
+  PROJECT_CANVAS_LAYOUT_MIN_WIDGET_SIZE,
   PROJECT_CANVAS_MAX_LAYOUT_WIDGETS,
   type ProjectCanvasDashboardLayout,
   type ProjectCanvasLayoutPoint,
   type ProjectCanvasLayouts,
+  type ProjectCanvasLayoutSize,
 } from "./projectCanvasProtocol";
 
 /**
@@ -52,15 +54,34 @@ function sanitizePoint(value: unknown): ProjectCanvasLayoutPoint | null {
   return x === null || y === null ? null : { x, y };
 }
 
-function sanitizeWidgets(
+function sanitizeDimension(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  if (
+    value < PROJECT_CANVAS_LAYOUT_MIN_WIDGET_SIZE ||
+    value > PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function sanitizeSize(value: unknown): ProjectCanvasLayoutSize | null {
+  if (!value || typeof value !== "object") return null;
+  const width = sanitizeDimension((value as { width?: unknown }).width);
+  const height = sanitizeDimension((value as { height?: unknown }).height);
+  return width === null || height === null ? null : { height, width };
+}
+
+function sanitizeOverrides<T>(
   value: unknown,
-): Record<string, ProjectCanvasLayoutPoint> {
+  sanitizeEntry: (entry: unknown) => T | null,
+): Record<string, T> {
   if (!value || typeof value !== "object") return {};
-  const entries: Array<[string, ProjectCanvasLayoutPoint]> = [];
-  for (const [widgetId, point] of Object.entries(value)) {
+  const entries: Array<[string, T]> = [];
+  for (const [widgetId, entry] of Object.entries(value)) {
     if (entries.length >= PROJECT_CANVAS_MAX_LAYOUT_WIDGETS) break;
     if (!WIDGET_ID_PATTERN.test(widgetId)) continue;
-    const sanitized = sanitizePoint(point);
+    const sanitized = sanitizeEntry(entry);
     if (sanitized) entries.push([widgetId, sanitized]);
   }
   // Object.fromEntries defines own properties, so a widget named `__proto__`
@@ -68,8 +89,24 @@ function sanitizeWidgets(
   return Object.fromEntries(entries);
 }
 
+function sanitizeWidgets(
+  value: unknown,
+): Record<string, ProjectCanvasLayoutPoint> {
+  return sanitizeOverrides(value, sanitizePoint);
+}
+
+function sanitizeSizes(
+  value: unknown,
+): Record<string, ProjectCanvasLayoutSize> {
+  return sanitizeOverrides(value, sanitizeSize);
+}
+
 function isEmptyLayout(layout: ProjectCanvasDashboardLayout): boolean {
-  return !layout.pan && Object.keys(layout.widgets).length === 0;
+  return (
+    !layout.pan &&
+    Object.keys(layout.widgets).length === 0 &&
+    Object.keys(layout.sizes).length === 0
+  );
 }
 
 /** Oldest written first, so pruning drops the least recently written. */
@@ -108,6 +145,7 @@ function readStoredDashboards(storageKey: string): StoredDashboardLayout[] {
     }
     const layout: ProjectCanvasDashboardLayout = {
       pan: sanitizePoint((entry as { pan?: unknown }).pan),
+      sizes: sanitizeSizes((entry as { sizes?: unknown }).sizes),
       widgets: sanitizeWidgets((entry as { widgets?: unknown }).widgets),
     };
     if (isEmptyLayout(layout)) continue;
@@ -124,7 +162,10 @@ export function readProjectCanvasLayouts(
   return Object.fromEntries(
     readStoredDashboards(
       projectCanvasLayoutStorageKey(communityId, projectId),
-    ).map(({ dashboard, pan, widgets }) => [dashboard, { pan, widgets }]),
+    ).map(({ dashboard, pan, sizes, widgets }) => [
+      dashboard,
+      { pan, sizes, widgets },
+    ]),
   );
 }
 
@@ -147,6 +188,7 @@ export function writeProjectCanvasDashboardLayout(
   );
   const next: ProjectCanvasDashboardLayout = {
     pan: sanitizePoint(layout.pan),
+    sizes: sanitizeSizes(layout.sizes),
     widgets: sanitizeWidgets(layout.widgets),
   };
   if (!isEmptyLayout(next)) dashboards.push({ dashboard, ...next });

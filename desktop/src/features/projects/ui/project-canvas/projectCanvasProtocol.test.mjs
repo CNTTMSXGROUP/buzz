@@ -9,6 +9,7 @@ import {
   parseProjectCanvasPackageDescriptorForE2e,
   parseProjectCanvasReady,
   PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT,
+  PROJECT_CANVAS_LAYOUT_MIN_WIDGET_SIZE,
   PROJECT_CANVAS_MAX_INIT_MESSAGE_BYTES,
   PROJECT_CANVAS_MAX_LAYOUT_WIDGETS,
   PROJECT_CANVAS_MESSAGE_RATE_LIMIT,
@@ -460,4 +461,74 @@ test("layout messages carry bounded coordinates for well-formed widget ids", () 
     ),
     null,
   );
+});
+
+test("layout messages carry bounded optional size overrides", () => {
+  const binding = { loadId: LOAD_ID, nonce: NONCE };
+  const layout = {
+    dashboard: "dev",
+    loadId: LOAD_ID,
+    nonce: NONCE,
+    pan: null,
+    protocolVersion: 1,
+    type: "canvas.layout",
+    widgets: {},
+  };
+  // Packages predating size persistence omit `sizes` and stay valid.
+  assert.deepEqual(parseProjectCanvasChildMessage(layout, binding), layout);
+
+  const sized = {
+    ...layout,
+    sizes: {
+      reviews: {
+        height: PROJECT_CANVAS_LAYOUT_MIN_WIDGET_SIZE,
+        width: PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT,
+      },
+      tasks: { height: 288, width: 336 },
+    },
+  };
+  assert.deepEqual(parseProjectCanvasChildMessage(sized, binding), sized);
+
+  const sizes = {};
+  for (let index = 0; index <= PROJECT_CANVAS_MAX_LAYOUT_WIDGETS; index += 1) {
+    sizes[`widget-${index}`] = { height: 144, width: 192 };
+  }
+  assert.equal(
+    parseProjectCanvasChildMessage({ ...layout, sizes }, binding),
+    null,
+  );
+
+  for (const invalid of [
+    { sizes: null },
+    { sizes: { "bad id": { height: 144, width: 192 } } },
+    { sizes: { widget: { width: 192 } } },
+    { sizes: { widget: { height: 144, width: 192, depth: 1 } } },
+    { sizes: { widget: { height: 144, width: "192" } } },
+    { sizes: { widget: { height: Number.NaN, width: 192 } } },
+    { sizes: { widget: { height: Number.POSITIVE_INFINITY, width: 192 } } },
+    {
+      sizes: {
+        widget: {
+          height: PROJECT_CANVAS_LAYOUT_MIN_WIDGET_SIZE - 1,
+          width: 192,
+        },
+      },
+    },
+    { sizes: { widget: { height: 0, width: 192 } } },
+    { sizes: { widget: { height: -144, width: 192 } } },
+    {
+      sizes: {
+        widget: {
+          height: 144,
+          width: PROJECT_CANVAS_LAYOUT_COORDINATE_LIMIT + 1,
+        },
+      },
+    },
+  ]) {
+    assert.equal(
+      parseProjectCanvasChildMessage({ ...layout, ...invalid }, binding),
+      null,
+      `expected ${JSON.stringify(invalid)} to be rejected`,
+    );
+  }
 });

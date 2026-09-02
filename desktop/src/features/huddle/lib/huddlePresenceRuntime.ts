@@ -144,13 +144,6 @@ export function startHuddlePresenceRuntime(
     return false;
   };
 
-  const sessionHasPendingOpaqueLifecycle = (sessionId: string) => {
-    for (const event of pendingOpaqueLifecycleEvents.values()) {
-      if (huddleSessionId(event) === sessionId) return true;
-    }
-    return false;
-  };
-
   const clearPendingOpaqueLifecycleForSession = (sessionId: string) => {
     for (const [eventId, event] of pendingOpaqueLifecycleEvents) {
       if (huddleSessionId(event) === sessionId) {
@@ -352,15 +345,10 @@ export function startHuddlePresenceRuntime(
           if (activeSessionGenerations.get(sessionId) !== requestedGeneration) {
             const liveGeneration = nextActiveSessionGenerations.get(sessionId);
             if (
-              pendingOpaqueLifecycleMatches(sessionId, liveGeneration) ||
-              (liveGeneration === undefined &&
-                !sessionHasPendingOpaqueLifecycle(sessionId))
+              liveGeneration !== undefined &&
+              pendingOpaqueLifecycleMatches(sessionId, liveGeneration)
             ) {
-              if (liveGeneration === undefined) {
-                mergedGenerations.delete(sessionId);
-              } else {
-                mergedGenerations.set(sessionId, liveGeneration);
-              }
+              mergedGenerations.set(sessionId, liveGeneration);
             }
             continue;
           }

@@ -513,6 +513,75 @@ test("preserves a newer generation learned during an older liveness refresh", as
   dispose();
 });
 
+test("preserves a changed generation when stale liveness omits the session", async () => {
+  let liveHandler;
+  let livenessTimer;
+  let resolveRefresh;
+  let livenessRequests = 0;
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) {
+        return [
+          event({ id: "start", kind: 48100, createdAt: 1 }),
+          participantEvent({
+            id: "old-join",
+            kind: 48101,
+            admissionId: "old-admission",
+            rosterRevision: 1,
+            generation: "1",
+            createdAt: 2,
+          }),
+        ];
+      }
+      livenessRequests += 1;
+      if (livenessRequests === 1) {
+        return [livenessEvent("room", "1")];
+      }
+      return new Promise((resolve) => {
+        resolveRefresh = resolve;
+      });
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => {
+      livenessTimer = callback;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
+  });
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), true);
+
+  livenessTimer();
+  await settle();
+  liveHandler(
+    participantEvent({
+      id: "new-join",
+      kind: 48101,
+      tags: [["p", CAROL]],
+      admissionId: "new-admission",
+      rosterRevision: 1,
+      generation: "2",
+      createdAt: 3,
+    }),
+  );
+  assert.equal(snapshots.at(-1).has(CAROL), true);
+
+  resolveRefresh([]);
+  await settle();
+  assert.equal(snapshots.at(-1).has(CAROL), true);
+  dispose();
+});
+
 test("replays an opaque-generation join once liveness establishes it", async () => {
   const generation1 = "11111111-1111-4111-8111-111111111111";
   const generation2 = "22222222-2222-4222-8222-222222222222";

@@ -488,6 +488,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   File? _downloadingRemoteFile;
   File? _remoteFile;
   int _sourceGeneration = 0;
+  bool _hasPlayableSource = false;
   bool _disposed = false;
 
   Future<void> _stopAndRewindCompletedPlayback() async {
@@ -515,18 +516,28 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     required Duration fallbackDuration,
   }) {
     _replaceSource();
-    if (!_requiresAuthenticatedLocalFile) {
-      return _load(
-        () => _player.setUrl(url, headers: headers()),
-        fallbackDuration: fallbackDuration,
-        sourceGeneration: _sourceGeneration,
-      );
-    }
-    _pendingRemote = (
+    final remote = (
       url: url,
       headers: headers,
       fallbackDuration: fallbackDuration,
     );
+    _pendingRemote = remote;
+    if (!_requiresAuthenticatedLocalFile) {
+      final sourceGeneration = _sourceGeneration;
+      final loading = _load(
+        () => _player.setUrl(remote.url, headers: remote.headers()),
+        fallbackDuration: fallbackDuration,
+        sourceGeneration: sourceGeneration,
+      );
+      return loading.whenComplete(() {
+        if (!_disposed &&
+            sourceGeneration == _sourceGeneration &&
+            !_state.hasError &&
+            identical(_pendingRemote, remote)) {
+          _pendingRemote = null;
+        }
+      });
+    }
     _update(VoiceNotePlaybackState(duration: fallbackDuration));
     return Future.value();
   }
@@ -534,6 +545,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   void _replaceSource() {
     _sourceGeneration += 1;
     _pendingRemote = null;
+    _hasPlayableSource = false;
     final remoteFile = _remoteFile;
     _remoteFile = null;
     unawaited(_deleteRemoteFile(remoteFile));
@@ -615,6 +627,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     try {
       final duration = await load();
       if (_disposed || sourceGeneration != _sourceGeneration) return;
+      _hasPlayableSource = true;
       _update(
         _state.copyWith(
           duration: duration ?? fallbackDuration,
@@ -640,13 +653,23 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     });
   }
 
+  Future<void> _play(int sourceGeneration) async {
+    try {
+      await _player.play();
+    } catch (_) {
+      if (_disposed || sourceGeneration != _sourceGeneration) return;
+      _coordinator.release(this);
+      _update(_state.copyWith(isLoading: false, hasError: true));
+    }
+  }
+
   Future<void> _toggle() async {
     if (_state.isLoading) return;
     if (_player.playing) {
       await pause();
     } else {
       final remote = _pendingRemote;
-      if (_state.hasError && remote == null) return;
+      if (_state.hasError && remote == null && !_hasPlayableSource) return;
       if (_state.hasError) {
         _update(_state.copyWith(hasError: false));
       }
@@ -654,17 +677,27 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
       if (!ownsPlayback || _disposed) return;
       if (remote != null) {
         final sourceGeneration = _sourceGeneration;
-        await _load(
-          _loadPendingRemote,
-          fallbackDuration: remote.fallbackDuration,
-          sourceGeneration: sourceGeneration,
-        );
-        if (sourceGeneration != _sourceGeneration || _pendingRemote != null) {
-          return;
+        if (_requiresAuthenticatedLocalFile) {
+          await _load(
+            _loadPendingRemote,
+            fallbackDuration: remote.fallbackDuration,
+            sourceGeneration: sourceGeneration,
+          );
+          if (sourceGeneration != _sourceGeneration || _pendingRemote != null) {
+            return;
+          }
+        } else {
+          await _load(
+            () => _player.setUrl(remote.url, headers: remote.headers()),
+            fallbackDuration: remote.fallbackDuration,
+            sourceGeneration: sourceGeneration,
+          );
+          if (sourceGeneration != _sourceGeneration || _state.hasError) return;
+          if (identical(_pendingRemote, remote)) _pendingRemote = null;
         }
       }
       if (_coordinator.ownsPlayback(this) && !_disposed && !_state.hasError) {
-        await _player.play();
+        unawaited(_play(_sourceGeneration));
       }
     }
   }

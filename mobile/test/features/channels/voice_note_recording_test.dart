@@ -83,10 +83,15 @@ class _FakeAudioPlayerBackend implements VoiceNoteAudioPlayerBackend {
   final durations = StreamController<Duration?>.broadcast();
   final states = StreamController<audio.PlayerState>.broadcast();
   final pathLoads = <Completer<Duration?>>[];
+  final urlLoads = <Completer<Duration?>>[];
   bool delayPathLoads = false;
+  bool delayUrlLoads = false;
+  bool delayPlay = false;
   bool _playing = false;
   int playCount = 0;
+  int pauseCount = 0;
   final loadedPaths = <String>[];
+  final loadedUrls = <String>[];
 
   @override
   Stream<Duration> get positionStream => positions.stream;
@@ -110,17 +115,33 @@ class _FakeAudioPlayerBackend implements VoiceNoteAudioPlayerBackend {
   }
 
   @override
-  Future<Duration?> setUrl(String url, {Map<String, String>? headers}) async =>
-      const Duration(seconds: 7);
-
-  @override
-  Future<void> play() async {
-    _playing = true;
-    playCount += 1;
+  Future<Duration?> setUrl(String url, {Map<String, String>? headers}) {
+    loadedUrls.add(url);
+    if (!delayUrlLoads) return Future.value(const Duration(seconds: 7));
+    final load = Completer<Duration?>();
+    urlLoads.add(load);
+    return load.future.whenComplete(() => urlLoads.remove(load));
   }
 
   @override
-  Future<void> pause() async => _playing = false;
+  Future<void> play() {
+    _playing = true;
+    playCount += 1;
+    if (!delayPlay) return Future.value();
+    final playback = Completer<void>();
+    late final StreamSubscription<audio.PlayerState> subscription;
+    subscription = states.stream.listen((state) {
+      if (!state.playing && !playback.isCompleted) playback.complete();
+    });
+    return playback.future.whenComplete(subscription.cancel);
+  }
+
+  @override
+  Future<void> pause() async {
+    pauseCount += 1;
+    _playing = false;
+    states.add(audio.PlayerState(false, audio.ProcessingState.ready));
+  }
 
   @override
   Future<void> seek(Duration position) async {}
@@ -354,7 +375,9 @@ void main() {
       final directory = await Directory.systemTemp.createTemp(
         'voice-note-single-flight-test',
       );
-      addTearDown(() => directory.delete(recursive: true));
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
       final player = DeviceVoiceNotePlayerController(
         coordinator: VoiceNotePlaybackCoordinator(),
         client: client,
@@ -394,7 +417,9 @@ void main() {
     final directory = await Directory.systemTemp.createTemp(
       'voice-note-retry-test',
     );
-    addTearDown(() => directory.delete(recursive: true));
+    addTearDown(() async {
+      if (await directory.exists()) await directory.delete(recursive: true);
+    });
     final player = DeviceVoiceNotePlayerController(
       coordinator: VoiceNotePlaybackCoordinator(),
       client: client,
@@ -535,6 +560,68 @@ void main() {
       expect(player.state.isLoading, isFalse);
     },
   );
+
+  test('pause interrupts production-shaped pending playback', () async {
+    final audioPlayer = _FakeAudioPlayerBackend()..delayPlay = true;
+    final player = DeviceVoiceNotePlayerController(
+      coordinator: VoiceNotePlaybackCoordinator(),
+      client: _SequencedHttpClient(),
+      requiresAuthenticatedLocalFile: false,
+      player: audioPlayer,
+    );
+    addTearDown(player.dispose);
+    await player.loadLocal(
+      '/tmp/voice-note.m4a',
+      fallbackDuration: const Duration(seconds: 7),
+    );
+
+    final playing = player.toggle();
+    await Future<void>.delayed(Duration.zero);
+    expect(audioPlayer.playCount, 1);
+    expect(audioPlayer.playing, isTrue);
+
+    await player.toggle();
+    await playing;
+
+    expect(audioPlayer.pauseCount, 1);
+    expect(audioPlayer.playing, isFalse);
+  });
+
+  test('Android remote failure retains the source for retry', () async {
+    final audioPlayer = _FakeAudioPlayerBackend()..delayUrlLoads = true;
+    final player = DeviceVoiceNotePlayerController(
+      coordinator: VoiceNotePlaybackCoordinator(),
+      client: _SequencedHttpClient(),
+      requiresAuthenticatedLocalFile: false,
+      player: audioPlayer,
+    );
+    addTearDown(player.dispose);
+    var authGeneration = 0;
+
+    final initialLoad = player.loadRemote(
+      'https://example.com/voice-note.mp4',
+      headers: () => {
+        'Authorization': 'Nostr signed-event-${authGeneration++}',
+      },
+      fallbackDuration: const Duration(seconds: 7),
+    );
+    await Future<void>.delayed(Duration.zero);
+    audioPlayer.urlLoads.single.completeError(StateError('network failed'));
+    await initialLoad;
+
+    expect(player.state.hasError, isTrue);
+    expect(audioPlayer.loadedUrls, hasLength(1));
+
+    final retry = player.toggle();
+    await Future<void>.delayed(Duration.zero);
+    expect(audioPlayer.loadedUrls, hasLength(2));
+    expect(authGeneration, 2);
+    audioPlayer.urlLoads.single.complete(const Duration(seconds: 7));
+    await retry;
+
+    expect(player.state.hasError, isFalse);
+    expect(audioPlayer.playCount, 1);
+  });
 
   test(
     'playback coordinator arbitrates instances and releases ownership',

@@ -16,6 +16,7 @@ internal object AndroidVoiceNotePackager {
     private const val videoBitRate = 8_000
     private const val videoFrameRate = 1
     private const val dequeueTimeoutUs = 10_000L
+    private const val encoderTimeoutNs = 30_000_000_000L
     private const val copyBufferSize = 1024 * 1024
 
     fun packageForUpload(
@@ -118,8 +119,12 @@ internal object AndroidVoiceNotePackager {
             var outputEnded = false
             var outputTrack = -1
             var muxerStarted = false
+            val encoderDeadlineNs = System.nanoTime() + encoderTimeoutNs
 
             while (!outputEnded) {
+                check(System.nanoTime() - encoderDeadlineNs < 0) {
+                    "Timed out creating the voice note envelope."
+                }
                 if (!inputEnded) {
                     val inputIndex = codec.dequeueInputBuffer(dequeueTimeoutUs)
                     if (inputIndex >= 0) {

@@ -1,12 +1,10 @@
 # Project Related-Channel Commands
 
-Status: draft architecture decision for the first collaborative Project-membership slice.
-
 ## Problem
 
 `kind:30621` gives a Project one owner-controlled identity and metadata event. That works for the Project name, description, visibility, home channel, and repository references, but it does not let Project collaborators link existing channels without the owner's key.
 
-The first requirement is deliberately narrow: a Project owner or home-channel administrator can link and unlink one existing related channel from Desktop or the `buzz` CLI. The implementation must not make Project metadata collaboratively replaceable, introduce a global Project revision, or pre-build a dormant protocol for future member types.
+The supported collaborative operation is deliberately narrow: a Project owner or home-channel administrator can link and unlink one existing related channel. The implementation does not make Project metadata collaboratively replaceable, introduce a global Project revision, or define protocol for member types without an implemented workflow.
 
 ## Decision
 
@@ -16,7 +14,7 @@ The accepted command events remain the attributable history. The projection is d
 
 This is a relay-local extension of NIP-MP, not a replacement for its portable owner-authored container. Linking a channel grants no authority over the Project, channel, or repository.
 
-## Phase 1 event
+## Command event
 
 Use regular `kind:47010`, signed by the human or agent performing the action. One event addresses exactly one related channel.
 
@@ -48,7 +46,7 @@ A remove uses the same shape with `op=remove`:
 }
 ```
 
-The Project coordinate uses the standard lowercase `a` tag. The target channel uses a canonical lowercase, hyphenated UUID in `d`, making reverse lookup available through a standard single-letter Nostr tag filter. `kind:47010` remains a regular event rather than a parameterized-replaceable event. `h` is forbidden because the event is global Project metadata rather than a channel-scoped message.
+The Project coordinate uses the standard lowercase `a` tag. The target channel uses a canonical lowercase, hyphenated UUID in `d`. `kind:47010` remains a regular event rather than a parameterized-replaceable event. `h` is forbidden because the event is global Project metadata rather than a channel-scoped message. The command tags describe and validate a write; they do not provide a reverse-lookup API.
 
 The protocol parser requires empty content and exactly one tag of each required type. The relay may also accept its existing ambient transport authorization tag, but rejects duplicated or unknown protocol tags.
 
@@ -80,11 +78,11 @@ The relay serializes Project replacements, deletions, and commands under the exi
 
 Each command is a desired-state toggle. Clients do not need to read a relation before changing it, and the relay decides state changes and no-ops under the same Project-coordinate lock. The lock gives commands a single authoritative acceptance order without a client-maintained predecessor protocol.
 
-Changes to unrelated channels do not share a revision. The relay rejects a command that would add a 65th effective related channel. During migration, owner-authored `30621` events and their derived snapshots use the same 64-channel bound.
+Changes to unrelated channels do not share a revision. The relay rejects a command that would add a 65th effective related channel. Owner-authored `30621` events and their derived snapshots use the same 64-channel bound.
 
 ## Persistence and reads
 
-Accepted commands are inserted into the normal event store. In the same database transaction, the relay upserts a channel-specific override keyed by community, Project owner, Project `d`, and channel UUID:
+Accepted state-changing commands are inserted into the normal event store. In the same database transaction, the relay upserts a channel-specific override keyed by community, Project owner, Project `d`, and channel UUID:
 
 - no row: inherit the live `30621` `buzz-related-channel` tag;
 - present: an accepted add wins;
@@ -94,19 +92,19 @@ Absent overrides are retained so an ordinary owner metadata update cannot silent
 
 Effective membership is the live legacy seed overlaid by the command overrides. The override table is the durable current-state authority. Accepted commands remain the attributable audit history, but neither authorization nor current-state reads replay that history.
 
-The relay also publishes one parameterized-replaceable `kind:30623` snapshot per Project, signed by its NIP-11 `self` key. Its tags are ordered exactly as deterministic `d=sha256("buzz:project-related-channels:v1" || NUL || Project coordinate)`, then `a=<Project coordinate>`, then at most 64 strictly sorted `c=[channel UUID]` tags. This is a bounded derived read model, not Project identity or command authority. If an owner metadata replacement makes the effective legacy-plus-override set exceed 64, the relay keeps the Project writable, logs the truncation, and publishes the first 64 canonical entries.
+The relay also publishes one parameterized-replaceable `kind:30623` snapshot per Project, signed by its NIP-11 `self` key. Its tags are ordered exactly as deterministic `d=sha256("buzz:project-related-channels:v1" || NUL || Project coordinate)`, then `a=<Project coordinate>`, then `e=<current-kind-30621-event-id>`, then at most 64 strictly sorted `c=[channel UUID]` tags. The `e` value is the exact lowercase event ID of the live owner-signed Project head. This is a bounded derived read model, not Project identity or command authority. If an owner metadata replacement makes the effective legacy-plus-override set exceed 64, the relay keeps the Project writable, logs the truncation, and publishes the first 64 canonical entries.
 
 An applied `47010` command, its override, and the new `30623` snapshot commit in one transaction. The relay's specialized `30621` replacement path commits an owner-authored Project head and its regenerated snapshot in the same transaction; generic replacement storage is not sufficient for Project writes. Project deletion tombstones the Project and its snapshot atomically. A no-op writes none of them. The relay signs the snapshot while the transaction's Project-coordinate guard is still held, so there is no post-commit reconciliation gap.
 
-Clients derive each snapshot's deterministic `d`, then query `kind:30623` by `d` and relay author in bounded chunks. A valid snapshot replaces legacy related-channel tags in the read model. During rollout, a missing snapshot leaves the legacy seed intact. An invalid snapshot fails closed to an empty related-channel projection for that Project rather than resurrecting legacy relations or failing the whole Projects surface. Because the relay may advance a replacement event's `created_at` beyond wall-clock time to preserve last-write-wins ordering, clients must not add an `until=now` bound to this current-state query.
+Clients first fetch the live owner-signed `kind:30621` Project head. If none exists, the Project is not found and the snapshot is not consulted. Clients then derive the snapshot's deterministic `d` and query `kind:30623` by `d` and relay author in bounded chunks. A valid snapshot must carry an `e` tag equal to the live Project event ID and replaces legacy related-channel tags in the read model. If no snapshot exists, clients may use the live Project metadata as the compatibility source. A present snapshot with a stale or malformed `e`, the wrong author, an invalid signature, or malformed content is an authoritative-state trust failure and must produce a visible error; clients must not convert it to an empty success or fall back to legacy metadata. Because the relay may advance a replacement event's `created_at` beyond wall-clock time to preserve last-write-wins ordering, clients must not add an `until=now` bound to this current-state query.
 
-A Project coordinate is its stable identity. While no live `30621` exists, commands are rejected and prior overrides are ineffective. A genuinely new Project uses a new `d`; Phase 1 adds no Project epoch or special deletion lifecycle.
+A Project coordinate is its stable identity. While no live `30621` exists, commands are rejected and prior overrides are ineffective. A genuinely new Project uses a new `d`; this protocol has no Project epoch or special deletion lifecycle.
 
 Generic NIP-09 deletion must not erase accepted `47010` command facts. Undoing a relationship is another authorized command.
 
-## Agent and Desktop surface
+## Client surfaces
 
-The first implementation exposes singular CLI operations:
+The relay and CLI implementation exposes singular operations:
 
 ```text
 buzz projects link-channel --project <coordinate> --channel <uuid>
@@ -116,26 +114,26 @@ buzz projects related-channels --project <coordinate>
 
 These names do not conflict with the existing `projects add-channel` command, which drafts a new channel for Desktop to create. The CLI returns the canonical write result. The read command queries the relay-authored snapshot by its deterministic `d` value and relay signer.
 
-Desktop uses the same signed desired-state event. It reads the bounded relay-authored snapshot, with the rollout fallback described above. Its existing owner-only create-channel flow continues to add the new channel to owner metadata. A separate Desktop delivery slice adds link-existing and unlink controls for authorized collaborators.
+The base implementation includes the relay behavior, CLI writes, and CLI snapshot read. Desktop support lives in the dependent Desktop change rather than the base: it uses the same signed desired-state event and bounded relay-authored snapshot, while the existing owner-only create-channel flow continues to add the new channel to owner metadata.
 
 ## Bounds and recovery
 
 - Validate and bound tags before allocating proportional collections.
 - Event insertion, override mutation, and snapshot replacement are one database transaction; a failure stores none and is never acknowledged as success.
 - The accepted signed event is the durable authorization/audit fact. Post-commit generic audit dispatch is not claimed to be atomic.
-- Rebuild processing is bounded, and clients read one bounded current-state snapshot rather than replaying command history.
+- Clients read one bounded current-state snapshot rather than replaying command history.
 
-## Deferred product direction
+## Future extensions
 
-Later work may generalize explicit Project membership to other types, including tasks that belong directly to Projects. That work should be designed from an implemented workflow rather than pre-built into this channel-only protocol.
+Explicit Project membership may later extend to other types, including tasks that belong directly to Projects. Each extension should be designed with its product workflow rather than pre-built into this channel-only protocol.
 
 Dynamically discovered content is not membership. A pull request mentioned in a member thread or a document attached to a member meeting remains derived context until explicitly added.
 
-The migration overlay is temporary. After legacy `buzz-related-channel` tags have been backfilled once into durable overrides, effective membership should stop consulting those tags so the collaborative model has one current-state source.
+The legacy-tag overlay is a compatibility mechanism: live owner metadata provides seed state and durable overrides record collaborative decisions. Removing the overlay requires an explicit data-conversion design; clients must not assume legacy tags have already been backfilled.
 
 Linking is a deliberate visibility action: an authorized administrator who is a member of a target channel may expose that channel UUID to people who can read the Project. Target membership prevents blind UUID guessing; it does not promise that a deliberately linked private channel remains undiscoverable through the Project.
 
-Cold-start reverse resolution from a related channel to its Projects is deferred. The relay snapshot's indexed `c` tags make that bounded lookup possible, while the first Desktop slice learns related channels through the normal Projects enumeration.
+Cold-start reverse resolution from a related channel to its Projects is not part of this protocol. Clients discover related channels from Projects they already know. If the product needs reverse resolution, it requires a separately designed and tested query surface.
 
 ## Rejected alternatives
 
@@ -149,16 +147,14 @@ Rejected because addressable coordinates include the signer, so administrators c
 
 ### Project generations
 
-Rejected for Phase 1 because the Project coordinate is already stable identity and current deletion/recreation semantics do not provide an epoch primitive. Adding one would require invasive interception of generic Project replacement and NIP-09 deletion paths.
+Rejected because the Project coordinate is already stable identity and current deletion/recreation semantics do not provide an epoch primitive. Adding one would require invasive interception of generic Project replacement and NIP-09 deletion paths.
 
 ### Generic member rows and batched commands
 
-Rejected because Phase 1 has one implemented member type and one user action. A channel-specific row and one-channel command are sufficient and make partial failure impossible.
+Rejected because the protocol has one implemented member type and one user action. A channel-specific row and one-channel command are sufficient and make partial failure impossible.
 
-## Delivery slices
+## Implementation boundaries
 
-1. Relay persistence, authorization, focused tests, and `buzz` CLI link/unlink commands.
-2. Desktop link-existing and unlink UI using the same commands.
-3. Other explicit member types only with their product workflow.
-
-Each slice must be independently usable and contain no dormant protocol path.
+- The base change owns relay persistence, authorization, snapshot reads, focused tests, and the `buzz` CLI commands.
+- The dependent Desktop change owns link-existing and unlink controls that use the base protocol.
+- Other explicit member types require their own product workflow and protocol decision.

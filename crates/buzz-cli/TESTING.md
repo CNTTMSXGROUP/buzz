@@ -492,50 +492,72 @@ buzz notes rm --name does-not-exist   # exits non-zero
 an existing channel. This is distinct from `projects add-channel`, which drafts
 a new channel for owner review in Buzz Desktop.
 
-Create a Project whose home is the stream channel from the earlier steps, then
-use the forum channel as the distinct related channel:
+The following flow creates its own Project and channel fixtures. Run it from the
+repository root after building `buzz-cli` and exporting the credentials from
+section 4:
 
 ```bash
-PROJECT_SLUG="cli-related-channels"
-buzz projects create "$PROJECT_SLUG" \
+BUZZ_BIN="${BUZZ_BIN:-$PWD/target/debug/buzz}"
+FIXTURE_SUFFIX="$(date +%s)-$$"
+PROJECT_SLUG="cli-related-channels-$FIXTURE_SUFFIX"
+
+HOME_CHANNEL_RESULT=$("$BUZZ_BIN" channels create \
+  --name "cli-project-home-$FIXTURE_SUFFIX" \
+  --type stream --visibility open)
+HOME_CHANNEL_ID=$(jq -er '.channel_id' <<<"$HOME_CHANNEL_RESULT")
+
+RELATED_CHANNEL_RESULT=$("$BUZZ_BIN" channels create \
+  --name "cli-project-related-$FIXTURE_SUFFIX" \
+  --type stream --visibility open)
+RELATED_CHANNEL_ID=$(jq -er '.channel_id' <<<"$RELATED_CHANNEL_RESULT")
+
+"$BUZZ_BIN" projects create "$PROJECT_SLUG" \
   --name "CLI related-channel test" \
-  --channel "$CHANNEL_ID" | jq .
-PROJECT_OWNER=$(buzz projects get "$PROJECT_SLUG" | jq -r '.pubkey')
+  --channel "$HOME_CHANNEL_ID" | jq -e '.accepted == true'
+PROJECT_OWNER=$("$BUZZ_BIN" projects get "$PROJECT_SLUG" | jq -er '.pubkey')
 PROJECT_COORD="30621:${PROJECT_OWNER}:${PROJECT_SLUG}"
-RELATED_CHANNEL_ID="$FORUM_ID"
 
-# Link an existing channel.
-buzz projects link-channel \
+# Link succeeds and the trusted relay snapshot contains the channel.
+"$BUZZ_BIN" projects link-channel \
   --project "$PROJECT_COORD" \
-  --channel "$RELATED_CHANNEL_ID" | jq .
-# Expected: {"event_id":"...","accepted":true,"message":"..."}
-buzz projects related-channels --project "$PROJECT_COORD" | jq .
-# Expected: snapshot_found=true and related_channels contains $RELATED_CHANNEL_ID.
+  --channel "$RELATED_CHANNEL_ID" | jq -e '.accepted == true'
+"$BUZZ_BIN" projects related-channels --project "$PROJECT_COORD" \
+  | jq -e --arg channel "$RELATED_CHANNEL_ID" \
+      '.snapshot_found == true and .source == "relay_snapshot" and (.related_channels | index($channel) != null)'
 
-# Repeating the same desired state is idempotent and still succeeds.
-buzz projects link-channel \
+# Repeating the desired state succeeds without changing readback.
+"$BUZZ_BIN" projects link-channel \
   --project "$PROJECT_COORD" \
-  --channel "$RELATED_CHANNEL_ID" | jq .
-# Expected: canonical accepted write output; readback remains unchanged.
+  --channel "$RELATED_CHANNEL_ID" | jq -e '.accepted == true'
+"$BUZZ_BIN" projects related-channels --project "$PROJECT_COORD" \
+  | jq -e --arg channel "$RELATED_CHANNEL_ID" \
+      '.snapshot_found == true and (.related_channels | index($channel) != null)'
 
-# Unlink the existing channel.
-buzz projects unlink-channel \
+# Unlink succeeds and removes the channel from the trusted snapshot.
+"$BUZZ_BIN" projects unlink-channel \
   --project "$PROJECT_COORD" \
-  --channel "$RELATED_CHANNEL_ID" | jq .
-# Expected: {"event_id":"...","accepted":true,"message":"..."}
-buzz projects related-channels --project "$PROJECT_COORD" | jq .
-# Expected: snapshot_found=true and related_channels does not contain $RELATED_CHANNEL_ID.
+  --channel "$RELATED_CHANNEL_ID" | jq -e '.accepted == true'
+"$BUZZ_BIN" projects related-channels --project "$PROJECT_COORD" \
+  | jq -e --arg channel "$RELATED_CHANNEL_ID" \
+      '.snapshot_found == true and .source == "relay_snapshot" and (.related_channels | index($channel) == null)'
 
-# Repeating unlink is also idempotent.
-buzz projects unlink-channel \
+# Repeating unlink is also an accepted no-op.
+"$BUZZ_BIN" projects unlink-channel \
   --project "$PROJECT_COORD" \
-  --channel "$RELATED_CHANNEL_ID" | jq .
-# Expected: canonical accepted write output; readback remains unchanged.
-
-# During rollout, if no snapshot exists yet, the command reads the live Project
-# event by owner + d and returns canonical legacy tags with
-# snapshot_found=false and source="project_metadata".
+  --channel "$RELATED_CHANNEL_ID" | jq -e '.accepted == true'
+"$BUZZ_BIN" projects related-channels --project "$PROJECT_COORD" \
+  | jq -e --arg channel "$RELATED_CHANNEL_ID" \
+      '.snapshot_found == true and (.related_channels | index($channel) == null)'
 ```
+
+Every command above exits zero when its assertion succeeds. A missing snapshot
+uses the live owner-signed Project metadata and reports
+`snapshot_found=false` with `source="project_metadata"`. A present snapshot
+must carry an `e` tag equal to that live Project event's lowercase ID. If the
+Project is not live, the command reports it as not found without consulting a
+snapshot. A stale or malformed `e`, invalid relay author, signature, or payload
+is a trust error: the command exits non-zero instead of returning an empty list
+or using the metadata fallback.
 
 ---
 
@@ -604,7 +626,15 @@ env -u BUZZ_PRIVATE_KEY \
 
 ```bash
 # Delete test channels
-buzz projects delete "$PROJECT_SLUG" | jq .
+if [[ -n "${PROJECT_SLUG:-}" ]]; then
+  "${BUZZ_BIN:-$PWD/target/debug/buzz}" projects delete "$PROJECT_SLUG" | jq .
+fi
+if [[ -n "${HOME_CHANNEL_ID:-}" ]]; then
+  "${BUZZ_BIN:-$PWD/target/debug/buzz}" channels delete --channel "$HOME_CHANNEL_ID" | jq .
+fi
+if [[ -n "${RELATED_CHANNEL_ID:-}" ]]; then
+  "${BUZZ_BIN:-$PWD/target/debug/buzz}" channels delete --channel "$RELATED_CHANNEL_ID" | jq .
+fi
 buzz channels delete --channel "$CHANNEL_ID" | jq .
 buzz channels delete --channel "$FORUM_ID" | jq .
 ```
@@ -677,6 +707,3 @@ buzz channels delete --channel "$FORUM_ID" | jq .
 | 60 | `notes ls` | ☐ | Own, --author all, --tag, --limit |
 | 61 | `notes rm` | ☐ | Delete→get 404, double-delete idempotent, missing slug → NotFound |
 | 62 | `users set-status` | ☐ | Text+emoji, text only, emoji-only (`--text ""`), `--clear`, `--clear` + `--text` → exit 1 |
-| 63 | `projects link-channel` | ☐ | Existing channel, repeated idempotent write, snapshot readback |
-| 64 | `projects unlink-channel` | ☐ | Existing relation, repeated idempotent write, snapshot readback |
-| 65 | `projects related-channels` | ☐ | Trusted relay snapshot found/missing, deterministic Project lookup |

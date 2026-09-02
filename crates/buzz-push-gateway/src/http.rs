@@ -5,6 +5,7 @@ use crate::{
     authority::{
         AuthorityError, AuthorityStore, Challenge, Delegation, DeliveryDisposition, NewInstallation,
     },
+    config::GatewayUrls,
     grant::GrantKeyring,
     model::*,
     token::TokenKeyring,
@@ -46,7 +47,8 @@ pub struct AppState {
     /// Server-owned dogfood application identity and APNs transport. The wire
     /// profile selector is fixed and App Attest verifies the configured app ID.
     pub profile: Arc<ProfileRuntime>,
-    pub delivery_url: url::Url,
+    /// Security-sensitive endpoints and audiences derived from one gateway origin.
+    pub gateway_urls: Arc<GatewayUrls>,
     pub max_grant_lifetime_seconds: i64,
     pub max_installation_lifetime_seconds: i64,
     pub endpoint_quota_window_seconds: i64,
@@ -151,7 +153,7 @@ async fn challenge(State(s): State<AppState>, body: Bytes) -> Response {
 #[derive(serde::Serialize)]
 struct EnrollTranscript<'a> {
     v: u8,
-    audience: &'static str,
+    audience: &'a str,
     challenge_id: uuid::Uuid,
     challenge: &'a str,
     key_id: &'a str,
@@ -186,7 +188,7 @@ async fn enroll(State(s): State<AppState>, body: Bytes) -> Response {
     };
     let t = EnrollTranscript {
         v: r.v,
-        audience: "https://push.buzz.xyz/v1/installations",
+        audience: &s.gateway_urls.enroll_audience,
         challenge_id: r.challenge_id,
         challenge: &r.challenge,
         key_id: &r.key_id,
@@ -324,7 +326,7 @@ async fn verify_installation_assertion<T: serde::Serialize>(
 #[derive(serde::Serialize)]
 struct DelegateTranscript<'a> {
     v: u8,
-    audience: &'static str,
+    audience: &'a str,
     challenge_id: uuid::Uuid,
     challenge: &'a str,
     installation_handle: uuid::Uuid,
@@ -352,7 +354,7 @@ async fn delegate(State(s): State<AppState>, body: Bytes) -> Response {
     }
     let t = DelegateTranscript {
         v: r.v,
-        audience: "https://push.buzz.xyz/v1/delegations",
+        audience: &s.gateway_urls.delegate_audience,
         challenge_id: r.challenge_id,
         challenge: &r.challenge,
         installation_handle: r.installation_handle,
@@ -413,7 +415,7 @@ async fn delegate(State(s): State<AppState>, body: Bytes) -> Response {
 #[derive(serde::Serialize)]
 struct RotateTranscript<'a> {
     v: u8,
-    audience: &'static str,
+    audience: &'a str,
     challenge_id: uuid::Uuid,
     challenge: &'a str,
     installation_handle: uuid::Uuid,
@@ -446,7 +448,7 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
     };
     let t = RotateTranscript {
         v: r.v,
-        audience: "https://push.buzz.xyz/v1/installations/endpoint",
+        audience: &s.gateway_urls.rotate_endpoint_audience,
         challenge_id: r.challenge_id,
         challenge: &r.challenge,
         installation_handle: r.installation_handle,
@@ -489,7 +491,7 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
 #[derive(serde::Serialize)]
 struct RevokeDelegationTranscript<'a> {
     v: u8,
-    audience: &'static str,
+    audience: &'a str,
     challenge_id: uuid::Uuid,
     challenge: &'a str,
     installation_handle: uuid::Uuid,
@@ -506,7 +508,7 @@ async fn revoke_delegation(State(s): State<AppState>, body: Bytes) -> Response {
     }
     let t = RevokeDelegationTranscript {
         v: r.v,
-        audience: "https://push.buzz.xyz/v1/delegations/revoke",
+        audience: &s.gateway_urls.revoke_delegation_audience,
         challenge_id: r.challenge_id,
         challenge: &r.challenge,
         installation_handle: r.installation_handle,
@@ -538,7 +540,7 @@ async fn revoke_delegation(State(s): State<AppState>, body: Bytes) -> Response {
 #[derive(serde::Serialize)]
 struct RevokeInstallationTranscript<'a> {
     v: u8,
-    audience: &'static str,
+    audience: &'a str,
     challenge_id: uuid::Uuid,
     challenge: &'a str,
     installation_handle: uuid::Uuid,
@@ -558,7 +560,7 @@ async fn revoke_installation(State(s): State<AppState>, body: Bytes) -> Response
     }
     let t = RevokeInstallationTranscript {
         v: r.v,
-        audience: "https://push.buzz.xyz/v1/installations/revoke",
+        audience: &s.gateway_urls.revoke_installation_audience,
         challenge_id: r.challenge_id,
         challenge: &r.challenge,
         installation_handle: r.installation_handle,
@@ -613,7 +615,7 @@ async fn deliver(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> 
     };
     let relay = match verify_auth_header(
         auth,
-        &s.delivery_url,
+        &s.gateway_urls.delivery,
         HttpMethod::POST,
         Timestamp::now(),
         Some(&body),
@@ -875,7 +877,9 @@ mod request_limit_tests {
                 app_attest: Arc::new(app_attest),
                 transport: Arc::new(NeverTransport),
             }),
-            delivery_url: "https://push.buzz.xyz/v1/deliveries/apns".parse().unwrap(),
+            gateway_urls: Arc::new(
+                GatewayUrls::from_origin("https://push.example".parse().unwrap()).unwrap(),
+            ),
             max_grant_lifetime_seconds: 86_400,
             max_installation_lifetime_seconds: 86_400,
             endpoint_quota_window_seconds: 60,

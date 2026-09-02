@@ -71,8 +71,10 @@ switch to refresh the display label (the install identity never changes);
 the persisted files are then picked up by any subsequent build. In the main
 checkout the script is a no-op that removes stale override files, restoring
 the plain `Buzz` identity. Direct Xcode builds and Runner tests also require a
-`BUZZ_PUSH_GATEWAY_URL` scheme environment variable containing the origin to
-use; the build phase validates and passes it through as a Flutter Dart define.
+`BUZZ_PUSH_GATEWAY_URL` build setting in the gitignored
+`mobile/ios/Flutter/AppOverrides.xcconfig`; the build phase validates and
+passes it through as a Flutter Dart define. Since `//` begins an xcconfig
+comment, spell the origin as `BUZZ_PUSH_GATEWAY_URL = https:/$()/push.example`.
 
 For an Android debug build that must remain installed alongside other Buzz
 worktree builds, set an explicit launcher name and package suffix when invoking
@@ -131,6 +133,7 @@ BUNDLE_IDENTIFIER = xyz.block.buzz.mobile
 BUZZ_DEVELOPMENT_TEAM = EYF346PHUG
 BUZZ_IOS_PUSH_ENVIRONMENT = development
 BUZZ_APP_ATTEST_ENVIRONMENT = development
+BUZZ_PUSH_GATEWAY_URL = https:/$()/push.example
 ```
 
 This exercises the client, extension, relay, and gateway integration without

@@ -24,7 +24,7 @@ if [ "$has_dart_define" = false ] && [ -n "${BUZZ_PUSH_GATEWAY_URL:-}" ]; then
 fi
 
 if [ -z "$gateway_origin" ]; then
-  echo "error: BUZZ_PUSH_GATEWAY_URL must be supplied with --dart-define for every mobile build." >&2
+  echo "error: BUZZ_PUSH_GATEWAY_URL must be supplied as a Dart define or Xcode build setting for every mobile build." >&2
   exit 1
 fi
 

@@ -2,7 +2,6 @@ import { useMarketChannel } from "@/features/market/lib/MarketChannelContext";
 import { presentMarketEvent } from "@/features/market/lib/marketEventPresentation";
 import { parseMarketEnvelope } from "@/features/market/lib/marketProtocol";
 import { MarketEventCard } from "@/features/market/ui/MarketEventCard";
-import { Badge } from "@/shared/ui/badge";
 
 export function MarketMessageBody(
   content: string,
@@ -18,12 +17,7 @@ export function MarketMessageBody(
   ) : null;
 }
 
-/**
- * Inside a market channel, lifecycle envelopes read as ordinary chat
- * messages: the agent's words as the body, with a small inline badge naming
- * the signed transition. Outside market channels (Pulse, forwarded events)
- * the full card treatment remains.
- */
+/** Pulse keeps the listing card; inside its channel signed transitions read as chat. */
 function MarketEventMessage({
   authorPubkey,
   content,
@@ -54,22 +48,15 @@ function MarketEventMessage({
       className="min-w-0 max-w-full"
       data-testid={`market-message-${envelope.type}`}
     >
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Badge className="capitalize" variant="secondary">
-          {presentation.eyebrow}
-        </Badge>
-        {presentation.amount ? (
-          <span className="text-xs font-medium text-muted-foreground">
-            {presentation.amount}
-          </span>
-        ) : null}
-        {rejection ? (
-          <Badge data-testid="market-message-rejected" variant="destructive">
-            Rejected · {rejection.reason}
-          </Badge>
-        ) : null}
-      </div>
-      <p className="mt-1 max-w-full text-message">{body}</p>
+      <p className="max-w-full text-message">{body}</p>
+      {rejection ? (
+        <p
+          className="mt-1 text-xs text-destructive"
+          data-testid="market-message-rejected"
+        >
+          Not accepted: {rejection.reason}
+        </p>
+      ) : null}
     </div>
   );
 }

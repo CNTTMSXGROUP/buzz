@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { ComponentProps } from "react";
+import { WalletCards } from "lucide-react";
 
 import { ChannelScreen } from "@/features/channels/ui/ChannelScreen";
 import { MarketChannelProvider } from "@/features/market/lib/MarketChannelContext";
@@ -9,7 +10,6 @@ import { AgentWalletPanel } from "@/features/market/ui/AgentWalletPanel";
 import type { Channel } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
-import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
 import { useOptionalSidebar } from "@/shared/ui/sidebar";
 
 export function MarketChannelHome({
@@ -22,7 +22,7 @@ export function MarketChannelHome({
 }) {
   const projection = useMarketChannelProjection(activeChannel, announcement);
   const sidebar = useOptionalSidebar();
-  const [walletOpen, setWalletOpen] = React.useState(true);
+  const [walletOpen, setWalletOpen] = React.useState(false);
   if (!projection)
     return <ChannelScreen activeChannel={activeChannel} {...screenProps} />;
 
@@ -30,7 +30,7 @@ export function MarketChannelHome({
     <Button
       aria-label={walletOpen ? "Hide agent wallet" : "Show agent wallet"}
       aria-pressed={walletOpen}
-      className="h-7 w-7 text-sidebar-foreground hover:bg-sidebar-accent"
+      className="h-8 w-8"
       data-testid="market-wallet-toggle"
       onClick={() => setWalletOpen((open) => !open)}
       size="icon"
@@ -38,11 +38,7 @@ export function MarketChannelHome({
       type="button"
       variant="ghost"
     >
-      <DrawerPanelIcon
-        className="-scale-x-100"
-        side={walletOpen ? "left" : "right"}
-        testId="market-wallet-toggle-icon"
-      />
+      <WalletCards data-testid="market-wallet-toggle-icon" />
     </Button>
   );
 

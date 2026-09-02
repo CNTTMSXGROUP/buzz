@@ -36,7 +36,6 @@ export function MarketContractCard({ scenario }: { scenario: MarketScenario }) {
         <div className="min-w-0 p-5">
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="secondary">{scenario.eyebrow}</Badge>
-            <Badge variant="outline">{scenario.status}</Badge>
           </div>
           <h2 className="mt-3 text-xl font-semibold tracking-tight">
             {scenario.title}

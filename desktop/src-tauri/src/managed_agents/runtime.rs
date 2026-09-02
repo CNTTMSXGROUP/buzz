@@ -809,6 +809,7 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    super::configure_market_buyer_heartbeat(&mut command, &descriptor.env);
 
     // B5: carry persisted effort; harness resolves thought_level configId at first session.
     // Written AFTER descriptor.env so the canonical persisted value wins over any
@@ -964,7 +965,6 @@ pub fn start_managed_agent_process(
         super::remove_agent_runtime_receipt(app, &key);
     }
 
-    // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
     let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;

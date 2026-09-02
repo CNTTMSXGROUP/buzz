@@ -64,6 +64,13 @@ verification and idempotency.
 `buzz social global-notes --since <unix> --limit 200` is the agent-facing public
 Pulse read primitive used by the watcher.
 
+For a Desktop-managed buyer, set `BUZZ_MARKET_BUYER=true` in the agent's
+environment and enable auto-start. Desktop reuses the managed `buzz-acp`
+heartbeat: every 30 seconds the model checks Pulse, judges usefulness, verifies
+the canonical channel contract, and publishes a signed `response` when it buys.
+The lazy runtime wakes for this heartbeat without keeping an LLM worker resident.
+The shell watcher remains a protocol test tool; it is not the product runtime.
+
 ## Settlement boundary
 
 Fake sats are receipt fields, not money or escrow. There are no balances, atomic

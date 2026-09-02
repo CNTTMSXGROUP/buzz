@@ -163,8 +163,7 @@ export const MessageRow = React.memo(
     videoReviewCommentRootId?: string;
     videoReviewContext?: VideoReviewContext;
   }) {
-    // Keep the transient send state with its timestamp rather than collapsing
-    // it into a grouped message row with no header.
+    // Keep transient send state with its timestamp and header.
     const isDisplayedAsContinuation = isContinuation && !message.pending;
     const [expandedDiffId, setExpandedDiffId] = React.useState<string | null>(
       null,
@@ -436,10 +435,7 @@ export const MessageRow = React.memo(
                 emojiOnly &&
                   "text-4xl leading-tight [&_p]:leading-tight [&_img[data-custom-emoji]]:h-[1.45em] [&_img[data-custom-emoji]]:align-middle [&_button:has(img[data-custom-emoji])]:align-middle",
               )}
-              // Only pass the author pubkey for agent-authored messages so
-              // config-nudge cards can authenticate the sender. Uses the
-              // raw event signer (signerPubkey), not a relay-delegated display
-              // author, because the agent itself must have signed the card.
+              // Authenticate config nudges with the raw event signer.
               configNudgeAuthorPubkey={getConfigNudgeAuthorPubkey(
                 message,
                 isKnownAgentPubkey,
@@ -935,8 +931,7 @@ export const MessageRow = React.memo(
         </article>
       </div>
     );
-    // Callbacks (onReply, onToggleReaction) intentionally excluded: inline arrows
-    // from parent create new refs every render — including them defeats memo.
+    // Exclude unstable parent callback refs so memoization remains useful.
   },
   (prev, next) =>
     prev.message.id === next.message.id &&

@@ -17,7 +17,6 @@ import {
 } from "@/features/profile/ui/ProfileAvatarWithStatus";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { Button } from "@/shared/ui/button";
-import { Badge } from "@/shared/ui/badge";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
@@ -203,11 +202,7 @@ export function ChannelScreenHeader({
         ) : undefined
       }
       statusBadge={
-        marketProjection ? (
-          <Badge data-testid="market-header-status" variant="outline">
-            {marketProjection.scenario.status}
-          </Badge>
-        ) : (
+        marketProjection ? undefined : (
           <ChannelHeaderStatusBadge
             ephemeralDisplay={activeChannelEphemeralDisplay}
           />

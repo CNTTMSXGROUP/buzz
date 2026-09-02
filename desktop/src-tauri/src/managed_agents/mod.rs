@@ -21,6 +21,7 @@ mod env_vars;
 pub(crate) mod git_bash;
 pub(crate) mod global_config;
 mod managed_node_paths;
+mod market_buyer;
 mod nest;
 pub(crate) mod parallelism;
 mod persona_avatars;
@@ -71,6 +72,7 @@ pub(crate) use global_config::{
     validate_global_config, GlobalAgentConfig,
 };
 pub(crate) use managed_node_paths::*;
+pub(crate) use market_buyer::configure_market_buyer_heartbeat;
 pub use nest::*;
 pub use parallelism::{acp_agents_value, effective_parallelism, harness_max_parallelism};
 pub use personas::*;

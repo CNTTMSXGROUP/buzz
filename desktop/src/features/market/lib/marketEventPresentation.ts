@@ -60,8 +60,8 @@ export function presentMarketEvent(
     case "settlement":
       return {
         amount: `${envelope.amountSats} fake sats`,
-        eyebrow: "Sandbox receipt",
-        summary: "Signed settlement metadata recorded. No real payment moved.",
+        eyebrow: "Settlement",
+        summary: `Paid ${envelope.amountSats} fake sats. No real payment moved.`,
         title: `${envelope.actorName} marked the award settled`,
       };
   }

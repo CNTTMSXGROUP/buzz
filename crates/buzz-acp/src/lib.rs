@@ -2719,6 +2719,10 @@ async fn tokio_main() -> Result<()> {
         None
     };
     let mut heartbeat_in_flight = false;
+    // A lazy managed harness has no ACP worker to claim until accepted work
+    // arrives. Preserve a due heartbeat as wake-worthy work so proactive
+    // agents can run without Desktop keeping an eager model process alive.
+    let mut heartbeat_pending = false;
 
     let mut presence_heartbeat = if config.presence_enabled {
         let interval = Duration::from_secs(60);
@@ -2888,7 +2892,11 @@ async fn tokio_main() -> Result<()> {
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+            lazy_wake_work_pending = lazy_pool_has_wake_work(
+                queue.has_flushable_work(),
+                queue.has_in_flight(),
+                heartbeat_pending,
+            );
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -3481,7 +3489,8 @@ async fn tokio_main() -> Result<()> {
                 } => {
                     let _ = result_rx;
                     if !pool_ready {
-                        tracing::debug!("heartbeat_skipped_pool_not_ready");
+                        heartbeat_pending = true;
+                        tracing::debug!("heartbeat_requested_pool_wake");
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
@@ -3491,6 +3500,7 @@ async fn tokio_main() -> Result<()> {
                         }
                     } else if pool.any_idle() {
                         dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        heartbeat_pending = false;
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -3795,6 +3805,14 @@ async fn tokio_main() -> Result<()> {
                             dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                         {
                             typing_channels.insert(channel_id, thread_tags);
+                        }
+                        if heartbeat_pending
+                            && !queue.has_undispatched_work()
+                            && !queue.has_in_flight()
+                            && pool.any_idle()
+                        {
+                            dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                            heartbeat_pending = false;
                         }
                     }
                     Err(error) => {
@@ -4812,6 +4830,14 @@ fn drain_ready_join_results(
     LoopAction::Continue
 }
 
+fn lazy_pool_has_wake_work(
+    queue_flushable: bool,
+    queue_in_flight: bool,
+    heartbeat_pending: bool,
+) -> bool {
+    queue_flushable || (heartbeat_pending && !queue_in_flight)
+}
+
 fn dispatch_heartbeat(
     pool: &mut AgentPool,
     ctx: &Arc<PromptContext>,
@@ -5528,6 +5554,14 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
 #[cfg(test)]
 mod heartbeat_base_prompt_tests {
     use super::*;
+
+    #[test]
+    fn lazy_pool_wakes_for_pending_heartbeat_without_channel_work() {
+        assert!(lazy_pool_has_wake_work(false, false, true));
+        assert!(lazy_pool_has_wake_work(true, false, false));
+        assert!(!lazy_pool_has_wake_work(false, false, false));
+        assert!(!lazy_pool_has_wake_work(false, true, true));
+    }
 
     // Pins the heartbeat dispatch path (dispatch_heartbeat, ~line 2359): a
     // legacy agent WITH a base_prompt must get <base> prepended to the

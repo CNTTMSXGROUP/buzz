@@ -260,6 +260,12 @@ Future<void> registerBuzzPushCommunitySnapshotStrict(
   List<Community> communities,
 ) => _registerBuzzPushCommunitySnapshot(communities, strict: true);
 
+/// Removes notifications rendered before a confirmed age restriction.
+Future<void> purgeAgeRestrictedBuzzNotifications() async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return;
+  await _channel.invokeMethod<void>('purgeAgeRestrictedNotifications');
+}
+
 Future<void> _registerBuzzPushCommunitySnapshot(
   List<Community> communities, {
   required bool strict,

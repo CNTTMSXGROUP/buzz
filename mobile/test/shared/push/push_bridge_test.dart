@@ -90,6 +90,18 @@ void main() {
     },
   );
 
+  test('purges notifications delivered before age restriction', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          expect(call.method, 'purgeAgeRestrictedNotifications');
+          expect(call.arguments, isNull);
+          return null;
+        });
+
+    await purgeAgeRestrictedBuzzNotifications();
+  });
+
   test('reads native notification authorization status', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

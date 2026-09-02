@@ -476,6 +476,11 @@ import os.log
       }
     case "openNotificationSettings":
       openNotificationSettings(result: result)
+    case "purgeAgeRestrictedNotifications":
+      let center = UNUserNotificationCenter.current()
+      center.removeAllDeliveredNotifications()
+      center.removeAllPendingNotificationRequests()
+      result(nil)
     case "endpointGrants":
       do {
         result(try endpointGrantStore.records().map(\.flutterArguments))

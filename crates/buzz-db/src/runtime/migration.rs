@@ -701,6 +701,11 @@ mod postgres_tests {
 
         assert_eq!(migrations.len(), 44);
         assert_eq!(migrations[0].version, 1);
+        assert_eq!(migrations[43].version, 44);
+        assert!(migrations[43]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE project_related_channel_overrides"));
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
             .sql

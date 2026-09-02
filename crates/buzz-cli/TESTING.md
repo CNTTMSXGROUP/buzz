@@ -486,6 +486,57 @@ buzz notes get --name dco-check   # exits non-zero: not found
 buzz notes rm --name does-not-exist   # exits non-zero
 ```
 
+### 6.13 Project related channels
+
+`projects link-channel` and `projects unlink-channel` change the membership of
+an existing channel. This is distinct from `projects add-channel`, which drafts
+a new channel for owner review in Buzz Desktop.
+
+Create a Project whose home is the stream channel from the earlier steps, then
+use the forum channel as the distinct related channel:
+
+```bash
+PROJECT_SLUG="cli-related-channels"
+buzz projects create "$PROJECT_SLUG" \
+  --name "CLI related-channel test" \
+  --channel "$CHANNEL_ID" | jq .
+PROJECT_OWNER=$(buzz projects get "$PROJECT_SLUG" | jq -r '.pubkey')
+PROJECT_COORD="30621:${PROJECT_OWNER}:${PROJECT_SLUG}"
+RELATED_CHANNEL_ID="$FORUM_ID"
+
+# Link an existing channel.
+buzz projects link-channel \
+  --project "$PROJECT_COORD" \
+  --channel "$RELATED_CHANNEL_ID" | jq .
+# Expected: {"event_id":"...","accepted":true,"message":"..."}
+buzz projects related-channels --project "$PROJECT_COORD" | jq .
+# Expected: snapshot_found=true and related_channels contains $RELATED_CHANNEL_ID.
+
+# Repeating the same desired state is idempotent and still succeeds.
+buzz projects link-channel \
+  --project "$PROJECT_COORD" \
+  --channel "$RELATED_CHANNEL_ID" | jq .
+# Expected: canonical accepted write output; readback remains unchanged.
+
+# Unlink the existing channel.
+buzz projects unlink-channel \
+  --project "$PROJECT_COORD" \
+  --channel "$RELATED_CHANNEL_ID" | jq .
+# Expected: {"event_id":"...","accepted":true,"message":"..."}
+buzz projects related-channels --project "$PROJECT_COORD" | jq .
+# Expected: snapshot_found=true and related_channels does not contain $RELATED_CHANNEL_ID.
+
+# Repeating unlink is also idempotent.
+buzz projects unlink-channel \
+  --project "$PROJECT_COORD" \
+  --channel "$RELATED_CHANNEL_ID" | jq .
+# Expected: canonical accepted write output; readback remains unchanged.
+
+# During rollout, if no snapshot exists yet, the command reads the live Project
+# event by owner + d and returns canonical legacy tags with
+# snapshot_found=false and source="project_metadata".
+```
+
 ---
 
 ## 7. Error Path Testing
@@ -553,6 +604,7 @@ env -u BUZZ_PRIVATE_KEY \
 
 ```bash
 # Delete test channels
+buzz projects delete "$PROJECT_SLUG" | jq .
 buzz channels delete --channel "$CHANNEL_ID" | jq .
 buzz channels delete --channel "$FORUM_ID" | jq .
 ```
@@ -625,3 +677,6 @@ buzz channels delete --channel "$FORUM_ID" | jq .
 | 60 | `notes ls` | ☐ | Own, --author all, --tag, --limit |
 | 61 | `notes rm` | ☐ | Delete→get 404, double-delete idempotent, missing slug → NotFound |
 | 62 | `users set-status` | ☐ | Text+emoji, text only, emoji-only (`--text ""`), `--clear`, `--clear` + `--text` → exit 1 |
+| 63 | `projects link-channel` | ☐ | Existing channel, repeated idempotent write, snapshot readback |
+| 64 | `projects unlink-channel` | ☐ | Existing relation, repeated idempotent write, snapshot readback |
+| 65 | `projects related-channels` | ☐ | Trusted relay snapshot found/missing, deterministic Project lookup |

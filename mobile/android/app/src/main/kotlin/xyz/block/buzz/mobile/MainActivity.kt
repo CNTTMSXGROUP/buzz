@@ -110,6 +110,8 @@ internal object AndroidImageProcessor {
 class MainActivity : FlutterFragmentActivity() {
     private var mediaUploadChannel: MethodChannel? = null
     private var ageSignalChannel: MethodChannel? = null
+    private var ageSignalRequestGeneration = 0
+    private var pendingAgeSignalResult: MethodChannel.Result? = null
     private var huddleMediaPlugin: HuddleMediaPlugin? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -158,6 +160,7 @@ class MainActivity : FlutterFragmentActivity() {
                             result,
                         )
                     }
+                    CANCEL_AGE_SIGNAL_METHOD -> cancelAgeSignalRequest(result)
                     else -> result.notImplemented()
                 }
             }
@@ -168,27 +171,54 @@ class MainActivity : FlutterFragmentActivity() {
         ageSignalsManager: AgeSignalsManager,
         result: MethodChannel.Result,
     ) {
+        ageSignalRequestGeneration += 1
+        val generation = ageSignalRequestGeneration
+        pendingAgeSignalResult = result
         val accessRequest = AgeSignalsAccessRequest.builder()
             .setActivity(this)
             .build()
         ageSignalsManager.requestAgeSignalsAccess(accessRequest)
             .addOnSuccessListener { accessResult ->
                 if (accessResult.ageSignalsStatus() != AgeSignalsStatus.SHARED) {
-                    replyWithNoAgeSignal(result)
+                    completeAgeSignalRequest(generation, result) { replyWithNoAgeSignal(result) }
                     return@addOnSuccessListener
                 }
 
                 ageSignalsManager.checkAgeSignals(AgeSignalsRequest.builder().build())
                     .addOnSuccessListener { ageSignalsResult ->
-                        replyWithAgeSignal(result, ageSignalsResult.ageUpper())
+                        completeAgeSignalRequest(generation, result) {
+                            replyWithAgeSignal(result, ageSignalsResult.ageUpper())
+                        }
                     }
                     .addOnFailureListener { error ->
-                        replyWithAgeSignalError(result, error)
+                        completeAgeSignalRequest(generation, result) {
+                            replyWithAgeSignalError(result, error)
+                        }
                     }
             }
             .addOnFailureListener { error ->
-                replyWithAgeSignalError(result, error)
+                completeAgeSignalRequest(generation, result) {
+                    replyWithAgeSignalError(result, error)
+                }
             }
+    }
+
+    private fun completeAgeSignalRequest(
+        generation: Int,
+        result: MethodChannel.Result,
+        reply: () -> Unit,
+    ) {
+        if (generation != ageSignalRequestGeneration || pendingAgeSignalResult !== result) return
+        pendingAgeSignalResult = null
+        reply()
+    }
+
+    private fun cancelAgeSignalRequest(result: MethodChannel.Result) {
+        ageSignalRequestGeneration += 1
+        val pending = pendingAgeSignalResult
+        pendingAgeSignalResult = null
+        pending?.error("age_signal_cancelled", "The age signal request was cancelled.", null)
+        result.success(null)
     }
 
     private fun replyWithAgeSignal(
@@ -446,6 +476,7 @@ class MainActivity : FlutterFragmentActivity() {
         private const val MEDIA_UPLOAD_CHANNEL = "buzz/media_upload"
         private const val AGE_SIGNAL_CHANNEL = "buzz/age_signal"
         private const val REQUEST_AGE_SIGNAL_METHOD = "requestAgeSignal"
+        private const val CANCEL_AGE_SIGNAL_METHOD = "cancelAgeSignalRequest"
         private const val SANITIZE_IMAGE_FOR_UPLOAD_METHOD = "sanitizeImageForUpload"
         private const val TRANSCODE_IMAGE_TO_JPEG_METHOD = "transcodeImageToJpeg"
         private const val TRANSCODE_VIDEO_TO_MP4_METHOD = "transcodeVideoToMp4"

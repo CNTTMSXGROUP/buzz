@@ -16,12 +16,15 @@ typedef AgeSignalRequest = Future<Map<Object?, Object?>?> Function();
 
 /// Waits before retrying a failed native age-signal request.
 typedef AgeSignalDelay = Future<void> Function(Duration duration);
+typedef AgeSignalCancel = Future<void> Function();
 
 Future<Map<Object?, Object?>?> _requestPlatformAgeSignal() =>
     ageSignalChannel.invokeMapMethod<Object?, Object?>('requestAgeSignal');
 
 Future<void> _delayAgeSignalRetry(Duration duration) =>
     Future<void>.delayed(duration);
+Future<void> _cancelPlatformAgeSignal() =>
+    ageSignalChannel.invokeMethod<void>('cancelAgeSignalRequest');
 
 bool shouldBlockForAgeSignal(Map<Object?, Object?> response) {
   if (response.length != 2 ||
@@ -59,15 +62,18 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
   AgeSignalNotifier({
     AgeSignalRequest? requestSignal,
     AgeSignalDelay? delay,
+    AgeSignalCancel? cancelSignal,
     Duration requestTimeout = ageSignalRequestTimeout,
   }) : _requestSignal = requestSignal ?? _requestPlatformAgeSignal,
        _delay = delay ?? _delayAgeSignalRetry,
+       _cancelSignal = cancelSignal ?? _cancelPlatformAgeSignal,
        _requestTimeout = requestTimeout;
 
   static const _maxAttempts = 2;
 
   final AgeSignalRequest _requestSignal;
   final AgeSignalDelay _delay;
+  final AgeSignalCancel _cancelSignal;
   final Duration _requestTimeout;
   bool _completed = false;
   Future<void>? _requestInFlight;
@@ -125,6 +131,7 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
           await _delay(ageSignalRetryDelay);
           continue;
         }
+        await _retireNativeRequest();
         // A stalled platform flow is not evidence that access is allowed.
         // Keep the launch gated and expose a deliberate retry action.
         state = AgeSignalState.retryableFailure;
@@ -173,6 +180,18 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
         _nativeRequestInFlight = null;
       }
       rethrow;
+    }
+  }
+
+  Future<void> _retireNativeRequest() async {
+    try {
+      await _cancelSignal();
+    } on MissingPluginException {
+      // Stay gated if cancellation cannot be acknowledged.
+    } on PlatformException {
+      // Stay gated if cancellation cannot be acknowledged.
+    } finally {
+      _nativeRequestInFlight = null;
     }
   }
 }

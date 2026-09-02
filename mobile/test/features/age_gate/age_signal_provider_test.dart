@@ -130,6 +130,7 @@ void main() {
             delays += 1;
           },
           requestTimeout: const Duration(milliseconds: 1),
+          cancelSignal: () async {},
         ),
       );
       final container = ProviderContainer();
@@ -159,6 +160,7 @@ void main() {
           response.complete({'status': 'signal', 'ageUpper': 17});
         },
         requestTimeout: const Duration(milliseconds: 1),
+        cancelSignal: () async {},
       ),
     );
     final container = ProviderContainer();
@@ -169,6 +171,37 @@ void main() {
     expect(container.read(provider), AgeSignalState.restricted);
     expect(requests, 1);
     expect(delays, 1);
+  });
+
+  test('a deliberate retry replaces an exhausted stalled request', () async {
+    var requests = 0;
+    var cancellations = 0;
+    final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
+      () => AgeSignalNotifier(
+        requestSignal: () {
+          requests += 1;
+          if (requests == 1) {
+            return Completer<Map<Object?, Object?>?>().future;
+          }
+          return Future.value({'status': 'noSignal', 'ageUpper': null});
+        },
+        delay: (_) async {},
+        cancelSignal: () async {
+          cancellations += 1;
+        },
+        requestTimeout: const Duration(milliseconds: 1),
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    await container.read(provider.notifier).request();
+    expect(container.read(provider), AgeSignalState.retryableFailure);
+    await container.read(provider.notifier).request();
+
+    expect(container.read(provider), AgeSignalState.allowed);
+    expect(requests, 2);
+    expect(cancellations, 1);
   });
 
   test('keeps a missing native channel gated and retryable', () async {

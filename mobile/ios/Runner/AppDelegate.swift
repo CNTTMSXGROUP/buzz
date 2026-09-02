@@ -31,6 +31,9 @@ import os.log
   private var qrScannerChannel: FlutterMethodChannel?
   private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
   private var ageSignalChannel: FlutterMethodChannel?
+  private var ageSignalTask: Task<Void, Never>?
+  private var ageSignalRequestID: UUID?
+  private var ageSignalResult: FlutterResult?
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
   private var nativeEmojiPickerCoordinator: NativeEmojiPickerCoordinator?
@@ -97,8 +100,8 @@ import os.log
     let ageSignalRegistrar = engineBridge.pluginRegistry.registrar(
       forPlugin: "BuzzAgeSignal"
     )
-    ageSignalChannel?.setMethodCallHandler { call, result in
-      Self.handleAgeSignalMethodCall(
+    ageSignalChannel?.setMethodCallHandler { [weak self] call, result in
+      self?.handleAgeSignalMethodCall(
         call,
         viewController: ageSignalRegistrar?.viewController,
         result: result
@@ -241,11 +244,16 @@ import os.log
     }
   }
 
-  private static func handleAgeSignalMethodCall(
+  private func handleAgeSignalMethodCall(
     _ call: FlutterMethodCall,
     viewController: UIViewController?,
     result: @escaping FlutterResult
   ) {
+    if call.method == "cancelAgeSignalRequest" {
+      cancelAgeSignalRequest()
+      result(nil)
+      return
+    }
     guard call.method == "requestAgeSignal" else {
       result(FlutterMethodNotImplemented)
       return
@@ -265,7 +273,10 @@ import os.log
       return
     }
 
-    Task { @MainActor in
+    let requestID = UUID()
+    ageSignalRequestID = requestID
+    ageSignalResult = result
+    ageSignalTask = Task { @MainActor [weak self] in
       do {
         let response = try await AgeRangeService.shared.requestAgeRange(
           ageGates: 18,
@@ -273,12 +284,17 @@ import os.log
         )
         switch response {
         case .declinedSharing:
-          result(Self.noAgeSignalResponse)
+          self?.completeAgeSignalRequest(requestID, value: Self.noAgeSignalResponse)
         case .sharing(let range):
           let ageUpper = range.upperBound.map { $0 as Any } ?? NSNull()
-          result(["status": "signal", "ageUpper": ageUpper])
+          self?.completeAgeSignalRequest(
+            requestID,
+            value: ["status": "signal", "ageUpper": ageUpper]
+          )
         @unknown default:
-          result(
+          self?.completeAgeSignalRequest(
+            requestID,
+            value:
             FlutterError(
               code: "age_signal_unavailable",
               message: "The age signal response is unsupported.",
@@ -287,7 +303,9 @@ import os.log
           )
         }
       } catch {
-        result(
+        self?.completeAgeSignalRequest(
+          requestID,
+          value:
           FlutterError(
             code: "age_signal_unavailable",
             message: "The age signal request failed.",
@@ -296,6 +314,29 @@ import os.log
         )
       }
     }
+  }
+
+  private func completeAgeSignalRequest(_ requestID: UUID, value: Any?) {
+    guard ageSignalRequestID == requestID, let result = ageSignalResult else { return }
+    ageSignalRequestID = nil
+    ageSignalResult = nil
+    ageSignalTask = nil
+    result(value)
+  }
+
+  private func cancelAgeSignalRequest() {
+    let result = ageSignalResult
+    ageSignalRequestID = nil
+    ageSignalResult = nil
+    ageSignalTask?.cancel()
+    ageSignalTask = nil
+    result?(
+      FlutterError(
+        code: "age_signal_cancelled",
+        message: "The age signal request was cancelled.",
+        details: nil
+      )
+    )
   }
 
   private static let noAgeSignalResponse: [String: Any] = [

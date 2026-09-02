@@ -73,7 +73,7 @@ impl SessionPrompt {
         }
         state.composer.render(
             &PromptContext {
-                current_date_time: String::new(),
+                current_date_time: chrono::Utc::now().format("%Y-%m-%d %H:00 %:z").to_string(),
                 goose_mode: self.mode,
                 variables: Default::default(),
             },
@@ -117,6 +117,20 @@ mod tests {
         let built = prompt.build(Path::new(".")).await.unwrap();
         assert!(built.contains("You are Fizz."));
         assert!(built.contains("Always ship the sprocket first."));
+    }
+
+    #[tokio::test]
+    async fn override_renders_current_date_time() {
+        let prompt = SessionPrompt::new(GooseMode::Auto);
+        prompt
+            .set_override("It is currently {{ current_date_time }}".to_string())
+            .await;
+        let built = prompt.build(Path::new(".")).await.unwrap();
+        assert!(built.starts_with("It is currently 20"), "{built:?}");
+        assert!(
+            !built.contains("{{"),
+            "template variable was not rendered: {built:?}"
+        );
     }
 
     #[tokio::test]

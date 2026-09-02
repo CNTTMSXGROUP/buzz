@@ -104,6 +104,18 @@ enrollment, or lease publication, so a later user opt-in can display pushes
 without rebuilding transport authority. An absent, malformed, or unreachable
 descriptor leaves push inactive without partial enrollment.
 
+Every mobile build must supply the gateway origin explicitly:
+
+```bash
+flutter build ios --dart-define=BUZZ_PUSH_GATEWAY_URL=https://push.example
+flutter build apk --dart-define=BUZZ_PUSH_GATEWAY_URL=https://push.example
+```
+
+The iOS and Android build gates fail when the define is absent. The app binds
+enrollment state to this origin and discards legacy or mismatched grants and
+pending enrollment journals before enrolling again. Notification permission is
+not reset.
+
 Relay rollout remains an explicit deployment opt-in. Only deployments with
 `BUZZ_PUSH_ENABLED=true` advertise the descriptor and process push. See
 `docs/push-gateway-deployment.md` for the canonical gateway profile contract,

@@ -258,15 +258,15 @@ A pubkey-only client cannot create, replace, or revoke a lease. If a platform en
 
 Implementations MUST NOT interpret this section as NIP-26 delegation. A future specification may define a narrowly scoped installation authorization for unattended endpoint rotation, but such a capability is neither required nor implied here.
 
-## Public APNs Gateway Profile (Buzz, normative)
+## APNs Gateway Profile (Buzz, normative)
 
-This section registers the public last-hop profile served at `https://push.buzz.xyz`. It is an optional profile of NIP-PL, but every requirement in this section is normative for implementations that use it. The gateway is stateful: it retains installation authority, encrypted APNs-token custody, relay delegations, replay reservations, and endpoint quotas. The relay remains the executor and retains lease acceptance, matching, tenant authorization, endpoint uniqueness, coalescing, durable jobs/retries, and lease-generation invalidation.
+This section registers a last-hop profile served at a deployment-configured HTTPS origin. It is an optional profile of NIP-PL, but every requirement in this section is normative for implementations that use it. The configured origin has no credentials, port, path, query, or fragment. The gateway is stateful: it retains installation authority, encrypted APNs-token custody, relay delegations, replay reservations, and endpoint quotas. The relay remains the executor and retains lease acceptance, matching, tenant authorization, endpoint uniqueness, coalescing, durable jobs/retries, and lease-generation invalidation.
 
 ### Registered values and lease mapping
 
 The registered `app_profile` value is `buzz-ios-dogfood`. It identifies the
 closed Buzz dogfood application identity, not an APNs transport environment.
-The canonical gateway owns its exact App Attest application identifier, APNs
+The configured gateway owns its exact App Attest application identifier, APNs
 topic, certificate-backed connection pool, and APNs environment. Enrollment
 succeeds only when App Attest cryptographically verifies the configured
 application identifier. The gateway MUST NOT accept an APNs topic from a client. The APNs token
@@ -289,7 +289,7 @@ Every App Attest operation signs a **transcript**, not the received request byte
 <domain> + "\\n" + <compact ordered JSON object>
 ```
 
-The JSON object has no insignificant whitespace and members appear in the exact order shown below. Strings use JSON escaping for quotation mark, reverse solidus, and U+0000..U+001F; all authority-bearing strings admitted by this profile are ASCII. UUID strings are canonical lowercase-hyphenated. Integers use shortest decimal notation. The fixed `audience` value is part of the signed object and prevents cross-route use. For enrollment, these exact transcript bytes are the App Attest `clientData` supplied to attestation verification. For every assertion route, `clientDataHash = SHA-256(transcript bytes)` is verified by App Attest. The separately stored challenge must equal the request `challenge`, is single-use, expires after 300 seconds, and is consumed only after successful cryptographic verification. Assertion `signCount` MUST strictly increase atomically for the installation.
+The JSON object has no insignificant whitespace and members appear in the exact order shown below. Strings use JSON escaping for quotation mark, reverse solidus, and U+0000..U+001F; all authority-bearing strings admitted by this profile are ASCII. UUID strings are canonical lowercase-hyphenated. Integers use shortest decimal notation. The `audience` value is the configured gateway origin plus the fixed route shown below. It is part of the signed object and prevents cross-origin and cross-route use. For enrollment, these exact transcript bytes are the App Attest `clientData` supplied to attestation verification. For every assertion route, `clientDataHash = SHA-256(transcript bytes)` is verified by App Attest. The separately stored challenge must equal the request `challenge`, is single-use, expires after 300 seconds, and is consumed only after successful cryptographic verification. Assertion `signCount` MUST strictly increase atomically for the installation.
 
 ### Challenge
 
@@ -318,7 +318,7 @@ Request members, in any request order:
 `expires_at` MUST satisfy `now < expires_at <= now + configured_max_installation_lifetime`; the selected profile MUST be enabled. The exact transcript is domain `buzz.push.enroll.v1` followed by this ordered object:
 
 ```json
-{"v":1,"audience":"https://push.buzz.xyz/v1/installations","challenge_id":"<uuid>","challenge":"<challenge>","key_id":"<standard-base64>","app_profile":"<registered-profile>","endpoint":"<lowercase-hex>","endpoint_epoch":1,"expires_at":<unix-seconds>}
+{"v":1,"audience":"<gateway-origin>/v1/installations","challenge_id":"<uuid>","challenge":"<challenge>","key_id":"<standard-base64>","app_profile":"<registered-profile>","endpoint":"<lowercase-hex>","endpoint_epoch":1,"expires_at":<unix-seconds>}
 ```
 
 The gateway verifies Apple's attestation chain, configured application identifier, production AAGUID, key identifier, and transcript. Apple documents no APNs-token-to-App-Attest-key binding; token provenance at enrollment is an explicit bootstrap assumption. It then stores only encrypted token custody plus its fingerprint. Success `201`:
@@ -342,7 +342,7 @@ Invalid attestation is `401 invalid_attestation`; a consumed/expired challenge o
 `not_before <= now + 300`, `not_before < expires_at`, and `expires_at <= now + configured_max_grant_lifetime`. The endpoint epoch MUST equal the current installation epoch. For each `(installation_handle, relay_pubkey)`, generation MUST strictly increase. A successful delegation atomically extends the authenticated installation lifetime through at least the delegation's `expires_at`, allowing renewal without duplicate token enrollment. Transcript domain `buzz.push.delegate.v1`; ordered object:
 
 ```json
-{"v":1,"audience":"https://push.buzz.xyz/v1/delegations","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","endpoint_epoch":<integer>,"generation":<integer>,"relay_pubkey":"<hex>","not_before":<integer>,"expires_at":<integer>}
+{"v":1,"audience":"<gateway-origin>/v1/delegations","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","endpoint_epoch":<integer>,"generation":<integer>,"relay_pubkey":"<hex>","not_before":<integer>,"expires_at":<integer>}
 ```
 
 Success `201`: `{"endpoint_grant":"<opaque-capability>"}`. The sealed grant contains no APNs token. Grant-key rotation MUST retain decrypt-only predecessor keys through the maximum lifetime of grants they issued.
@@ -358,7 +358,7 @@ Success `201`: `{"endpoint_grant":"<opaque-capability>"}`. The sealed grant cont
 `new_endpoint_epoch` MUST equal `endpoint_epoch + 1` without overflow. Transcript domain `buzz.push.rotate-endpoint.v1`; ordered object:
 
 ```json
-{"v":1,"audience":"https://push.buzz.xyz/v1/installations/endpoint","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","endpoint_epoch":<integer>,"new_endpoint_epoch":<integer>,"endpoint":"<lowercase-hex>"}
+{"v":1,"audience":"<gateway-origin>/v1/installations/endpoint","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","endpoint_epoch":<integer>,"new_endpoint_epoch":<integer>,"endpoint":"<lowercase-hex>"}
 ```
 
 A successful atomic rotation invalidates every grant sealed to the old epoch and returns `200 {"status":"rotated"}`.
@@ -374,7 +374,7 @@ A successful atomic rotation invalidates every grant sealed to the old epoch and
 Transcript domain `buzz.push.revoke-delegation.v1`; ordered object:
 
 ```json
-{"v":1,"audience":"https://push.buzz.xyz/v1/delegations/revoke","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","relay_pubkey":"<hex>","generation":<integer>}
+{"v":1,"audience":"<gateway-origin>/v1/delegations/revoke","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","relay_pubkey":"<hex>","generation":<integer>}
 ```
 
 The generation identifies the current delegation generation. Success is `200 {"status":"revoked"}`.
@@ -388,14 +388,14 @@ The generation identifies the current delegation generation. Success is `200 {"s
 `new_endpoint_epoch` MUST equal `endpoint_epoch + 1` without overflow. Transcript domain `buzz.push.revoke-installation.v1`; ordered object:
 
 ```json
-{"v":1,"audience":"https://push.buzz.xyz/v1/installations/revoke","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","endpoint_epoch":<integer>,"new_endpoint_epoch":<integer>}
+{"v":1,"audience":"<gateway-origin>/v1/installations/revoke","challenge_id":"<uuid>","challenge":"<challenge>","installation_handle":"<uuid>","endpoint_epoch":<integer>,"new_endpoint_epoch":<integer>}
 ```
 
 Success is `200 {"status":"revoked"}`. The revocation atomically invalidates the installation and every delegation.
 
 ### Relay delivery
 
-`POST /v1/deliveries/apns` has the exact externally configured URL `https://push.buzz.xyz/v1/deliveries/apns`. Request:
+`POST /v1/deliveries/apns` has the exact externally configured URL `<gateway-origin>/v1/deliveries/apns`. Request:
 
 ```json
 {"v":1,"endpoint_grant":"<opaque-capability>","request_id":"<uuid>","expires_at":<unix-seconds>}
@@ -449,4 +449,4 @@ Zombie leases (e.g. `#h` after leaving a channel) are neutralized by match-time 
 - NIP-11 `supported_extensions`: contains `"nip-pl"` pre-numbering; descriptor object `push` as specified in Executor Discovery
 - Classes: `silent`, `default`, `time_sensitive`, `urgent`
 - `h_grammar` values: `"uuid-v4-lowercase"` (initial entry; origins may register additional grammars with this NIP)
-- Public APNs gateway profile: base URL `https://push.buzz.xyz`; app profile `buzz-ios-dogfood`; wire version `1`
+- APNs gateway profile: deployment-configured HTTPS origin; app profile `buzz-ios-dogfood`; wire version `1`

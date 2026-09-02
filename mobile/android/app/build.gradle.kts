@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.util.Base64
 
 plugins {
     id("com.android.application")
@@ -20,6 +21,24 @@ val uploadSigningValues =
     )
 val missingUploadSigningValues = uploadSigningValues.filterValues { it.isNullOrBlank() }.keys
 val hasUploadSigning = missingUploadSigningValues.isEmpty()
+val dartDefines = providers.gradleProperty("dart-defines").orNull.orEmpty()
+val pushGatewayDefinePrefix = "BUZZ_PUSH_GATEWAY_URL="
+val hasPushGatewayOrigin =
+    dartDefines.split(',').any { encoded ->
+        val define = runCatching { String(Base64.getDecoder().decode(encoded)) }.getOrNull()
+        define?.startsWith(pushGatewayDefinePrefix) == true &&
+            define.length > pushGatewayDefinePrefix.length
+    }
+
+tasks.matching { it.name.startsWith("compileFlutterBuild") }.configureEach {
+    doFirst {
+        if (!hasPushGatewayOrigin) {
+            throw GradleException(
+                "BUZZ_PUSH_GATEWAY_URL must be supplied with --dart-define for every mobile build.",
+            )
+        }
+    }
+}
 
 // Worktree-aware debug identity (gitignored, written by
 // scripts/mobile-worktree-overrides.sh): debug builds from a git worktree get a

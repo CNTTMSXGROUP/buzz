@@ -345,7 +345,32 @@ import os.log
     }
     switch call.method {
     case "startRegistration":
-      startPushRegistration(result: result)
+      guard let arguments = call.arguments as? [String: Any],
+        let gatewayText = arguments["gatewayUrl"] as? String,
+        let gatewayURL = URL(string: gatewayText)
+      else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Push registration requires gatewayUrl.",
+            details: nil
+          )
+        )
+        return
+      }
+      do {
+        let gatewayOrigin = try BuzzPushTranscript.canonicalGatewayOrigin(gatewayURL).text
+        try endpointGrantStore.reset(forGatewayOrigin: gatewayOrigin)
+        startPushRegistration(result: result)
+      } catch {
+        result(
+          FlutterError(
+            code: "push_gateway_configuration_failed",
+            message: "Push gateway configuration is invalid.",
+            details: error.localizedDescription
+          )
+        )
+      }
     case "takePendingNotificationResponse":
       result(pushNavigationBuffer.take()?.flutterArguments)
     case "notificationAuthorizationStatus":

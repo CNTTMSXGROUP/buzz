@@ -804,7 +804,7 @@ mobile-check:
 
 # Run mobile tests
 mobile-test:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter test
+    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter test --dart-define=BUZZ_PUSH_GATEWAY_URL=https://push.example
 
 # Regenerate the emoji dataset asset from desktop's emoji-mart install.
 # Output is committed — rerun after bumping @emoji-mart/data.
@@ -813,8 +813,9 @@ mobile-emoji-data:
 
 # Compile an unsigned Android debug APK (worktree-aware debug identity)
 mobile-build-android:
+    test -n "${BUZZ_PUSH_GATEWAY_URL:-}" || { echo "BUZZ_PUSH_GATEWAY_URL is required" >&2; exit 1; }
     ./scripts/mobile-worktree-overrides.sh
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter build apk --debug --no-pub
+    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter build apk --debug --no-pub --dart-define="BUZZ_PUSH_GATEWAY_URL=${BUZZ_PUSH_GATEWAY_URL}"
 
 # Run the mobile app on iOS simulator (worktree-aware debug identity)
 mobile-dev:
@@ -825,9 +826,10 @@ mobile-dev:
         sleep 3
     fi
     ./scripts/mobile-worktree-overrides.sh
+    test -n "${BUZZ_PUSH_GATEWAY_URL:-}" || { echo "BUZZ_PUSH_GATEWAY_URL is required" >&2; exit 1; }
     cd {{mobile_dir}}
     unset GIT_DIR GIT_WORK_TREE
-    flutter run
+    flutter run --dart-define="BUZZ_PUSH_GATEWAY_URL=${BUZZ_PUSH_GATEWAY_URL}"
 
 # Uninstall stale worktree-suffixed Buzz debug installs (production apps kept)
 mobile-clean:

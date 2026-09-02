@@ -142,7 +142,9 @@ Future<void> syncPendingBuzzPushNotificationResponse() async {
 Future<void> startBuzzPushRegistration() async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
-    await _channel.invokeMethod<void>('startRegistration');
+    await _channel.invokeMethod<void>('startRegistration', {
+      'gatewayUrl': Env.pushGatewayUrl,
+    });
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }

@@ -6,13 +6,32 @@ import Security
 /// UserDefaults or logs. Dart can read the closed record through the push bridge.
 final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   private static let service = "buzz.push.endpoint-grants"
-  private static let recordsAccount = "v1"
-  private static let pendingAccount = "pending-v1"
+  private static let legacyRecordsAccount = "v1"
+  private static let legacyPendingAccount = "pending-v1"
+  private static let recordsAccount = "v2"
+  private static let pendingAccount = "pending-v2"
 
   private let accessGroup: String?
 
   init(accessGroup: String?) {
     self.accessGroup = accessGroup
+  }
+
+  func reset(forGatewayOrigin gatewayOrigin: String) throws {
+    try delete(account: Self.legacyRecordsAccount)
+    try delete(account: Self.legacyPendingAccount)
+
+    let allRecords = try records()
+    let retainedRecords = allRecords.filter { $0.gatewayOrigin == gatewayOrigin }
+    if retainedRecords.count != allRecords.count {
+      try replace(retainedRecords, account: Self.recordsAccount)
+    }
+
+    let allPending = try pendingEnrollments()
+    let retainedPending = allPending.filter { $0.gatewayOrigin == gatewayOrigin }
+    if retainedPending.count != allPending.count {
+      try replace(retainedPending, account: Self.pendingAccount)
+    }
   }
 
   func records() throws -> [BuzzPushEndpointGrantRecord] {
@@ -39,34 +58,43 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   func save(_ record: BuzzPushEndpointGrantRecord) throws {
     var all = try records()
     all.removeAll {
-      $0.relayOrigin == record.relayOrigin && $0.appProfile == record.appProfile
+      $0.gatewayOrigin == record.gatewayOrigin && $0.relayOrigin == record.relayOrigin
+        && $0.appProfile == record.appProfile
     }
     all.append(record)
     try replace(all, account: Self.recordsAccount)
   }
 
   func pendingEnrollment(
+    gatewayOrigin: String,
     relayOrigin: String,
     appProfile: String
   ) throws -> BuzzPushPendingEnrollmentRecord? {
     try pendingEnrollments().first {
-      $0.relayOrigin == relayOrigin && $0.appProfile == appProfile
+      $0.gatewayOrigin == gatewayOrigin && $0.relayOrigin == relayOrigin
+        && $0.appProfile == appProfile
     }
   }
 
   func savePendingEnrollment(_ record: BuzzPushPendingEnrollmentRecord) throws {
     var all = try pendingEnrollments()
     all.removeAll {
-      $0.relayOrigin == record.relayOrigin && $0.appProfile == record.appProfile
+      $0.gatewayOrigin == record.gatewayOrigin && $0.relayOrigin == record.relayOrigin
+        && $0.appProfile == record.appProfile
     }
     all.append(record)
     try replace(all, account: Self.pendingAccount)
   }
 
-  func removePendingEnrollment(relayOrigin: String, appProfile: String) throws {
+  func removePendingEnrollment(
+    gatewayOrigin: String,
+    relayOrigin: String,
+    appProfile: String
+  ) throws {
     var all = try pendingEnrollments()
     all.removeAll {
-      $0.relayOrigin == relayOrigin && $0.appProfile == appProfile
+      $0.gatewayOrigin == gatewayOrigin && $0.relayOrigin == relayOrigin
+        && $0.appProfile == appProfile
     }
     try replace(all, account: Self.pendingAccount)
   }
@@ -109,6 +137,13 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     let addStatus = SecItemAdd(add as CFDictionary, nil)
     guard addStatus == errSecSuccess else {
       throw keychainError(addStatus, operation: "add")
+    }
+  }
+
+  private func delete(account: String) throws {
+    let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw keychainError(status, operation: "delete legacy state")
     }
   }
 

@@ -2,6 +2,8 @@
 /// It contains no APNs endpoint, only its hash and the exact authenticated
 /// enrollment material needed to replay a committed request idempotently.
 public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
+  /// Gateway authority for which this retry journal remains valid.
+  public let gatewayOrigin: String
   public let relayOrigin: String
   public let relayPubkey: String
   public let endpointHash: String
@@ -16,6 +18,7 @@ public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
   public let delegationGeneration: Int64
 
   public init(
+    gatewayOrigin: String,
     relayOrigin: String,
     relayPubkey: String,
     endpointHash: String,
@@ -29,6 +32,7 @@ public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
     attestation: String? = nil,
     delegationGeneration: Int64 = 0
   ) {
+    self.gatewayOrigin = gatewayOrigin
     self.relayOrigin = relayOrigin
     self.relayPubkey = relayPubkey
     self.endpointHash = endpointHash

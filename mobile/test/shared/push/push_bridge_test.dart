@@ -53,6 +53,7 @@ void main() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(_channel, (call) async {
             expect(call.method, 'startRegistration');
+            expect(call.arguments, {'gatewayUrl': Env.pushGatewayUrl});
             return null;
           });
 
@@ -246,11 +247,9 @@ void main() {
     },
   );
 
-  test('development push gateway matches the compiled configuration', () {
-    const expectedGateway = String.fromEnvironment(
-      'BUZZ_PUSH_GATEWAY_URL',
-      defaultValue: 'https://push.buzz.xyz',
-    );
+  test('push gateway matches the required compiled configuration', () {
+    const expectedGateway = String.fromEnvironment('BUZZ_PUSH_GATEWAY_URL');
+    expect(expectedGateway, isNotEmpty);
     expect(Env.pushGatewayUrl, expectedGateway);
   });
 

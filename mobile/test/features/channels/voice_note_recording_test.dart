@@ -368,12 +368,12 @@ void main() {
   );
 
   test(
-    'rapid remote toggles share one download and one auth generation',
+    'second remote toggle cancels download and third retries with fresh auth',
     () async {
       final client = _SequencedHttpClient();
       final audioPlayer = _FakeAudioPlayerBackend();
       final directory = await Directory.systemTemp.createTemp(
-        'voice-note-single-flight-test',
+        'voice-note-toggle-cancel-test',
       );
       addTearDown(() async {
         if (await directory.exists()) await directory.delete(recursive: true);
@@ -396,16 +396,36 @@ void main() {
       );
 
       final firstToggle = player.toggle();
-      final secondToggle = player.toggle();
       await Future<void>.delayed(Duration.zero);
-
-      expect(client.requests, hasLength(1));
-      expect(authGeneration, 1);
-      client.responses.single.complete(
-        http.StreamedResponse(Stream.value(<int>[1, 2, 3]), 200),
+      final firstRequest =
+          client.requests.single as http.AbortableStreamedRequest;
+      final secondToggle = player.toggle();
+      await firstRequest.abortTrigger;
+      client.responses.single.completeError(
+        http.RequestAbortedException(firstRequest.url),
       );
       await Future.wait([firstToggle, secondToggle]);
 
+      expect(client.requests, hasLength(1));
+      expect(authGeneration, 1);
+      expect(audioPlayer.loadedPaths, isEmpty);
+      expect(audioPlayer.playCount, 0);
+      expect(player.state.isLoading, isFalse);
+      expect(directory.listSync().whereType<File>(), isEmpty);
+
+      final retry = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      expect(client.requests, hasLength(2));
+      expect(
+        client.requests.last.headers['Authorization'],
+        'Nostr signed-event-1',
+      );
+      client.responses.last.complete(
+        http.StreamedResponse(Stream.value(<int>[1, 2, 3]), 200),
+      );
+      await retry;
+
+      expect(authGeneration, 2);
       expect(audioPlayer.loadedPaths, hasLength(1));
       expect(audioPlayer.playCount, 1);
     },

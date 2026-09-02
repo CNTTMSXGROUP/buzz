@@ -112,6 +112,15 @@ class _LoadingVoiceNotePlayer extends _FakeVoiceNotePlayer {
   }) async {}
 }
 
+class _ToggleTrackingLoadingVoiceNotePlayer extends _LoadingVoiceNotePlayer {
+  int toggleCount = 0;
+
+  @override
+  Future<void> toggle() async {
+    toggleCount += 1;
+  }
+}
+
 class _RetryableVoiceNotePlayer extends _FakeVoiceNotePlayer {
   _RetryableVoiceNotePlayer() {
     _state = const VoiceNotePlaybackState(hasError: true);
@@ -1004,6 +1013,41 @@ void main() {
         expect(find.byType(BuzzLoadingIndicator), findsOneWidget);
         expect(find.byType(CircularProgressIndicator), findsNothing);
         expect(find.bySemanticsLabel('Loading voice note'), findsOneWidget);
+      });
+
+      testWidgets('routes repeated loading-control taps through toggle', (
+        tester,
+      ) async {
+        const url = 'https://example.com/media/cancel-loading-voice-note.mp4';
+        final player = _ToggleTrackingLoadingVoiceNotePlayer();
+
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: '![audio]($url)',
+              tags: [
+                [
+                  'imeta',
+                  'url $url',
+                  'm video/mp4',
+                  'duration 3.0',
+                  'filename voice-note-loading.mp4',
+                ],
+              ],
+            ),
+            overrides: [
+              voiceNotePlayerFactoryProvider.overrideWithValue(() => player),
+            ],
+          ),
+        );
+        await tester.pump();
+
+        final control = find.byKey(const ValueKey('voice-note-play-pause'));
+        await tester.tap(control);
+        await tester.tap(control);
+        await tester.pump();
+
+        expect(player.toggleCount, 2);
       });
 
       testWidgets('offers an accessible retry after a voice note fails', (

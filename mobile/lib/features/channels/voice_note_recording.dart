@@ -485,6 +485,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   _pendingRemote;
   Completer<void>? _downloadAbort;
   Future<void>? _toggleOperation;
+  bool _toggleCancellationRequested = false;
   File? _downloadingRemoteFile;
   File? _remoteFile;
   int _sourceGeneration = 0;
@@ -645,11 +646,21 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   @override
   Future<void> toggle() {
     final activeToggle = _toggleOperation;
-    if (activeToggle != null) return activeToggle;
+    if (activeToggle != null) {
+      if (!_toggleCancellationRequested) {
+        _toggleCancellationRequested = true;
+        unawaited(pause());
+      }
+      return activeToggle;
+    }
+    _toggleCancellationRequested = false;
     final operation = _toggle();
     _toggleOperation = operation;
     return operation.whenComplete(() {
-      if (identical(_toggleOperation, operation)) _toggleOperation = null;
+      if (identical(_toggleOperation, operation)) {
+        _toggleOperation = null;
+        _toggleCancellationRequested = false;
+      }
     });
   }
 

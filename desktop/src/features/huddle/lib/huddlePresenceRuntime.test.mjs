@@ -668,6 +668,73 @@ test("replays an opaque-generation join and leave in causal order", async () => 
   dispose();
 });
 
+test("replays an opaque-generation end after matching liveness", async () => {
+  const generation1 = "11111111-1111-4111-8111-111111111111";
+  const generation2 = "22222222-2222-4222-8222-222222222222";
+  let liveHandler;
+  let livenessTimer;
+  let resolveRefresh;
+  let livenessRequests = 0;
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) {
+        return [event({ id: "start", kind: 48100, createdAt: 1 })];
+      }
+      livenessRequests += 1;
+      if (livenessRequests === 1) {
+        return [livenessEvent("room", generation1)];
+      }
+      return new Promise((resolve) => {
+        resolveRefresh = resolve;
+      });
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setLivenessTimer: (callback) => {
+      livenessTimer = callback;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
+  });
+  await settle();
+
+  livenessTimer();
+  await settle();
+  liveHandler(
+    participantEvent({
+      id: "new-join",
+      kind: 48101,
+      admissionId: "new-admission",
+      rosterRevision: 1,
+      generation: generation2,
+      createdAt: 2,
+    }),
+  );
+  liveHandler(
+    event({
+      id: "new-end",
+      kind: 48103,
+      pubkey: RELAY,
+      generation: generation2,
+      createdAt: 3,
+    }),
+  );
+
+  resolveRefresh([livenessEvent("room", generation2)]);
+  await settle();
+  assert.deepEqual([...snapshots.at(-1)], []);
+  dispose();
+});
+
 test("stale liveness removes unchanged requested sessions and preserves new ones", async () => {
   let liveHandler;
   let livenessTimer;

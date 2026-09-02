@@ -70,7 +70,9 @@ For direct Xcode / Android Studio / `flutter run` development, run
 switch to refresh the display label (the install identity never changes);
 the persisted files are then picked up by any subsequent build. In the main
 checkout the script is a no-op that removes stale override files, restoring
-the plain `Buzz` identity.
+the plain `Buzz` identity. Direct Xcode builds and Runner tests also require a
+`BUZZ_PUSH_GATEWAY_URL` scheme environment variable containing the origin to
+use; the build phase validates and passes it through as a Flutter Dart define.
 
 For an Android debug build that must remain installed alongside other Buzz
 worktree builds, set an explicit launcher name and package suffix when invoking

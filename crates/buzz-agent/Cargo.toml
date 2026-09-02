@@ -24,6 +24,24 @@ path = "src/main.rs"
 name = "fake-mcp"
 path = "tests/bin/fake_mcp.rs"
 
+# Test-only lock holder: a real second process that takes the coordinator's
+# cross-process advisory lock, so the auth tests can prove genuine
+# inter-process single-flight and crash-release rather than same-process
+# handles. Tiny; only used by the databricks auth integration tests.
+[[bin]]
+name = "lock-holder"
+path = "tests/bin/lock_holder.rs"
+
+# Test-only auth worker: a real second process that runs the PUBLIC auth
+# coordinator API (`acquire_with_intent`) with a scripted browser opener and a
+# shared temp cache, so the auth tests can prove the cross-process single-flight
+# contract end-to-end — durable cooldown sharing and one-grant/one-cache races
+# across a genuine process boundary, not two in-process handles. Only used by
+# the databricks auth integration tests.
+[[bin]]
+name = "auth-worker"
+path = "tests/bin/auth_worker.rs"
+
 [dependencies]
 # For the `buzz-agent auth <provider>` subcommand only. Provider auth for the
 # agent loop itself is goose's; this is the interactive PKCE login that seeds
@@ -69,11 +87,12 @@ url = { workspace = true }
 urlencoding = "2"
 webbrowser = "1"
 dirs = "6"
-
+fs2 = "0.4"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 
 [dev-dependencies]
+fs2 = "0.4"
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "process", "time", "net"] }
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 axum = { workspace = true }

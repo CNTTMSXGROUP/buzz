@@ -588,6 +588,15 @@ function observedStateMatchesPersonaInput(
     (observed.avatarUrl ?? "") !== (submitted.avatarUrl ?? "")
   )
     return false;
+  // Description: full-write semantics (the dialog always sends the current
+  // value; absent/empty clears). Mirror normalize_description: trim, then
+  // blank/absent → null. Do NOT strip prohibited bytes — a U+200B description
+  // must NOT appear to match an unchanged or cleared observed value, because
+  // the Rust backend rejected it before writing.
+  const submittedDescRaw = submitted.description ?? null;
+  const submittedDesc =
+    submittedDescRaw !== null ? submittedDescRaw.trim() || null : null;
+  if ((observed.description ?? null) !== submittedDesc) return false;
   // Runtime: UpdatePersonaRequest is a full write — omitted/undefined runtime
   // means "clear this field to null". Compare against observed null when
   // submitted.runtime is undefined (clear semantics). If submitted.runtime is

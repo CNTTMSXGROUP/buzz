@@ -2240,3 +2240,196 @@ test("test_combined_dl_save_publish_retry_failure_names_both_catalog_and_remaind
     cap.restore();
   }
 });
+
+// ── Test family 13: description settlement (Carl round-6 P2) ─────────────────
+//
+// `observedStateMatchesPersonaInput` must compare description using the same
+// canonical normalization as the Rust backend (normalize_description): trim,
+// blank/absent → null. Prohibited bytes (e.g. U+200B) must NOT be stripped —
+// a submitted description containing U+200B returns a non-null normalized value
+// that will not match the observed null (unchanged store), so settlement
+// correctly reports the edit as not persisted.
+
+test("test_rejected_description_ordinary_save_does_not_close", async () => {
+  // Rust rejects the U+200B description before writing — persona store is
+  // unchanged. observedStateMatchesPersonaInput must detect the mismatch
+  // (submitted "\u200B" normalizes to "\u200B", not null) and NOT close.
+  const cap = captureToasts();
+  try {
+    const originalPersona = makeDefinition({ description: null });
+    const opts = makeOpts({
+      personaInput: makePersonaInput({ description: "\u200B" }),
+      updatePersona: async () => {
+        throw new Error("description contains prohibited characters");
+      },
+      refetchStores: async () => ({ persona: originalPersona, agent: null }),
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(result, false, "rejected description edit must not succeed");
+    assert.equal(
+      opts._calls.onDone,
+      0,
+      "dialog must not close when description was rejected by the backend",
+    );
+  } finally {
+    cap.restore();
+  }
+});
+
+test("test_rejected_description_publish_path_does_not_retry_or_close", async () => {
+  // Same rejection on the save-and-publish path. The backend rejects before
+  // writing; no old-record publication retry must fire and the dialog must stay
+  // open (onDone 0).
+  const cap = captureToasts();
+  try {
+    const originalPersona = makeDefinition({ description: null });
+    let retryCalls = 0;
+    const opts = makeOpts({
+      ctx: {
+        kind: "definition-only",
+        definition: makeDefinition({ description: null }),
+      },
+      personaInput: makePersonaInput({ description: "\u200B" }),
+      publishCatalogUpdates: true,
+      updatePersonaAndPublish: async () => {
+        throw new Error("description contains prohibited characters");
+      },
+      refetchStores: async () => ({ persona: originalPersona, agent: null }),
+      publishRetry: async () => {
+        retryCalls++;
+        return { persona: originalPersona, publicationStatus: "published" };
+      },
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(
+      result,
+      false,
+      "rejected description publish must not succeed",
+    );
+    assert.equal(
+      opts._calls.onDone,
+      0,
+      "dialog must not close when publish description was rejected",
+    );
+    // No retry must fire: the write never persisted, so there is no old record
+    // to republish and publishRetry is for post-persist relay failures only.
+    // Settlement detects non-persistence and routes to partial-failure, not retry.
+    assert.equal(
+      retryCalls,
+      0,
+      "publishRetry must not fire when the description edit was rejected before writing",
+    );
+  } finally {
+    cap.restore();
+  }
+});
+
+test("test_rejected_description_combined_di_does_not_advance_to_instance_write", async () => {
+  // Combined D+I save: rejected description means D did not persist. The
+  // coordinator must stop at D settlement and NOT advance to the I write.
+  const cap = captureToasts();
+  try {
+    const originalPersona = makeDefinition({ description: null });
+    let agentCalls = 0;
+    const opts = makeOpts({
+      ctx: {
+        kind: "instance-with-definition",
+        definition: makeDefinition({ description: null }),
+        instance: makeInstance(),
+      },
+      personaInput: makePersonaInput({ description: "\u200B" }),
+      agentInput: makeAgentInput({ name: "Alice-renamed" }),
+      publishCatalogUpdates: false,
+      updatePersona: async () => {
+        throw new Error("description contains prohibited characters");
+      },
+      updateManagedAgent: async () => {
+        agentCalls++;
+        return {
+          agent: makeInstance({ name: "Alice-renamed" }),
+          profileSyncError: null,
+        };
+      },
+      refetchStores: async () => ({ persona: originalPersona, agent: null }),
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(
+      result,
+      false,
+      "combined D+I with rejected description must not succeed",
+    );
+    assert.equal(
+      opts._calls.onDone,
+      0,
+      "dialog must not close when D was not persisted",
+    );
+    assert.equal(
+      agentCalls,
+      0,
+      "I write must not advance when D settlement detected non-persistence",
+    );
+  } finally {
+    cap.restore();
+  }
+});
+
+test("test_description_clear_blank_to_null_settles_as_persisted", async () => {
+  // Submitting a blank description clears it (normalize: blank → null).
+  // The observed persona's description is null (cleared). Settlement must
+  // recognise this as a successful write.
+  const persistedPersona = makeDefinition({ description: null });
+  const opts = makeOpts({
+    personaInput: makePersonaInput({ description: "   " }),
+    refetchStores: async () => ({ persona: persistedPersona, agent: null }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "blank description clearing must settle as success",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called after successful clear",
+  );
+});
+
+test("test_description_trim_and_preserve_existing_settles_correctly", async () => {
+  // A description with leading/trailing whitespace trims to the stored value.
+  // Settlement must recognise "  Good agent.  " as matching observed "Good agent.".
+  // A concurrent unrelated definition field (displayName) is also updated and
+  // must not disturb the description comparison.
+  const persistedPersona = makeDefinition({
+    displayName: "Alice-renamed",
+    description: "Good agent.",
+  });
+  const opts = makeOpts({
+    personaInput: makePersonaInput({
+      displayName: "Alice-renamed",
+      description: "  Good agent.  ",
+    }),
+    refetchStores: async () => ({ persona: persistedPersona, agent: null }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "trimmed description must settle as success against observed stored value",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called when trimmed description matches observed",
+  );
+});

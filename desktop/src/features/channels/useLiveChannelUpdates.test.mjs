@@ -9,6 +9,8 @@ import {
   channelMessagesKey,
   threadRepliesKey,
 } from "@/features/messages/lib/messageQueryKeys.ts";
+import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages.ts";
+import { buildMainTimelineEntries } from "@/features/messages/lib/threadPanel.ts";
 import { relayClient } from "@/shared/api/relayClient.ts";
 import { KIND_STREAM_MESSAGE } from "@/shared/constants/kinds";
 
@@ -105,7 +107,7 @@ async function mountLiveUpdates(client) {
   };
 }
 
-test("non-broadcast replies stay out of channelMessagesKey and merge into an existing thread cache", async () => {
+test("non-broadcast replies feed the raw projection and root thread cache without rendering as timeline rows", async () => {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -123,13 +125,29 @@ test("non-broadcast replies stay out of channelMessagesKey and merge into an exi
 
   callback(reply);
 
-  assert.deepEqual(client.getQueryData(channelMessagesKey(CHANNEL_ID)), [
-    rootEvent(),
-  ]);
+  const rawMessages = client.getQueryData(channelMessagesKey(CHANNEL_ID));
+  assert.deepEqual(rawMessages, [rootEvent(), reply]);
   assert.deepEqual(client.getQueryData(threadRepliesKey(CHANNEL_ID, ROOT_ID)), [
     existingReply,
     reply,
   ]);
+  const entries = buildMainTimelineEntries(
+    formatTimelineMessages(rawMessages, channel, undefined, null),
+  );
+  assert.deepEqual(
+    entries.map((entry) => ({
+      id: entry.message.id,
+      summaryThreadHeadId: entry.summary?.threadHeadId ?? null,
+      summaryReplyCount: entry.summary?.replyCount ?? 0,
+    })),
+    [
+      {
+        id: ROOT_ID,
+        summaryThreadHeadId: ROOT_ID,
+        summaryReplyCount: 1,
+      },
+    ],
+  );
 
   unmount();
   client.clear();
@@ -159,6 +177,7 @@ test("nested non-broadcast replies use the root thread cache instead of the pare
 
   assert.deepEqual(client.getQueryData(channelMessagesKey(CHANNEL_ID)), [
     rootEvent(),
+    nestedReply,
   ]);
   assert.deepEqual(client.getQueryData(threadRepliesKey(CHANNEL_ID, ROOT_ID)), [
     parentReply,
@@ -192,6 +211,7 @@ test("non-broadcast replies merge into an existing empty thread query", async ()
 
   assert.deepEqual(client.getQueryData(channelMessagesKey(CHANNEL_ID)), [
     rootEvent(),
+    reply,
   ]);
   assert.deepEqual(client.getQueryData(threadRepliesKey(CHANNEL_ID, ROOT_ID)), [
     reply,
@@ -214,6 +234,7 @@ test("non-broadcast replies do not create thread cache entries for unopened thre
 
   assert.deepEqual(client.getQueryData(channelMessagesKey(CHANNEL_ID)), [
     rootEvent(),
+    reply,
   ]);
   assert.equal(
     client.getQueryCache().find({

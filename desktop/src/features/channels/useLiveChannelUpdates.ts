@@ -342,10 +342,6 @@ export function useLiveChannelUpdates(
           );
         }
       }
-
-      if (isThreadedReply) {
-        return;
-      }
     }
 
     // Merge into the timeline cache for the active channel.

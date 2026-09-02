@@ -163,24 +163,36 @@ export function useChannelSections(
       // to supersede is consumed into pending here and can never be GC'd out.
       const outbox = readChannelSectionsOutbox(pubkey, relayUrl);
       if (outbox) {
-        // publishSections synchronously copies the intent into this window's
-        // own v2 key and returns whether that transfer is durable. Mark the
-        // legacy blob consumed ONLY when it is: a `setItem` failure (quota)
-        // returns false, so the marker is not written and the legacy record
-        // stays replayable on a later boot rather than being silently
-        // suppressed (Thufir pass-3 finding). A crash between a durable
-        // transfer and the marker write replays the legacy blob once more, a
-        // crash after resumes it from the v2 key. The marker is what stops the
-        // never-deleted legacy key republishing above the head every boot
-        // (Thufir pass-2 resurrection finding).
-        const durable = managerRef.current?.publishSections(outbox.store);
-        if (durable && outbox.legacyRawToConsume !== null) {
-          markChannelSectionsLegacyConsumed(
-            pubkey,
-            relayUrl,
-            outbox.legacyRawToConsume,
-          );
+        // When bootstrap fetched and applied a remote head, only replay an
+        // outbox edit that was queued AFTER that head — an edit queued before
+        // the applied head was authored without knowledge of that state and has
+        // already lost whole-blob LWW. Legacy records (queuedAt=0) are treated
+        // as pre-head under any non-zero head. A `hold` (absent/failed fetch)
+        // carries no confirmed head, so we always replay.
+        const headCreatedAt =
+          result.action === "apply-remote" ? result.data.createdAt : 0;
+        if (outbox.queuedAt > headCreatedAt) {
+          // publishSections synchronously copies the intent into this window's
+          // own v2 key and returns whether that transfer is durable. Mark the
+          // legacy blob consumed ONLY when it is: a `setItem` failure (quota)
+          // returns false, so the marker is not written and the legacy record
+          // stays replayable on a later boot rather than being silently
+          // suppressed (Thufir pass-3 finding). A crash between a durable
+          // transfer and the marker write replays the legacy blob once more, a
+          // crash after resumes it from the v2 key. The marker is what stops the
+          // never-deleted legacy key republishing above the head every boot
+          // (Thufir pass-2 resurrection finding).
+          const durable = managerRef.current?.publishSections(outbox.store);
+          if (durable && outbox.legacyRawToConsume !== null) {
+            markChannelSectionsLegacyConsumed(
+              pubkey,
+              relayUrl,
+              outbox.legacyRawToConsume,
+            );
+          }
         }
+        // Stale outbox (queuedAt ≤ headCreatedAt) is left for reclamation
+        // below — reclaimSupersededSectionsOutbox will clean it up.
       } else {
         clearChannelSectionsOutbox(pubkey, relayUrl);
       }

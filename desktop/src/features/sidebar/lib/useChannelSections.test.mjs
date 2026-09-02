@@ -36,6 +36,12 @@ runWholeBlobHookSuite({
   useHook: useChannelSections,
   storageKey,
   readOutbox: readChannelSectionsOutbox,
+  legacyOutboxKey: (pubkey, relayUrl) => {
+    const encoded = encodeURIComponent(
+      relayUrl.trim().replace(/\/$/, "").toLowerCase(),
+    );
+    return `buzz-channel-sections-outbox.v1:${pubkey}:${encoded}`;
+  },
   makeEdit: (r) => r.createSection("A1-Section"),
   makeB1Store: () =>
     JSON.stringify({

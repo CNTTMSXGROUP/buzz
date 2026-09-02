@@ -418,7 +418,7 @@ export function resumeWholeBlobOutbox<T>(
   pubkey: string,
   relayUrl: string,
   parseStore: (json: unknown) => T | null,
-): { store: T; legacyRawToConsume: string | null } | null {
+): { store: T; legacyRawToConsume: string | null; queuedAt: number } | null {
   const consumed = readLegacyConsumed(prefix, pubkey, relayUrl);
   let best: OutboxRecord<T> | null = null;
   for (const record of enumerateOutbox(
@@ -447,6 +447,7 @@ export function resumeWholeBlobOutbox<T>(
   return {
     store: best.store,
     legacyRawToConsume: best.key === legacyKey ? best.raw : null,
+    queuedAt: best.queuedAt,
   };
 }
 

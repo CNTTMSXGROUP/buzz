@@ -260,7 +260,11 @@ export function writeChannelSectionsOutbox(
 export function readChannelSectionsOutbox(
   pubkey: string,
   relayUrl: string,
-): { store: ChannelSectionStore; legacyRawToConsume: string | null } | null {
+): {
+  store: ChannelSectionStore;
+  legacyRawToConsume: string | null;
+  queuedAt: number;
+} | null {
   return resumeWholeBlobOutbox(
     OUTBOX_KEY_PREFIX,
     legacyOutboxKey(pubkey, relayUrl),

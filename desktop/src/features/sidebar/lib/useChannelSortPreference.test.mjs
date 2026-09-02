@@ -36,6 +36,12 @@ runWholeBlobHookSuite({
   useHook: useChannelSortPreference,
   storageKey,
   readOutbox: readChannelSortOutbox,
+  legacyOutboxKey: (pubkey, relayUrl) => {
+    const encoded = encodeURIComponent(
+      relayUrl.trim().replace(/\/$/, "").toLowerCase(),
+    );
+    return `buzz-channel-sort-outbox.v1:${pubkey}:${encoded}`;
+  },
   makeEdit: (r) => r.setSortModeFor("channels", "alpha"),
   makeB1Store: () =>
     JSON.stringify({ version: 1, groups: { channels: "recent" } }),

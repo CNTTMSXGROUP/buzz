@@ -285,7 +285,7 @@ export function useChannelStars(
           channelId,
         );
         if (!persisted) return prev;
-        manager?.publishStars(persisted);
+        manager?.publishStars(persisted, channelId);
         return persisted;
       });
     },

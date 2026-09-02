@@ -58,7 +58,7 @@ export type MergeLaneConfig<S> = {
   /** Serialize a store into the JSON object to be encrypted and published. */
   serializePayload: (store: S) => unknown;
   /** Max-merge a local pending store with the fetched remote, producing the store to publish. */
-  mergeWithRemote: (local: S, remote: S) => S;
+  mergeWithRemote: (local: S, remote: S, preservedKey?: string) => S;
   /**
    * True when `retained` subsumes `attempted` — i.e. the retained relay head
    * contains all the per-entry winners from the local write. Used to confirm
@@ -114,6 +114,10 @@ export class MergeLaneSyncManager<S> {
   // fetch/publish sequence touching shared manager state.
   private publishInFlight = false;
   private lastPublishedStore: S | null = null;
+  // The channelId preserved during the most recent click. Threaded into the
+  // pre-publish max-merge so the clicked channel is never evicted when the
+  // merged result reaches the capacity bound (Kalvin P3).
+  private pendingPreservedKey: string | undefined = undefined;
   protected destroyed = false;
   // Per-channel high-water of every `rev` and `updatedAt` this manager has
   // observed (bootstrap, live, reconnect, reconcile, pre-publish, cross-window
@@ -211,9 +215,13 @@ export class MergeLaneSyncManager<S> {
     return this.pendingStore;
   }
 
-  publish(store: S): void {
+  publish(store: S, preservedKey?: string): void {
     this.pendingStore = store;
     ++this.pendingGeneration;
+    // Record the channelId to preserve through the pre-publish max-merge so
+    // the clicked channel is never evicted when merging remote entries pushes
+    // the result over the capacity bound (Kalvin P3).
+    this.pendingPreservedKey = preservedKey;
     // Persist synchronously so a click made <2s before quit/community-switch
     // survives teardown and resumes on next mount (durable outbox). This
     // window's own key is the only one written — a single unconditional
@@ -292,10 +300,16 @@ export class MergeLaneSyncManager<S> {
     if (!remote) return { kind: "retain" };
     this.observe(remote.store);
     // Max-merge: the local edit's per-entry winners survive by construction and
-    // any newer remote entries fold in, so no adopt step is needed.
+    // any newer remote entries fold in, so no adopt step is needed. Pass the
+    // preserved key through so the clicked channel is never evicted when the
+    // merged result reaches the capacity bound (Kalvin P3).
     return {
       kind: "publish",
-      store: this.config.mergeWithRemote(store, remote.store),
+      store: this.config.mergeWithRemote(
+        store,
+        remote.store,
+        this.pendingPreservedKey,
+      ),
     };
   }
 

@@ -284,7 +284,7 @@ export function useChannelMutes(
           channelId,
         );
         if (!persisted) return prev;
-        manager?.publishMutes(persisted);
+        manager?.publishMutes(persisted, channelId);
         return persisted;
       });
     },

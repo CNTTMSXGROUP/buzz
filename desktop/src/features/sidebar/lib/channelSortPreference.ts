@@ -180,7 +180,11 @@ export function writeChannelSortOutbox(
 export function readChannelSortOutbox(
   pubkey: string,
   relayUrl: string,
-): { store: ChannelSortStore; legacyRawToConsume: string | null } | null {
+): {
+  store: ChannelSortStore;
+  legacyRawToConsume: string | null;
+  queuedAt: number;
+} | null {
   return resumeWholeBlobOutbox(
     OUTBOX_KEY_PREFIX,
     legacyOutboxKey(pubkey, relayUrl),

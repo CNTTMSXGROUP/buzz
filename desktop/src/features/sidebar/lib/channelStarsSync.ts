@@ -43,7 +43,8 @@ export class ChannelStarSyncManager extends MergeLaneSyncManager<ChannelStarStor
       publishErrorMsg: "Failed to publish channel stars.",
       parse: parseStarPayload,
       serializePayload: (store) => ({ version: 1, channels: store.channels }),
-      mergeWithRemote: mergeStores,
+      mergeWithRemote: (local, remote, preservedKey) =>
+        mergeStores(local, remote, preservedKey),
       isSubsumedBy: isStarsStoreSubsumedBy,
       storesEqual: starsStoresEqual,
       observe: (highWater, store) => {
@@ -62,8 +63,8 @@ export class ChannelStarSyncManager extends MergeLaneSyncManager<ChannelStarStor
   }
 
   /** Publish a star store, debounced to 2s. */
-  publishStars(store: ChannelStarStore): void {
-    this.publish(store);
+  publishStars(store: ChannelStarStore, preservedKey?: string): void {
+    this.publish(store, preservedKey);
   }
 
   /** Fetch the current remote head for this pubkey's stars blob. */

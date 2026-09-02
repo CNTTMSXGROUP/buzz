@@ -36,6 +36,8 @@ export function runWholeBlobHookSuite({
   useHook,
   storageKey,
   readOutbox,
+  // legacyOutboxKey(pubkey, relayUrl): returns the legacy shared outbox key string
+  legacyOutboxKey,
   // makeEdit(result): call one mutation action on the hook result
   makeEdit,
   // makeB1Store(): serialized JSON string for the peer storage event
@@ -250,6 +252,51 @@ export function runWholeBlobHookSuite({
     } finally {
       cleanup();
       relayClient.fetchEvents = origFetch;
+      restoreRelay();
+      restoreTauri();
+    }
+  });
+
+  // Mutation: removing queuedAt > headCreatedAt guard in the hook replays the
+  // stale outbox, overwriting device-B's t=200 state with a t=100 edit.
+  test(`${label}: stale outbox record (queuedAt < bootstrap head) is NOT replayed`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const { relayClient } = await import("@/shared/api/relayClient");
+    const pubkey = `pk-${label}-sr`;
+    const relayUrl = `wss://r.${label}-sr`;
+    // Relay head at t=200 (device B's state).
+    const head = {
+      pubkey,
+      content: "good-cipher",
+      created_at: 200,
+      id: "evt-head-200",
+    };
+    const publishCalls = [];
+    const restoreRelay = stubRelay(relayClient, { publishCalls });
+    relayClient.fetchEvents = async () => [head];
+    const restoreTauri = stubTauri(pubkey, () => makeRemotePayload());
+    // Pre-populate a stale legacy outbox record queued at t=100 (before the head).
+    const legKey = legacyOutboxKey(pubkey, relayUrl);
+    const staleRaw = JSON.stringify({
+      store: JSON.parse(makeRemotePayload()),
+      queuedAt: 100,
+    });
+    window.localStorage.setItem(legKey, staleRaw);
+    let hook = null;
+    try {
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 6; i++) await Promise.resolve();
+      });
+      assert.equal(
+        publishCalls.length,
+        0,
+        `${label}: stale outbox record (queuedAt=100 < head=200) must not be replayed`,
+      );
+      hook.unmount();
+    } finally {
+      cleanup();
+      window.localStorage.removeItem(legKey);
       restoreRelay();
       restoreTauri();
     }

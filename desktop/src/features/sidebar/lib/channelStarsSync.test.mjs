@@ -142,3 +142,90 @@ test("stars wire: typed API (publishStars, getPendingStarStore, fetchRemoteStars
     mock.reset();
   }
 });
+
+// Mutation: removing preservedKey from mergeWithRemote call lets the clicked
+// channel be evicted at 501 entries (Kalvin P3).
+test("P3: clicked channel is preserved through pre-publish mergeWithRemote at capacity boundary (501 entries)", async () => {
+  // Local store: 500 entries where the clicked channel has the OLDEST updatedAt
+  // (so it would be evicted by boundStarStore if not preserved).
+  // Remote store: the same 499 oldest channels plus one fresh channel not in local.
+  // Merged result: 501 channels. Without preservedKey, the clicked channel
+  // (oldest updatedAt=1) is evicted. With preservedKey it must survive.
+  const MAX = 500;
+  const clickedId = "ch-clicked";
+  const clickedEntry = { starred: true, updatedAt: 1, rev: 1 }; // oldest updatedAt
+
+  // Local: clicked channel + 499 others with updatedAt=100
+  const localChannels = { [clickedId]: clickedEntry };
+  for (let i = 0; i < MAX - 1; i++) {
+    localChannels[`ch-local-${i}`] = { starred: false, updatedAt: 100, rev: 0 };
+  }
+  const localStore = { version: 1, channels: localChannels };
+
+  // Remote: same 499 non-clicked channels + one fresh channel not in local
+  const remoteChannels = {};
+  for (let i = 0; i < MAX - 1; i++) {
+    remoteChannels[`ch-local-${i}`] = {
+      starred: false,
+      updatedAt: 100,
+      rev: 0,
+    };
+  }
+  remoteChannels["ch-remote-new"] = { starred: false, updatedAt: 100, rev: 0 };
+  const remoteStore = { version: 1, channels: remoteChannels };
+
+  // Pre-publish fetch returns the remote store (decryptable).
+  const fw = makeFakeWindow();
+  const restore = installFakeWindow(fw);
+  const tauri = installEchoTauri("pk-p3-preserve");
+  // Mint the remote head so the manager can decrypt it.
+  const remoteHead = tauri.mintHead(remoteStore, 50, "evt-remote");
+  remoteHead.tags = [["d", "channel-stars"]];
+
+  let fetchCalls = 0;
+  mock.method(relayClient, "fetchEvents", () => {
+    fetchCalls++;
+    // First fetch (pre-publish): return the remote head.
+    // Subsequent fetch (confirmRetainedHeadSubsumes): return the merged published event.
+    if (fetchCalls === 1) return Promise.resolve([remoteHead]);
+    return Promise.resolve([]); // simplified: no confirmation needed for this test
+  });
+  let publishedEvent = null;
+  mock.method(relayClient, "publishEvent", (evt) => {
+    publishedEvent = evt;
+    return Promise.resolve();
+  });
+
+  try {
+    const m = new ChannelStarSyncManager("pk-p3-preserve", RELAY);
+    // Publish with preservedKey — the clicked channel must survive the merge.
+    m.publishStars(localStore, clickedId);
+    fw._fireTimer();
+    await new Promise((r) => setTimeout(r, 30));
+    // The published event was produced by mergeWithRemote(local, remote, clickedId).
+    // After merging: 501 channels → bounded to 500 with clickedId preserved.
+    assert.ok(publishedEvent !== null, "publish must have been attempted");
+    // Decrypt the published event to verify clicked channel survived.
+    const plaintext = tauri.capturedPlaintext();
+    assert.ok(plaintext !== null, "encrypt must have been called");
+    const published = JSON.parse(plaintext);
+    assert.ok(
+      clickedId in published.channels,
+      `clicked channel "${clickedId}" must survive 501-entry merge when preservedKey is passed`,
+    );
+    assert.ok(
+      "ch-remote-new" in published.channels,
+      "new remote channel must be present in merged result",
+    );
+    assert.equal(
+      Object.keys(published.channels).length,
+      MAX,
+      `merged result must be bounded to ${MAX} entries`,
+    );
+    m.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});

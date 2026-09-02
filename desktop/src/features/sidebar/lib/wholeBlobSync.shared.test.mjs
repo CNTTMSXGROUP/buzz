@@ -698,3 +698,145 @@ test("prior-gen fold: edit-2 queued during e1 publish still publishes above e1's
     mock.reset();
   }
 });
+
+// Mutation: removing the queuedAt guard lets a stale outbox replay above the head.
+test("stale outbox replay (P1): bootstrap records lastRemoteHead; post-bootstrap publish fires above the head", async () => {
+  // This manager-level test confirms bootstrap records the fetched head so that
+  // a publish() immediately after freezes publishBaseline to the real head and
+  // fires correctly. The hook-level queuedAt guard is exercised in wholeBlobHook.shared.test.mjs.
+  mock.method(relayClient, "fetchEvents", () =>
+    Promise.resolve([
+      {
+        pubkey: "pk-stale-replay",
+        content: "good-cipher",
+        created_at: 200,
+        id: "evt-head",
+      },
+    ]),
+  );
+  const publishCalls = [];
+  mock.method(relayClient, "publishEvent", (...args) => {
+    publishCalls.push(args);
+    return Promise.resolve();
+  });
+  const { fireDelay, restore } = makeTimerBed();
+  const tauri = installTauriMock(
+    JSON.stringify(
+      makeStore([{ id: "remote-from-relay", name: "Remote", order: 0 }]),
+    ),
+  );
+  try {
+    const manager = new SyntheticWholeBlobManager("pk-stale-replay", RELAY);
+    await manager.bootstrap(nonEmptyStore());
+    assert.equal(
+      manager.getPendingStore(),
+      null,
+      "no pending edit after bootstrap",
+    );
+    // An edit queued after bootstrap should fire: baseline is {200,"evt-head"},
+    // pre-publish fetch returns {200,"evt-head"} → remoteAdvancedSince = false → publish.
+    manager.publishSections(
+      makeStore([{ id: "fresh-edit", name: "Fresh", order: 0 }]),
+    );
+    await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    assert.equal(
+      publishCalls.length,
+      1,
+      "edit queued after bootstrap publishes above the head",
+    );
+    manager.destroy();
+  } finally {
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});
+
+// Mutation: reverting to synchronous recordRemoteHead in subscribeLive re-opens P2b.
+test("P2b decrypt gap: watermark advances synchronously; lastRemoteHead advances only after successful decrypt", async () => {
+  // After a live event at createdAt=300 that fails to decrypt, a subsequent
+  // publish() must NOT freeze publishBaseline to {300,"live-evt"}: the head tuple
+  // is unconfirmed until decrypt succeeds. When the pre-publish fetch returns the
+  // same event as decryptable, it is a genuine advance and triggers adopt rather
+  // than a silent publish over the unseen remote-only changes (Kalvin P2b).
+  let liveCallback = null;
+  mock.method(relayClient, "subscribeLive", (_f, cb) => {
+    liveCallback = cb;
+    return Promise.resolve(async () => {});
+  });
+  let fetchCalls = 0;
+  mock.method(relayClient, "fetchEvents", () => {
+    fetchCalls++;
+    if (fetchCalls === 1) return Promise.resolve([]); // bootstrap: absent
+    // Pre-publish fetch: same live event, now decryptable
+    return Promise.resolve([
+      {
+        pubkey: "pk-p2b",
+        content: "good-cipher",
+        created_at: 300,
+        id: "live-evt",
+      },
+    ]);
+  });
+  const publishCalls = [];
+  mock.method(relayClient, "publishEvent", (...args) => {
+    publishCalls.push(args);
+    return Promise.resolve();
+  });
+  const { fireDelay, restore } = makeTimerBed();
+  const remotePayload = JSON.stringify(
+    makeStore([{ id: "remote-live", name: "Remote", order: 0 }]),
+  );
+  const tauri = installTauriMock(remotePayload);
+  const fw = makeFakeWindow();
+  const wmKey = `buzz-sync-watermark.v1:${watermarkLane}:pk-p2b:${RELAY_KEY}`;
+  const origLs = globalThis.window?.localStorage;
+  try {
+    if (typeof globalThis.window === "undefined") globalThis.window = {};
+    globalThis.window.localStorage = fw.localStorage;
+    const manager = new SyntheticWholeBlobManager("pk-p2b", RELAY);
+    await manager.subscribeToSections(() => {});
+    assert.ok(liveCallback !== null, "live subscription installed");
+    // Deliver a live event whose content will fail decrypt (bad-cipher).
+    // Watermark must advance synchronously; lastRemoteHead must NOT advance
+    // (head tuple unconfirmed until decrypt succeeds).
+    liveCallback({
+      pubkey: "pk-p2b",
+      content: "bad-cipher",
+      created_at: 300,
+      id: "live-evt",
+    });
+    assert.ok(
+      Number(fw.localStorage.getItem(wmKey) ?? "0") >= 300,
+      "watermark advances synchronously for undecryptable live event",
+    );
+    // With fix: lastRemoteHead = {0,""} → publishBaseline frozen to {0,""}.
+    // Pre-publish fetch returns {300,"live-evt"} decryptable → advance → adopt.
+    // Without fix: baseline would be {300,"live-evt"} → no advance → publish
+    // (pre-live content silently overwrites unseen remote state).
+    const adopted = [];
+    manager.setOnRemoteAdopted((r) => adopted.push(r));
+    manager.publishSections(
+      makeStore([{ id: "pre-live", name: "Pre", order: 0 }]),
+    );
+    await fireDelay(2000);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    assert.equal(
+      publishCalls.length,
+      0,
+      "pre-live edit must not publish over unseen remote",
+    );
+    assert.equal(
+      adopted.length,
+      1,
+      "edit adopted away — remote is the true head",
+    );
+    manager.destroy();
+  } finally {
+    if (origLs !== undefined) globalThis.window.localStorage = origLs;
+    tauri.restore();
+    restore();
+    mock.reset();
+  }
+});

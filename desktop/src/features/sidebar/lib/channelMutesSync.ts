@@ -43,7 +43,8 @@ export class ChannelMuteSyncManager extends MergeLaneSyncManager<ChannelMuteStor
       publishErrorMsg: "Failed to publish channel mutes.",
       parse: parseMutePayload,
       serializePayload: (store) => ({ version: 1, channels: store.channels }),
-      mergeWithRemote: mergeStores,
+      mergeWithRemote: (local, remote, preservedKey) =>
+        mergeStores(local, remote, preservedKey),
       isSubsumedBy: isMutesStoreSubsumedBy,
       storesEqual: mutesStoresEqual,
       observe: (highWater, store) => {
@@ -62,8 +63,8 @@ export class ChannelMuteSyncManager extends MergeLaneSyncManager<ChannelMuteStor
   }
 
   /** Publish a mute store, debounced to 2s. */
-  publishMutes(store: ChannelMuteStore): void {
-    this.publish(store);
+  publishMutes(store: ChannelMuteStore, preservedKey?: string): void {
+    this.publish(store, preservedKey);
   }
 
   /** Fetch the current remote head for this pubkey's mutes blob. */

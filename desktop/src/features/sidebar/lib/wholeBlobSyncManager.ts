@@ -761,11 +761,29 @@ export class WholeBlobSyncManager<S> {
       },
       (event: RelayEvent) => {
         if (event.pubkey !== this.pubkey) return;
-        // Record the raw head before decrypt so an undecryptable live event
-        // still advances the watermark and blocks future seed-publish.
-        this.recordRemoteHead(event.created_at, event.id);
+        // Advance the watermark synchronously for every event — even one that
+        // fails to decrypt — so an undecryptable live event still blocks a
+        // future seed-publish. `lastRemoteCreatedAt` is advanced here too so
+        // `clampPublishCreatedAt` never stamps below an observed head.
+        // `lastRemoteHead` (the full id+createdAt tuple used to freeze
+        // publishBaseline) is updated only AFTER decrypt succeeds: a user click
+        // that arrives in the async decrypt gap must not race against a baseline
+        // that includes a head id the store has not yet reflected. Freezing the
+        // baseline against a head the store doesn't know yet would make
+        // pre-publish check see no advance and publish pre-head content over
+        // the live event's remote-only changes (Kalvin P2b).
+        advanceWatermark(
+          this.pubkey,
+          this.config.dTag,
+          this.relayUrl,
+          event.created_at,
+        );
+        if (event.created_at > this.lastRemoteCreatedAt) {
+          this.lastRemoteCreatedAt = event.created_at;
+        }
         void this.decryptAndParse(event).then((result) => {
           if (result) {
+            this.recordRemoteHead(result.createdAt, result.eventId);
             onUpdate(result);
           }
         });

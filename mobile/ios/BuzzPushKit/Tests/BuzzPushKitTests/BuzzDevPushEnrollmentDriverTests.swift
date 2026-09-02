@@ -141,7 +141,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
         name: "delegate",
         replacements: [
           ("https://push.buzz.xyz", Self.gatewayOrigin),
-          (Self.firstChallengeId, Self.secondChallengeId)
+          (Self.firstChallengeId, Self.secondChallengeId),
         ]
       )
     )
@@ -417,6 +417,192 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     XCTAssertTrue(store.saved.isEmpty)
     XCTAssertTrue(store.pending.isEmpty)
+  }
+
+  func testLegacyInstallationIsRevokedBeforeStateIsDiscarded() async throws {
+    let legacy = BuzzPushLegacyEndpointGrantRecord(
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      relayMetadataPubkey: nil,
+      gatewayInstallationHandle: Self.installationHandle,
+      installationId: Self.installationId,
+      endpointGrant: "legacy-grant",
+      endpointHash: Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init)))),
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore(legacyRecords: [legacy])
+    let appAttest = RecordingAppAttest()
+    let driver = try makeDriver(store: store, appAttest: appAttest)
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("POST", "http://push.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/revoke"):
+        let body = try Self.body(request)
+        XCTAssertEqual(body["installation_handle"] as? String, Self.installationHandle)
+        XCTAssertEqual(body["endpoint_epoch"] as? Int, 1)
+        XCTAssertEqual(body["new_endpoint_epoch"] as? Int, 2)
+        XCTAssertEqual(body["assertion"] as? String, Self.assertion)
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      case ("GET", "https://relay.example/"):
+        return Self.response(request, status: 500, json: ["error": "stop_after_cleanup"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      _ = try await driver.enroll(
+        deviceToken: Data((1...32).map(UInt8.init)),
+        relayURL: Self.relayURL
+      )
+      XCTFail("Expected the relay request to stop enrollment")
+    } catch let error as BuzzDevPushEnrollmentError {
+      XCTAssertEqual(
+        error,
+        .unexpectedStatus(
+          route: "NIP-11",
+          expected: 200,
+          actual: 500,
+          body: #"{"error":"stop_after_cleanup"}"#
+        )
+      )
+    }
+    XCTAssertTrue(store.legacyRecords.isEmpty)
+    XCTAssertEqual(appAttest.clientData.count, 1)
+  }
+
+  func testFailedLegacyRevocationPreservesDurableState() async throws {
+    let legacy = BuzzPushLegacyEndpointGrantRecord(
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      relayMetadataPubkey: nil,
+      gatewayInstallationHandle: Self.installationHandle,
+      installationId: Self.installationId,
+      endpointGrant: "legacy-grant",
+      endpointHash: Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init)))),
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore(legacyRecords: [legacy])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      if request.url?.path == "/v1/installations/challenges" {
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      }
+      return Self.response(request, status: 503, json: ["error": "temporarily_unavailable"])
+    }
+
+    do {
+      _ = try await driver.enroll(
+        deviceToken: Data((1...32).map(UInt8.init)),
+        relayURL: Self.relayURL
+      )
+      XCTFail("Expected legacy cleanup to fail")
+    } catch let error as BuzzDevPushEnrollmentError {
+      XCTAssertEqual(
+        error,
+        .unexpectedStatus(
+          route: "v1/installations/revoke",
+          expected: 200,
+          actual: 503,
+          body: #"{"error":"temporarily_unavailable"}"#
+        )
+      )
+    }
+    XCTAssertEqual(store.legacyRecords, [legacy])
+  }
+
+  func testLegacyPendingEnrollmentIsRecoveredThenRevoked() async throws {
+    let endpointData = Data((1...32).map(UInt8.init))
+    let pending = BuzzPushLegacyPendingEnrollmentRecord(
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      endpointHash: Self.hex(SHA256.hash(data: endpointData)),
+      appProfile: "buzz-ios-dogfood",
+      expiresAt: Self.expiresAt,
+      installationId: Self.installationId,
+      gatewayInstallationHandle: nil,
+      challengeId: Self.firstChallengeId,
+      challenge: Self.challenge,
+      keyId: Self.keyId,
+      attestation: Self.attestation,
+      delegationGeneration: 0
+    )
+    let store = MemoryGrantStore(legacyPending: [pending])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("POST", "http://push.example/v1/installations"):
+        let body = try Self.body(request)
+        XCTAssertEqual(body["challenge_id"] as? String, Self.firstChallengeId)
+        XCTAssertEqual(body["endpoint"] as? String, Self.endpoint)
+        return Self.response(
+          request,
+          status: 201,
+          json: [
+            "installation_handle": Self.installationHandle,
+            "endpoint_epoch": 1,
+            "expires_at": Self.expiresAt,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.secondChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/revoke"):
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      case ("GET", "https://relay.example/"):
+        return Self.response(request, status: 500, json: ["error": "stop_after_cleanup"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      _ = try await driver.enroll(deviceToken: endpointData, relayURL: Self.relayURL)
+      XCTFail("Expected the relay request to stop enrollment")
+    } catch let error as BuzzDevPushEnrollmentError {
+      XCTAssertEqual(
+        error,
+        .unexpectedStatus(
+          route: "NIP-11",
+          expected: 200,
+          actual: 500,
+          body: #"{"error":"stop_after_cleanup"}"#
+        )
+      )
+    }
+    XCTAssertTrue(store.legacyPending.isEmpty)
   }
 
   func testRealAppAttestFailsLoudlyWhenUnsupported() async throws {
@@ -1188,19 +1374,32 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   var saved: [BuzzPushEndpointGrantRecord]
   var pending: [BuzzPushPendingEnrollmentRecord] = []
+  var legacyRecords: [BuzzPushLegacyEndpointGrantRecord]
+  var legacyPending: [BuzzPushLegacyPendingEnrollmentRecord]
   var grantSaveFailuresRemaining: Int
   init(
     records: [BuzzPushEndpointGrantRecord] = [],
     pending: [BuzzPushPendingEnrollmentRecord] = [],
+    legacyRecords: [BuzzPushLegacyEndpointGrantRecord] = [],
+    legacyPending: [BuzzPushLegacyPendingEnrollmentRecord] = [],
     grantSaveFailuresRemaining: Int = 0
   ) {
     saved = records
     self.pending = pending
+    self.legacyRecords = legacyRecords
+    self.legacyPending = legacyPending
     self.grantSaveFailuresRemaining = grantSaveFailuresRemaining
   }
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
     saved.removeAll { $0.gatewayOrigin != gatewayOrigin }
     pending.removeAll { $0.gatewayOrigin != gatewayOrigin }
+  }
+  func legacyEnrollmentState() throws -> BuzzPushLegacyEnrollmentState {
+    BuzzPushLegacyEnrollmentState(records: legacyRecords, pending: legacyPending)
+  }
+  func removeLegacyEnrollmentState() throws {
+    legacyRecords = []
+    legacyPending = []
   }
   func records() throws -> [BuzzPushEndpointGrantRecord] { saved }
   func save(_ record: BuzzPushEndpointGrantRecord) throws {

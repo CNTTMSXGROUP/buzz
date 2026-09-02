@@ -60,11 +60,86 @@ public struct BuzzPushEndpointGrantRecord: Codable, Equatable, Sendable {
   }
 }
 
+/// Endpoint grant persisted by clients that predate gateway-origin binding.
+public struct BuzzPushLegacyEndpointGrantRecord: Codable, Equatable, Sendable {
+  /// Relay origin associated with the legacy grant.
+  public let relayOrigin: String
+  /// Relay delegation key associated with the legacy grant.
+  public let relayPubkey: String
+  /// Optional relay metadata authority.
+  public let relayMetadataPubkey: String?
+  /// Gateway installation that owns the enrolled endpoint.
+  public let gatewayInstallationHandle: String?
+  /// Unlinkable relay-facing installation identifier.
+  public let installationId: String
+  /// Opaque relay delegation capability.
+  public let endpointGrant: String
+  /// Digest of the enrolled APNs endpoint.
+  public let endpointHash: String
+  /// Gateway application profile.
+  public let appProfile: String
+  /// Endpoint rotation epoch.
+  public let endpointEpoch: Int64
+  /// Delegation generation.
+  public let generation: Int64
+  /// Grant expiration timestamp.
+  public let expiresAt: Int64
+}
+
+/// Crash-recovery journal persisted by clients that predate gateway-origin binding.
+public struct BuzzPushLegacyPendingEnrollmentRecord: Codable, Equatable, Sendable {
+  /// Relay origin associated with the pending enrollment.
+  public let relayOrigin: String
+  /// Relay delegation key associated with the pending enrollment.
+  public let relayPubkey: String
+  /// Digest of the APNs endpoint used by the exact request.
+  public let endpointHash: String
+  /// Gateway application profile.
+  public let appProfile: String
+  /// Requested installation expiration timestamp.
+  public let expiresAt: Int64
+  /// Unlinkable relay-facing installation identifier.
+  public let installationId: String
+  /// Recovered gateway installation, when the request already committed.
+  public let gatewayInstallationHandle: String?
+  /// Exact enrollment challenge identifier.
+  public let challengeId: String?
+  /// Exact enrollment challenge value.
+  public let challenge: String?
+  /// App Attest key used by the exact enrollment request.
+  public let keyId: String?
+  /// App Attest object used by the exact enrollment request.
+  public let attestation: String?
+  /// Last attempted delegation generation.
+  public let delegationGeneration: Int64
+}
+
+/// Durable pre-origin enrollment state that must be resolved before replacement.
+public struct BuzzPushLegacyEnrollmentState: Equatable, Sendable {
+  /// Persisted legacy grants.
+  public let records: [BuzzPushLegacyEndpointGrantRecord]
+  /// Persisted legacy enrollment retry journals.
+  public let pending: [BuzzPushLegacyPendingEnrollmentRecord]
+
+  /// Creates a legacy-state snapshot for cleanup.
+  public init(
+    records: [BuzzPushLegacyEndpointGrantRecord],
+    pending: [BuzzPushLegacyPendingEnrollmentRecord]
+  ) {
+    self.records = records
+    self.pending = pending
+  }
+}
+
 /// Persistence boundary for endpoint grants. The Runner implementation stores
 /// records in its Keychain access group and exposes them over the Flutter bridge.
 public protocol BuzzPushEndpointGrantStore {
-  /// Discards legacy records and records issued by any other gateway authority.
+  /// Discards records issued by any other explicitly identified gateway authority.
   func reset(forGatewayOrigin gatewayOrigin: String) throws
+  /// Returns pre-origin state without deleting its durable retry record.
+  func legacyEnrollmentState() throws -> BuzzPushLegacyEnrollmentState
+  /// Removes pre-origin state after its gateway installation has been resolved.
+  func removeLegacyEnrollmentState() throws
   func records() throws -> [BuzzPushEndpointGrantRecord]
   func save(_ record: BuzzPushEndpointGrantRecord) throws
   func pendingEnrollment(
@@ -394,11 +469,12 @@ public final class BuzzDevPushEnrollmentDriver {
     relayURL: URL
   ) async throws -> BuzzPushEndpointGrantRecord {
     precondition(!deviceToken.isEmpty, "The APNs device token must not be empty")
+    let endpoint = Self.lowercaseHex(deviceToken)
+    let endpointHash = Self.lowercaseHex(Data(SHA256.hash(data: deviceToken)))
+    try await resolveLegacyEnrollmentState(endpoint: endpoint, endpointHash: endpointHash)
     let relayOrigin = try Self.relayOrigin(relayURL)
     let relayKeys = try await fetchCurrentRelayKeys(from: relayOrigin.url)
     let relayPubkey = relayKeys.pushPubkey
-    let endpoint = Self.lowercaseHex(deviceToken)
-    let endpointHash = Self.lowercaseHex(Data(SHA256.hash(data: deviceToken)))
     let nowSeconds = Int64(now().timeIntervalSince1970)
 
     let storedRecords = try store.records()
@@ -714,6 +790,77 @@ public final class BuzzDevPushEnrollmentDriver {
     return record
   }
 
+  private func resolveLegacyEnrollmentState(
+    endpoint: String,
+    endpointHash: String
+  ) async throws {
+    let legacy = try store.legacyEnrollmentState()
+    guard !legacy.records.isEmpty || !legacy.pending.isEmpty else { return }
+
+    let nowSeconds = Int64(now().timeIntervalSince1970)
+    var installationEpochs: [UUID: Int64] = [:]
+    for record in legacy.records {
+      guard record.endpointHash == endpointHash,
+        record.appProfile == Self.appProfile,
+        record.expiresAt > nowSeconds
+      else { continue }
+      guard let value = record.gatewayInstallationHandle,
+        let handle = UUID(uuidString: value),
+        value == handle.uuidString.lowercased(),
+        record.endpointEpoch > 0
+      else {
+        throw BuzzDevPushEnrollmentError.invalidResponse(route: "legacy endpoint grant")
+      }
+      installationEpochs[handle] = max(installationEpochs[handle] ?? 0, record.endpointEpoch)
+    }
+
+    for pending in legacy.pending {
+      guard pending.endpointHash == endpointHash,
+        pending.appProfile == Self.appProfile,
+        pending.expiresAt > nowSeconds
+      else { continue }
+      if let value = pending.gatewayInstallationHandle {
+        guard let handle = UUID(uuidString: value),
+          value == handle.uuidString.lowercased()
+        else {
+          throw BuzzDevPushEnrollmentError.invalidResponse(
+            route: "legacy pending enrollment"
+          )
+        }
+        installationEpochs[handle] = max(installationEpochs[handle] ?? 0, Self.endpointEpoch)
+        continue
+      }
+
+      guard let challengeId = pending.challengeId,
+        let challengeUUID = UUID(uuidString: challengeId),
+        challengeId == challengeUUID.uuidString.lowercased(),
+        let challengeValue = pending.challenge,
+        let keyId = pending.keyId,
+        let attestation = pending.attestation
+      else {
+        throw BuzzDevPushEnrollmentError.invalidResponse(route: "legacy pending enrollment")
+      }
+      let recovered = try await enrollInstallation(
+        challenge: Challenge(id: challengeUUID, value: challengeValue),
+        endpoint: endpoint,
+        expiresAt: pending.expiresAt,
+        attestation: BuzzDevAttestation(keyId: keyId, attestation: attestation)
+      )
+      installationEpochs[recovered] = Self.endpointEpoch
+    }
+
+    for (handle, endpointEpoch) in installationEpochs {
+      do {
+        try await revokeInstallation(handle: handle, endpointEpoch: endpointEpoch)
+      } catch BuzzDevPushEnrollmentError.unexpectedStatus(
+        route: "v1/installations/revoke", _, actual: 404, _
+      ) {
+        // The configured authority has no live installation to clean up.
+      }
+    }
+    try store.removeLegacyEnrollmentState()
+  }
+
   private func makeInstallationId() throws -> String {
     let bytes = try installationIdBytes()
     precondition(
@@ -800,6 +947,39 @@ public final class BuzzDevPushEnrollmentDriver {
       throw BuzzDevPushEnrollmentError.invalidResponse(route: "v1/delegations")
     }
     return response.endpointGrant
+  }
+
+  private func revokeInstallation(handle: UUID, endpointEpoch: Int64) async throws {
+    let (newEndpointEpoch, overflow) = endpointEpoch.addingReportingOverflow(1)
+    guard !overflow else {
+      throw BuzzDevPushEnrollmentError.invalidResponse(route: "legacy endpoint grant")
+    }
+    let revokeChallenge = try await challenge()
+    let clientData = try BuzzPushTranscript.revokeInstallation(
+      gatewayOrigin: gatewayBaseURL,
+      challengeId: revokeChallenge.id,
+      challenge: revokeChallenge.value,
+      installationHandle: handle,
+      endpointEpoch: endpointEpoch,
+      newEndpointEpoch: newEndpointEpoch
+    )
+    let assertion = try await appAttest.assertion(clientData: clientData)
+    let response: MutationResponse = try await post(
+      route: "v1/installations/revoke",
+      expectedStatus: 200,
+      body: InstallationRevocationRequest(
+        v: 1,
+        challengeId: revokeChallenge.id.uuidString.lowercased(),
+        challenge: revokeChallenge.value,
+        installationHandle: handle.uuidString.lowercased(),
+        endpointEpoch: endpointEpoch,
+        newEndpointEpoch: newEndpointEpoch,
+        assertion: assertion
+      )
+    )
+    guard response.status == "revoked" else {
+      throw BuzzDevPushEnrollmentError.invalidResponse(route: "v1/installations/revoke")
+    }
   }
 
   private func fetchCurrentRelayKeys(from relayOrigin: URL) async throws -> RelayKeys {
@@ -967,6 +1147,25 @@ private struct InstallationResponse: Decodable {
     case expiresAt = "expires_at"
   }
 }
+private struct InstallationRevocationRequest: Encodable {
+  let v: Int
+  let challengeId: String
+  let challenge: String
+  let installationHandle: String
+  let endpointEpoch: Int64
+  let newEndpointEpoch: Int64
+  let assertion: String
+  enum CodingKeys: String, CodingKey {
+    case v
+    case challengeId = "challenge_id"
+    case challenge
+    case installationHandle = "installation_handle"
+    case endpointEpoch = "endpoint_epoch"
+    case newEndpointEpoch = "new_endpoint_epoch"
+    case assertion
+  }
+}
+private struct MutationResponse: Decodable { let status: String }
 private struct DelegationRequest: Encodable {
   let v: Int
   let challengeId: String

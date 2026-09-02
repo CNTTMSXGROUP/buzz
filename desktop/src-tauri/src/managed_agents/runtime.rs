@@ -990,9 +990,6 @@ pub fn start_managed_agent_process(
     Ok(())
 }
 
-mod child_log_filter;
-use child_log_filter::child_rust_log_filter;
-
 #[cfg(test)]
 mod test_fixtures;
 

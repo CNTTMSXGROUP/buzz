@@ -9,7 +9,6 @@ import { ChannelScreenLoadingFallback } from "@/features/channels/ui/ChannelScre
 import { ChannelViewOverrideProvider } from "@/features/channels/ui/ChannelViewOverrideContext";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { useProfileQuery, useUsersBatchQuery } from "@/features/profile/hooks";
-import { fetchAvatarDataUrl } from "@/features/profile/lib/selfProfileStorage";
 import {
   type Project,
   useProjectPullRequestsQuery,
@@ -25,11 +24,14 @@ import { useLiveProjectWorkItems } from "@/features/projects/useLiveProjectWorkI
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import { getAvatarSnapshotUrl } from "@/shared/lib/animatedAvatar";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import { Button } from "@/shared/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 import { ProjectChannelResourcesView } from "./ProjectChannelResourcesView";
+import {
+  fetchCanvasAvatarDataUrl,
+  selectAvatarsWithinBudget,
+} from "./project-canvas/canvasAvatars";
 import { ProjectCanvasSurface } from "./project-canvas/ProjectCanvasSurface";
 import type { ProjectCanvasOpenTarget } from "./project-canvas/projectCanvasBroker";
 import type { ProjectCanvasSnapshots } from "./project-canvas/projectCanvasProtocol";
@@ -54,7 +56,6 @@ const MAX_CANVAS_PEOPLE_PER_CHANNEL = 5;
 const MAX_CANVAS_REPOSITORIES = 64;
 const MAX_CANVAS_REVIEWS = 32;
 const MAX_CANVAS_AVATARS = 8;
-const MAX_CANVAS_AVATAR_DATA_URL_LENGTH = 48 * 1_024;
 
 function boundedCanvasText(value: string, maxLength: number): string {
   return value.slice(0, maxLength);
@@ -230,21 +231,24 @@ export function ProjectChannelHome({
   const canvasAvatarQueries = useQueries({
     queries: canvasAvatarCandidates.map(({ pubkey, snapshotUrl }) => ({
       gcTime: 10 * 60_000,
-      queryFn: () => fetchAvatarDataUrl(rewriteRelayUrl(snapshotUrl)),
+      queryFn: () => fetchCanvasAvatarDataUrl(snapshotUrl),
       queryKey: ["project-canvas-avatar", pubkey, snapshotUrl],
       staleTime: 10 * 60_000,
     })),
   });
   const canvasAvatarDataByPubkey = React.useMemo(() => {
+    // The channel snapshot ships these to the frame in one RPC message, so the
+    // combined ceiling applies here exactly as it does to a people lookup.
+    const budgeted = selectAvatarsWithinBudget(
+      canvasAvatarCandidates.map((_candidate, index) => {
+        const dataUrl = canvasAvatarQueries[index]?.data;
+        return dataUrl?.startsWith("data:image/") ? dataUrl : null;
+      }),
+    );
     const avatars = new Map<string, string>();
     canvasAvatarCandidates.forEach((candidate, index) => {
-      const dataUrl = canvasAvatarQueries[index]?.data;
-      if (
-        dataUrl?.startsWith("data:image/") &&
-        dataUrl.length <= MAX_CANVAS_AVATAR_DATA_URL_LENGTH
-      ) {
-        avatars.set(candidate.pubkey, dataUrl);
-      }
+      const dataUrl = budgeted[index];
+      if (dataUrl) avatars.set(candidate.pubkey, dataUrl);
     });
     return avatars;
   }, [canvasAvatarCandidates, canvasAvatarQueries]);

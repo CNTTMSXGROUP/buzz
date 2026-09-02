@@ -7,12 +7,14 @@ import {
   useUnassignProjectIssueMutation,
 } from "@/features/projects/issueAssignments";
 import { useUpdateProjectIssueStatusMutation } from "@/features/projects/issueMutations";
-import { fetchAvatarDataUrl } from "@/features/profile/lib/selfProfileStorage";
 import { sendChannelMessage } from "@/shared/api/tauriMessages";
 import { getUsersBatch, searchUsers } from "@/shared/api/tauriProfiles";
 import { getAvatarSnapshotUrl } from "@/shared/lib/animatedAvatar";
-import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import {
+  fetchCanvasAvatarDataUrl,
+  selectAvatarsWithinBudget,
+} from "./canvasAvatars";
 import type { Repository } from "@/features/projects/hooks";
 import type { ProjectIssue } from "@/features/projects/projectIssues.mjs";
 import type { ProjectPullRequest } from "@/features/projects/projectPullRequests.mjs";
@@ -28,7 +30,6 @@ import type { ProjectCanvasSnapshots } from "./projectCanvasProtocol";
 const MAX_BROKER_ROWS = 50;
 const MAX_BROKER_TEXT = 256;
 const MAX_AVATAR_CACHE_ENTRIES = 32;
-const MAX_AVATAR_DATA_URL_LENGTH = 48 * 1_024;
 
 function boundedText(value: string, maxLength = MAX_BROKER_TEXT): string {
   return value.slice(0, maxLength);
@@ -36,8 +37,10 @@ function boundedText(value: string, maxLength = MAX_BROKER_TEXT): string {
 
 /**
  * Bounded avatar inliner: canvas frames run with `connect-src 'none'`, so
- * people rows carry small data-URL avatars instead of relay URLs. The cache
- * holds at most 32 entries of at most 48 KiB each; failures are cached as
+ * people rows carry re-encoded data-URL avatars instead of relay URLs. Each
+ * image is downscaled to a canvas-sized square before it is cached, so the
+ * cache holds at most 32 entries of at most
+ * {@link CANVAS_AVATAR_MAX_DATA_URL_LENGTH} each; failures are cached as
  * misses so a broken avatar cannot retrigger fetch loops.
  */
 async function inlineAvatarDataUrl(
@@ -54,15 +57,11 @@ async function inlineAvatarDataUrl(
   }
   let dataUrl: string | null = null;
   try {
-    dataUrl = await fetchAvatarDataUrl(rewriteRelayUrl(snapshotUrl));
+    dataUrl = await fetchCanvasAvatarDataUrl(snapshotUrl);
   } catch {
     dataUrl = null;
   }
-  const accepted =
-    dataUrl?.startsWith("data:image/") &&
-    dataUrl.length <= MAX_AVATAR_DATA_URL_LENGTH
-      ? dataUrl
-      : "";
+  const accepted = dataUrl?.startsWith("data:image/") ? dataUrl : "";
   cache.set(snapshotUrl, accepted);
   while (cache.size > MAX_AVATAR_CACHE_ENTRIES) {
     const oldest = cache.keys().next().value;
@@ -152,7 +151,7 @@ export function useProjectCanvasBroker({
       pubkeys: string[],
     ): Promise<ProjectCanvasPersonRow[]> => {
       const batch = await getUsersBatch(pubkeys);
-      return Promise.all(
+      const rows = await Promise.all(
         pubkeys.map(async (pubkey) => {
           const profile = batch.profiles[pubkey];
           return {
@@ -169,6 +168,16 @@ export function useProjectCanvasBroker({
           };
         }),
       );
+      // Every row travels in one RPC message. Without a combined ceiling a
+      // handful of avatars overruns it and the frame gets a `too-large` error
+      // instead of the lookup — losing the names too, not just the pictures.
+      const budgeted = selectAvatarsWithinBudget(
+        rows.map((row) => row.avatarDataUrl),
+      );
+      return rows.map((row, index) => ({
+        ...row,
+        avatarDataUrl: budgeted[index] ?? null,
+      }));
     };
     brokerRef.current = new ProjectCanvasBroker({
       lookupPeople: lookupProfiles,

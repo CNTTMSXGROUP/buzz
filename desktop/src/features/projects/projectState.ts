@@ -20,7 +20,6 @@ const LOWER_HEX_64 = /^[0-9a-f]{64}$/;
 
 export type ProjectState = {
   deleted: boolean;
-  event: RelayEvent;
   identityEventId: string;
   projectTags: string[][];
   revision: string;
@@ -202,7 +201,6 @@ export function parseProjectState(
   }
   return {
     deleted,
-    event,
     identityEventId: identityTags[0][1],
     projectTags,
     revision,

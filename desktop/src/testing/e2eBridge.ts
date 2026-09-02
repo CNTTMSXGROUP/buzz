@@ -6304,38 +6304,14 @@ function buildMockProjectStateEvent(
   );
 }
 
-function rejectMockProjectChange(
-  socket: MockSocket,
-  event: RelayEvent,
-  message: string,
-): void {
-  sendWsText(socket.handler, ["OK", event.id, false, message]);
-}
-
 function applyMockProjectRelatedChannelChange(
   socket: MockSocket,
   event: RelayEvent,
 ): void {
-  const coordinateTags = event.tags.filter((tag) => tag[0] === "a");
-  const revisionTags = event.tags.filter(
+  const coordinate = event.tags.find((tag) => tag[0] === "a")?.[1];
+  const expectedRevision = event.tags.find(
     (tag) => tag[0] === "expected-revision",
-  );
-  if (
-    event.tags.length !== 2 ||
-    coordinateTags.length !== 1 ||
-    coordinateTags[0].length !== 2 ||
-    revisionTags.length !== 1 ||
-    revisionTags[0].length !== 2
-  ) {
-    rejectMockProjectChange(
-      socket,
-      event,
-      "invalid: malformed Project change tags",
-    );
-    return;
-  }
-
-  const coordinate = coordinateTags[0][1];
+  )?.[1];
   const store = getMockProjectEventStore();
   const projectionIndex = store.findIndex(
     (candidate) =>
@@ -6345,50 +6321,24 @@ function applyMockProjectRelatedChannelChange(
       ),
   );
   const projection = store[projectionIndex];
-  if (!projection) {
-    rejectMockProjectChange(socket, event, "invalid: Project State not found");
-    return;
+  if (!coordinate || !expectedRevision || !projection) {
+    throw new Error("Mock Project change is missing its current projection.");
   }
   const currentRevision = projection.tags.find((tag) => tag[0] === "rev")?.[1];
-  if (revisionTags[0][1] !== currentRevision) {
-    rejectMockProjectChange(
-      socket,
-      event,
+  if (expectedRevision !== currentRevision) {
+    sendWsText(socket.handler, [
+      "OK",
+      event.id,
+      false,
       `conflict: Project revision is ${currentRevision ?? "unknown"}`,
-    );
+    ]);
     return;
   }
 
-  let body: {
-    v: number;
+  const body = JSON.parse(event.content) as {
     patch: { related_channels: { add: string[]; remove: string[] } };
   };
-  try {
-    body = JSON.parse(event.content) as typeof body;
-  } catch {
-    rejectMockProjectChange(
-      socket,
-      event,
-      "invalid: malformed Project change content",
-    );
-    return;
-  }
-  const patch = body?.patch?.related_channels;
-  if (
-    body?.v !== 1 ||
-    !patch ||
-    !Array.isArray(patch.add) ||
-    !Array.isArray(patch.remove) ||
-    patch.add.some((channelId) => typeof channelId !== "string") ||
-    patch.remove.some((channelId) => typeof channelId !== "string")
-  ) {
-    rejectMockProjectChange(
-      socket,
-      event,
-      "invalid: malformed Project change content",
-    );
-    return;
-  }
+  const patch = body.patch.related_channels;
 
   const projectionBody = JSON.parse(projection.content) as {
     project_tags: string[][];
@@ -6402,12 +6352,7 @@ function applyMockProjectRelatedChannelChange(
       candidate.id === identityId,
   );
   if (!identityEvent) {
-    rejectMockProjectChange(
-      socket,
-      event,
-      "invalid: Project identity not found",
-    );
-    return;
+    throw new Error("Mock Project State is missing its identity event.");
   }
 
   const related = new Set(
@@ -6415,17 +6360,6 @@ function applyMockProjectRelatedChannelChange(
       .filter((tag) => tag[0] === "buzz-related-channel")
       .map((tag) => tag[1]),
   );
-  if (
-    patch.add.some((channelId) => related.has(channelId)) ||
-    patch.remove.some((channelId) => !related.has(channelId))
-  ) {
-    rejectMockProjectChange(
-      socket,
-      event,
-      "invalid: Project related-channel patch is stale",
-    );
-    return;
-  }
   for (const channelId of patch.remove) related.delete(channelId);
   for (const channelId of patch.add) related.add(channelId);
 

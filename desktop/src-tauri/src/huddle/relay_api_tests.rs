@@ -110,52 +110,6 @@ async fn wire_send_failure_is_preserved_for_pipeline_owner() {
 }
 
 #[test]
-fn authenticated_roster_parsing_preserves_only_authoritative_publisher_roles() {
-    let publisher = serde_json::json!({
-        "peer_index": 7,
-        "pubkey": "agent",
-        "epoch": 3,
-        "role": "AgentTtsPublisher",
-    });
-    assert_eq!(
-        parse_audio_roster_peer(&publisher),
-        Some((7, "agent".to_string(), 3, true))
-    );
-
-    let participant = serde_json::json!({
-        "peer_index": 8,
-        "pubkey": "human",
-        "role": "Participant",
-    });
-    assert_eq!(
-        parse_audio_roster_peer(&participant),
-        Some((8, "human".to_string(), 0, false))
-    );
-
-    let overflowing_index = serde_json::json!({
-        "peer_index": 256,
-        "pubkey": "invalid",
-        "role": "AgentTtsPublisher",
-    });
-    assert_eq!(parse_audio_roster_peer(&overflowing_index), None);
-}
-
-#[test]
-fn duplicate_identity_is_a_typed_lost_election() {
-    let error = format_audio_relay_error(&serde_json::json!({
-        "code": "duplicate_identity",
-        "message": "publisher already connected",
-    }));
-    assert!(error.is_lost_election());
-
-    let other = format_audio_relay_error(&serde_json::json!({
-        "code": "not_member",
-        "message": "membership required",
-    }));
-    assert!(!other.is_lost_election());
-}
-
-#[test]
 fn tts_upsampling_doubles_rate_with_linear_midpoints() {
     assert_eq!(
         upsample_tts_24k_to_48k(&[0.0, 1.0, -1.0]),

@@ -80,12 +80,6 @@ impl AudioRelayConnectError {
         self.code.as_deref()
     }
 
-    /// The relay admitted another socket as this agent's voice publisher.
-    /// Callers drop the utterance instead of surfacing an error.
-    pub(crate) fn is_lost_election(&self) -> bool {
-        self.code() == Some("duplicate_identity")
-    }
-
     pub(crate) fn from_relay_payload(value: &serde_json::Value) -> Self {
         Self {
             code: value["code"].as_str().map(str::to_string),
@@ -129,24 +123,13 @@ fn format_audio_relay_error(value: &serde_json::Value) -> AudioRelayConnectError
     AudioRelayConnectError::from_relay_payload(value)
 }
 
-fn parse_audio_roster_peer(peer: &serde_json::Value) -> Option<(u8, String, u8, bool)> {
-    Some((
-        u8::try_from(peer["peer_index"].as_u64()?).ok()?,
-        peer["pubkey"].as_str()?.to_string(),
-        // Absent `epoch` (legacy relay) degrades to 0 so the fence becomes a
-        // no-op rather than rejecting every frame.
-        u8::try_from(peer["epoch"].as_u64().unwrap_or(0)).ok()?,
-        peer["role"].as_str() == Some("AgentTtsPublisher"),
-    ))
-}
-
 async fn connect_authenticated_audio_socket(
     channel_id: &str,
     parent_channel_id: Option<&str>,
     relay_url: &str,
     keys: &nostr::Keys,
     auth_tag_json: Option<&str>,
-) -> Result<(WsSink, WsReceiver, u8, Vec<(u8, String, u8, bool)>), AudioRelayConnectError> {
+) -> Result<(WsSink, WsReceiver, u8, Vec<(u8, String, u8)>), AudioRelayConnectError> {
     use nostr::JsonUtil;
 
     let ws_url = format!("{relay_url}/huddle/{channel_id}/audio");
@@ -205,7 +188,19 @@ async fn connect_authenticated_audio_socket(
                             let peers = value["peers"]
                                 .as_array()
                                 .map(|peers| {
-                                    peers.iter().filter_map(parse_audio_roster_peer).collect()
+                                    peers
+                                        .iter()
+                                        .filter_map(|peer| {
+                                            Some((
+                                                peer["peer_index"].as_u64()? as u8,
+                                                peer["pubkey"].as_str()?.to_string(),
+                                                // Absent `epoch` (legacy relay) degrades
+                                                // to 0 so the fence becomes a no-op rather
+                                                // than rejecting every frame.
+                                                peer["epoch"].as_u64().unwrap_or(0) as u8,
+                                            ))
+                                        })
+                                        .collect()
                                 })
                                 .unwrap_or_default();
                             let peer_index = value["peer_index"]
@@ -250,7 +245,6 @@ pub(crate) async fn connect_audio_relay(
         tts_cancel,
         tts_active,
         local_tts_publishers,
-        audio_peer_pubkeys,
         remote_stt_pipeline,
         agent_pubkeys,
         human_floor,
@@ -260,7 +254,6 @@ pub(crate) async fn connect_audio_relay(
             Arc::clone(&hs.tts_cancel),
             Arc::clone(&hs.tts_active),
             Arc::clone(&hs.local_tts_publishers),
-            Arc::clone(&hs.audio_peer_pubkeys),
             Arc::clone(&hs.remote_stt_pipeline),
             Arc::clone(&hs.agent_pubkeys),
             hs.human_floor.clone(),
@@ -290,7 +283,6 @@ pub(crate) async fn connect_audio_relay(
             tts_cancel,
             tts_active,
             local_tts_publishers,
-            audio_peer_pubkeys,
             remote_stt_pipeline,
             agent_pubkeys,
             human_floor,
@@ -443,14 +435,14 @@ fn queue_tts_broadcast_packet(
 /// Open a send-only v2 Huddle audio peer authenticated as a locally managed
 /// agent. The relay therefore assigns the synthesized stream to that agent's
 /// existing pubkey; no backend or wire-protocol extension is required.
-pub(super) async fn connect_tts_audio_publisher(
+pub(crate) async fn connect_tts_audio_publisher(
     channel_id: &str,
     parent_channel_id: Option<&str>,
     state: &AppState,
     keys: &nostr::Keys,
     auth_tag_json: Option<&str>,
     local_tts_publishers: super::tts::LocalTtsPublishers,
-) -> Result<super::tts::TtsAudioPublisher, AudioRelayConnectError> {
+) -> Result<super::tts::TtsAudioPublisher, String> {
     let relay_url = crate::relay::relay_ws_url_with_override(state);
     let (ws_tx, ws_rx, peer_index, _) = connect_authenticated_audio_socket(
         channel_id,
@@ -459,7 +451,8 @@ pub(super) async fn connect_tts_audio_publisher(
         keys,
         auth_tag_json,
     )
-    .await?;
+    .await
+    .map_err(|error| error.to_string())?;
 
     let cancel = CancellationToken::new();
     let publisher_cancel = cancel.clone();
@@ -584,11 +577,10 @@ struct AudioRelayPipelineArgs {
     pcm_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     cancel: CancellationToken,
     app_handle: Option<tauri::AppHandle>,
-    initial_peers: Vec<(u8, String, u8, bool)>,
+    initial_peers: Vec<(u8, String, u8)>,
     tts_cancel: Arc<AtomicBool>,
     tts_active: Arc<AtomicBool>,
     local_tts_publishers: super::tts::LocalTtsPublishers,
-    audio_peer_pubkeys: Arc<std::sync::Mutex<std::collections::HashMap<u8, String>>>,
     remote_stt_pipeline: Arc<std::sync::Mutex<Option<std::sync::Weak<super::stt::SttPipeline>>>>,
     agent_pubkeys: Arc<std::sync::Mutex<Vec<String>>>,
     human_floor: super::human_floor::HumanFloor,
@@ -607,7 +599,6 @@ async fn audio_relay_pipeline(args: AudioRelayPipelineArgs) -> Result<(), String
         tts_cancel,
         tts_active,
         local_tts_publishers,
-        audio_peer_pubkeys,
         remote_stt_pipeline,
         agent_pubkeys,
         human_floor,
@@ -723,7 +714,6 @@ async fn audio_relay_pipeline(args: AudioRelayPipelineArgs) -> Result<(), String
         tts_active,
         tts_cancel,
         local_tts_publishers,
-        audio_peer_pubkeys,
         remote_stt_pipeline,
         agent_pubkeys,
         human_floor,

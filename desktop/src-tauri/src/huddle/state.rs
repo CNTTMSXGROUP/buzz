@@ -4,7 +4,7 @@
 //! phase enum, voice input mode, and response types.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, Weak,
@@ -112,12 +112,6 @@ pub struct HuddleState {
     /// echo, never another socket authenticated as the same bot.
     #[serde(skip)]
     pub local_tts_publishers: tts::LocalTtsPublishers,
-    /// Relay-authoritative managed-agent TTS publishers, keyed by peer index.
-    /// The receive loop derives this only from publisher-role-bearing roster
-    /// snapshots/deltas. Removal immediately restores local fallback for the
-    /// next message.
-    #[serde(skip)]
-    pub audio_peer_pubkeys: Arc<Mutex<HashMap<u8, String>>>,
     /// Whether this client created the huddle (vs. joined it).
     /// Used to enforce that only the creator can end/archive the huddle.
     pub is_creator: bool,
@@ -227,7 +221,6 @@ impl Clone for HuddleState {
             remote_stt_pipeline: Arc::new(Mutex::new(None)),
             tts_pipeline: None, // Never clone the pipeline handle.
             local_tts_publishers: Arc::clone(&self.local_tts_publishers),
-            audio_peer_pubkeys: Arc::clone(&self.audio_peer_pubkeys),
             is_creator: self.is_creator,
             tts_enabled: self.tts_enabled,
             transcription_enabled: self.transcription_enabled,
@@ -266,7 +259,6 @@ impl Default for HuddleState {
             remote_stt_pipeline: Arc::new(Mutex::new(None)),
             tts_pipeline: None,
             local_tts_publishers: tts::LocalTtsPublishers::default(),
-            audio_peer_pubkeys: Arc::new(Mutex::new(HashMap::new())),
             is_creator: false,
             tts_enabled: true,
             transcription_enabled: false,

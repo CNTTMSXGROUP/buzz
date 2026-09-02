@@ -207,6 +207,7 @@ void main() {
 
   test('an uncancellable stalled request remains the single flight', () async {
     var requests = 0;
+    var restarts = 0;
     final provider = NotifierProvider<AgeSignalNotifier, AgeSignalState>(
       () => AgeSignalNotifier(
         requestSignal: () {
@@ -215,6 +216,9 @@ void main() {
         },
         delay: (_) async {},
         cancelSignal: () async => false,
+        restartSignal: () async {
+          restarts += 1;
+        },
         requestTimeout: const Duration(milliseconds: 1),
       ),
     );
@@ -226,6 +230,7 @@ void main() {
 
     expect(container.read(provider), AgeSignalState.retryableFailure);
     expect(requests, 1);
+    expect(restarts, 1);
   });
 
   test('keeps a missing native channel gated and retryable', () async {

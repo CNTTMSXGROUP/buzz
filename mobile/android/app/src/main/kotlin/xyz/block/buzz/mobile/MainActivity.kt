@@ -1,5 +1,7 @@
 package xyz.block.buzz.mobile
 
+import android.content.Intent
+
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -161,6 +163,7 @@ class MainActivity : FlutterFragmentActivity() {
                         )
                     }
                     CANCEL_AGE_SIGNAL_METHOD -> cancelAgeSignalRequest(result)
+                    RESTART_AGE_SIGNAL_METHOD -> restartForAgeSignal(result)
                     else -> result.notImplemented()
                 }
             }
@@ -221,6 +224,21 @@ class MainActivity : FlutterFragmentActivity() {
         // Play age-signals 0.0.4 exposes non-cancellable Tasks. Retain the
         // original single flight rather than allowing an overlapping prompt.
         result.success(false)
+    }
+
+    private fun restartForAgeSignal(result: MethodChannel.Result) {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        if (launchIntent == null) {
+            result.error("age_signal_restart_failed", "Buzz could not restart.", null)
+            return
+        }
+        result.success(null)
+        window.decorView.post {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            startActivity(launchIntent)
+            finishAffinity()
+            Runtime.getRuntime().exit(0)
+        }
     }
 
     private fun replyWithAgeSignal(
@@ -479,6 +497,7 @@ class MainActivity : FlutterFragmentActivity() {
         private const val AGE_SIGNAL_CHANNEL = "buzz/age_signal"
         private const val REQUEST_AGE_SIGNAL_METHOD = "requestAgeSignal"
         private const val CANCEL_AGE_SIGNAL_METHOD = "cancelAgeSignalRequest"
+        private const val RESTART_AGE_SIGNAL_METHOD = "restartForAgeSignal"
         private const val SANITIZE_IMAGE_FOR_UPLOAD_METHOD = "sanitizeImageForUpload"
         private const val TRANSCODE_IMAGE_TO_JPEG_METHOD = "transcodeImageToJpeg"
         private const val TRANSCODE_VIDEO_TO_MP4_METHOD = "transcodeVideoToMp4"

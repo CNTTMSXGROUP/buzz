@@ -17,6 +17,7 @@ typedef AgeSignalRequest = Future<Map<Object?, Object?>?> Function();
 /// Waits before retrying a failed native age-signal request.
 typedef AgeSignalDelay = Future<void> Function(Duration duration);
 typedef AgeSignalCancel = Future<bool> Function();
+typedef AgeSignalRestart = Future<void> Function();
 
 Future<Map<Object?, Object?>?> _requestPlatformAgeSignal() =>
     ageSignalChannel.invokeMapMethod<Object?, Object?>('requestAgeSignal');
@@ -26,6 +27,8 @@ Future<void> _delayAgeSignalRetry(Duration duration) =>
 Future<bool> _cancelPlatformAgeSignal() async =>
     await ageSignalChannel.invokeMethod<bool>('cancelAgeSignalRequest') ??
     false;
+Future<void> _restartForPlatformAgeSignal() =>
+    ageSignalChannel.invokeMethod<void>('restartForAgeSignal');
 
 bool shouldBlockForAgeSignal(Map<Object?, Object?> response) {
   if (response.length != 2 ||
@@ -64,10 +67,12 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
     AgeSignalRequest? requestSignal,
     AgeSignalDelay? delay,
     AgeSignalCancel? cancelSignal,
+    AgeSignalRestart? restartSignal,
     Duration requestTimeout = ageSignalRequestTimeout,
   }) : _requestSignal = requestSignal ?? _requestPlatformAgeSignal,
        _delay = delay ?? _delayAgeSignalRetry,
        _cancelSignal = cancelSignal ?? _cancelPlatformAgeSignal,
+       _restartSignal = restartSignal ?? _restartForPlatformAgeSignal,
        _requestTimeout = requestTimeout;
 
   static const _maxAttempts = 2;
@@ -75,8 +80,10 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
   final AgeSignalRequest _requestSignal;
   final AgeSignalDelay _delay;
   final AgeSignalCancel _cancelSignal;
+  final AgeSignalRestart _restartSignal;
   final Duration _requestTimeout;
   bool _completed = false;
+  bool _restartRequired = false;
   Future<void>? _requestInFlight;
   Future<Map<Object?, Object?>?>? _nativeRequestInFlight;
 
@@ -85,6 +92,10 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
 
   Future<void> request() async {
     if (_completed) return;
+    if (_restartRequired) {
+      await _restartSignal();
+      return;
+    }
 
     final requestInFlight = _requestInFlight;
     if (requestInFlight != null) {
@@ -195,6 +206,8 @@ class AgeSignalNotifier extends Notifier<AgeSignalState> {
     } finally {
       if (retired) {
         _nativeRequestInFlight = null;
+      } else {
+        _restartRequired = true;
       }
     }
   }

@@ -30,6 +30,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
       pendingEnrollments: allPending,
       cleanupStates: gatewayCleanupStates(),
       saveCleanupState: saveGatewayCleanupState,
+      removeCleanupState: removeGatewayCleanupState,
       replaceRecords: { try self.replace($0, account: Self.recordsAccount) },
       replacePendingEnrollments: { try self.replace($0, account: Self.pendingAccount) }
     )

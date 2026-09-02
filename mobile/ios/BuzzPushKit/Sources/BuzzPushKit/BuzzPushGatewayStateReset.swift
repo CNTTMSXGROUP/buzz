@@ -1,17 +1,38 @@
 /// Performs the ordered state transition when the configured push gateway changes.
 public enum BuzzPushGatewayStateReset {
-  /// Journals every retired-gateway record before replacing active state.
+  /// Restores current-gateway state and journals retired state before replacing active state.
   public static func run(
     gatewayOrigin: String,
     records: [BuzzPushEndpointGrantRecord],
     pendingEnrollments: [BuzzPushPendingEnrollmentRecord],
     cleanupStates: [BuzzPushGatewayCleanupState],
     saveCleanupState: (BuzzPushGatewayCleanupState) throws -> Void,
+    removeCleanupState: (String) throws -> Void,
     replaceRecords: ([BuzzPushEndpointGrantRecord]) throws -> Void,
     replacePendingEnrollments: ([BuzzPushPendingEnrollmentRecord]) throws -> Void
   ) throws {
-    let staleRecords = records.filter { $0.gatewayOrigin != gatewayOrigin }
-    let stalePending = pendingEnrollments.filter { $0.gatewayOrigin != gatewayOrigin }
+    var nextRecords = records
+    var nextPending = pendingEnrollments
+    let restoredState = cleanupStates.first { $0.gatewayOrigin == gatewayOrigin }
+    if let restoredState {
+      for record in restoredState.grants
+      where !nextRecords.contains(where: {
+        $0.gatewayOrigin == record.gatewayOrigin && $0.relayOrigin == record.relayOrigin
+          && $0.appProfile == record.appProfile
+      }) {
+        nextRecords.append(record)
+      }
+      for pending in restoredState.pendingEnrollments
+      where !nextPending.contains(where: {
+        $0.gatewayOrigin == pending.gatewayOrigin && $0.relayOrigin == pending.relayOrigin
+          && $0.appProfile == pending.appProfile
+      }) {
+        nextPending.append(pending)
+      }
+    }
+
+    let staleRecords = nextRecords.filter { $0.gatewayOrigin != gatewayOrigin }
+    let stalePending = nextPending.filter { $0.gatewayOrigin != gatewayOrigin }
     let staleOrigins = Set(staleRecords.map(\.gatewayOrigin) + stalePending.map(\.gatewayOrigin))
 
     for origin in staleOrigins.sorted() {
@@ -36,13 +57,16 @@ public enum BuzzPushGatewayStateReset {
       try saveCleanupState(state)
     }
 
-    if !staleRecords.isEmpty {
-      try replaceRecords(records.filter { $0.gatewayOrigin == gatewayOrigin })
+    if !staleRecords.isEmpty || nextRecords.count != records.count {
+      try replaceRecords(nextRecords.filter { $0.gatewayOrigin == gatewayOrigin })
     }
-    if !stalePending.isEmpty {
+    if !stalePending.isEmpty || nextPending.count != pendingEnrollments.count {
       try replacePendingEnrollments(
-        pendingEnrollments.filter { $0.gatewayOrigin == gatewayOrigin }
+        nextPending.filter { $0.gatewayOrigin == gatewayOrigin }
       )
+    }
+    if restoredState != nil {
+      try removeCleanupState(gatewayOrigin)
     }
   }
 }

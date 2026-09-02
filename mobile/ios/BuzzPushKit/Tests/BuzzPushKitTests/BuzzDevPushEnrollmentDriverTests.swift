@@ -440,6 +440,32 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     )
   }
 
+  func testGatewayResetRestoresCurrentCleanupBeforeRemovingJournal() throws {
+    let record = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: "https://gateway-a.example",
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: Self.installationId,
+      endpointGrant: "gateway-a-grant",
+      endpointHash: String(repeating: "b", count: 64),
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore(records: [record])
+
+    try store.reset(forGatewayOrigin: "https://gateway-b.example")
+    store.resetOperations.removeAll()
+    try store.reset(forGatewayOrigin: "https://gateway-a.example")
+
+    XCTAssertEqual(store.saved, [record])
+    XCTAssertTrue(store.cleanup.isEmpty)
+    XCTAssertEqual(store.resetOperations, ["records", "cleanup-removed:https://gateway-a.example"])
+  }
+
   func testSuccessfulEnrollmentRevokesAndDeletesStaleGatewayCleanup() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     let current = BuzzPushEndpointGrantRecord(
@@ -1395,6 +1421,10 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
       saveCleanupState: { state in
         self.resetOperations.append("cleanup:\(state.gatewayOrigin)")
         try self.saveGatewayCleanupState(state)
+      },
+      removeCleanupState: {
+        self.resetOperations.append("cleanup-removed:\($0)")
+        try self.removeGatewayCleanupState(gatewayOrigin: $0)
       },
       replaceRecords: {
         self.resetOperations.append("records")

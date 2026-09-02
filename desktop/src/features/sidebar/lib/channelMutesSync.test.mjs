@@ -8,7 +8,7 @@ import test, { mock } from "node:test";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   parseMutePayload,
-  readChannelMutesOutbox,
+  readChannelMutesOutboxWithMeta,
 } from "./channelMutesStorage.ts";
 import { ChannelMuteSyncManager } from "./channelMutesSync.ts";
 import {
@@ -94,7 +94,7 @@ test("mutes wire: outbox/subsumption callbacks are wired to mutes storage (not s
     m.publishMutes(store);
     // Outbox must be written synchronously on publish — proves writeChannelMutesOutbox is wired.
     assert.ok(
-      readChannelMutesOutbox("pk-outbox-mutes", RELAY) !== null,
+      readChannelMutesOutboxWithMeta("pk-outbox-mutes", RELAY) !== null,
       "publishMutes must write to the mutes outbox (not stars)",
     );
     // Drive through a full publish cycle with a subsuming head. After discardPending,
@@ -107,7 +107,10 @@ test("mutes wire: outbox/subsumption callbacks are wired to mutes storage (not s
     );
     fw._fireTimer(); // fires debounce → doPublish → fetchOwnBlob → publish → confirmRetained
     await new Promise((r) => setTimeout(r, 30));
-    assert.equal(readChannelMutesOutbox("pk-outbox-mutes", RELAY), null);
+    assert.equal(
+      readChannelMutesOutboxWithMeta("pk-outbox-mutes", RELAY),
+      null,
+    );
     m.destroy();
   } finally {
     tauri.restore();
@@ -211,124 +214,6 @@ test("P3: clicked channel is preserved through pre-publish mergeWithRemote at ca
   }
 });
 
-// Mutation: calling public publish() on reconnect resets pendingPreservedKey,
-// letting a 501-entry pre-publish merge evict the clicked channel again (P3).
-test("P3 reconnect: retryReconnectMutesPublish preserves clicked channel key across reconnect", async () => {
-  const MAX = 500;
-  const clickedId = "ch-reconnect-mute";
-  const clickedEntry = { muted: true, updatedAt: 1, rev: 1 }; // oldest
-  const localChannels = { [clickedId]: clickedEntry };
-  for (let i = 0; i < MAX - 1; i++) {
-    localChannels[`ch-local-${i}`] = { muted: false, updatedAt: 100, rev: 0 };
-  }
-  const localStore = { version: 1, channels: localChannels };
-
-  // Remote: a new channel not in local, making merged = 501
-  const remoteChannels = {};
-  for (let i = 0; i < MAX - 1; i++) {
-    remoteChannels[`ch-local-${i}`] = { muted: false, updatedAt: 100, rev: 0 };
-  }
-  remoteChannels["ch-remote-rc"] = { muted: false, updatedAt: 100, rev: 0 };
-  const remoteStore = { version: 1, channels: remoteChannels };
-
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
-  const tauri = installEchoTauri("pk-p3-reconnect-mutes");
-  const remoteHead = tauri.mintHead(remoteStore, 50, "evt-rc-mutes");
-  remoteHead.tags = [["d", "channel-mutes"]];
-
-  let fetchCalls = 0;
-  mock.method(relayClient, "fetchEvents", () => {
-    fetchCalls++;
-    if (fetchCalls === 1) return Promise.resolve([remoteHead]);
-    return Promise.resolve([]);
-  });
-  let publishedEvent = null;
-  mock.method(relayClient, "publishEvent", (evt) => {
-    publishedEvent = evt;
-    return Promise.resolve();
-  });
-
-  try {
-    const m = new ChannelMuteSyncManager("pk-p3-reconnect-mutes", RELAY);
-    // Initial click: sets pendingPreservedKey = clickedId
-    m.publishMutes(localStore, clickedId);
-    // Cancel the debounce (simulates quit before the 2s fires).
-    fw._fireTimer(); // flush pending timer
-    // Let any microtasks settle — abort the current cycle if one started
-    await new Promise((r) => setTimeout(r, 0));
-    // Reset: simulate the manager having a pending edit with preservedKey set
-    // but the cycle not yet complete. We reinitialise with a fresh timer.
-    m.cancelPendingMutePublish();
-    // Re-publish with key to set pendingPreservedKey properly
-    fetchCalls = 0;
-    publishedEvent = null;
-    m.publishMutes(localStore, clickedId);
-    // Use retryReconnectMutesPublish — must NOT reset pendingPreservedKey
-    m.retryReconnectMutesPublish();
-    fw._fireTimer();
-    await new Promise((r) => setTimeout(r, 30));
-    // If retryReconnect properly preserved the key, clicked channel survives.
-    assert.ok(publishedEvent !== null, "publish must have fired after retry");
-    const plaintext = tauri.capturedPlaintext();
-    const published = JSON.parse(plaintext);
-    assert.ok(
-      clickedId in published.channels,
-      `clicked channel must survive 501-entry merge after retryReconnectMutesPublish`,
-    );
-    m.destroy();
-  } finally {
-    tauri.restore();
-    restore();
-    mock.reset();
-  }
-});
-
-// Mutation: omitting preservedKey from writeChannelMutesOutbox means it is not
-// persisted in the envelope, so readChannelMutesOutboxPreservedKey returns
-// undefined and bootstrap replay calls publishMutes(outbox) without protection
-// — a 501-entry pre-publish merge can evict the clicked channel on remount (P3).
-test("P3 remount: writeChannelMutesOutbox persists preservedKey; readChannelMutesOutboxPreservedKey recovers it", async () => {
-  const {
-    readChannelMutesOutbox,
-    readChannelMutesOutboxPreservedKey,
-    writeChannelMutesOutbox,
-  } = await import("./channelMutesStorage.ts");
-
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
-
-  const pubkey = "pk-p3-remount-mutes-storage";
-  const relayUrl = "wss://r.remount-mutes";
-  const clickedId = "ch-remount-mutes";
-  const store = {
-    version: 1,
-    channels: { [clickedId]: { muted: true, updatedAt: 1, rev: 0 } },
-  };
-
-  try {
-    writeChannelMutesOutbox(pubkey, store, relayUrl, clickedId);
-
-    assert.ok(
-      readChannelMutesOutbox(pubkey, relayUrl) !== null,
-      "outbox must be written",
-    );
-
-    const restoredKey = readChannelMutesOutboxPreservedKey(pubkey, relayUrl);
-    assert.equal(
-      restoredKey,
-      clickedId,
-      "preservedKey must be readable back from the written mutes outbox record",
-    );
-
-    writeChannelMutesOutbox(pubkey, store, "wss://r.no-key", undefined);
-    const noKey = readChannelMutesOutboxPreservedKey(pubkey, "wss://r.no-key");
-    assert.equal(
-      noKey,
-      undefined,
-      "absent preservedKey must read back as undefined",
-    );
-  } finally {
-    restore();
-  }
-});
+// P3 reconnect and P3 remount/restart scenarios are in mergeLaneHook.shared.test.mjs,
+// parameterized across both lanes, triggering the actual registered reconnect callback
+// and seeding foreign-nonce outbox envelopes to model quit/restart (Kalvin P3).

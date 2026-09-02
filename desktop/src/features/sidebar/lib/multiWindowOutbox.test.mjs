@@ -87,7 +87,7 @@ test("(i+iii+ix) reclaim deletes proven-stale key and keeps coexisting fresh edi
     assert.ok(!ls.has(stale), "proven-stale key reclaimed");
     assert.ok(ls.has(fresh), "fresh edit survives");
     assert.deepEqual(
-      stars.readChannelStarsOutbox(PK, RELAY).channels.z,
+      stars.readChannelStarsOutboxWithMeta(PK, RELAY).store.channels.z,
       starEntry(true, 300, 9),
     );
   });
@@ -144,9 +144,9 @@ test("(ii) merge-lane and whole-blob resume across window teardown/remount", () 
       starStore({ b: starEntry(true, 200, 1) }),
       200,
     );
-    const resumed = stars.readChannelStarsOutbox(PK, RELAY);
-    assert.deepEqual(resumed.channels.a, starEntry(true, 100, 1));
-    assert.deepEqual(resumed.channels.b, starEntry(true, 200, 1));
+    const resumed = stars.readChannelStarsOutboxWithMeta(PK, RELAY);
+    assert.deepEqual(resumed.store.channels.a, starEntry(true, 100, 1));
+    assert.deepEqual(resumed.store.channels.b, starEntry(true, 200, 1));
     writeAt(
       ls,
       foreignKey("sort", "A", 0),
@@ -172,7 +172,7 @@ test("(iv) stars: legacy shared key resumes and is never reclaimed", () =>
       JSON.stringify(starStore({ a: starEntry(true, 100, 1) })),
     );
     assert.deepEqual(
-      stars.readChannelStarsOutbox(PK, RELAY).channels.a,
+      stars.readChannelStarsOutboxWithMeta(PK, RELAY).store.channels.a,
       starEntry(true, 100, 1),
       "legacy entry resumes",
     );
@@ -202,9 +202,9 @@ test("(v) crash between write-new/delete-old: merge-lane coalesces, whole-blob r
       starStore({ b: starEntry(true, 200, 1) }),
       200,
     );
-    const resumed = stars.readChannelStarsOutbox(PK, RELAY);
-    assert.deepEqual(resumed.channels.a, starEntry(true, 100, 1));
-    assert.deepEqual(resumed.channels.b, starEntry(true, 200, 1));
+    const resumed = stars.readChannelStarsOutboxWithMeta(PK, RELAY);
+    assert.deepEqual(resumed.store.channels.a, starEntry(true, 100, 1));
+    assert.deepEqual(resumed.store.channels.b, starEntry(true, 200, 1));
   });
   withStorage((ls) => {
     const base = `${PREFIX.sort}:${SCOPE}:${outboxWindowNonce()}`;
@@ -243,7 +243,7 @@ test("(vi-viii) reload seq above surviving keys; whole-blob key tiebreak; merge-
       "new key strictly above surviving",
     );
     assert.deepEqual(
-      stars.readChannelStarsOutbox(PK, RELAY).channels.b,
+      stars.readChannelStarsOutboxWithMeta(PK, RELAY).store.channels.b,
       starEntry(true, 100, 1),
     );
   });
@@ -279,7 +279,7 @@ test("(vi-viii) reload seq above surviving keys; whole-blob key tiebreak; merge-
       200,
     );
     assert.deepEqual(
-      stars.readChannelStarsOutbox(PK, RELAY).channels.c,
+      stars.readChannelStarsOutboxWithMeta(PK, RELAY).store.channels.c,
       starEntry(true, 100, 5),
       "higher rev wins",
     );
@@ -360,16 +360,16 @@ test("(x) legacy outbox: replay-once, rewritten-blob replay, crash-recovery, and
       legacyKey("stars"),
       JSON.stringify(starStore({ a: starEntry(true, 100, 1) })),
     );
-    const outbox = stars.readChannelStarsOutbox(PK, RELAY);
+    const outboxMeta = stars.readChannelStarsOutboxWithMeta(PK, RELAY);
     assert.ok(
       stars.isStarsStoreSubsumedBy(
-        outbox,
+        outboxMeta.store,
         starStore({ a: starEntry(true, 100, 1) }),
       ),
       "head-subsumed legacy fold is publish-free",
     );
     assert.ok(
-      !stars.isStarsStoreSubsumedBy(outbox, starStore({})),
+      !stars.isStarsStoreSubsumedBy(outboxMeta.store, starStore({})),
       "unsubsumed legacy click still needs a publish",
     );
   });

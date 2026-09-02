@@ -7,8 +7,7 @@ import {
   DEFAULT_STORE,
   isStarsStoreSubsumedBy,
   mergeStores,
-  readChannelStarsOutbox,
-  readChannelStarsOutboxPreservedKey,
+  readChannelStarsOutboxWithMeta,
   readChannelStarsStore,
   reclaimSubsumedStarsOutbox,
   starredChannelIdsFromStore,
@@ -116,8 +115,8 @@ export function useChannelStars(
       // syncs. Merges all records (order-independent), then publishes. Replay
       // runs BEFORE reclamation so a same-second record the head appears to
       // supersede is consumed into pending here and can never be GC'd out.
-      const outbox = readChannelStarsOutbox(pubkey, relayUrl);
-      if (outbox) {
+      const outboxMeta = readChannelStarsOutboxWithMeta(pubkey, relayUrl);
+      if (outboxMeta) {
         // Skip the publish only when the fetched head already subsumes the
         // fold — a lingering never-deleted legacy key or head-subsumed record
         // would otherwise re-drive an identical publish on every boot. A `hold`
@@ -126,17 +125,17 @@ export function useChannelStars(
         // noise only.
         const subsumed =
           result.action === "apply-remote" &&
-          isStarsStoreSubsumedBy(outbox, result.data.store);
+          isStarsStoreSubsumedBy(outboxMeta.store, result.data.store);
         if (!subsumed) {
-          // Restore the preservedKey written alongside this window's outbox
-          // record so the clicked channel's capacity reservation survives
-          // remount (Kalvin P3). Old records without the field produce
-          // undefined, which publishes without a reservation — same as before.
-          const preservedKey = readChannelStarsOutboxPreservedKey(
-            pubkey,
-            relayUrl,
+          // Forward the preserved key so the clicked channel's capacity
+          // reservation survives remount and restart. The key is selected
+          // from all records (own and foreign) by max queuedAt, so it is
+          // recovered even when the prior window's record is now foreign
+          // after a quit (Kalvin P3).
+          managerRef.current?.publishStars(
+            outboxMeta.store,
+            outboxMeta.preservedKey,
           );
-          managerRef.current?.publishStars(outbox, preservedKey);
         }
       } else {
         clearChannelStarsOutbox(pubkey, relayUrl);

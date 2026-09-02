@@ -16,6 +16,11 @@ import {
   writeOwnOutbox,
 } from "./sidebarSyncWatermark";
 
+export type OutboxWithMeta<S> = {
+  store: S;
+  preservedKey?: string;
+};
+
 // ─── Key helpers ──────────────────────────────────────────────────────────────
 
 /**
@@ -172,17 +177,30 @@ export function writeOutbox<S>(
 
 /**
  * Merge every window's persisted unpublished edit into one store for resume,
- * or null when none exists. Per-entry merge is order-independent so two
- * windows' concurrent clicks on different channels both survive.
+ * returning both the merged store and the most-recent explicit `preservedKey`
+ * across ALL records (own and foreign), or null when no records exist.
+ *
+ * The preserved key is selected deterministically: the record with the highest
+ * `queuedAt` that carries an explicit `preservedKey`; ties broken by key
+ * string (max). This works whether the record was written by the current window
+ * (isOwn) or by a prior window that has since closed — after a quit the nonce
+ * is gone and the record is foreign, but its `preservedKey` is still durable
+ * in localStorage and is recovered here (Kalvin P3 restart durability).
+ *
+ * Per-entry merge is order-independent so two windows' concurrent clicks on
+ * different channels both survive. Both the fold and the bound apply the
+ * selected preserved key so the clicked channel is never evicted before it
+ * reaches the manager.
  */
-export function readOutbox<S>(
+export function readOutboxWithMeta<S>(
   outboxPrefix: string,
   pubkey: string,
   relayUrl: string,
   parse: (json: unknown) => S | null,
   merge: (a: S, b: S) => S,
   defaultStore: S,
-): S | null {
+  bound: (s: S, preservedKey?: string) => S,
+): OutboxWithMeta<S> | null {
   const records = enumerateOutbox(
     outboxPrefix,
     legacyOutboxKey(outboxPrefix, pubkey, relayUrl),
@@ -191,7 +209,29 @@ export function readOutbox<S>(
     parse,
   );
   if (records.length === 0) return null;
-  return records.reduce<S>((acc, r) => merge(acc, r.store), defaultStore);
+  // Select the surviving preservedKey: max queuedAt among records that carry
+  // an explicit preservedKey; ties broken by key string (max).
+  let bestKey: string | undefined;
+  let bestQueuedAt = -1;
+  let bestStorageKey = "";
+  for (const r of records) {
+    if (r.preservedKey === undefined) continue;
+    if (
+      r.queuedAt > bestQueuedAt ||
+      (r.queuedAt === bestQueuedAt && r.key > bestStorageKey)
+    ) {
+      bestKey = r.preservedKey;
+      bestQueuedAt = r.queuedAt;
+      bestStorageKey = r.key;
+    }
+  }
+  // Fold all records and apply the capacity bound with the selected key so the
+  // clicked channel is never evicted during the outbox read itself.
+  const merged = records.reduce<S>(
+    (acc, r) => merge(acc, r.store),
+    defaultStore,
+  );
+  return { store: bound(merged, bestKey), preservedKey: bestKey };
 }
 
 /** Clear this window's own outbox key (its edit published or is a no-op). */
@@ -201,34 +241,6 @@ export function clearOutbox(
   relayUrl: string,
 ): void {
   clearOwnOutbox(outboxPrefix, pubkey, relayUrl);
-}
-
-/**
- * Read the `preservedKey` stored by the most recent click in THIS window's own
- * outbox record, or `undefined` when no own record exists or it carries none.
- *
- * The `preservedKey` identifies the channel that must survive capacity bounding
- * across a remount. It is intentionally read from this window's own record
- * only — merging multiple windows' records into one store loses the per-click
- * provenance, so we recover protection from the authoritative own-window entry.
- */
-export function readOutboxPreservedKey(
-  outboxPrefix: string,
-  pubkey: string,
-  relayUrl: string,
-  parseStore: (json: unknown) => unknown,
-): string | undefined {
-  const records = enumerateOutbox(
-    outboxPrefix,
-    legacyOutboxKey(outboxPrefix, pubkey, relayUrl),
-    pubkey,
-    relayUrl,
-    parseStore,
-  );
-  // Return the preservedKey from this window's own record (if any). Own records
-  // are the only ones that carry a preservedKey written by this session.
-  const own = records.find((r) => r.isOwn);
-  return own?.preservedKey;
 }
 
 /**

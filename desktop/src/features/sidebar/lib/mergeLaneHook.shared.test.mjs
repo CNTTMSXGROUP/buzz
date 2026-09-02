@@ -449,4 +449,265 @@ export function runMergeLaneHookSuite({
       restore();
     }
   });
+
+  // P3 reconnect: hook's registered subscribeToReconnects callback must use
+  // retryReconnect*Publish(), NOT publish*(pending), so pendingPreservedKey is
+  // not reset. With 500 local entries and 1 fresh remote entry, merged = 501.
+  // Without the fix, publish*(pending) resets pendingPreservedKey → the clicked
+  // channel is evicted. Reverting the hook's reconnect effect to publish*(pending)
+  // fails this test while leaving the manager-level tests green.
+  //
+  // Failing mutation: revert hook reconnect from retryReconnect*Publish() to
+  // publish*(outbox or pending).
+  test(`${label}: P3 reconnect — registered reconnect callback preserves clicked channel through 501-entry merge`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const { relayClient } = await import("@/shared/api/relayClient");
+
+    const MAX = MAX_ENTRIES;
+    const clickedId = `ch-rc-click-${label}`;
+    const relayUrl = "wss://relay-p3-rc";
+
+    // Local: clicked channel (oldest) + 499 others at updatedAt=100
+    const localChannels = {
+      [clickedId]: { [entryValueField]: true, updatedAt: 1, rev: 1 },
+    };
+    for (let i = 0; i < MAX - 1; i++) {
+      localChannels[`ch-rc-${i}`] = {
+        [entryValueField]: false,
+        updatedAt: 100,
+        rev: 0,
+      };
+    }
+    // Remote: same 499 + one fresh channel → merged = 501
+    const remoteChannels = {};
+    for (let i = 0; i < MAX - 1; i++) {
+      remoteChannels[`ch-rc-${i}`] = {
+        [entryValueField]: false,
+        updatedAt: 100,
+        rev: 0,
+      };
+    }
+    remoteChannels[`ch-rc-new-${label}`] = {
+      [entryValueField]: false,
+      updatedAt: 100,
+      rev: 0,
+    };
+
+    const pubkey = `pk-p3-rc-${label}`;
+    const reconnect = {};
+    const restore = stubRelay(relayClient, { reconnect });
+    const tauri = installEchoTauri(pubkey);
+    const remoteHead = tauri.mintHead(
+      { version: 1, channels: remoteChannels },
+      50,
+      `evt-rc-${label}`,
+    );
+    remoteHead.tags = [["d", dTag]];
+    remoteHead.pubkey = pubkey;
+    remoteHead.kind = 30078;
+
+    const publishCalls = [];
+    let fetchCalls = 0;
+    relayClient.fetchEvents = async () => {
+      fetchCalls++;
+      return fetchCalls === 1 ? [remoteHead] : [];
+    };
+    relayClient.publishEvent = async (evt) => {
+      publishCalls.push(evt);
+    };
+
+    // Use timer bed so the 2s click debounce does not fire unexpectedly.
+    // retryReconnectPublish cancels the debounce and calls startCycle directly,
+    // so no timer needs to be fired after the reconnect — just drain microtasks.
+    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+    const origDateNow = Date.now;
+    Date.now = () => 100 * 1_000;
+
+    // Seed local store so the hook mounts with 500 entries
+    window.localStorage.setItem(
+      storageKey(pubkey, relayUrl),
+      JSON.stringify({ version: 1, channels: localChannels }),
+    );
+
+    let hook = null;
+    try {
+      // Mount and let bootstrap settle
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+
+      // Click the channel — registers it in pendingPreservedKey, schedules 2s debounce
+      await act(async () => hook.result.current[trueAction](clickedId));
+
+      // Trigger the registered reconnect callback (exercises the real production seam).
+      // The callback: fetchRemote*() → retryReconnect*Publish() → startCycle() → doPublish().
+      // retryReconnectPublish cancels the debounce and drives the cycle directly.
+      assert.ok(
+        typeof reconnect.cb === "function",
+        "subscribeToReconnects must register a callback",
+      );
+      fetchCalls = 0;
+      publishCalls.length = 0;
+      await act(async () => {
+        // Drive the reconnect callback's async chain: fetchRemote → retryReconnect.
+        const p = reconnect.cb();
+        // Drain microtasks to let fetchRemote resolve and retryReconnectPublish run.
+        for (let i = 0; i < 100; i++) await Promise.resolve();
+        await p;
+        // Drain doPublish's internal async chain: fetchOwn → publishEvent → confirm.
+        for (let i = 0; i < 100; i++) await Promise.resolve();
+      });
+
+      assert.ok(
+        publishCalls.length > 0,
+        "publish must have fired after reconnect",
+      );
+      const plaintext = tauri.capturedPlaintext();
+      assert.ok(plaintext !== null, "encrypt must have been called");
+      const published = JSON.parse(plaintext);
+      assert.ok(
+        clickedId in published.channels,
+        `clicked channel "${clickedId}" must survive 501-entry merge after reconnect — ` +
+          `reverting hook to publish*(pending) resets pendingPreservedKey and fails this`,
+      );
+
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreTimers();
+      restore();
+      window.localStorage.clear();
+    }
+  });
+
+  // P3 restart: after a quit the prior window's outbox record is foreign (the
+  // session nonce is gone). Bootstrap must recover the preservedKey from the
+  // foreign record and forward it to publishStars/publishMutes. Without the fix
+  // (readOutboxPreservedKey only finding own records), preservedKey is undefined
+  // and the 501-entry pre-publish merge evicts the clicked channel.
+  //
+  // Failing mutations:
+  // (a) Revert to readOutboxPreservedKey (isOwn filter): returns undefined for
+  //     the foreign record → publish with no key → clicked channel evicted.
+  // (b) Drop bootstrap's preservedKey forward (publish(outbox, undefined)):
+  //     same eviction even if key was recovered.
+  test(`${label}: P3 restart — foreign-nonce outbox with preservedKey is recovered on bootstrap; clicked channel survives 501-entry merge`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const { relayClient } = await import("@/shared/api/relayClient");
+
+    const MAX = MAX_ENTRIES;
+    const clickedId = `ch-restart-click-${label}`;
+    const relayUrl = "wss://relay-p3-restart";
+    const pubkey = `pk-p3-restart-${label}`;
+    const encodedRelay = encodeURIComponent(relayUrl);
+
+    // Local: clicked channel (oldest updatedAt=1) + 499 others at updatedAt=100
+    const localChannels = {
+      [clickedId]: { [entryValueField]: true, updatedAt: 1, rev: 1 },
+    };
+    for (let i = 0; i < MAX - 1; i++) {
+      localChannels[`ch-rs-${i}`] = {
+        [entryValueField]: false,
+        updatedAt: 100,
+        rev: 0,
+      };
+    }
+    // Remote: same 499 + one fresh channel → merged = 501
+    const remoteChannels = {};
+    for (let i = 0; i < MAX - 1; i++) {
+      remoteChannels[`ch-rs-${i}`] = {
+        [entryValueField]: false,
+        updatedAt: 100,
+        rev: 0,
+      };
+    }
+    remoteChannels[`ch-rs-new-${label}`] = {
+      [entryValueField]: false,
+      updatedAt: 100,
+      rev: 0,
+    };
+
+    // Seed local store
+    window.localStorage.setItem(
+      storageKey(pubkey, relayUrl),
+      JSON.stringify({ version: 1, channels: localChannels }),
+    );
+
+    // Seed a FOREIGN-NONCE outbox envelope (models the prior window's record after quit).
+    // The nonce "foreign-nonce-xyz" won't match this window's outboxWindowNonce(),
+    // so enumerateOutbox finds it as a non-own record. The envelope carries preservedKey.
+    const foreignKey = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:foreign-nonce-xyz:0000`;
+    const foreignEnvelope = JSON.stringify({
+      store: { version: 1, channels: localChannels },
+      queuedAt: 1000,
+      preservedKey: clickedId,
+    });
+    window.localStorage.setItem(foreignKey, foreignEnvelope);
+
+    const restore = stubRelay(relayClient);
+    const tauri = installEchoTauri(pubkey);
+    const remoteHead = tauri.mintHead(
+      { version: 1, channels: remoteChannels },
+      50,
+      `evt-rs-${label}`,
+    );
+    remoteHead.tags = [["d", dTag]];
+    remoteHead.pubkey = pubkey;
+    remoteHead.kind = 30078;
+
+    const publishCalls = [];
+    let fetchCalls = 0;
+    relayClient.fetchEvents = async () => {
+      fetchCalls++;
+      return fetchCalls === 1 ? [remoteHead] : [];
+    };
+    relayClient.publishEvent = async (evt) => {
+      publishCalls.push(evt);
+    };
+
+    // Use the timer bed so the 2s debounce is captured; fire it to trigger
+    // the bootstrap publish cycle.
+    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+    const origDateNow = Date.now;
+    Date.now = () => 100 * 1_000;
+
+    let hook = null;
+    try {
+      // Mount and drive bootstrap (outbox replay calls publish, schedules debounce)
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+      });
+
+      // Fire the 2s debounce to trigger the publish cycle
+      await fireDelay(2000);
+      // Drain doPublish's internal chain (fetchOwn → publishEvent → confirm)
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      assert.ok(
+        publishCalls.length > 0,
+        "bootstrap must trigger a publish for the resumed outbox",
+      );
+      const plaintext = tauri.capturedPlaintext();
+      assert.ok(plaintext !== null, "encrypt must have been called");
+      const published = JSON.parse(plaintext);
+      assert.ok(
+        clickedId in published.channels,
+        `clicked channel "${clickedId}" must survive 501-entry merge after restart — ` +
+          `readOutboxPreservedKey with isOwn filter returns undefined for foreign record and fails this`,
+      );
+
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreTimers();
+      restore();
+      window.localStorage.clear();
+    }
+  });
 }

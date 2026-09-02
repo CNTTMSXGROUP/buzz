@@ -8,7 +8,7 @@ import test, { mock } from "node:test";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   parseStarPayload,
-  readChannelStarsOutbox,
+  readChannelStarsOutboxWithMeta,
 } from "./channelStarsStorage.ts";
 import { ChannelStarSyncManager } from "./channelStarsSync.ts";
 import {
@@ -95,7 +95,7 @@ test("stars wire: outbox/subsumption callbacks are wired to stars storage (not m
     m.publishStars(store);
     // Outbox must be written synchronously on publish — proves writeChannelStarsOutbox is wired.
     assert.ok(
-      readChannelStarsOutbox("pk-outbox-stars", RELAY) !== null,
+      readChannelStarsOutboxWithMeta("pk-outbox-stars", RELAY) !== null,
       "publishStars must write to the stars outbox (not mutes)",
     );
     // Drive through a full publish cycle: fire debounce, return a subsuming head on
@@ -109,7 +109,10 @@ test("stars wire: outbox/subsumption callbacks are wired to stars storage (not m
     );
     fw._fireTimer(); // fires debounce → doPublish → fetchOwnBlob → publish → confirmRetained
     await new Promise((r) => setTimeout(r, 30));
-    assert.equal(readChannelStarsOutbox("pk-outbox-stars", RELAY), null);
+    assert.equal(
+      readChannelStarsOutboxWithMeta("pk-outbox-stars", RELAY),
+      null,
+    );
     m.destroy();
   } finally {
     tauri.restore();
@@ -230,122 +233,6 @@ test("P3: clicked channel is preserved through pre-publish mergeWithRemote at ca
   }
 });
 
-// Mutation: calling public publish() on reconnect resets pendingPreservedKey,
-// letting a 501-entry pre-publish merge evict the clicked channel (P3 reconnect).
-test("P3 reconnect: retryReconnectStarsPublish preserves clicked channel key across reconnect", async () => {
-  const MAX = 500;
-  const clickedId = "ch-reconnect-star";
-  const clickedEntry = { starred: true, updatedAt: 1, rev: 1 }; // oldest
-  const localChannels = { [clickedId]: clickedEntry };
-  for (let i = 0; i < MAX - 1; i++) {
-    localChannels[`ch-local-${i}`] = { starred: false, updatedAt: 100, rev: 0 };
-  }
-  const localStore = { version: 1, channels: localChannels };
-
-  const remoteChannels = {};
-  for (let i = 0; i < MAX - 1; i++) {
-    remoteChannels[`ch-local-${i}`] = {
-      starred: false,
-      updatedAt: 100,
-      rev: 0,
-    };
-  }
-  remoteChannels["ch-remote-rc"] = { starred: false, updatedAt: 100, rev: 0 };
-  const remoteStore = { version: 1, channels: remoteChannels };
-
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
-  const tauri = installEchoTauri("pk-p3-reconnect-stars");
-  const remoteHead = tauri.mintHead(remoteStore, 50, "evt-rc-stars");
-  remoteHead.tags = [["d", "channel-stars"]];
-
-  let fetchCalls = 0;
-  mock.method(relayClient, "fetchEvents", () => {
-    fetchCalls++;
-    if (fetchCalls === 1) return Promise.resolve([remoteHead]);
-    return Promise.resolve([]);
-  });
-  let publishedEvent = null;
-  mock.method(relayClient, "publishEvent", (evt) => {
-    publishedEvent = evt;
-    return Promise.resolve();
-  });
-
-  try {
-    const m = new ChannelStarSyncManager("pk-p3-reconnect-stars", RELAY);
-    m.publishStars(localStore, clickedId);
-    m.cancelPendingStarPublish();
-    fetchCalls = 0;
-    publishedEvent = null;
-    // Re-publish to set pendingPreservedKey, then retry via reconnect path.
-    m.publishStars(localStore, clickedId);
-    m.retryReconnectStarsPublish();
-    fw._fireTimer();
-    await new Promise((r) => setTimeout(r, 30));
-    assert.ok(publishedEvent !== null, "publish must have fired after retry");
-    const plaintext = tauri.capturedPlaintext();
-    const published = JSON.parse(plaintext);
-    assert.ok(
-      clickedId in published.channels,
-      `clicked channel must survive 501-entry merge after retryReconnectStarsPublish`,
-    );
-    m.destroy();
-  } finally {
-    tauri.restore();
-    restore();
-    mock.reset();
-  }
-});
-
-// Mutation: omitting preservedKey from writeChannelStarsOutbox means it is not
-// persisted in the envelope, so readChannelStarsOutboxPreservedKey returns
-// undefined and bootstrap replay calls publishStars(outbox) without protection
-// — a 501-entry pre-publish merge can evict the clicked channel on remount (P3).
-test("P3 remount: writeChannelStarsOutbox persists preservedKey; readChannelStarsOutboxPreservedKey recovers it", async () => {
-  const {
-    readChannelStarsOutbox,
-    readChannelStarsOutboxPreservedKey,
-    writeChannelStarsOutbox,
-  } = await import("./channelStarsStorage.ts");
-
-  const fw = makeFakeWindow();
-  const restore = installFakeWindow(fw);
-
-  const pubkey = "pk-p3-remount-storage";
-  const relayUrl = "wss://r.remount-storage";
-  const clickedId = "ch-remount-storage";
-  const store = {
-    version: 1,
-    channels: { [clickedId]: { starred: true, updatedAt: 1, rev: 0 } },
-  };
-
-  try {
-    // Write WITH preservedKey — models a click that calls publishStars(store, clickedId).
-    writeChannelStarsOutbox(pubkey, store, relayUrl, clickedId);
-
-    // The merged outbox must be present.
-    assert.ok(
-      readChannelStarsOutbox(pubkey, relayUrl) !== null,
-      "outbox must be written",
-    );
-
-    // The preserved key must round-trip through the storage envelope.
-    const restoredKey = readChannelStarsOutboxPreservedKey(pubkey, relayUrl);
-    assert.equal(
-      restoredKey,
-      clickedId,
-      "preservedKey must be readable back from the written outbox record",
-    );
-
-    // Writing WITHOUT preservedKey (old behaviour / other-window record) returns undefined.
-    writeChannelStarsOutbox(pubkey, store, "wss://r.no-key", undefined);
-    const noKey = readChannelStarsOutboxPreservedKey(pubkey, "wss://r.no-key");
-    assert.equal(
-      noKey,
-      undefined,
-      "absent preservedKey must read back as undefined",
-    );
-  } finally {
-    restore();
-  }
-});
+// P3 reconnect and P3 remount/restart scenarios are in mergeLaneHook.shared.test.mjs,
+// parameterized across both lanes, triggering the actual registered reconnect callback
+// and seeding foreign-nonce outbox envelopes to model quit/restart (Kalvin P3).

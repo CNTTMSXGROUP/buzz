@@ -1,11 +1,11 @@
 import {
   clearOutbox,
   makeStorageKey,
-  readOutbox,
-  readOutboxPreservedKey,
+  readOutboxWithMeta,
   readStore,
   reclaimSubsumedOutbox,
   writeOutbox,
+  type OutboxWithMeta,
 } from "./mergeLaneStorage.shared";
 
 const STORAGE_KEY_PREFIX = "buzz-channel-mutes.v1";
@@ -296,38 +296,31 @@ export function writeChannelMutesOutbox(
 }
 
 /**
- * Merge every window's persisted unpublished edit into one store for resume, or
- * null when none exists. Per-entry `mergeStores` is order-independent, so two
- * windows' concurrent clicks on different channels both survive.
+ * Merge every window's persisted unpublished edit into one store for resume,
+ * together with the most-recent explicit `preservedKey` across all records
+ * (own and foreign), or null when no records exist.
+ *
+ * The preserved key is selected deterministically: the record with the highest
+ * `queuedAt` that carries an explicit `preservedKey`; ties broken by storage
+ * key string (max). This recovers the durable reservation after a quit and
+ * restart, when the prior window's record is now foreign (its session nonce is
+ * gone) but its `preservedKey` is still in localStorage (Kalvin P3).
+ *
+ * Both the fold and the capacity bound apply the selected key so the clicked
+ * channel is never evicted during the read itself.
  */
-export function readChannelMutesOutbox(
+export function readChannelMutesOutboxWithMeta(
   pubkey: string,
   relayUrl: string,
-): ChannelMuteStore | null {
-  return readOutbox(
+): OutboxWithMeta<ChannelMuteStore> | null {
+  return readOutboxWithMeta(
     OUTBOX_KEY_PREFIX,
     pubkey,
     relayUrl,
     parseMutePayload,
     mergeStores,
     DEFAULT_STORE,
-  );
-}
-
-/**
- * Read the `preservedKey` from this window's own outbox record, or `undefined`
- * when none exists. Used on bootstrap to restore the capacity-bounding
- * reservation across remount (Kalvin P3).
- */
-export function readChannelMutesOutboxPreservedKey(
-  pubkey: string,
-  relayUrl: string,
-): string | undefined {
-  return readOutboxPreservedKey(
-    OUTBOX_KEY_PREFIX,
-    pubkey,
-    relayUrl,
-    parseMutePayload,
+    boundMuteStore,
   );
 }
 

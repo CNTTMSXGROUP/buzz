@@ -8,8 +8,7 @@ import {
   isMutesStoreSubsumedBy,
   mergeStores,
   mutedChannelIdsFromStore,
-  readChannelMutesOutbox,
-  readChannelMutesOutboxPreservedKey,
+  readChannelMutesOutboxWithMeta,
   readChannelMutesStore,
   reclaimSubsumedMutesOutbox,
   storageKey,
@@ -115,8 +114,8 @@ export function useChannelMutes(
       // quit/community-switch so a click made <2s before teardown still syncs.
       // Replay runs BEFORE reclamation so a same-second record the head appears
       // to supersede is consumed into pending here and can never be GC'd out.
-      const outbox = readChannelMutesOutbox(pubkey, relayUrl);
-      if (outbox) {
+      const outboxMeta = readChannelMutesOutboxWithMeta(pubkey, relayUrl);
+      if (outboxMeta) {
         // Skip the publish only when the fetched head already subsumes the
         // fold — a lingering never-deleted legacy key or head-subsumed record
         // would otherwise re-drive an identical publish on every boot. A `hold`
@@ -125,17 +124,17 @@ export function useChannelMutes(
         // noise only.
         const subsumed =
           result.action === "apply-remote" &&
-          isMutesStoreSubsumedBy(outbox, result.data.store);
+          isMutesStoreSubsumedBy(outboxMeta.store, result.data.store);
         if (!subsumed) {
-          // Restore the preservedKey written alongside this window's outbox
-          // record so the clicked channel's capacity reservation survives
-          // remount (Kalvin P3). Old records without the field produce
-          // undefined, which publishes without a reservation — same as before.
-          const preservedKey = readChannelMutesOutboxPreservedKey(
-            pubkey,
-            relayUrl,
+          // Forward the preserved key so the clicked channel's capacity
+          // reservation survives remount and restart. The key is selected
+          // from all records (own and foreign) by max queuedAt, so it is
+          // recovered even when the prior window's record is now foreign
+          // after a quit (Kalvin P3).
+          managerRef.current?.publishMutes(
+            outboxMeta.store,
+            outboxMeta.preservedKey,
           );
-          managerRef.current?.publishMutes(outbox, preservedKey);
         }
       } else {
         clearChannelMutesOutbox(pubkey, relayUrl);

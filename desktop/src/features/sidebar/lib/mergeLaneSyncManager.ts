@@ -368,6 +368,7 @@ export class MergeLaneSyncManager<S> {
   private discardPending(gen: number): void {
     if (gen !== this.pendingGeneration) return;
     this.pendingStore = null;
+    this.pendingPreservedKey = undefined;
     this.config.clearOutbox(this.pubkey, this.relayUrl);
   }
 

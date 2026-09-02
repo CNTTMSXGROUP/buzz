@@ -29,9 +29,9 @@ public enum BuzzPushTranscriptError: Error, Equatable {
 /// generated and asserted by the gateway's own encoder. The tests in this
 /// package replay those vectors byte-for-byte.
 ///
-/// The `audience` member binds the transcript to the configured gateway origin
-/// and one fixed protocol route. A transcript for one gateway or route cannot
-/// be replayed against another.
+/// The `audience` member uses the fixed origin and route registered by NIP-PL
+/// v1. A configurable gateway origin changes transport routing, not these
+/// protocol bytes.
 public enum BuzzPushTranscript {
     // MARK: Domains
 
@@ -43,6 +43,9 @@ public enum BuzzPushTranscript {
 
     /// Wire version pinned by NIP-PL. Every transcript carries `"v":1`.
     public static let wireVersion: Int64 = 1
+
+    /// Origin registered by NIP-PL v1 for every App Attest transcript audience.
+    private static let registeredAudienceOrigin = "https://push.buzz.xyz"
 
     // MARK: Transcripts
 
@@ -202,11 +205,8 @@ public enum BuzzPushTranscript {
     }
 
     private static func audience(_ gatewayOrigin: URL, route: String) throws -> String {
-        let canonical = try canonicalGatewayOrigin(gatewayOrigin)
-        guard let value = URL(string: route, relativeTo: canonical.url)?.absoluteURL else {
-            throw BuzzPushTranscriptError.invalidGatewayOrigin
-        }
-        return value.absoluteString
+        _ = try canonicalGatewayOrigin(gatewayOrigin)
+        return "\(registeredAudienceOrigin)/\(route)"
     }
 
     /// Ordered compact JSON object writer. Emission order == call order;

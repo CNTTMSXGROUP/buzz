@@ -138,7 +138,7 @@ final class BuzzPushTranscriptTests: XCTestCase {
         )
     }
 
-    func testConfiguredOriginBindsTranscriptAudience() throws {
+    func testConfiguredTransportOriginKeepsRegisteredTranscriptAudience() throws {
         let bytes = try BuzzPushTranscript.delegate(
             gatewayOrigin: URL(string: "https://push.example")!,
             challengeId: Self.challengeId,
@@ -153,7 +153,7 @@ final class BuzzPushTranscriptTests: XCTestCase {
 
         XCTAssertTrue(
             String(decoding: bytes, as: UTF8.self)
-                .contains("\"audience\":\"https://push.example/v1/delegations\"")
+                .contains("\"audience\":\"https://push.buzz.xyz/v1/delegations\"")
         )
     }
 

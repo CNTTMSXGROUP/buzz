@@ -26,7 +26,7 @@ pub struct KeyConfig {
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub health_addr: SocketAddr,
-    /// External gateway origin and every security-sensitive URL derived from it.
+    /// External gateway origin, delivery URL, and registered transcript audiences.
     pub gateway_urls: GatewayUrls,
     pub max_grant_lifetime_seconds: i64,
     pub max_installation_lifetime_seconds: i64,
@@ -43,7 +43,7 @@ pub struct Config {
     pub token_keys: Vec<KeyConfig>,
 }
 
-/// Canonical gateway URLs derived from one explicitly configured origin.
+/// Gateway transport URLs and registered NIP-PL v1 transcript audiences.
 #[derive(Debug, Clone)]
 pub struct GatewayUrls {
     /// External HTTPS origin serving the gateway.
@@ -70,11 +70,15 @@ impl GatewayUrls {
                 .map_err(|_| ConfigError::Invalid("BUZZ_PUSH_GATEWAY_ORIGIN"))
         };
         let delivery = derive("v1/deliveries/apns")?;
-        let enroll_audience = derive("v1/installations")?.to_string();
-        let delegate_audience = derive("v1/delegations")?.to_string();
-        let rotate_endpoint_audience = derive("v1/installations/endpoint")?.to_string();
-        let revoke_delegation_audience = derive("v1/delegations/revoke")?.to_string();
-        let revoke_installation_audience = derive("v1/installations/revoke")?.to_string();
+        // NIP-PL v1 registers these exact audience strings. The configurable
+        // origin controls transport only; changing transcript bytes requires
+        // a separately versioned protocol profile.
+        let enroll_audience = "https://push.buzz.xyz/v1/installations".to_owned();
+        let delegate_audience = "https://push.buzz.xyz/v1/delegations".to_owned();
+        let rotate_endpoint_audience = "https://push.buzz.xyz/v1/installations/endpoint".to_owned();
+        let revoke_delegation_audience = "https://push.buzz.xyz/v1/delegations/revoke".to_owned();
+        let revoke_installation_audience =
+            "https://push.buzz.xyz/v1/installations/revoke".to_owned();
         Ok(Self {
             origin,
             delivery,
@@ -332,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_urls_are_derived_from_the_configured_origin() {
+    fn gateway_transport_uses_configured_origin_and_transcript_audiences_stay_registered() {
         let config = Config::from_map(&base()).unwrap();
         assert_eq!(config.gateway_urls.origin.as_str(), "https://push.example/");
         assert_eq!(
@@ -341,23 +345,23 @@ mod tests {
         );
         assert_eq!(
             config.gateway_urls.enroll_audience,
-            "https://push.example/v1/installations"
+            "https://push.buzz.xyz/v1/installations"
         );
         assert_eq!(
             config.gateway_urls.delegate_audience,
-            "https://push.example/v1/delegations"
+            "https://push.buzz.xyz/v1/delegations"
         );
         assert_eq!(
             config.gateway_urls.rotate_endpoint_audience,
-            "https://push.example/v1/installations/endpoint"
+            "https://push.buzz.xyz/v1/installations/endpoint"
         );
         assert_eq!(
             config.gateway_urls.revoke_delegation_audience,
-            "https://push.example/v1/delegations/revoke"
+            "https://push.buzz.xyz/v1/delegations/revoke"
         );
         assert_eq!(
             config.gateway_urls.revoke_installation_audience,
-            "https://push.example/v1/installations/revoke"
+            "https://push.buzz.xyz/v1/installations/revoke"
         );
     }
 

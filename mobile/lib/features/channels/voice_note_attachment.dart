@@ -114,6 +114,20 @@ class VoiceNoteAttachment extends HookConsumerWidget {
         ? Radii.dialog + Grid.quarter - Grid.twelve
         : Radii.md;
 
+    final onPlaybackPressed = state.hasError && !isRemote
+        ? null
+        : () {
+            unawaited(HapticFeedback.selectionClick());
+            unawaited(player.toggle());
+          };
+    final playbackControlLabel = state.isLoading
+        ? 'Cancel voice note loading'
+        : state.hasError && isRemote
+        ? 'Retry voice note'
+        : state.isPlaying
+        ? 'Pause voice note'
+        : 'Play voice note';
+
     return Container(
       key: ValueKey('voice-note-attachment:$source'),
       constraints: BoxConstraints(
@@ -132,44 +146,41 @@ class VoiceNoteAttachment extends HookConsumerWidget {
           SizedBox.square(
             dimension: 40,
             child: Semantics(
+              container: true,
               button: true,
-              label: state.hasError && isRemote ? 'Retry voice note' : null,
-              child: IconButton.filledTonal(
-                key: const ValueKey('voice-note-play-pause'),
-                tooltip: state.hasError && isRemote
-                    ? 'Retry voice note'
-                    : state.isPlaying
-                    ? 'Pause voice note'
-                    : 'Play voice note',
-                onPressed: state.hasError && !isRemote
-                    ? null
-                    : () {
-                        unawaited(HapticFeedback.selectionClick());
-                        unawaited(player.toggle());
-                      },
-                style: IconButton.styleFrom(
-                  minimumSize: const Size.square(40),
-                  maximumSize: const Size.square(40),
-                  padding: EdgeInsets.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              label: playbackControlLabel,
+              onTap: onPlaybackPressed,
+              excludeSemantics: true,
+              child: ExcludeSemantics(
+                child: IconButton.filledTonal(
+                  key: const ValueKey('voice-note-play-pause'),
+                  tooltip: playbackControlLabel,
+                  onPressed: onPlaybackPressed,
+                  style: IconButton.styleFrom(
+                    minimumSize: const Size.square(40),
+                    maximumSize: const Size.square(40),
+                    padding: EdgeInsets.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  icon: state.isLoading
+                      ? ExcludeSemantics(
+                          child: BuzzLoadingIndicator(
+                            size: 18,
+                            color: context.colors.onSecondaryContainer,
+                          ),
+                        )
+                      : state.hasError && isRemote
+                      ? Icon(
+                          LucideIcons.refreshCcw,
+                          key: const ValueKey('voice-note-retry-icon'),
+                          size: 18,
+                          color: context.colors.onSecondaryContainer,
+                        )
+                      : VoiceNotePlayPauseIcon(
+                          isPlaying: state.isPlaying,
+                          color: context.colors.onSecondaryContainer,
+                        ),
                 ),
-                icon: state.isLoading
-                    ? BuzzLoadingIndicator(
-                        size: 18,
-                        color: context.colors.onSecondaryContainer,
-                        semanticLabel: 'Loading voice note',
-                      )
-                    : state.hasError && isRemote
-                    ? Icon(
-                        LucideIcons.refreshCcw,
-                        key: const ValueKey('voice-note-retry-icon'),
-                        size: 18,
-                        color: context.colors.onSecondaryContainer,
-                      )
-                    : VoiceNotePlayPauseIcon(
-                        isPlaying: state.isPlaying,
-                        color: context.colors.onSecondaryContainer,
-                      ),
               ),
             ),
           ),

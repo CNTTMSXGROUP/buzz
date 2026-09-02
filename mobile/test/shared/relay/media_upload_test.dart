@@ -1223,6 +1223,68 @@ void main() {
   });
 
   group('uploadVoiceNote', () {
+    test(
+      'removes generated Android package when fast-start rewrite fails',
+      () async {
+        final previousPlatform = debugDefaultTargetPlatformOverride;
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        final sourceDirectory = await Directory.systemTemp.createTemp(
+          'voice_note_rewrite_source_',
+        );
+        final generatedDirectory = await Directory.systemTemp.createTemp(
+          'voice_note_rewrite_generated_',
+        );
+        final source = File('${sourceDirectory.path}/recording.m4a');
+        final generated = File('${generatedDirectory.path}/packaged.mp4');
+        await source.writeAsBytes(const [1, 2, 3]);
+        await generated.writeAsBytes(const [4, 5, 6]);
+        _setMockMediaUploadPlatformHandler((call) async {
+          if (call.method == 'packageVoiceNoteForUpload') {
+            return generated.path;
+          }
+          return null;
+        });
+        addTearDown(() async {
+          debugDefaultTargetPlatformOverride = previousPlatform;
+          _setMockMediaUploadPlatformHandler((call) async {
+            switch (call.method) {
+              case 'sanitizeImageForUpload':
+                final arguments = call.arguments as Map<Object?, Object?>;
+                return arguments['bytes'] as Uint8List;
+              case 'transcodeImageToJpeg':
+                return _jpegBytes;
+              default:
+                return null;
+            }
+          });
+          if (await sourceDirectory.exists()) {
+            await sourceDirectory.delete(recursive: true);
+          }
+          if (await generatedDirectory.exists()) {
+            await generatedDirectory.delete(recursive: true);
+          }
+        });
+        final service = MediaUploadService(
+          baseUrl: 'https://relay.example',
+          nsec: nostr.Keys.generate().nsec,
+          pickGalleryVideo: () async => null,
+          pickGalleryImage: () async => null,
+        );
+
+        await expectLater(
+          service.uploadVoiceNote(
+            XFile(source.path, mimeType: 'audio/mp4'),
+            duration: const Duration(seconds: 3),
+          ),
+          throwsFormatException,
+        );
+
+        expect(await source.exists(), isTrue);
+        expect(await generated.exists(), isFalse);
+        expect(generatedDirectory.listSync().whereType<File>(), isEmpty);
+      },
+    );
+
     test('uploads the packaged voice note as a video MP4 audio card', () async {
       final sourceDirectory = await Directory.systemTemp.createTemp(
         'voice_note_source_',

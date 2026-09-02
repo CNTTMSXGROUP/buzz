@@ -8,8 +8,9 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
-  func testVoiceNoteEnvelopeGenerationHasBoundedDeadline() {
+  func testVoiceNotePackagingStagesHaveBoundedDeadlines() {
     XCTAssertEqual(VoiceNotePackager.videoEnvelopeTimeout, 30)
+    XCTAssertEqual(VoiceNotePackager.exportTimeout, 30)
   }
 
   func testPushAuthorizationStatusNamesCoverDisplayPermissionStates() {

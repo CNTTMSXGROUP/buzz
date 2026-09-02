@@ -3,6 +3,7 @@ import Flutter
 
 enum VoiceNotePackager {
     static let videoEnvelopeTimeout: TimeInterval = 30
+    static let exportTimeout: TimeInterval = 30
 
     static func package(
         sourcePath: String,
@@ -262,32 +263,58 @@ enum VoiceNotePackager {
         exportSession.shouldOptimizeForNetworkUse = true
         exportSession.metadata = []
         exportSession.metadataItemFilter = nil
-        exportSession.exportAsynchronously {
+        let completionQueue = DispatchQueue(label: "xyz.block.buzz.voice-note-export")
+        var completed = false
+        func complete(_ block: () -> Void) {
+            dispatchPrecondition(condition: .onQueue(completionQueue))
+            guard !completed else { return }
+            completed = true
             try? FileManager.default.removeItem(at: videoURL)
-            switch exportSession.status {
-            case .completed:
-                do {
-                    try MP4Canonicalizer.neutralizeSampleDependencyBoxes(at: outputURL)
-                    result(outputURL.path)
-                } catch {
-                    try? FileManager.default.removeItem(at: outputURL)
-                    result(
-                        FlutterError(
-                            code: "transcode_failed",
-                            message: "Unable to canonicalize voice note.",
-                            details: error.localizedDescription
-                        )
-                    )
-                }
-            default:
+            block()
+        }
+        completionQueue.asyncAfter(deadline: .now() + exportTimeout) {
+            guard !completed else { return }
+            exportSession.cancelExport()
+            complete {
                 try? FileManager.default.removeItem(at: outputURL)
                 result(
                     FlutterError(
                         code: "transcode_failed",
-                        message: "Voice note packaging failed.",
-                        details: exportSession.error?.localizedDescription
+                        message: "Voice note packaging timed out.",
+                        details: nil
                     )
                 )
+            }
+        }
+        exportSession.exportAsynchronously {
+            completionQueue.async {
+                complete {
+                    switch exportSession.status {
+                    case .completed:
+                        do {
+                            try MP4Canonicalizer.neutralizeSampleDependencyBoxes(at: outputURL)
+                            result(outputURL.path)
+                        } catch {
+                            try? FileManager.default.removeItem(at: outputURL)
+                            result(
+                                FlutterError(
+                                    code: "transcode_failed",
+                                    message: "Unable to canonicalize voice note.",
+                                    details: error.localizedDescription
+                                )
+                            )
+                        }
+                    default:
+                        try? FileManager.default.removeItem(at: outputURL)
+                        result(
+                            FlutterError(
+                                code: "transcode_failed",
+                                message: "Voice note packaging failed.",
+                                details: exportSession.error?.localizedDescription
+                            )
+                        )
+                    }
+                }
             }
         }
     }

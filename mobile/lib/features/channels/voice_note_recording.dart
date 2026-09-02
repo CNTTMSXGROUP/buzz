@@ -494,6 +494,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
   Completer<void>? _downloadAbort;
   Future<void>? _toggleOperation;
   bool _toggleCancellationRequested = false;
+  int _playbackOperationGeneration = 0;
   File? _downloadingRemoteFile;
   File? _remoteFile;
   int _sourceGeneration = 0;
@@ -537,6 +538,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
 
   void _replaceSource() {
     _sourceGeneration += 1;
+    _playbackOperationGeneration += 1;
     _pendingRemote = null;
     _hasPlayableSource = false;
     final remoteFile = _remoteFile;
@@ -548,15 +550,22 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     }
   }
 
-  Future<Duration?> _loadPendingRemote() async {
+  Future<Duration?> _loadPendingRemote(int playbackOperationGeneration) async {
     final remote = _pendingRemote;
-    if (remote == null) return null;
+    if (remote == null ||
+        playbackOperationGeneration != _playbackOperationGeneration) {
+      return null;
+    }
     final sourceGeneration = _sourceGeneration;
     final uri = Uri.parse(remote.url);
     final requestAbort = Completer<void>();
     _downloadAbort = requestAbort;
     File? file;
     try {
+      if (playbackOperationGeneration != _playbackOperationGeneration) {
+        if (!requestAbort.isCompleted) requestAbort.complete();
+        return null;
+      }
       final request = http.AbortableStreamedRequest(
         'GET',
         uri,
@@ -584,6 +593,10 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         throw HttpException('Voice note download is too large', uri: uri);
       }
       final directory = await _temporaryDirectory();
+      if (playbackOperationGeneration != _playbackOperationGeneration) {
+        if (!requestAbort.isCompleted) requestAbort.complete();
+        return null;
+      }
       file = File(
         '${directory.path}${Platform.pathSeparator}'
         'buzz-voice-note-${DateTime.now().microsecondsSinceEpoch}.mp4',
@@ -608,15 +621,30 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
             },
           );
       if (_disposed ||
+          playbackOperationGeneration != _playbackOperationGeneration ||
+          sourceGeneration != _sourceGeneration ||
+          !_coordinator.ownsPlayback(this)) {
+        if (!requestAbort.isCompleted) requestAbort.complete();
+        return null;
+      }
+      final duration = await _player.setFilePath(file.path);
+      if (_disposed ||
+          playbackOperationGeneration != _playbackOperationGeneration ||
           sourceGeneration != _sourceGeneration ||
           !_coordinator.ownsPlayback(this)) {
         return null;
       }
       await _deleteRemoteFile(_remoteFile);
+      if (_disposed ||
+          playbackOperationGeneration != _playbackOperationGeneration ||
+          sourceGeneration != _sourceGeneration ||
+          !_coordinator.ownsPlayback(this)) {
+        return null;
+      }
       _remoteFile = file;
       _downloadingRemoteFile = null;
-      _pendingRemote = null;
-      return _player.setFilePath(file.path);
+      if (identical(_pendingRemote, remote)) _pendingRemote = null;
+      return duration;
     } on http.RequestAbortedException {
       return null;
     } finally {
@@ -643,13 +671,22 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     Future<Duration?> Function() load, {
     required Duration fallbackDuration,
     required int sourceGeneration,
+    int? playbackOperationGeneration,
   }) async {
     _update(
       VoiceNotePlaybackState(duration: fallbackDuration, isLoading: true),
     );
     try {
       final duration = await load();
-      if (_disposed || sourceGeneration != _sourceGeneration) return;
+      if (_disposed ||
+          sourceGeneration != _sourceGeneration ||
+          (playbackOperationGeneration != null &&
+              playbackOperationGeneration != _playbackOperationGeneration)) {
+        if (sourceGeneration == _sourceGeneration) {
+          _update(_state.copyWith(isLoading: false));
+        }
+        return;
+      }
       _hasPlayableSource = true;
       _update(
         _state.copyWith(
@@ -659,7 +696,15 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         ),
       );
     } catch (_) {
-      if (_disposed || sourceGeneration != _sourceGeneration) return;
+      if (_disposed ||
+          sourceGeneration != _sourceGeneration ||
+          (playbackOperationGeneration != null &&
+              playbackOperationGeneration != _playbackOperationGeneration)) {
+        if (sourceGeneration == _sourceGeneration) {
+          _update(_state.copyWith(isLoading: false));
+        }
+        return;
+      }
       _coordinator.release(this);
       _update(_state.copyWith(isLoading: false, hasError: true));
     }
@@ -676,7 +721,8 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
       return activeToggle;
     }
     _toggleCancellationRequested = false;
-    final operation = _toggle();
+    final playbackOperationGeneration = ++_playbackOperationGeneration;
+    final operation = _toggle(playbackOperationGeneration);
     _toggleOperation = operation;
     return operation.whenComplete(() {
       if (identical(_toggleOperation, operation)) {
@@ -696,7 +742,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
     }
   }
 
-  Future<void> _toggle() async {
+  Future<void> _toggle(int playbackOperationGeneration) async {
     if (_state.isLoading) return;
     if (_player.playing) {
       await pause();
@@ -707,16 +753,23 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
         _update(_state.copyWith(hasError: false));
       }
       final ownsPlayback = await _coordinator.activate(this);
-      if (!ownsPlayback || _disposed) return;
+      if (!ownsPlayback ||
+          _disposed ||
+          playbackOperationGeneration != _playbackOperationGeneration) {
+        return;
+      }
       if (remote != null) {
         final sourceGeneration = _sourceGeneration;
         if (_requiresAuthenticatedLocalFile) {
           await _load(
-            _loadPendingRemote,
+            () => _loadPendingRemote(playbackOperationGeneration),
             fallbackDuration: remote.fallbackDuration,
             sourceGeneration: sourceGeneration,
+            playbackOperationGeneration: playbackOperationGeneration,
           );
-          if (sourceGeneration != _sourceGeneration || _pendingRemote != null) {
+          if (playbackOperationGeneration != _playbackOperationGeneration ||
+              sourceGeneration != _sourceGeneration ||
+              _pendingRemote != null) {
             return;
           }
         } else {
@@ -724,12 +777,20 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
             () => _player.setUrl(remote.url, headers: remote.headers()),
             fallbackDuration: remote.fallbackDuration,
             sourceGeneration: sourceGeneration,
+            playbackOperationGeneration: playbackOperationGeneration,
           );
-          if (sourceGeneration != _sourceGeneration || _state.hasError) return;
+          if (playbackOperationGeneration != _playbackOperationGeneration ||
+              sourceGeneration != _sourceGeneration ||
+              _state.hasError) {
+            return;
+          }
           if (identical(_pendingRemote, remote)) _pendingRemote = null;
         }
       }
-      if (_coordinator.ownsPlayback(this) && !_disposed && !_state.hasError) {
+      if (playbackOperationGeneration == _playbackOperationGeneration &&
+          _coordinator.ownsPlayback(this) &&
+          !_disposed &&
+          !_state.hasError) {
         unawaited(_play(_sourceGeneration));
       }
     }
@@ -737,6 +798,8 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
 
   @override
   Future<void> pause() async {
+    _playbackOperationGeneration += 1;
+    _coordinator.release(this);
     final activeDownloadAbort = _downloadAbort;
     if (activeDownloadAbort != null && !activeDownloadAbort.isCompleted) {
       activeDownloadAbort.complete();

@@ -1012,7 +1012,11 @@ void main() {
 
         expect(find.byType(BuzzLoadingIndicator), findsOneWidget);
         expect(find.byType(CircularProgressIndicator), findsNothing);
-        expect(find.bySemanticsLabel('Loading voice note'), findsOneWidget);
+        expect(
+          find.bySemanticsLabel('Cancel voice note loading'),
+          findsOneWidget,
+        );
+        expect(find.bySemanticsLabel('Loading voice note'), findsNothing);
       });
 
       testWidgets('routes repeated loading-control taps through toggle', (
@@ -1042,12 +1046,22 @@ void main() {
         );
         await tester.pump();
 
-        final control = find.byKey(const ValueKey('voice-note-play-pause'));
-        await tester.tap(control);
-        await tester.tap(control);
+        final control = find.bySemanticsLabel('Cancel voice note loading');
+        final controlSemantics = tester.getSemantics(control);
+        expect(
+          controlSemantics.getSemanticsData().hasAction(SemanticsAction.tap),
+          isTrue,
+        );
+        tester.binding.performSemanticsAction(
+          SemanticsActionEvent(
+            type: SemanticsAction.tap,
+            viewId: tester.view.viewId,
+            nodeId: controlSemantics.id,
+          ),
+        );
         await tester.pump();
 
-        expect(player.toggleCount, 2);
+        expect(player.toggleCount, 1);
       });
 
       testWidgets('offers an accessible retry after a voice note fails', (

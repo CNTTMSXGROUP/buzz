@@ -171,6 +171,7 @@ class _CoordinatedPlayer extends VoiceNotePlayerController {
   final bool isRemote;
   VoiceNotePlaybackState _state = const VoiceNotePlaybackState();
   int pauseCount = 0;
+  Completer<void>? pauseBarrier;
 
   @override
   VoiceNotePlaybackState get state => _state;
@@ -191,6 +192,7 @@ class _CoordinatedPlayer extends VoiceNotePlayerController {
   @override
   Future<void> pause() async {
     pauseCount += 1;
+    await pauseBarrier?.future;
     _state = _state.copyWith(isPlaying: false);
   }
 
@@ -434,6 +436,206 @@ void main() {
   );
 
   test(
+    'second toggle during coordinator activation cancels before GET and retries',
+    () async {
+      final coordinator = VoiceNotePlaybackCoordinator();
+      final pauseBarrier = Completer<void>();
+      final previous = _CoordinatedPlayer(
+        coordinator,
+        source: '/tmp/previous.m4a',
+        isRemote: false,
+      )..pauseBarrier = pauseBarrier;
+      await previous.toggle();
+
+      final client = _SequencedHttpClient();
+      final audioPlayer = _FakeAudioPlayerBackend();
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-activation-cancel-test',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: coordinator,
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+        player: audioPlayer,
+      );
+      addTearDown(player.dispose);
+      addTearDown(previous.dispose);
+      var authGeneration = 0;
+      await player.loadRemote(
+        'https://example.com/voice-note.mp4',
+        headers: () => {
+          'Authorization': 'Nostr signed-event-${authGeneration++}',
+        },
+        fallbackDuration: const Duration(seconds: 7),
+      );
+
+      final firstToggle = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      expect(previous.pauseCount, 1);
+      final secondToggle = player.toggle();
+      pauseBarrier.complete();
+      await Future.wait([firstToggle, secondToggle]);
+
+      expect(client.requests, isEmpty);
+      expect(authGeneration, 0);
+      expect(audioPlayer.loadedPaths, isEmpty);
+      expect(audioPlayer.playCount, 0);
+
+      final retry = player.toggle();
+      while (client.requests.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(client.requests, hasLength(1));
+      expect(
+        client.requests.single.headers['Authorization'],
+        'Nostr signed-event-0',
+      );
+      client.responses.single.complete(
+        http.StreamedResponse(Stream.value(<int>[1, 2, 3]), 200),
+      );
+      await retry;
+
+      expect(authGeneration, 1);
+      expect(audioPlayer.loadedPaths, hasLength(1));
+      expect(audioPlayer.playCount, 1);
+    },
+  );
+
+  test(
+    'second toggle during local source load suppresses play and retries',
+    () async {
+      final client = _SequencedHttpClient();
+      final audioPlayer = _FakeAudioPlayerBackend()..delayPathLoads = true;
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-source-load-cancel-test',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: VoiceNotePlaybackCoordinator(),
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+        player: audioPlayer,
+      );
+      addTearDown(player.dispose);
+      var authGeneration = 0;
+      await player.loadRemote(
+        'https://example.com/voice-note.mp4',
+        headers: () => {
+          'Authorization': 'Nostr signed-event-${authGeneration++}',
+        },
+        fallbackDuration: const Duration(seconds: 7),
+      );
+
+      final firstToggle = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      client.responses.single.complete(
+        http.StreamedResponse(Stream.value(<int>[1, 2, 3]), 200),
+      );
+      while (audioPlayer.pathLoads.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      final cancelledFile = File(audioPlayer.loadedPaths.single);
+      final secondToggle = player.toggle();
+      audioPlayer.pathLoads.single.complete(const Duration(seconds: 7));
+      await Future.wait([firstToggle, secondToggle]);
+
+      expect(audioPlayer.playCount, 0);
+      expect(player.state.isLoading, isFalse);
+      expect(await cancelledFile.exists(), isFalse);
+
+      final retry = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      expect(client.requests, hasLength(2));
+      expect(
+        client.requests.last.headers['Authorization'],
+        'Nostr signed-event-1',
+      );
+      client.responses.last.complete(
+        http.StreamedResponse(Stream.value(<int>[4, 5, 6]), 200),
+      );
+      while (audioPlayer.pathLoads.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      audioPlayer.pathLoads.single.complete(const Duration(seconds: 7));
+      await retry;
+
+      expect(authGeneration, 2);
+      expect(audioPlayer.playCount, 1);
+    },
+  );
+
+  test(
+    'failed local source load retains remote source for authenticated retry',
+    () async {
+      final client = _SequencedHttpClient();
+      final audioPlayer = _FakeAudioPlayerBackend()..delayPathLoads = true;
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-source-load-retry-test',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final player = DeviceVoiceNotePlayerController(
+        coordinator: VoiceNotePlaybackCoordinator(),
+        client: client,
+        temporaryDirectory: () async => directory,
+        requiresAuthenticatedLocalFile: true,
+        player: audioPlayer,
+      );
+      addTearDown(player.dispose);
+      var authGeneration = 0;
+      await player.loadRemote(
+        'https://example.com/voice-note.mp4',
+        headers: () => {
+          'Authorization': 'Nostr signed-event-${authGeneration++}',
+        },
+        fallbackDuration: const Duration(seconds: 7),
+      );
+
+      final firstToggle = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      client.responses.single.complete(
+        http.StreamedResponse(Stream.value(<int>[1, 2, 3]), 200),
+      );
+      while (audioPlayer.pathLoads.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      audioPlayer.pathLoads.single.completeError(StateError('load failed'));
+      await firstToggle;
+
+      expect(player.state.hasError, isTrue);
+      expect(audioPlayer.playCount, 0);
+
+      final retry = player.toggle();
+      await Future<void>.delayed(Duration.zero);
+      expect(client.requests, hasLength(2));
+      expect(
+        client.requests.last.headers['Authorization'],
+        'Nostr signed-event-1',
+      );
+      client.responses.last.complete(
+        http.StreamedResponse(Stream.value(<int>[4, 5, 6]), 200),
+      );
+      while (audioPlayer.pathLoads.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      audioPlayer.pathLoads.single.complete(const Duration(seconds: 7));
+      await retry;
+
+      expect(authGeneration, 2);
+      expect(player.state.hasError, isFalse);
+      expect(audioPlayer.playCount, 1);
+    },
+  );
+
+  test(
     'oversized remote download aborts and leaves no temporary file',
     () async {
       final client = _SequencedHttpClient();
@@ -583,10 +785,11 @@ void main() {
       );
 
       final firstToggle = player.toggle();
-      final secondToggle = player.toggle();
-      await Future<void>.delayed(Duration.zero);
+      while (client.requests.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
       final request = client.requests.single as http.AbortableStreamedRequest;
-      await player.pause();
+      final secondToggle = player.toggle();
       await request.abortTrigger;
       client.responses.single.completeError(
         http.RequestAbortedException(request.url),

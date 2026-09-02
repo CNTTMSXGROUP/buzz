@@ -91,10 +91,12 @@ Future<String> _packagePickedVoiceNoteForUpload(String filePath) async {
       await source.delete();
       return destination.path;
     } catch (_) {
-      try {
-        await destination.delete();
-      } on FileSystemException {
-        // Best-effort cleanup; preserve the original platform error.
+      for (final file in [destination, source]) {
+        try {
+          if (await file.exists()) await file.delete();
+        } on FileSystemException {
+          // Best-effort cleanup; preserve the original platform error.
+        }
       }
       rethrow;
     }

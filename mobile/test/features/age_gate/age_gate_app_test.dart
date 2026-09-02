@@ -279,6 +279,42 @@ void main() {
 
     expect(purges, 2);
   });
+
+  testWidgets(
+    'retries a successful purge for interactions donated by stale extensions',
+    (tester) async {
+      var purges = 0;
+      VoidCallback? runMaintenance;
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            ageSignalProvider.overrideWith(() => _BlockingAgeSignalNotifier()),
+            communityListProvider.overrideWith(
+              () => _SuccessfulCleanupCommunityListNotifier(),
+            ),
+            ageRestrictedNotificationPurgerProvider.overrideWithValue(() async {
+              purges += 1;
+            }),
+            ageRestrictedNotificationMaintenanceScheduleProvider
+                .overrideWithValue((callback) {
+                  runMaintenance = callback;
+                  return () {};
+                }),
+          ],
+          child: const AgeSignalPushBootstrap(child: SizedBox()),
+        ),
+      );
+      await tester.pump();
+      expect(purges, 1);
+
+      runMaintenance!();
+      await tester.pump();
+      await tester.pump();
+
+      expect(purges, 2);
+    },
+  );
 }
 
 class _AuthenticatedAuthNotifier extends AuthNotifier {
@@ -336,6 +372,14 @@ class _RetryingCleanupCommunityListNotifier extends CommunityListNotifier {
       throw StateError('injected restricted cleanup failure');
     }
   }
+}
+
+class _SuccessfulCleanupCommunityListNotifier extends CommunityListNotifier {
+  @override
+  Future<List<Community>> build() async => const [];
+
+  @override
+  Future<void> enforceAgeRestrictionOnPush() async {}
 }
 
 class _UnavailableCommunityListNotifier extends CommunityListNotifier {

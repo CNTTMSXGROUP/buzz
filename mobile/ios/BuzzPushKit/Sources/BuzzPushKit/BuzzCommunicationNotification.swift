@@ -100,6 +100,7 @@ public struct BuzzCommunicationNotificationDescriptor: Equatable, Sendable {
       ordinaryContent: UNMutableNotificationContent,
       resolution: BuzzPushResolution,
       isStillAllowed: @escaping () -> Bool = { true },
+      onDeletionFailure: @escaping (Error) -> Void = { _ in },
       completion: @escaping (UNNotificationContent) -> Void
     ) {
       guard isStillAllowed(),
@@ -117,7 +118,10 @@ public struct BuzzCommunicationNotificationDescriptor: Equatable, Sendable {
           return
         }
         guard isStillAllowed() else {
-          deleteAllInteractions { _ in
+          deleteAllInteractions { error in
+            if let error {
+              onDeletionFailure(error)
+            }
             completion(ordinaryContent)
           }
           return

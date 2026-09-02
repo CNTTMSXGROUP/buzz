@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -40,6 +41,24 @@ final ageRestrictedNotificationPurgerProvider =
     Provider<Future<void> Function()>(
       (ref) => purgeAgeRestrictedBuzzNotifications,
     );
+
+/// Delay between successful maintenance purges while restriction remains active.
+const ageRestrictedNotificationMaintenanceDelay = Duration(seconds: 30);
+
+/// Schedules a recheck for interactions donated by stale extensions.
+final ageRestrictedNotificationMaintenanceScheduleProvider =
+    Provider<VoidCallback Function(VoidCallback)>((ref) {
+      if (defaultTargetPlatform != TargetPlatform.iOS) {
+        return (_) => () {};
+      }
+      return (callback) {
+        final timer = Timer(
+          ageRestrictedNotificationMaintenanceDelay,
+          callback,
+        );
+        return timer.cancel;
+      };
+    });
 
 /// Starts the push lifecycle only after the launch age check allows access.
 class AgeSignalPushBootstrap extends HookConsumerWidget {
@@ -117,6 +136,9 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
     final purgeNotifications = ref.watch(
       ageRestrictedNotificationPurgerProvider,
     );
+    final scheduleMaintenancePurge = ref.watch(
+      ageRestrictedNotificationMaintenanceScheduleProvider,
+    );
     final resumeGeneration = useState(0);
     final retryGeneration = useState(0);
     final consecutiveFailures = useRef(0);
@@ -138,10 +160,18 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
     useEffect(
       () {
         var cancelled = false;
+        VoidCallback? cancelMaintenancePurge;
         unawaited(() async {
           try {
             await purgeNotifications();
             consecutivePurgeFailures.value = 0;
+            if (!cancelled) {
+              cancelMaintenancePurge = scheduleMaintenancePurge(() {
+                if (!cancelled) {
+                  purgeRetryGeneration.value += 1;
+                }
+              });
+            }
           } catch (error, stackTrace) {
             reportPushLeaseCleanupError(error, stackTrace);
             final delay = ageSignalPushSnapshotRetryDelay(
@@ -154,10 +184,14 @@ class _AgeRestrictedPushCleanup extends HookConsumerWidget {
             }
           }
         }());
-        return () => cancelled = true;
+        return () {
+          cancelled = true;
+          cancelMaintenancePurge?.call();
+        };
       },
       [
         purgeNotifications,
+        scheduleMaintenancePurge,
         waitBeforeRetry,
         resumeGeneration.value,
         purgeRetryGeneration.value,

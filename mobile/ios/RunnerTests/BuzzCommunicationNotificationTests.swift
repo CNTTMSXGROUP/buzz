@@ -208,6 +208,63 @@ final class BuzzCommunicationNotificationTests: XCTestCase {
     XCTAssertFalse(donateCalled)
   }
 
+  func testFailedLateDonationDeletionReactivatesFenceUntilAppRetry() throws {
+    let ordinary = UNMutableNotificationContent()
+    ordinary.title = "Alice"
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fenceStore = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let fenceAtStart = fenceStore.current()
+    var order: [String] = []
+    let deletionFailure = NSError(domain: "test", code: 3)
+    let presenter = BuzzCommunicationNotificationPresenter(
+      donate: { _, completion in
+        order.append("donate")
+        XCTAssertNoThrow(try fenceStore.performFencedCleanup {})
+        completion(nil)
+      },
+      deleteAllInteractions: { completion in
+        order.append("delete")
+        completion(deletionFailure)
+      },
+      updateContent: { content, _ in content }
+    )
+    let completed = expectation(description: "failed deletion fenced")
+
+    presenter.present(
+      ordinaryContent: ordinary,
+      resolution: communicationResolution(),
+      isStillAllowed: {
+        !fenceStore.current().requiresDiscard(since: fenceAtStart)
+      },
+      onDeletionFailure: { error in
+        XCTAssertEqual(error as NSError, deletionFailure)
+        XCTAssertNoThrow(try fenceStore.begin())
+        order.append("fence")
+      }
+    ) { content in
+      order.append("complete")
+      XCTAssertEqual(content.title, "Alice")
+      completed.fulfill()
+    }
+
+    wait(for: [completed], timeout: 1)
+    XCTAssertEqual(order, ["donate", "delete", "fence", "complete"])
+    XCTAssertTrue(fenceStore.current().isFencing)
+
+    var retryError: Error?
+    try fenceStore.performFencedAsyncCleanup(
+      { $0(nil) },
+      completion: { retryError = $0 }
+    )
+    XCTAssertNil(retryError)
+    XCTAssertFalse(fenceStore.current().isFencing)
+  }
+
   private func communicationResolution(
     displayName: String = "Alice",
     groupName: String? = "General",

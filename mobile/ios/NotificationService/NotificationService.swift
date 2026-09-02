@@ -76,6 +76,9 @@ final class NotificationService: UNNotificationServiceExtension {
           resolution: resolution,
           isStillAllowed: { [weak self] in
             self?.restrictionFenceIsUnchanged() ?? false
+          },
+          onDeletionFailure: { [weak self] _ in
+            self?.activateRestrictionFence()
           }
         ) { [weak self] specializedContent in
           self?.finish(specializedContent)
@@ -106,7 +109,10 @@ final class NotificationService: UNNotificationServiceExtension {
       return
     }
 
-    INInteraction.deleteAll { [restrictedFallbackContent] _ in
+    INInteraction.deleteAll { [weak self, restrictedFallbackContent] error in
+      if error != nil {
+        self?.activateRestrictionFence()
+      }
       let center = UNUserNotificationCenter.current()
       center.removeAllDeliveredNotifications()
       center.removeAllPendingNotificationRequests()
@@ -122,6 +128,15 @@ final class NotificationService: UNNotificationServiceExtension {
     !Self.loadRestrictionFence(
       appGroupIdentifier: appGroupIdentifier
     ).requiresDiscard(since: restrictionFenceAtStart)
+  }
+
+  private func activateRestrictionFence() {
+    guard let appGroupIdentifier,
+      let container = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: appGroupIdentifier
+      )
+    else { return }
+    try? BuzzAgeRestrictionFenceStore(containerURL: container).begin()
   }
 
   private static func restrictedFallback(

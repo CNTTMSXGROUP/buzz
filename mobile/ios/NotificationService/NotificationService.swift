@@ -98,14 +98,13 @@ final class NotificationService: UNNotificationServiceExtension {
   private func finish(_ content: UNNotificationContent) {
     guard let contentHandler else { return }
     self.contentHandler = nil
-    let currentFence = Self.loadRestrictionFence(
-      appGroupIdentifier: appGroupIdentifier
-    )
-    let mustDiscardResolvedContent = currentFence.requiresDiscard(
+    let handedOff = Self.handoffIfRestrictionFenceUnchanged(
+      appGroupIdentifier: appGroupIdentifier,
       since: restrictionFenceAtStart
-    )
-    guard mustDiscardResolvedContent else {
+    ) {
       contentHandler(content)
+    }
+    guard !handedOff else {
       return
     }
 
@@ -128,6 +127,24 @@ final class NotificationService: UNNotificationServiceExtension {
     !Self.loadRestrictionFence(
       appGroupIdentifier: appGroupIdentifier
     ).requiresDiscard(since: restrictionFenceAtStart)
+  }
+
+  private static func handoffIfRestrictionFenceUnchanged(
+    appGroupIdentifier: String?,
+    since earlier: BuzzAgeRestrictionFence,
+    handoff: () -> Void
+  ) -> Bool {
+    guard let appGroupIdentifier,
+      let container = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: appGroupIdentifier
+      )
+    else { return false }
+    do {
+      return try BuzzAgeRestrictionFenceStore(containerURL: container)
+        .performIfUnchanged(since: earlier, handoff)
+    } catch {
+      return false
+    }
   }
 
   private func activateRestrictionFence() {

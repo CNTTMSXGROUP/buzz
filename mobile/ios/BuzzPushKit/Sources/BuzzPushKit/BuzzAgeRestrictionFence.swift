@@ -112,6 +112,21 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
     }
   }
 
+  /// Performs a synchronous handoff only when the persisted fence still
+  /// matches [earlier], while keeping cleanup transitions ordered behind it.
+  public func performIfUnchanged(
+    since earlier: BuzzAgeRestrictionFence,
+    _ handoff: () -> Void
+  ) throws -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return try withProcessLock {
+      guard !loadLocked().requiresDiscard(since: earlier) else { return false }
+      handoff()
+      return true
+    }
+  }
+
   /// Completes a cleanup phase with another generation change.
   @discardableResult
   public func settleIfFencing(expectedToken: String? = nil) throws -> BuzzAgeRestrictionFence {

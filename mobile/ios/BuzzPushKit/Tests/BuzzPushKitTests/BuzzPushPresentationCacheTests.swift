@@ -195,6 +195,56 @@ struct BuzzPushPresentationCacheTests {
     #expect(newest.token != active.token)
   }
 
+  @Test("Cross-process lock orders a final handoff before cleanup begins")
+  func crossProcessLockSerializesHandoffAndBegin() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let handoffEntered = DispatchSemaphore(value: 0)
+    let releaseHandoff = DispatchSemaphore(value: 0)
+    let handoffFinished = DispatchSemaphore(value: 0)
+    let beginFinished = DispatchSemaphore(value: 0)
+    let handingOffStore = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let beginningStore = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let settled = try handingOffStore.settleIfFencing()
+
+    DispatchQueue.global().async {
+      _ = try? handingOffStore.performIfUnchanged(since: settled) {
+        handoffEntered.signal()
+        releaseHandoff.wait()
+      }
+      handoffFinished.signal()
+    }
+    #expect(handoffEntered.wait(timeout: .now() + 1) == .success)
+
+    DispatchQueue.global().async {
+      _ = try? beginningStore.begin()
+      beginFinished.signal()
+    }
+    #expect(beginFinished.wait(timeout: .now() + 0.05) == .timedOut)
+
+    releaseHandoff.signal()
+    #expect(handoffFinished.wait(timeout: .now() + 1) == .success)
+    #expect(beginFinished.wait(timeout: .now() + 1) == .success)
+    #expect(beginningStore.current().isFencing)
+  }
+
+  @Test("A changed fence refuses the final handoff")
+  func changedFenceRefusesHandoff() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    let settled = try store.settleIfFencing()
+    _ = try store.begin()
+    var handedOff = false
+
+    let accepted = try store.performIfUnchanged(since: settled) {
+      handedOff = true
+    }
+
+    #expect(!accepted)
+    #expect(!handedOff)
+  }
+
   @Test("Age restriction fence discards active and superseded resolutions")
   func ageRestrictionFenceDiscardPolicy() {
     let initial = BuzzAgeRestrictionFence.initial

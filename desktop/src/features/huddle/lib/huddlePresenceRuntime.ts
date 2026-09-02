@@ -342,6 +342,7 @@ export function startHuddlePresenceRuntime(
         ...requestedSessionGenerations.keys(),
       ]);
       if (disposed) return;
+      if (!hydrated) return;
       if (requestVersion !== livenessRequestVersion) {
         const mergedGenerations = new Map(activeSessionGenerations);
         for (const [

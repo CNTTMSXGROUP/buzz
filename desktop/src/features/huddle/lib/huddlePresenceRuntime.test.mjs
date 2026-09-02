@@ -735,6 +735,89 @@ test("replays an opaque-generation end after matching liveness", async () => {
   dispose();
 });
 
+test("opaque lifecycle overflow fences an older liveness settlement", async () => {
+  const generation1 = "11111111-1111-4111-8111-111111111111";
+  const generation2 = "22222222-2222-4222-8222-222222222222";
+  let liveHandler;
+  let livenessTimer;
+  let resolveRefresh;
+  let retry;
+  let livenessRequests = 0;
+  const snapshots = [];
+  const dispose = startHuddlePresenceRuntime({
+    relaySelfPubkey: RELAY,
+    channelIds: ["general"],
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+    fetchEvents: async (filter) => {
+      if (!filter.kinds?.includes(48104)) {
+        return [
+          event({ id: "start", kind: 48100, createdAt: 1 }),
+          participantEvent({
+            id: "old-join",
+            kind: 48101,
+            admissionId: "old-admission",
+            rosterRevision: 1,
+            generation: generation1,
+            createdAt: 2,
+          }),
+        ];
+      }
+      livenessRequests += 1;
+      if (livenessRequests === 1) {
+        return [livenessEvent("room", generation1)];
+      }
+      return new Promise((resolve) => {
+        resolveRefresh = resolve;
+      });
+    },
+    subscribeToReconnects: () => () => {},
+    onPresence: (participants) => snapshots.push(new Set(participants)),
+    setRetryTimer: (callback) => {
+      retry = callback;
+      return callback;
+    },
+    clearRetryTimer: () => {
+      retry = undefined;
+    },
+    setLivenessTimer: (callback) => {
+      livenessTimer = callback;
+      return callback;
+    },
+    clearLivenessTimer: () => {
+      livenessTimer = undefined;
+    },
+  });
+  await settle();
+  assert.equal(snapshots.at(-1).has(BOB), true);
+
+  livenessTimer();
+  await settle();
+  for (let index = 0; index <= 1_000; index += 1) {
+    liveHandler(
+      participantEvent({
+        id: `opaque-${index}`,
+        kind: 48101,
+        tags: [["p", CAROL]],
+        admissionId: `opaque-admission-${index}`,
+        rosterRevision: index + 1,
+        generation: generation2,
+        createdAt: index + 3,
+      }),
+    );
+  }
+  assert.deepEqual([...snapshots.at(-1)], []);
+  assert.equal(typeof retry, "function");
+
+  resolveRefresh([livenessEvent("room", generation1)]);
+  await settle();
+  assert.deepEqual([...snapshots.at(-1)], []);
+  assert.equal(typeof retry, "function");
+  dispose();
+});
+
 test("stale liveness removes unchanged requested sessions and preserves new ones", async () => {
   let liveHandler;
   let livenessTimer;

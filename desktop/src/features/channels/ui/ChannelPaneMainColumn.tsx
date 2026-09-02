@@ -11,11 +11,16 @@ const IN_FLOW_CHANNEL_CONTENT_STYLE = {
 
 export function ChannelPaneMainColumn({
   children,
+  hideRightHeader = false,
 }: {
   children: React.ReactNode;
+  hideRightHeader?: boolean;
 }) {
   const channelView = useChannelViewOverride();
   const mainColumnHeader = channelView?.mainColumnHeader;
+  const headerOnRight =
+    Boolean(mainColumnHeader) &&
+    channelView?.mainColumnHeaderPlacement === "right";
   const className = cn(
     "relative isolate flex min-h-0 min-w-0 flex-1 flex-col",
     channelView?.mainContent && "hidden",
@@ -32,12 +37,37 @@ export function ChannelPaneMainColumn({
         )}
       >
         <div
-          className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+          className={cn(
+            "relative flex min-h-0 min-w-0 flex-1",
+            headerOnRight
+              ? "flex-row [container-type:inline-size]"
+              : "flex-col",
+          )}
           style={IN_FLOW_CHANNEL_CONTENT_STYLE}
         >
-          {mainColumnHeader}
           <div
-            className={channelView?.hideMainColumnBody ? "hidden" : "contents"}
+            className={cn(
+              headerOnRight
+                ? cn(
+                    "order-last min-h-0 shrink-0 [width:clamp(24rem,38%,28.8rem)]",
+                    hideRightHeader
+                      ? "hidden"
+                      : "hidden [@container(min-width:52rem)]:flex",
+                  )
+                : "contents",
+            )}
+            data-testid="channel-main-column-header"
+          >
+            {mainColumnHeader}
+          </div>
+          <div
+            className={cn(
+              channelView?.hideMainColumnBody
+                ? "hidden"
+                : headerOnRight
+                  ? "relative flex min-h-0 min-w-0 flex-1 flex-col"
+                  : "contents",
+            )}
             data-testid="channel-main-column-body"
           >
             {children}

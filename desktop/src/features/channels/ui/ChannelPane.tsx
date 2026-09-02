@@ -623,7 +623,7 @@ export const ChannelPane = React.memo(function ChannelPane({
               <ThreadRepliesErrorCard onRetry={onRetryHuddleThreadReplies} />
             </div>
           ) : null}
-          <ChannelPaneMainColumn>
+          <ChannelPaneMainColumn hideRightHeader={hasSplitAuxiliaryPane}>
             <MessageTimeline
               ref={messageTimelineRef}
               channelId={activeChannel?.id}

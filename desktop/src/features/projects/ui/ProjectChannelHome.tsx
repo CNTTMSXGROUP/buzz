@@ -700,6 +700,8 @@ export function ProjectChannelHome({
                             snapshots={canvasSnapshots}
                           />
                         ) : null,
+                      mainColumnHeaderPlacement:
+                        activeView === "chat" ? "right" : "top",
                       mainContent,
                       onSelectChannelView: () => selectView("chat"),
                     }}

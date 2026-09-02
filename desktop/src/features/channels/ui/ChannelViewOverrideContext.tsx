@@ -5,6 +5,7 @@ type ChannelViewOverride = {
   hideMainColumnBody?: boolean;
   isChannelViewActive: boolean;
   mainColumnHeader?: React.ReactNode;
+  mainColumnHeaderPlacement?: "top" | "right";
   mainContent: React.ReactNode;
   onSelectChannelView: () => void;
 };

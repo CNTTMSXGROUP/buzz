@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
-import { installMockBridge } from "../helpers/bridge";
+import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 async function openStarterProject(page: Page) {
   const projectRow = page.getByTestId("sidebar-project-buzz");
@@ -10,6 +10,20 @@ async function openStarterProject(page: Page) {
     await page.getByTestId("project-browser-result-buzz").click();
   }
   await projectRow.click();
+}
+
+async function waitForMockLiveSubscription(page: Page, channelName: string) {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (name) =>
+          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+            channelName: name,
+          }) ?? false,
+        channelName,
+      ),
+    )
+    .toBe(true);
 }
 
 async function expectCanvasReady(page: Page) {
@@ -26,7 +40,7 @@ async function expectCanvasReady(page: Page) {
   return { iframe, root };
 }
 
-test("project canvas uses one sandboxed frame across preview and full modes", async ({
+test("project canvas uses one sandboxed frame across right-pane and full modes", async ({
   page,
 }) => {
   await installMockBridge(page);
@@ -40,7 +54,22 @@ test("project canvas uses one sandboxed frame across preview and full modes", as
   const surface = page.getByTestId("project-canvas-surface");
   await expect(surface).toHaveAttribute("data-canvas-mode", "preview");
   await expect(page.getByTestId("project-canvas-show-full")).toBeVisible();
-  await expect(page.getByTestId("channel-composer-overlay")).toBeVisible();
+  const composer = page.getByTestId("channel-composer-overlay");
+  await expect(composer).toBeVisible();
+
+  const bodyBox = await page
+    .getByTestId("channel-main-column-body")
+    .boundingBox();
+  const composerBox = await composer.boundingBox();
+  const surfaceBox = await surface.boundingBox();
+  if (!bodyBox || !composerBox || !surfaceBox) {
+    throw new Error("Project chat and Canvas pane were not visible.");
+  }
+  expect(surfaceBox.height).toBeGreaterThan(surfaceBox.width);
+  expect(bodyBox.x + bodyBox.width).toBeLessThanOrEqual(surfaceBox.x + 1);
+  expect(composerBox.x + composerBox.width).toBeLessThanOrEqual(
+    surfaceBox.x + 1,
+  );
 
   const { iframe, root } = await expectCanvasReady(page);
   const initialSource = await iframe.getAttribute("src");
@@ -87,9 +116,9 @@ test("project canvas uses one sandboxed frame across preview and full modes", as
     "aria-selected",
     "true",
   );
-  await expect(
-    page.getByTestId("project-canvas-preview-boundary"),
-  ).toBeVisible();
+  await expect(page.getByTestId("project-canvas-preview-boundary")).toHaveCount(
+    0,
+  );
   await expect(page.getByTestId("channel-composer-overlay")).toBeHidden();
   await expect(iframe).toHaveAttribute("src", initialSource ?? "");
   await expect(root).toHaveAttribute("data-canvas-mode", "full");
@@ -138,6 +167,47 @@ test("project canvas uses one sandboxed frame across preview and full modes", as
       ),
     )
     .toBe(2);
+});
+
+test("project canvas yields to a right-side panel at a wide viewport", async ({
+  page,
+}) => {
+  await page.setViewportSize({ height: 900, width: 1920 });
+  await installMockBridge(page);
+  await page.goto("/");
+  await openStarterProject(page);
+  await expect(page.getByTestId("project-channel-home")).toBeVisible();
+  await waitForMockLiveSubscription(page, "buzz");
+
+  const surface = page.getByTestId("project-canvas-surface");
+  await expect(surface).toBeVisible();
+  const { iframe } = await expectCanvasReady(page);
+  const initialSource = await iframe.getAttribute("src");
+  const rootId = await page.evaluate((pubkey) => {
+    return (
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "buzz",
+        content: "Project thread that opens beside chat.",
+        pubkey,
+      })?.id ?? null
+    );
+  }, TEST_IDENTITIES.tyler.pubkey);
+  expect(rootId).not.toBeNull();
+
+  await page.getByTestId(`reply-message-${rootId}`).click({ force: true });
+  await expect(page.getByTestId("message-thread-panel")).toBeVisible();
+  await expect(surface).toBeHidden();
+  const bodyBox = await page
+    .getByTestId("channel-main-column-body")
+    .boundingBox();
+  if (!bodyBox) throw new Error("Project chat was not visible beside thread.");
+  expect(bodyBox.width).toBeGreaterThan(832);
+  await expect(iframe).toHaveAttribute("src", initialSource ?? "");
+
+  await page.getByTestId("auxiliary-panel-close").click();
+  await expect(page.getByTestId("message-thread-panel")).toHaveCount(0);
+  await expect(surface).toBeVisible();
+  await expect(iframe).toHaveAttribute("src", initialSource ?? "");
 });
 
 test("Reload activates a new package revision and releases the old handle", async ({
@@ -252,7 +322,7 @@ test("a failed candidate commit restores the active Canvas", async ({
     .toBe(2);
 });
 
-test("project canvas preview and full tab stay contained at a narrow viewport", async ({
+test("project canvas uses the full tab instead of squeezing narrow chat", async ({
   page,
 }) => {
   await page.setViewportSize({ height: 844, width: 390 });
@@ -263,26 +333,26 @@ test("project canvas preview and full tab stay contained at a narrow viewport", 
   await page.keyboard.press("Escape");
 
   const surface = page.getByTestId("project-canvas-surface");
-  const { iframe } = await expectCanvasReady(page);
   await expect(surface).toHaveAttribute("data-canvas-mode", "preview");
-  await expect(page.getByTestId("project-canvas-show-full")).toBeVisible();
+  await expect(surface).toBeHidden();
+  await expect(page.getByTestId("project-canvas-show-full")).toBeHidden();
+  await expect(page.getByTestId("channel-composer-overlay")).toBeVisible();
+
+  await page.getByTestId("project-channel-tab-canvas").click();
+  await expect(surface).toHaveAttribute("data-canvas-mode", "full");
+  await expect(surface).toBeVisible();
+  await expect(page.getByTestId("channel-composer-overlay")).toBeHidden();
+  const { iframe, root } = await expectCanvasReady(page);
+  await expect(root).toHaveAttribute("data-canvas-mode", "full");
   const surfaceBox = await surface.boundingBox();
   const frameBox = await iframe.boundingBox();
-  if (!surfaceBox || !frameBox)
-    throw new Error("Canvas frame was not visible.");
+  if (!surfaceBox || !frameBox) {
+    throw new Error("Full Canvas frame was not visible.");
+  }
   expect(frameBox.x).toBeGreaterThanOrEqual(surfaceBox.x);
   expect(frameBox.x + frameBox.width).toBeLessThanOrEqual(
     surfaceBox.x + surfaceBox.width,
   );
-
-  await page.getByTestId("project-canvas-show-full").click();
-  await expect(surface).toHaveAttribute("data-canvas-mode", "full");
-  await expect(page.getByTestId("channel-composer-overlay")).toBeHidden();
-  await expect(
-    page
-      .frameLocator('[data-testid="project-canvas-frame"]')
-      .locator("#canvas-root"),
-  ).toHaveAttribute("data-canvas-mode", "full");
 });
 
 test("unexpected child navigation tears down the Canvas frame", async ({

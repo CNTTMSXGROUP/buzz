@@ -816,7 +816,6 @@ public final class BuzzDevPushEnrollmentDriver {
     }
     let current = document.push.keys.filter(\.current)
     guard current.count == 1,
-      document.push.gatewayOrigin == gatewayOrigin,
       Self.isLowercaseHexPubkey(current[0].pubkey)
     else {
       throw BuzzDevPushEnrollmentError.invalidRelayDescriptor
@@ -1002,13 +1001,7 @@ private struct RelayInformation: Decodable {
       let pubkey: String
       let current: Bool
     }
-    let gatewayOrigin: String
     let keys: [Key]
-
-    enum CodingKeys: String, CodingKey {
-      case gatewayOrigin = "gateway_origin"
-      case keys
-    }
   }
   let relaySelf: String?
   let push: Push

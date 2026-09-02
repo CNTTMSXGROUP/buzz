@@ -910,30 +910,6 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(URLProtocolStub.requests.count, 1)
   }
 
-  func testRejectsMismatchedGatewayOriginBeforeGatewayEnrollment() async throws {
-    let driver = try makeDriver(store: MemoryGrantStore(), appAttest: RecordingAppAttest())
-    URLProtocolStub.handler = { request in
-      Self.response(
-        request,
-        status: 200,
-        json: [
-          "push": [
-            "gateway_origin": "https://other-push.example",
-            "keys": [["pubkey": Self.relayPubkey, "current": true]],
-          ]
-        ]
-      )
-    }
-
-    do {
-      _ = try await driver.enroll(deviceToken: Data([1]), relayURL: Self.relayURL)
-      XCTFail("Expected an invalid relay descriptor")
-    } catch {
-      XCTAssertEqual(error as? BuzzDevPushEnrollmentError, .invalidRelayDescriptor)
-    }
-    XCTAssertEqual(URLProtocolStub.requests.count, 1)
-  }
-
   func testTracksRelayMetadataAuthoritySeparatelyFromPushDelegationKey() async throws {
     let pushPubkey = String(repeating: "b", count: 64)
     let oldMetadataPubkey = String(repeating: "c", count: 64)
@@ -1193,11 +1169,6 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     status: Int,
     json: [String: Any]
   ) -> (HTTPURLResponse, Data) {
-    var json = json
-    if var push = json["push"] as? [String: Any], push["gateway_origin"] == nil {
-      push["gateway_origin"] = Self.gatewayOrigin
-      json["push"] = push
-    }
     let data = try! JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
     let response = HTTPURLResponse(
       url: request.url!,

@@ -20,7 +20,6 @@ const _installationIdPattern = r'^[0-9a-f]{32}$';
 
 class BuzzPushLeaseDescriptor {
   final String origin;
-  final String gatewayOrigin;
   final String executorKeyId;
   final String executorPubkey;
   final String transport;
@@ -32,7 +31,6 @@ class BuzzPushLeaseDescriptor {
 
   const BuzzPushLeaseDescriptor({
     required this.origin,
-    required this.gatewayOrigin,
     required this.executorKeyId,
     required this.executorPubkey,
     required this.transport,
@@ -86,7 +84,6 @@ class BuzzPushLeaseDescriptor {
       push,
       required: const {
         'origin',
-        'gateway_origin',
         'keys',
         'app_profiles',
         'push_kinds',
@@ -96,7 +93,6 @@ class BuzzPushLeaseDescriptor {
       },
       allowed: const {
         'origin',
-        'gateway_origin',
         'keys',
         'app_profiles',
         'push_kinds',
@@ -108,10 +104,6 @@ class BuzzPushLeaseDescriptor {
     );
 
     final origin = _canonicalOrigin(push['origin']);
-    final gatewayOrigin = _canonicalHttpOrigin(
-      push['gateway_origin'],
-      name: 'gateway_origin',
-    );
     final keys = _mapList(push['keys'], name: 'push.keys');
     final keyIds = <String>{};
     final currentKeys = <Map<String, dynamic>>[];
@@ -235,7 +227,6 @@ class BuzzPushLeaseDescriptor {
     }
     final maxStringLength = limitation['max_string_len'] as int;
     _checkStringLength(origin, maxStringLength, name: 'origin');
-    _checkStringLength(gatewayOrigin, maxStringLength, name: 'gateway_origin');
     _checkStringLength(
       currentKey['id'] as String,
       maxStringLength,
@@ -248,7 +239,6 @@ class BuzzPushLeaseDescriptor {
 
     return BuzzPushLeaseDescriptor(
       origin: origin,
-      gatewayOrigin: gatewayOrigin,
       executorKeyId: currentKey['id'] as String,
       executorPubkey: currentKey['pubkey'] as String,
       transport: transport!,
@@ -257,21 +247,6 @@ class BuzzPushLeaseDescriptor {
       maxPlaintextLength: limitation['max_plaintext_len'] as int,
       maxEndpointLength: limitation['max_endpoint_len'] as int,
       maxStringLength: maxStringLength,
-    );
-  }
-}
-
-void validateBuzzPushGatewayOrigin({
-  required BuzzPushLeaseDescriptor descriptor,
-  required String configuredGatewayUrl,
-}) {
-  final configured = _canonicalHttpOrigin(
-    configuredGatewayUrl,
-    name: 'configured gateway origin',
-  );
-  if (configured != descriptor.gatewayOrigin) {
-    throw StateError(
-      'Configured push gateway does not match the relay NIP-11 descriptor',
     );
   }
 }
@@ -582,22 +557,6 @@ String _canonicalOrigin(Object? value) {
       uri.hasFragment ||
       '${uri.scheme}://${uri.authority}' != origin) {
     throw FormatException('Invalid canonical push origin: $origin');
-  }
-  return origin;
-}
-
-String _canonicalHttpOrigin(Object? value, {required String name}) {
-  final origin = _nonEmptyString(value, name: name);
-  final uri = Uri.tryParse(origin);
-  if (uri == null ||
-      uri.scheme != 'https' ||
-      uri.host.isEmpty ||
-      uri.userInfo.isNotEmpty ||
-      uri.path.isNotEmpty ||
-      uri.hasQuery ||
-      uri.hasFragment ||
-      uri.origin != origin) {
-    throw FormatException('$name must be a canonical HTTPS origin');
   }
   return origin;
 }

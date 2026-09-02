@@ -319,23 +319,6 @@ void main() {
     );
   });
 
-  test('descriptor requires a canonical HTTPS gateway origin', () {
-    final missing = _descriptorJson(relay.public);
-    (missing['push'] as Map<String, dynamic>).remove('gateway_origin');
-    final malformed = _descriptorJson(relay.public);
-    (malformed['push'] as Map<String, dynamic>)['gateway_origin'] =
-        'https://push.example/path';
-
-    expect(
-      () => BuzzPushLeaseDescriptor.fromRelayInformation(missing),
-      throwsA(isA<FormatException>()),
-    );
-    expect(
-      () => BuzzPushLeaseDescriptor.fromRelayInformation(malformed),
-      throwsA(isA<FormatException>()),
-    );
-  });
-
   test('descriptor rejects unknown push fields', () {
     final information = _descriptorJson(relay.public);
     (information['push'] as Map<String, dynamic>)['future'] = true;
@@ -343,25 +326,6 @@ void main() {
     expect(
       () => BuzzPushLeaseDescriptor.fromRelayInformation(information),
       throwsA(isA<FormatException>()),
-    );
-  });
-
-  test('configured gateway must match relay descriptor', () {
-    final descriptor = _descriptor(relay.public);
-
-    expect(
-      () => validateBuzzPushGatewayOrigin(
-        descriptor: descriptor,
-        configuredGatewayUrl: 'https://other-push.example',
-      ),
-      throwsStateError,
-    );
-    expect(
-      () => validateBuzzPushGatewayOrigin(
-        descriptor: descriptor,
-        configuredGatewayUrl: 'https://push.example',
-      ),
-      returnsNormally,
     );
   });
 }
@@ -431,7 +395,6 @@ Map<String, dynamic> _descriptorJson(String relayPubkey) => {
   'supported_extensions': ['nip-er', 'nip-pl'],
   'push': {
     'origin': 'wss://tenant.example:8443',
-    'gateway_origin': 'https://push.example',
     'keys': [
       {'id': 'relay-v1', 'pubkey': relayPubkey, 'current': true},
     ],

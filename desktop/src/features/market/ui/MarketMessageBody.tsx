@@ -3,16 +3,20 @@ import { presentMarketEvent } from "@/features/market/lib/marketEventPresentatio
 import { parseMarketEnvelope } from "@/features/market/lib/marketProtocol";
 import { MarketEventCard } from "@/features/market/ui/MarketEventCard";
 
-export function MarketMessageBody(
-  content: string,
-  authorPubkey?: string,
-  eventId?: string,
-) {
+import type { TimelineMessage } from "@/features/messages/types";
+
+export function MarketMessageBody({
+  body: content,
+  pubkey: authorPubkey,
+  id: eventId,
+  parentId,
+}: Pick<TimelineMessage, "body" | "pubkey" | "id" | "parentId">) {
   return parseMarketEnvelope(content) ? (
     <MarketEventMessage
       authorPubkey={authorPubkey ?? ""}
       content={content}
       eventId={eventId}
+      isThreadReply={parentId != null}
     />
   ) : null;
 }
@@ -22,10 +26,12 @@ function MarketEventMessage({
   authorPubkey,
   content,
   eventId,
+  isThreadReply,
 }: {
   authorPubkey: string;
   content: string;
   eventId?: string;
+  isThreadReply: boolean;
 }) {
   const projection = useMarketChannel();
   const envelope = parseMarketEnvelope(content);
@@ -33,15 +39,20 @@ function MarketEventMessage({
   if (!projection) {
     return <MarketEventCard authorPubkey={authorPubkey} content={content} />;
   }
-
-  const presentation = presentMarketEvent(envelope);
+  if (isThreadReply) {
+    return (
+      <p className="max-w-full text-message">
+        {envelope.type === "contract"
+          ? envelope.listing.summary
+          : presentMarketEvent(envelope).summary}
+      </p>
+    );
+  }
+  if (envelope.type !== "response") return null;
   const rejection = eventId
     ? projection.rejected.find((entry) => entry.eventId === eventId)
     : undefined;
-  const body =
-    envelope.type === "contract"
-      ? `Opened this market: ${envelope.listing.title}`
-      : presentation.summary;
+  const body = envelope.message;
 
   return (
     <div

@@ -66,7 +66,7 @@ import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelec
 import { usePrepareDmSendChannel } from "@/features/channels/ui/usePrepareDmSendChannel";
 import { useChannelPaneMessages } from "@/features/channels/ui/useChannelPaneMessages";
 import { useRoutedMessageEdit } from "@/features/channels/ui/useRoutedMessageEdit";
-import { MarketChannelIntro } from "@/features/market/ui/MarketChannelIntro"; import { useMarketObserver } from "@/features/market/ui/marketChannelComposer";
+import { useMarketTimelineMessages } from "@/features/market/lib/marketTimeline"; import { MarketChannelIntro } from "@/features/market/ui/MarketChannelIntro"; import { useMarketObserver } from "@/features/market/ui/marketChannelComposer";
 import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
@@ -203,6 +203,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   );
   const [isMainDeferredEditPending, setMainDeferredEditPending] = React.useState(false);
   const isMarketObserver = useMarketObserver(agentPubkeys, currentPubkey);
+  const marketTimelineMessages = useMarketTimelineMessages(messages);
   const isNonMemberView =
     activeChannel !== null &&
     !activeChannel.isMember &&
@@ -373,7 +374,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     useChannelPaneMessages({
       activeChannel,
       isHuddleTranscript,
-      messages,
+      messages: marketTimelineMessages,
       profiles,
       threadSummaries,
     });

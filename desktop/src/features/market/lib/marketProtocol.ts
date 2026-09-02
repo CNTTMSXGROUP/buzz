@@ -100,9 +100,19 @@ export type MarketProjection = {
   contract: MarketContractEnvelope;
   contractAuthorPubkey: string;
   listingEventId: string;
+  bids: MarketBid[];
   scenario: MarketScenario;
   rejected: Array<{ eventId: string; reason: string }>;
   wallet: MarketWallet;
+};
+
+export type MarketBid = {
+  eventId: string;
+  actorName: string;
+  amountSats?: number;
+  bidderPubkey: string;
+  message: string;
+  quantity: number;
 };
 
 export type MarketWallet = {
@@ -500,6 +510,16 @@ export function projectMarketChannel(
     .reverse();
 
   const settled = settlements.size > 0;
+  const bids: MarketBid[] = [...responses.entries()].map(
+    ([eventId, { envelope, note }]) => ({
+      eventId,
+      actorName: envelope.actorName,
+      amountSats: envelope.amountSats,
+      bidderPubkey: note.pubkey,
+      message: envelope.message,
+      quantity: envelope.quantity,
+    }),
+  );
   const fulfilled = fulfillments.size;
   const scenarioId = scenarioIdForListing(listing.listing, settled);
   const quantity = listing.listing.quantity;
@@ -532,6 +552,7 @@ export function projectMarketChannel(
     contract: listing,
     contractAuthorPubkey: listingEntry.note.pubkey,
     listingEventId,
+    bids,
     rejected,
     wallet: { escrowedSats, settledSats },
     scenario: {

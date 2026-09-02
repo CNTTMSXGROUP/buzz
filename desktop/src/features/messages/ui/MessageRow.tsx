@@ -408,11 +408,7 @@ export const MessageRow = React.memo(
             />
           );
         default: {
-          const marketBody = MarketMessageBody(
-            message.body,
-            message.pubkey,
-            message.id,
-          );
+          const marketBody = MarketMessageBody(message);
           if (marketBody) return marketBody;
           const waveMessage = parseWaveMessageContent(message.body);
           if (waveMessage) {

@@ -141,6 +141,16 @@ test("projectMarketChannel folds a channel contract through fake settlement", ()
   assert.ok(projection);
   assert.equal(projection.channelId, CHANNEL_ID);
   assert.equal(projection.contractAuthorPubkey, SELLER);
+  assert.deepEqual(projection.bids, [
+    {
+      eventId: RESPONSE_ID,
+      actorName: "Buyer Agent",
+      amountSats: 50,
+      bidderPubkey: BUYER,
+      message: "I reserve the report.",
+      quantity: 1,
+    },
+  ]);
   assert.equal(projection.scenario.status, "Fulfilled");
   assert.equal(projection.scenario.activity.length, 5);
   assert.equal(
@@ -257,6 +267,10 @@ test("reverse auction enforces the minimum decrement", () => {
   );
 
   assert.ok(projection);
+  assert.deepEqual(
+    projection.bids.map(({ eventId }) => eventId),
+    [RESPONSE_ID],
+  );
   assert.equal(projection.scenario.liveMetrics[1].value, "1");
   assert.equal(
     projection.rejected[0].reason,

@@ -18,8 +18,8 @@ migration:
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {cpu: 250m, memory: 128Mi}
-# Exact externally reachable HTTPS origin. The gateway derives every protocol
-# route and App Attest audience from this one value.
+# Exact externally reachable HTTPS origin. The gateway derives transport routes
+# from this value; NIP-PL v1 App Attest audiences remain registered constants.
 gatewayOrigin: ""
 maxGrantLifetimeSeconds: 2592000
 profiles:

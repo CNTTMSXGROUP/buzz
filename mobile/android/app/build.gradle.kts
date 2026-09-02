@@ -1,5 +1,6 @@
-import java.util.Properties
+import java.net.URI
 import java.util.Base64
+import java.util.Properties
 
 plugins {
     id("com.android.application")
@@ -23,18 +24,33 @@ val missingUploadSigningValues = uploadSigningValues.filterValues { it.isNullOrB
 val hasUploadSigning = missingUploadSigningValues.isEmpty()
 val dartDefines = providers.gradleProperty("dart-defines").orNull.orEmpty()
 val pushGatewayDefinePrefix = "BUZZ_PUSH_GATEWAY_URL="
-val hasPushGatewayOrigin =
-    dartDefines.split(',').any { encoded ->
+val pushGatewayOrigins =
+    dartDefines.split(',').mapNotNull { encoded ->
         val define = runCatching { String(Base64.getDecoder().decode(encoded)) }.getOrNull()
-        define?.startsWith(pushGatewayDefinePrefix) == true &&
-            define.length > pushGatewayDefinePrefix.length
+        define
+            ?.takeIf { it.startsWith(pushGatewayDefinePrefix) }
+            ?.removePrefix(pushGatewayDefinePrefix)
     }
+fun isValidPushGatewayOrigin(value: String): Boolean {
+    val uri = runCatching { URI(value) }.getOrNull() ?: return false
+    val scheme = uri.scheme?.lowercase()
+    return (scheme == "http" || scheme == "https") &&
+        !uri.host.isNullOrBlank() &&
+        uri.rawUserInfo == null &&
+        (uri.rawPath.isNullOrEmpty() || uri.rawPath == "/") &&
+        uri.rawQuery == null &&
+        uri.rawFragment == null &&
+        (uri.port == -1 || uri.port in 1..65535)
+}
+val hasValidPushGatewayOrigin =
+    pushGatewayOrigins.size == 1 && isValidPushGatewayOrigin(pushGatewayOrigins.single())
 
 tasks.matching { it.name.startsWith("compileFlutterBuild") }.configureEach {
     doFirst {
-        if (!hasPushGatewayOrigin) {
+        if (!hasValidPushGatewayOrigin) {
             throw GradleException(
-                "BUZZ_PUSH_GATEWAY_URL must be supplied with --dart-define for every mobile build.",
+                "BUZZ_PUSH_GATEWAY_URL must be supplied as an HTTP(S) origin without " +
+                    "credentials, path, query, or fragment for every mobile build.",
             )
         }
     }

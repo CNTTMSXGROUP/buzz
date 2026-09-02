@@ -13,7 +13,7 @@
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL` | PostgreSQL authority/admission store. Runtime credentials need DML on the six gateway tables, not DDL. |
-| `BUZZ_PUSH_GATEWAY_ORIGIN` | Exact externally reachable HTTPS origin. No credentials, port, path, query, or fragment. The gateway derives all routes and App Attest audiences from it. |
+| `BUZZ_PUSH_GATEWAY_ORIGIN` | Exact externally reachable HTTPS origin. No credentials, port, path, query, or fragment. The gateway derives its transport routes from it; NIP-PL v1 App Attest audiences remain the registered `https://push.buzz.xyz/v1/...` constants. |
 | `BUZZ_PUSH_MAX_GRANT_LIFETIME_SECONDS` | Maximum delegation capability lifetime (`1..=31536000`). |
 | `BUZZ_PUSH_MAX_INSTALLATION_LIFETIME_SECONDS` | Maximum encrypted-token installation lifetime (default 90 days, max one year). Clients must renew before expiry. |
 | `BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH` | Read-only mounted Apple App Attest root certificate PEM. |

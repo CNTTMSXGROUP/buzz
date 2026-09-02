@@ -70,6 +70,7 @@ final class BuzzCommunicationNotificationTests: XCTestCase {
       donate: { _, completion in
         completion(NSError(domain: "test", code: 1))
       },
+      deleteAllInteractions: { completion in completion(nil) },
       updateContent: { content, _ in
         updateCalled = true
         return content
@@ -99,6 +100,7 @@ final class BuzzCommunicationNotificationTests: XCTestCase {
         order.append("donate")
         completion(nil)
       },
+      deleteAllInteractions: { completion in completion(nil) },
       updateContent: { _, _ in
         order.append("update")
         let specialized = UNMutableNotificationContent()
@@ -126,6 +128,7 @@ final class BuzzCommunicationNotificationTests: XCTestCase {
     ordinary.body = "Hello Buzz"
     let presenter = BuzzCommunicationNotificationPresenter(
       donate: { _, completion in completion(nil) },
+      deleteAllInteractions: { completion in completion(nil) },
       updateContent: { _, _ in throw NSError(domain: "test", code: 2) }
     )
     let completed = expectation(description: "ordinary fallback returned")
@@ -140,6 +143,69 @@ final class BuzzCommunicationNotificationTests: XCTestCase {
     }
 
     wait(for: [completed], timeout: 1)
+  }
+
+  func testFenceChangeDeletesDonatedInteractionBeforeCompleting() {
+    let ordinary = UNMutableNotificationContent()
+    ordinary.title = "Alice"
+    var allowed = true
+    var order: [String] = []
+    let presenter = BuzzCommunicationNotificationPresenter(
+      donate: { _, completion in
+        order.append("donate")
+        allowed = false
+        completion(nil)
+      },
+      deleteAllInteractions: { completion in
+        order.append("delete")
+        completion(nil)
+      },
+      updateContent: { content, _ in
+        order.append("update")
+        return content
+      }
+    )
+    let completed = expectation(description: "restricted donation deleted")
+
+    presenter.present(
+      ordinaryContent: ordinary,
+      resolution: communicationResolution(),
+      isStillAllowed: { allowed }
+    ) { content in
+      order.append("complete")
+      XCTAssertEqual(content.title, "Alice")
+      completed.fulfill()
+    }
+
+    wait(for: [completed], timeout: 1)
+    XCTAssertEqual(order, ["donate", "delete", "complete"])
+  }
+
+  func testBlockedFenceDoesNotDonate() {
+    let ordinary = UNMutableNotificationContent()
+    ordinary.title = "Alice"
+    var donateCalled = false
+    let presenter = BuzzCommunicationNotificationPresenter(
+      donate: { _, completion in
+        donateCalled = true
+        completion(nil)
+      },
+      deleteAllInteractions: { completion in completion(nil) },
+      updateContent: { content, _ in content }
+    )
+    let completed = expectation(description: "blocked donation skipped")
+
+    presenter.present(
+      ordinaryContent: ordinary,
+      resolution: communicationResolution(),
+      isStillAllowed: { false }
+    ) { content in
+      XCTAssertEqual(content.title, "Alice")
+      completed.fulfill()
+    }
+
+    wait(for: [completed], timeout: 1)
+    XCTAssertFalse(donateCalled)
   }
 
   private func communicationResolution(

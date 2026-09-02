@@ -65,6 +65,78 @@ struct BuzzPushPresentationCacheTests {
     #expect(store.current().isFencing)
   }
 
+  @Test("Asynchronous fenced cleanup waits for acknowledged success")
+  func asynchronousFencedCleanupWaitsForSuccess() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    var acknowledge: ((Error?) -> Void)?
+    var didComplete = false
+
+    try store.performFencedAsyncCleanup(
+      { acknowledge = $0 },
+      completion: { error in
+        #expect(error == nil)
+        didComplete = true
+      }
+    )
+
+    #expect(store.current().isFencing)
+    #expect(!didComplete)
+    let acknowledgeCleanup = try #require(acknowledge)
+    acknowledgeCleanup(nil)
+    #expect(!store.current().isFencing)
+    #expect(didComplete)
+  }
+
+  @Test("Failed asynchronous cleanup remains fenced")
+  func failedAsynchronousCleanupRemainsFenced() throws {
+    struct CleanupFailure: Error {}
+
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    var reportedFailure = false
+
+    try store.performFencedAsyncCleanup(
+      { $0(CleanupFailure()) },
+      completion: { error in
+        reportedFailure = error is CleanupFailure
+      }
+    )
+
+    #expect(reportedFailure)
+    #expect(store.current().isFencing)
+  }
+
+  @Test("Older asynchronous cleanup cannot settle a newer fence")
+  func olderAsynchronousCleanupCannotSettleNewerFence() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = BuzzAgeRestrictionFenceStore(containerURL: directory)
+    var acknowledgeOlder: ((Error?) -> Void)?
+    var acknowledgeNewer: ((Error?) -> Void)?
+
+    try store.performFencedAsyncCleanup(
+      { acknowledgeOlder = $0 },
+      completion: { _ in }
+    )
+    try store.performFencedAsyncCleanup(
+      { acknowledgeNewer = $0 },
+      completion: { _ in }
+    )
+    let newerFence = store.current()
+
+    let completeOlder = try #require(acknowledgeOlder)
+    completeOlder(nil)
+    #expect(store.current() == newerFence)
+    #expect(store.current().isFencing)
+
+    let completeNewer = try #require(acknowledgeNewer)
+    completeNewer(nil)
+    #expect(!store.current().isFencing)
+  }
+
   @Test("Age restriction fence discards active and superseded resolutions")
   func ageRestrictionFenceDiscardPolicy() {
     let initial = BuzzAgeRestrictionFence.initial

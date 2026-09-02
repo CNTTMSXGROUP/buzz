@@ -1,6 +1,7 @@
 import BuzzPushKit
 import Flutter
 import Foundation
+import Intents
 import UserNotifications
 
 final class BuzzPushSnapshotBridge {
@@ -79,19 +80,35 @@ final class BuzzPushSnapshotBridge {
             ]
           )
         }
-        try ageRestrictionFenceStore.performFencedCleanup {
-          try store.replaceCommunities([])
-          try BuzzPushKeychain.replace(
-            signingKeys: [:],
-            accessGroup: self.keychainAccessGroup
-          )
-        }
-        DispatchQueue.main.async {
-          let center = UNUserNotificationCenter.current()
-          center.removeAllDeliveredNotifications()
-          center.removeAllPendingNotificationRequests()
-          result(nil)
-        }
+        try ageRestrictionFenceStore.performFencedAsyncCleanup(
+          { completion in
+            try store.replaceCommunities([])
+            try BuzzPushKeychain.replace(
+              signingKeys: [:],
+              accessGroup: self.keychainAccessGroup
+            )
+            INInteraction.deleteAll(completion: completion)
+          },
+          completion: { error in
+            guard error == nil else {
+              Self.complete(
+                result,
+                value: FlutterError(
+                  code: "age_restriction_purge_failed",
+                  message: "Unable to fence and purge restricted notifications.",
+                  details: error?.localizedDescription
+                )
+              )
+              return
+            }
+            DispatchQueue.main.async {
+              let center = UNUserNotificationCenter.current()
+              center.removeAllDeliveredNotifications()
+              center.removeAllPendingNotificationRequests()
+              result(nil)
+            }
+          }
+        )
       } catch {
         Self.complete(
           result,
@@ -184,9 +201,25 @@ final class BuzzPushSnapshotBridge {
               ]
             )
           }
-          // Rotate the cross-process token before clearing the snapshot. An
-          // NSE that already loaded the prior state must discard its result.
-          try ageRestrictionFenceStore.performFencedCleanup(replaceSnapshot)
+          try ageRestrictionFenceStore.performFencedAsyncCleanup(
+            { completion in
+              try replaceSnapshot()
+              INInteraction.deleteAll(completion: completion)
+            },
+            completion: { error in
+              Self.complete(
+                result,
+                value: error.map {
+                  FlutterError(
+                    code: "snapshot_sync_failed",
+                    message: "Unable to sync push community state.",
+                    details: $0.localizedDescription
+                  )
+                }
+              )
+            }
+          )
+          return
         } else {
           try replaceSnapshot()
           if requiresStore {

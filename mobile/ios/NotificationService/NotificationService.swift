@@ -1,5 +1,6 @@
 import BuzzPushKit
 import Foundation
+import Intents
 import Security
 import UserNotifications
 
@@ -72,7 +73,10 @@ final class NotificationService: UNNotificationServiceExtension {
         self.bestAttemptContent = content
         self.communicationPresenter.present(
           ordinaryContent: content,
-          resolution: resolution
+          resolution: resolution,
+          isStillAllowed: { [weak self] in
+            self?.restrictionFenceIsUnchanged() ?? false
+          }
         ) { [weak self] specializedContent in
           self?.finish(specializedContent)
         }
@@ -102,14 +106,22 @@ final class NotificationService: UNNotificationServiceExtension {
       return
     }
 
-    let center = UNUserNotificationCenter.current()
-    center.removeAllDeliveredNotifications()
-    center.removeAllPendingNotificationRequests()
-    contentHandler(restrictedFallbackContent ?? Self.restrictedFallback(from: content))
-    // The handler queues delivery, so purge again after handing back only the
-    // privacy-safe fallback. The persisted fence protects every later finish.
-    center.removeAllDeliveredNotifications()
-    center.removeAllPendingNotificationRequests()
+    INInteraction.deleteAll { [restrictedFallbackContent] _ in
+      let center = UNUserNotificationCenter.current()
+      center.removeAllDeliveredNotifications()
+      center.removeAllPendingNotificationRequests()
+      contentHandler(restrictedFallbackContent ?? Self.restrictedFallback(from: content))
+      // The handler queues delivery, so purge again after handing back only the
+      // privacy-safe fallback. The persisted fence protects every later finish.
+      center.removeAllDeliveredNotifications()
+      center.removeAllPendingNotificationRequests()
+    }
+  }
+
+  private func restrictionFenceIsUnchanged() -> Bool {
+    !Self.loadRestrictionFence(
+      appGroupIdentifier: appGroupIdentifier
+    ).requiresDiscard(since: restrictionFenceAtStart)
   }
 
   private static func restrictedFallback(

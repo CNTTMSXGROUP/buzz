@@ -71,18 +71,42 @@ public final class BuzzAgeRestrictionFenceStore: @unchecked Sendable {
   /// every cleanup write succeeds. A thrown cleanup leaves the fence active so
   /// notification extensions continue to fail closed.
   public func performFencedCleanup(_ cleanup: () throws -> Void) throws {
-    try begin()
+    let active = try begin()
     try cleanup()
-    try settleIfFencing()
+    try settleIfFencing(expectedToken: active.token)
+  }
+
+  /// Rotates the durable fence before asynchronous cleanup begins and settles
+  /// it only after the cleanup callback acknowledges success. A thrown setup
+  /// error or callback error leaves the fence active.
+  public func performFencedAsyncCleanup(
+    _ cleanup: (@escaping (Error?) -> Void) throws -> Void,
+    completion: @escaping (Error?) -> Void
+  ) throws {
+    let active = try begin()
+    try cleanup { [self] error in
+      guard error == nil else {
+        completion(error)
+        return
+      }
+      do {
+        try settleIfFencing(expectedToken: active.token)
+        completion(nil)
+      } catch {
+        completion(error)
+      }
+    }
   }
 
   /// Completes a cleanup phase with another generation change.
   @discardableResult
-  public func settleIfFencing() throws -> BuzzAgeRestrictionFence {
+  public func settleIfFencing(expectedToken: String? = nil) throws -> BuzzAgeRestrictionFence {
     lock.lock()
     defer { lock.unlock() }
     let current = loadLocked()
-    guard current.isFencing else { return current }
+    guard current.isFencing,
+      expectedToken == nil || current.token == expectedToken
+    else { return current }
     let settled = BuzzAgeRestrictionFence(
       token: UUID().uuidString.lowercased(),
       isFencing: false

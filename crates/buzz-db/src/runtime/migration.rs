@@ -2765,6 +2765,14 @@ mod postgres_tests {
             "all NIP-FI tables must be absent after migration 0044: {present:?}"
         );
 
+        // Advance to the current schema before checking the current deletion
+        // catalog. The assertions above keep the migration-0044 boundary under
+        // test while allowing later migrations to add catalogued relations.
+        MIGRATOR
+            .run(&pool)
+            .await
+            .expect("apply migrations after 0044");
+
         // The deletion catalog must validate with ledger relations gone.
         crate::deletion::DeletionStore::new(pool.clone())
             .validate_catalog()

@@ -16,6 +16,8 @@ import os.log
     accessGroup: Bundle.main.object(forInfoDictionaryKey: "BuzzKeychainAccessGroup") as? String
   )
   private var enrollmentTask: Task<Void, Never>?
+  private var gatewayCleanupTask: Task<Void, Never>?
+  private var pushGatewayURL: URL?
   private var appGroupIdentifier: String? {
     Bundle.main.object(forInfoDictionaryKey: "BuzzAppGroupIdentifier") as? String
   }
@@ -280,6 +282,7 @@ import os.log
   ) {
     super.application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
     apnsDeviceToken = deviceToken
+    scheduleRetiredGatewayCleanup()
     apnsRegistrationBuffer.recordToken(deviceToken)
   }
 
@@ -359,8 +362,10 @@ import os.log
         return
       }
       do {
-        let gatewayOrigin = try BuzzPushTranscript.canonicalGatewayOrigin(gatewayURL).text
-        try endpointGrantStore.reset(forGatewayOrigin: gatewayOrigin)
+        let gatewayOrigin = try BuzzPushTranscript.canonicalGatewayOrigin(gatewayURL)
+        try endpointGrantStore.reset(forGatewayOrigin: gatewayOrigin.text)
+        pushGatewayURL = gatewayOrigin.url
+        scheduleRetiredGatewayCleanup()
         startPushRegistration(result: result)
       } catch {
         result(
@@ -513,6 +518,9 @@ import os.log
       enrollmentTask = Task { [weak self] in
         defer { self?.enrollmentTask = nil }
         do {
+          if let cleanupTask = self?.gatewayCleanupTask {
+            await cleanupTask.value
+          }
           let record = try await driver.enroll(
             deviceToken: deviceToken,
             relayURL: relayURL
@@ -537,6 +545,39 @@ import os.log
           message: "Development push enrollment is not configured.",
           details: error.localizedDescription
         )
+      )
+    }
+  }
+
+  private func scheduleRetiredGatewayCleanup() {
+    guard gatewayCleanupTask == nil,
+      let deviceToken = apnsDeviceToken,
+      !deviceToken.isEmpty,
+      let gatewayURL = pushGatewayURL
+    else { return }
+    do {
+      let driver = try BuzzDevPushEnrollmentDriver(
+        gatewayBaseURL: gatewayURL,
+        store: endpointGrantStore,
+        appAttestKeychainAccessGroup: pushKeychainAccessGroup
+      )
+      gatewayCleanupTask = Task { [weak self] in
+        defer { self?.gatewayCleanupTask = nil }
+        do {
+          try await driver.cleanRetiredGateways(deviceToken: deviceToken)
+        } catch {
+          os_log(
+            "Retired push gateway cleanup remains queued: %{public}@",
+            type: .error,
+            error.localizedDescription
+          )
+        }
+      }
+    } catch {
+      os_log(
+        "Retired push gateway cleanup could not start: %{public}@",
+        type: .error,
+        error.localizedDescription
       )
     }
   }

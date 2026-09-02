@@ -428,8 +428,14 @@ public final class BuzzDevPushEnrollmentDriver {
     deviceToken: Data,
     relayURL: URL
   ) async throws -> BuzzPushEndpointGrantRecord {
-    try await cleanStaleGateways(deviceToken: deviceToken)
+    try await cleanRetiredGateways(deviceToken: deviceToken)
     return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
+  }
+
+  /// Revokes durable installations from gateways that are no longer configured.
+  public func cleanRetiredGateways(deviceToken: Data) async throws {
+    precondition(!deviceToken.isEmpty, "The APNs device token must not be empty")
+    try await cleanStaleGateways(deviceToken: deviceToken)
   }
 
   private func enrollCurrent(

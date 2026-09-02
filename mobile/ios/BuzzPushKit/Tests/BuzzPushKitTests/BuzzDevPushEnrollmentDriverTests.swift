@@ -466,7 +466,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(store.resetOperations, ["records", "cleanup-removed:https://gateway-a.example"])
   }
 
-  func testSuccessfulEnrollmentRevokesAndDeletesStaleGatewayCleanup() async throws {
+  func testCleanupRevokesAndDeletesStaleGatewaysWithoutRelayEnrollment() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     let current = BuzzPushEndpointGrantRecord(
       gatewayOrigin: Self.gatewayOrigin,
@@ -553,10 +553,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       }
     }
 
-    _ = try await driver.enroll(
-      deviceToken: Data((1...32).map(UInt8.init)),
-      relayURL: Self.relayURL
-    )
+    try await driver.cleanRetiredGateways(deviceToken: Data((1...32).map(UInt8.init)))
 
     XCTAssertEqual(store.saved, [current])
     XCTAssertTrue(store.cleanup.isEmpty)

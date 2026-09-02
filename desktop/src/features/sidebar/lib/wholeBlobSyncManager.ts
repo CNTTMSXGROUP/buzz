@@ -214,9 +214,16 @@ export class WholeBlobSyncManager<S> {
   // fetchOwnBlobBeforePublish so an edit whose baseline is {0,""} because
   // bootstrap failed still publishes ABOVE the first head it discovers rather
   // than adopting it away. (For a successful bootstrap, releaseDeferred re-freezes
-  // publishBaseline to lastRemoteHead, so the baseline is not {0,""} at doPublish
-  // and this flag is never consulted.)
+  // publishBaseline to the bootstrap-result head, so the baseline is not {0,""}
+  // at doPublish and this flag is never consulted.)
   private bootstrapFailed = false;
+  // Disarmed once any head is independently observed after a failed bootstrap
+  // (live relay subscription or a reconnect/periodic fetch). When disarmed, the
+  // failed-bootstrap exception in fetchOwnBlobBeforePublish is suppressed: the
+  // independently-observed head is already a genuine remote advance that the
+  // normal remoteAdvancedSince check correctly adopts — the exception must not
+  // override that by treating the head as a "first unknown base".
+  private bootstrapFailedExternalHeadObserved = false;
   // Event ids we signed and sent to the relay but whose ACK never arrived (the
   // publish promise rejected as a timeout/socket error after the frame left).
   // The relay MAY have accepted such a write, so if a later cycle's pre-publish
@@ -267,6 +274,13 @@ export class WholeBlobSyncManager<S> {
       // decrypt it, so seed-publish is blocked even when the payload is
       // unreadable (e.g. wrong key).
       this.recordRemoteHead(event.created_at, event.id);
+      // A head was independently observed via a non-bootstrap fetch (reconnect,
+      // periodic refresh, etc.). Disarm the failed-bootstrap exception so this
+      // head is treated as a genuine remote advance rather than a "first unknown
+      // base" — the normal remoteAdvancedSince check handles it from here.
+      if (this.bootstrapFailed) {
+        this.bootstrapFailedExternalHeadObserved = true;
+      }
       const result = await this.decryptAndParse(event);
       if (!result) {
         return { status: "failed", createdAt: event.created_at };
@@ -354,21 +368,32 @@ export class WholeBlobSyncManager<S> {
 
   /**
    * Release any edit that was deferred until bootstrap resolved. Called by
-   * bootstrap() after it sets bootstrapResolved=true. If a pending edit exists
-   * with no timer or in-flight cycle, re-freeze publishBaseline from the
-   * now-established lastRemoteHead and schedule the normal 2s debounce.
+   * bootstrap() after it sets bootstrapResolved=true, passing the head that
+   * bootstrap itself observed (the canonical head at the moment bootstrap
+   * completed — NOT the mutable lastRemoteHead, which subscribeLive may advance
+   * at any time). If a pending edit exists with no timer or in-flight cycle,
+   * re-freeze publishBaseline to canonicalMax(queueTimeBaseline, bootstrapResultHead)
+   * and schedule the normal 2s debounce.
    *
-   * Re-freezing the baseline here (rather than leaving it at the {0,""} it had
-   * when publish() was called during unresolved bootstrap) is the P2a fix for
-   * the success path: the edit's comparison point becomes the head that
-   * bootstrap just established, so the pre-publish fetch for the same head
-   * returns "not advanced" and the edit publishes above it correctly. A peer
-   * head that arrives BETWEEN bootstrap resolution and doPublish is correctly
-   * seen as a genuine advance (its timestamp exceeds the just-frozen baseline)
-   * and is adopted per normal LWW. For a failed bootstrap, lastRemoteHead stays
-   * {0,""} and the bootstrapFailed flag enables the doPublish-time exception.
+   * Re-freezing the baseline here is the P2a fix for the success path: the
+   * edit's comparison point becomes the head bootstrap established, so the
+   * pre-publish fetch for the same head returns "not advanced" and the edit
+   * publishes above it correctly.
+   *
+   * Using the bootstrap-result snapshot (not mutable lastRemoteHead) is critical:
+   * subscribeLive can advance lastRemoteHead while bootstrap is unresolved. A
+   * live peer head arriving AFTER the click but BEFORE bootstrap resolves is
+   * never incorporated into the editable store while a local edit is pending;
+   * using mutable lastRemoteHead here would fold that live head into the baseline,
+   * making the pre-publish check see equality and publish the pre-head blob OVER
+   * the peer's write. With the bootstrap-result snapshot, that live peer head
+   * remains a genuine advance (its timestamp exceeds the just-frozen baseline)
+   * and is adopted per normal LWW when the pre-publish fetch returns it.
+   *
+   * For a failed bootstrap, bootstrapResultHead is {0,""} and the bootstrapFailed
+   * flag enables the doPublish-time exception.
    */
-  private releaseDeferred(): void {
+  private releaseDeferred(bootstrapResultHead: PublishBaseline): void {
     if (
       !this.destroyed &&
       this.pendingStore !== null &&
@@ -376,11 +401,12 @@ export class WholeBlobSyncManager<S> {
       this.retryTimer === null &&
       !this.publishInFlight
     ) {
-      // Re-freeze the baseline to the head now known from bootstrap. For a
-      // successful bootstrap this is the fetched head; for a failed bootstrap
-      // lastRemoteHead is still {0,""} (the bootstrapFailed exception handles
-      // that case separately in fetchOwnBlobBeforePublish).
-      this.publishBaseline = { ...this.lastRemoteHead };
+      // Re-freeze the baseline to the head established by bootstrap. For a
+      // successful bootstrap this is the exact head returned by the fetch
+      // (snapshotted before runBootstrap ran, so subscribeLive cannot race it);
+      // for a failed bootstrap bootstrapResultHead is {0,""} (the bootstrapFailed
+      // exception handles that case in fetchOwnBlobBeforePublish).
+      this.publishBaseline = { ...bootstrapResultHead };
       this.debounceTimer = window.setTimeout(() => {
         this.debounceTimer = null;
         this.startCycle();
@@ -606,15 +632,24 @@ export class WholeBlobSyncManager<S> {
         // Failed-bootstrap exception (P2a): the edit was queued while bootstrap
         // was in-flight and bootstrap subsequently FAILED — no head was ever
         // fetched, so publishBaseline and lastRemoteHead were never advanced.
-        // releaseDeferred() re-freezes publishBaseline from lastRemoteHead, but
-        // when bootstrap failed that is still {0,""}. Any head the relay returns
-        // here is the TRUE first established baseline; publish above it rather
-        // than adopting it away. (When bootstrap SUCCEEDS, releaseDeferred sets
-        // publishBaseline to the fetched head before scheduling the timer, so
-        // this branch is not reached for successful bootstraps whose head was
-        // already known when the debounce fired.)
+        // releaseDeferred() re-freezes publishBaseline from the bootstrap-result
+        // head, but when bootstrap failed that is still {0,""}. The FIRST head
+        // the relay returns at pre-publish time is the TRUE first established
+        // baseline; publish above it rather than adopting it away.
+        //
+        // Guard: this exception fires only when no external head was independently
+        // observed after the edit was queued (subscribeLive or a reconnect/periodic
+        // fetch set bootstrapFailedExternalHeadObserved). An independently-observed
+        // head is a genuine post-click remote advance — the normal
+        // remoteAdvancedSince check above correctly adopts it.
+        //
+        // (For a successful bootstrap, releaseDeferred sets publishBaseline to the
+        // fetched head before scheduling the timer, so this branch is not reached
+        // for successful bootstraps whose head was already known when the debounce
+        // fired.)
         if (
           this.bootstrapFailed &&
+          !this.bootstrapFailedExternalHeadObserved &&
           this.publishBaseline.createdAt === 0 &&
           this.publishBaseline.eventId === ""
         ) {
@@ -872,6 +907,16 @@ export class WholeBlobSyncManager<S> {
         void this.decryptAndParse(event).then((result) => {
           if (result) {
             this.recordRemoteHead(result.createdAt, result.eventId);
+            // A live head was independently observed (not via a pre-publish
+            // fetch). If bootstrap previously failed and a pending edit's
+            // failed-bootstrap exception could still fire, disarm it: this live
+            // head is a genuine post-click remote advance — the normal
+            // remoteAdvancedSince check in fetchOwnBlobBeforePublish handles it
+            // correctly (adopts the advancing head rather than treating it as
+            // a "first unknown base" to publish above).
+            if (this.bootstrapFailed) {
+              this.bootstrapFailedExternalHeadObserved = true;
+            }
             onUpdate(result);
           }
         });
@@ -899,19 +944,41 @@ export class WholeBlobSyncManager<S> {
     if (fetchResult.status === "failed") {
       this.bootstrapFailed = true;
     }
+    // Snapshot the bootstrap result head as the baseline for releaseDeferred.
+    // We derive this from fetchResult directly — NOT from lastRemoteHead —
+    // because subscribeLive may have updated lastRemoteHead with a live peer
+    // head that arrived during the bootstrap fetch. That live head must remain
+    // a genuine remote advance after bootstrap resolves; folding it into the
+    // baseline would make the pre-publish check see equality and publish over
+    // it. fetchResult carries exactly the head bootstrap itself fetched (or
+    // nothing, if the relay was absent or the fetch failed).
+    const bootstrapResultHead: PublishBaseline =
+      fetchResult.status === "found"
+        ? { createdAt: fetchResult.createdAt, eventId: fetchResult.eventId }
+        : { createdAt: 0, eventId: "" };
     const result = runBootstrap({
       fetchResult,
       lastHead: this.lastRemoteCreatedAt,
       localStore,
       isLocalNonEmpty: this.config.isLocalNonEmpty,
-      publishFn: (s) => this.publish(s),
+      // Absent-bootstrap seed-publish guard (Defect 1 / Thufir pass-4 finding 1):
+      // when the relay confirms absent and local state is non-empty, runBootstrap
+      // calls publishFn(localStore) to seed the user's local blob to the relay.
+      // But if a pending edit already exists (the user clicked during the async
+      // fetch), that edit IS the seed intent — do NOT call publish(localStore),
+      // which would bump the generation and overwrite the pending edit's outbox
+      // entry with the stale mount snapshot.
+      publishFn: (s) => {
+        if (this.pendingStore === null) this.publish(s);
+      },
     });
     // Mark bootstrap resolved BEFORE returning. The hook's .then() runs
     // synchronously on the resolved promise, so any publish() it calls will
     // already see bootstrapResolved=true and schedule the debounce normally.
-    // releaseDeferred() covers edits queued via other paths during the fetch.
+    // releaseDeferred() covers edits queued via other paths during the fetch,
+    // using the bootstrap-result snapshot so no post-click live head races in.
     this.bootstrapResolved = true;
-    this.releaseDeferred();
+    this.releaseDeferred(bootstrapResultHead);
     return result;
   }
 

@@ -4,6 +4,7 @@ import { after, before, test } from "node:test";
 import { JSDOM } from "jsdom";
 import { makeHookStubs } from "./sidebarSyncTestHelpers.mjs";
 import { runWholeBlobHookSuite } from "./wholeBlobHook.shared.test.mjs";
+import { runWholeBlobP2aSuite } from "./wholeBlobSyncP2a.shared.test.mjs";
 
 const { act, cleanup, renderHook } = await import("@testing-library/react");
 const { relayClient } = await import("@/shared/api/relayClient");
@@ -13,6 +14,7 @@ const {
   readChannelSectionsOutbox,
 } = await import("./channelSectionsStorage.ts");
 const { useChannelSections } = await import("./useChannelSections.ts");
+const { ChannelSectionSyncManager } = await import("./channelSectionsSync.ts");
 const { normalizeRelayUrl } = await import("@/shared/lib/normalizeRelayUrl");
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
@@ -196,4 +198,31 @@ test("legacy replay whose v2 transfer fails (quota) does not write the consumed 
     restoreRelay();
     restoreTauri();
   }
+});
+
+runWholeBlobP2aSuite({
+  label: "sections",
+  Manager: ChannelSectionSyncManager,
+  publishEdit: (m, store) => m.publishSections(store),
+  subscribe: (m, cb) => m.subscribeToSections(cb),
+  makeNonEmptyStore: () => ({
+    version: 1,
+    sections: [{ id: "s1", name: "Work", order: 0 }],
+    assignments: {},
+  }),
+  makeEditStore: () => ({
+    version: 1,
+    sections: [{ id: "click", name: "Click", order: 0 }],
+    assignments: {},
+  }),
+  makeMountStore: () => ({
+    version: 1,
+    sections: [{ id: "mount", name: "Mount", order: 0 }],
+    assignments: {},
+  }),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
 });

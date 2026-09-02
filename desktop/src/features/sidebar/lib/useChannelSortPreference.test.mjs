@@ -4,12 +4,14 @@ import { after, before, test } from "node:test";
 import { JSDOM } from "jsdom";
 import { makeHookStubs } from "./sidebarSyncTestHelpers.mjs";
 import { runWholeBlobHookSuite } from "./wholeBlobHook.shared.test.mjs";
+import { runWholeBlobP2aSuite } from "./wholeBlobSyncP2a.shared.test.mjs";
 
 const { act, cleanup, renderHook } = await import("@testing-library/react");
 const { relayClient } = await import("@/shared/api/relayClient");
 const { useChannelSortPreference } = await import(
   "./useChannelSortPreference.ts"
 );
+const { ChannelSortSyncManager } = await import("./channelSortSync.ts");
 const { readChannelSortOutbox, storageKey } = await import(
   "./channelSortPreference.ts"
 );
@@ -127,4 +129,15 @@ test("legacy replay whose v2 transfer fails (quota) does not write the consumed 
     restoreRelay();
     restoreTauri();
   }
+});
+
+runWholeBlobP2aSuite({
+  label: "sort",
+  Manager: ChannelSortSyncManager,
+  publishEdit: (m, store) => m.publishSortPrefs(store),
+  subscribe: (m, cb) => m.subscribeToSortPrefs(cb),
+  makeNonEmptyStore: () => ({ version: 1, groups: { s1: "recent" } }),
+  makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
+  makeMountStore: () => ({ version: 1, groups: { mount: "recent" } }),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
 });

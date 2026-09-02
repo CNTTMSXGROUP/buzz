@@ -535,9 +535,6 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         // actors are home-channel admins. Standard CLI auth includes
         // `channels:write`, not `repos:write`.
         KIND_PROJECT_RELATED_CHANNEL => Ok(Scope::ChannelsWrite),
-        // Relay-derived read model. Clients are rejected by the relay-only gate;
-        // this keeps the registered-kind scope map total.
-        KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT => Ok(Scope::ChannelsWrite),
         KIND_GIT_PATCH
         | KIND_GIT_PULL_REQUEST
         | KIND_GIT_PR_UPDATE
@@ -5593,10 +5590,6 @@ mod postgres_tests {
         );
         assert!(is_global_only_kind(KIND_PROJECT_RELATED_CHANNEL));
         assert!(!requires_h_channel_scope(KIND_PROJECT_RELATED_CHANNEL));
-        assert_eq!(
-            required_scope_for_kind(KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT, &dummy).unwrap(),
-            Scope::ChannelsWrite
-        );
         assert!(is_global_only_kind(KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT));
         assert!(buzz_core::kind::is_relay_only_kind(
             KIND_PROJECT_RELATED_CHANNELS_SNAPSHOT

@@ -214,7 +214,6 @@ pub fn build_project_related_channel_command(
     project_coordinate: &str,
     channel_id: Uuid,
     operation: ProjectRelatedChannelOperation,
-    auth: Option<Tag>,
 ) -> Result<EventBuilder, SdkError> {
     let _ = ProjectRelatedChannelCoordinate::parse(project_coordinate)?;
     if channel_id.is_nil() {
@@ -222,7 +221,7 @@ pub fn build_project_related_channel_command(
             "d target must not be the nil UUID".into(),
         ));
     }
-    let mut tags = vec![
+    let tags = vec![
         Tag::parse(["a", project_coordinate])
             .map_err(|error| SdkError::InvalidTag(error.to_string()))?,
         Tag::parse(["op", operation.as_str()])
@@ -230,16 +229,6 @@ pub fn build_project_related_channel_command(
         Tag::parse(["d", &channel_id.to_string()])
             .map_err(|error| SdkError::InvalidTag(error.to_string()))?,
     ];
-    if let Some(auth) = auth {
-        let parts = auth.as_slice();
-        if parts.len() != 4 || parts.first().map(String::as_str) != Some("auth") {
-            return Err(SdkError::InvalidInput(
-                "auth tag must have exactly four elements".into(),
-            ));
-        }
-        tags.push(auth);
-    }
-
     Ok(EventBuilder::new(Kind::Custom(KIND_PROJECT_RELATED_CHANNEL as u16), "").tags(tags))
 }
 
@@ -381,9 +370,9 @@ mod tests {
             &coordinate(&keys),
             Uuid::new_v4(),
             ProjectRelatedChannelOperation::Add,
-            Some(auth),
         )
         .expect("build command")
+        .tag(auth)
         .sign_with_keys(&keys)
         .expect("sign command");
 
@@ -399,7 +388,6 @@ mod tests {
             &coordinate(&keys),
             channel,
             ProjectRelatedChannelOperation::Remove,
-            None,
         )
         .is_ok());
 

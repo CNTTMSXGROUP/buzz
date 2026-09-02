@@ -28,7 +28,6 @@ async fn submit_related_channel_command(
         &project_coordinate.coordinate,
         channel_id,
         operation,
-        None,
     )
     .map_err(sdk_error)?;
     let event = client.sign_event(builder)?;

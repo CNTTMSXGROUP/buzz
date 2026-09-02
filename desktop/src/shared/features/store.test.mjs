@@ -47,7 +47,7 @@ test("setOverride persists stable IDs but unknown IDs stay filtered on read", ()
 });
 
 test("thread-scoped ACP session preference persists without changing existing experiments", () => {
-  const { values } = installStorage({ workflows: true, projects: false });
+  const { values } = installStorage({ workflows: true, pulse: false });
 
   setOverride("threadScopedAcpSessions", true);
 
@@ -55,7 +55,7 @@ test("thread-scoped ACP session preference persists without changing existing ex
     values.get(OVERRIDES_KEY),
     JSON.stringify({
       workflows: true,
-      projects: false,
+      pulse: false,
       threadScopedAcpSessions: true,
     }),
   );

@@ -46,4 +46,22 @@ public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
     self.attestation = attestation
     self.delegationGeneration = delegationGeneration
   }
+
+  func withGatewayInstallationHandle(_ handle: String) -> Self {
+    Self(
+      gatewayOrigin: gatewayOrigin,
+      relayOrigin: relayOrigin,
+      relayPubkey: relayPubkey,
+      endpointHash: endpointHash,
+      appProfile: appProfile,
+      expiresAt: expiresAt,
+      installationId: installationId,
+      gatewayInstallationHandle: handle,
+      challengeId: challengeId,
+      challenge: challenge,
+      keyId: keyId,
+      attestation: attestation,
+      delegationGeneration: delegationGeneration
+    )
+  }
 }

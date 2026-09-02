@@ -388,7 +388,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertThrowsError(try JSONDecoder().decode(BuzzPushEndpointGrantRecord.self, from: data))
   }
 
-  func testDriverDiscardsGrantAndPendingStateFromAnotherGateway() throws {
+  func testDriverMovesGrantAndPendingStateFromAnotherGatewayIntoCleanupJournal() throws {
     let record = BuzzPushEndpointGrantRecord(
       gatewayOrigin: "https://old-gateway.example",
       relayOrigin: "wss://relay.example",
@@ -416,6 +416,136 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     XCTAssertTrue(store.saved.isEmpty)
     XCTAssertTrue(store.pending.isEmpty)
+    XCTAssertEqual(
+      store.cleanup,
+      [
+        BuzzPushGatewayCleanupState(
+          gatewayOrigin: "https://old-gateway.example",
+          grants: [record],
+          pendingEnrollments: [pending]
+        )
+      ]
+    )
+  }
+
+  func testSuccessfulEnrollmentRevokesAndDeletesStaleGatewayCleanup() async throws {
+    let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
+    let current = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      installationId: Self.installationId,
+      endpointGrant: "current-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let staleHandle = "44444444-4444-4444-8444-444444444444"
+    let stale = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: "http://old-gateway.example",
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: staleHandle,
+      installationId: Self.installationId,
+      endpointGrant: "stale-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore(records: [current, stale])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/revoke"):
+        let body = try Self.body(request)
+        XCTAssertEqual(body["installation_handle"] as? String, staleHandle)
+        XCTAssertEqual(body["endpoint_epoch"] as? Int, 1)
+        XCTAssertEqual(body["new_endpoint_epoch"] as? Int, 2)
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    _ = try await driver.enroll(
+      deviceToken: Data((1...32).map(UInt8.init)),
+      relayURL: Self.relayURL
+    )
+
+    XCTAssertEqual(store.saved, [current])
+    XCTAssertTrue(store.cleanup.isEmpty)
+  }
+
+  func testFailedStaleGatewayRevocationKeepsCleanupJournal() async throws {
+    let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
+    let current = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      installationId: Self.installationId,
+      endpointGrant: "current-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let stale = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: "http://old-gateway.example",
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: "44444444-4444-4444-8444-444444444444",
+      installationId: Self.installationId,
+      endpointGrant: "stale-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore(records: [current, stale])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      if request.url?.absoluteString == "https://relay.example/" {
+        return Self.response(
+          request,
+          status: 200,
+          json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+        )
+      }
+      return Self.response(request, status: 503, json: ["error": "unavailable"])
+    }
+
+    _ = try await driver.enroll(
+      deviceToken: Data((1...32).map(UInt8.init)),
+      relayURL: Self.relayURL
+    )
+
+    XCTAssertEqual(store.saved, [current])
+    XCTAssertEqual(try XCTUnwrap(store.cleanup.first).grants, [stale])
   }
 
   func testRealAppAttestFailsLoudlyWhenUnsupported() async throws {
@@ -1187,6 +1317,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   var saved: [BuzzPushEndpointGrantRecord]
   var pending: [BuzzPushPendingEnrollmentRecord] = []
+  var cleanup: [BuzzPushGatewayCleanupState] = []
   var grantSaveFailuresRemaining: Int
   init(
     records: [BuzzPushEndpointGrantRecord] = [],
@@ -1198,6 +1329,20 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
     self.grantSaveFailuresRemaining = grantSaveFailuresRemaining
   }
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
+    let origins = Set(
+      saved.filter { $0.gatewayOrigin != gatewayOrigin }.map(\.gatewayOrigin)
+        + pending.filter { $0.gatewayOrigin != gatewayOrigin }.map(\.gatewayOrigin)
+    )
+    for origin in origins {
+      cleanup.removeAll { $0.gatewayOrigin == origin }
+      cleanup.append(
+        BuzzPushGatewayCleanupState(
+          gatewayOrigin: origin,
+          grants: saved.filter { $0.gatewayOrigin == origin },
+          pendingEnrollments: pending.filter { $0.gatewayOrigin == origin }
+        )
+      )
+    }
     saved.removeAll { $0.gatewayOrigin != gatewayOrigin }
     pending.removeAll { $0.gatewayOrigin != gatewayOrigin }
   }
@@ -1239,6 +1384,14 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
       $0.gatewayOrigin == gatewayOrigin && $0.relayOrigin == relayOrigin
         && $0.appProfile == appProfile
     }
+  }
+  func gatewayCleanupStates() throws -> [BuzzPushGatewayCleanupState] { cleanup }
+  func saveGatewayCleanupState(_ state: BuzzPushGatewayCleanupState) throws {
+    cleanup.removeAll { $0.gatewayOrigin == state.gatewayOrigin }
+    cleanup.append(state)
+  }
+  func removeGatewayCleanupState(gatewayOrigin: String) throws {
+    cleanup.removeAll { $0.gatewayOrigin == gatewayOrigin }
   }
 }
 

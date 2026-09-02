@@ -10,6 +10,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   private static let legacyPendingAccount = "pending-v1"
   private static let recordsAccount = "v2"
   private static let pendingAccount = "pending-v2"
+  private static let cleanupAccount = "gateway-cleanup-v1"
 
   private let accessGroup: String?
 
@@ -22,12 +23,36 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     try delete(account: Self.legacyPendingAccount)
 
     let allRecords = try records()
+    let allPending = try pendingEnrollments()
+    let staleRecords = allRecords.filter { $0.gatewayOrigin != gatewayOrigin }
+    let stalePending = allPending.filter { $0.gatewayOrigin != gatewayOrigin }
+    for origin in Set(staleRecords.map(\.gatewayOrigin) + stalePending.map(\.gatewayOrigin)) {
+      var state = try gatewayCleanupStates().first { $0.gatewayOrigin == origin }
+        ?? BuzzPushGatewayCleanupState(
+          gatewayOrigin: origin,
+          grants: [],
+          pendingEnrollments: []
+        )
+      for record in staleRecords where record.gatewayOrigin == origin {
+        state.grants.removeAll {
+          $0.relayOrigin == record.relayOrigin && $0.appProfile == record.appProfile
+        }
+        state.grants.append(record)
+      }
+      for pending in stalePending where pending.gatewayOrigin == origin {
+        state.pendingEnrollments.removeAll {
+          $0.relayOrigin == pending.relayOrigin && $0.appProfile == pending.appProfile
+        }
+        state.pendingEnrollments.append(pending)
+      }
+      // Persist cleanup authority before removing it from active state.
+      try saveGatewayCleanupState(state)
+    }
     let retainedRecords = allRecords.filter { $0.gatewayOrigin == gatewayOrigin }
     if retainedRecords.count != allRecords.count {
       try replace(retainedRecords, account: Self.recordsAccount)
     }
 
-    let allPending = try pendingEnrollments()
     let retainedPending = allPending.filter { $0.gatewayOrigin == gatewayOrigin }
     if retainedPending.count != allPending.count {
       try replace(retainedPending, account: Self.pendingAccount)
@@ -97,6 +122,32 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
         && $0.appProfile == appProfile
     }
     try replace(all, account: Self.pendingAccount)
+  }
+
+  func gatewayCleanupStates() throws -> [BuzzPushGatewayCleanupState] {
+    var query = baseQuery(account: Self.cleanupAccount)
+    query[kSecReturnData as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecItemNotFound { return [] }
+    guard status == errSecSuccess, let data = result as? Data else {
+      throw keychainError(status, operation: "read gateway cleanup")
+    }
+    return try JSONDecoder().decode([BuzzPushGatewayCleanupState].self, from: data)
+  }
+
+  func saveGatewayCleanupState(_ state: BuzzPushGatewayCleanupState) throws {
+    var states = try gatewayCleanupStates()
+    states.removeAll { $0.gatewayOrigin == state.gatewayOrigin }
+    states.append(state)
+    try replace(states, account: Self.cleanupAccount)
+  }
+
+  func removeGatewayCleanupState(gatewayOrigin: String) throws {
+    var states = try gatewayCleanupStates()
+    states.removeAll { $0.gatewayOrigin == gatewayOrigin }
+    try replace(states, account: Self.cleanupAccount)
   }
 
   private func pendingEnrollments() throws -> [BuzzPushPendingEnrollmentRecord] {

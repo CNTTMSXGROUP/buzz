@@ -167,6 +167,7 @@ pub async fn run_turn(
 
     let max_rounds = ctx.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
     let mut reflections = 0usize;
+    let mut context_recoveries = 0u32;
 
     // Every loop decision is a goose `Operation` -- see
     // `PLANS/BUZZ_OPERATIONS_MIGRATION.md`. Two machines, because they run at
@@ -192,15 +193,13 @@ pub async fn run_turn(
             .map(|extension| (Arc::clone(ctx.mcp), extension.to_string())),
         reply_guard_tools,
     );
-    let start_machine = crate::ops::round_start(
-        ctx.steers.clone(),
-        crate::ops::BuzzCompactionOperation::new(
-            ctx.model.clone(),
-            Arc::clone(ctx.mcp),
-            ctx.hook_extension.map(str::to_string),
-        ),
-        ctx.cancel.clone(),
+    let compaction = crate::ops::BuzzCompactionOperation::new(
+        ctx.model.clone(),
+        Arc::clone(ctx.mcp),
+        ctx.hook_extension.map(str::to_string),
     );
+    let start_machine =
+        crate::ops::round_start(ctx.steers.clone(), compaction.clone(), ctx.cancel.clone());
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
     // Operations may emit; nothing in this step does, but a dropped receiver
     // would silently swallow events from the ones that follow.
@@ -244,6 +243,41 @@ pub async fn run_turn(
         }
 
         match round(&ctx, &mut state, &mut tokens, &mut reflections).await {
+            Err(AgentError::LlmContextExceeded(error)) => {
+                const MAX_CONTEXT_RECOVERIES_PER_TURN: u32 = 3;
+                if context_recoveries >= MAX_CONTEXT_RECOVERIES_PER_TURN {
+                    return (
+                        Err(AgentError::LlmContextExceeded(error)),
+                        tokens,
+                        state.conversation().messages().to_vec(),
+                    );
+                }
+                context_recoveries += 1;
+                tracing::warn!(
+                    attempt = context_recoveries,
+                    "provider reported context overflow; forcing compaction and retry"
+                );
+                match compaction.force(&state.conversation()).await {
+                    Ok(effects) => {
+                        if apply_effects(&mut state, effects) {
+                            continue;
+                        }
+                        return (
+                            Err(AgentError::LlmContextExceeded(error)),
+                            tokens,
+                            state.conversation().messages().to_vec(),
+                        );
+                    }
+                    Err(compaction_error) => {
+                        tracing::warn!(error = %compaction_error, "forced compaction failed");
+                        return (
+                            Err(AgentError::LlmContextExceeded(error)),
+                            tokens,
+                            state.conversation().messages().to_vec(),
+                        );
+                    }
+                }
+            }
             Err(e) => return (Err(e), tokens, state.conversation().messages().to_vec()),
             Ok(Round::Continued) => continue,
             Ok(Round::Stopped(reason)) => {
@@ -352,7 +386,8 @@ fn apply_effects(
             ConversationEffect::ReplaceConversation(conversation) => {
                 state.replace(conversation);
                 // The running total described a conversation that no longer
-                // exists; let goose re-estimate from the compacted messages.
+                // exists; use the conservative visible-history estimate until
+                // the provider reports fresh occupancy for the compacted state.
                 state.set_total_tokens(None);
                 changed = true;
             }
@@ -681,8 +716,8 @@ fn classify_provider_error(error: goose_provider_types::errors::ProviderError) -
         {
             AgentError::LlmModelNotFound(message)
         }
-        ProviderError::ContextLengthExceeded(_)
-        | ProviderError::RateLimitExceeded { .. }
+        ProviderError::ContextLengthExceeded(_) => AgentError::LlmContextExceeded(message),
+        ProviderError::RateLimitExceeded { .. }
         | ProviderError::ServerError(_)
         | ProviderError::NetworkError(_)
         | ProviderError::RequestFailed(_)
@@ -904,6 +939,10 @@ mod tests {
                 "model gpt-9 not found".into()
             )),
             AgentError::LlmModelNotFound(_)
+        ));
+        assert!(matches!(
+            classify_provider_error(ProviderError::ContextLengthExceeded("too large".into())),
+            AgentError::LlmContextExceeded(_)
         ));
         assert!(matches!(
             classify_provider_error(ProviderError::NetworkError("connection reset".into())),

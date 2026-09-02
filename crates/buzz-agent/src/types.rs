@@ -72,6 +72,7 @@ impl StopReason {
 pub enum AgentError {
     InvalidParams(String),
     Llm(String),
+    LlmContextExceeded(String),
     LlmAuth(String),
     LlmModelNotFound(String),
     Mcp(String),
@@ -83,6 +84,7 @@ impl std::fmt::Display for AgentError {
         match self {
             Self::InvalidParams(s) => write!(f, "invalid params: {s}"),
             Self::Llm(s) => write!(f, "llm: {s}"),
+            Self::LlmContextExceeded(s) => write!(f, "llm context exceeded: {s}"),
             Self::LlmAuth(s) => write!(f, "llm auth: {s}"),
             Self::LlmModelNotFound(s) => write!(f, "llm model not found: {s}"),
             Self::Mcp(s) => write!(f, "mcp: {s}"),

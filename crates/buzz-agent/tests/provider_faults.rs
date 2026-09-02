@@ -46,6 +46,8 @@ enum Reply {
     Unauthorized,
     /// A hard server error, the non-retryable-looking kind.
     ServerError,
+    /// The submitted conversation exceeds the model context window.
+    ContextExceeded,
     /// Headers and a first chunk, then the connection dies with no
     /// `finish_reason` and no `[DONE]`. Models a provider or proxy dropping
     /// mid-stream, which is not the same as any HTTP status.
@@ -137,6 +139,12 @@ fn spawn_scripted_provider(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
                     "Internal Server Error",
                     None,
                     r#"{"error":{"message":"boom","type":"server_error"}}"#,
+                ),
+                Reply::ContextExceeded => error_response(
+                    400,
+                    "Bad Request",
+                    None,
+                    r#"{"error":{"message":"maximum context length exceeded","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
                 ),
                 Reply::TruncatedStream => {
                     // Deliberately no content-length: a length would let the
@@ -432,6 +440,23 @@ fn server_error_ends_the_turn_and_stops_retrying() {
     assert!(
         hits <= 6,
         "provider saw {hits} completion requests: retries must stay bounded"
+    );
+}
+
+#[test]
+fn context_overflow_compacts_and_retries_the_turn() {
+    // First request overflows. The next request is the compaction summary, and
+    // the third is the retried agent turn against the compacted conversation.
+    let (resp, hits) = prompt_once(vec![Reply::ContextExceeded, Reply::Ok, Reply::Ok]);
+
+    let stop = assert_turn_ended(&resp, "context overflow then recovery");
+    assert!(
+        stop.is_some(),
+        "a recoverable context overflow must complete the same turn: {resp}"
+    );
+    assert!(
+        hits >= 3,
+        "provider saw {hits} completion request(s): expected overflow, summary, and retried turn"
     );
 }
 

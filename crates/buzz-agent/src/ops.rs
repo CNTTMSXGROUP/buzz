@@ -433,20 +433,35 @@ fn context_limit_override() -> Result<Option<usize>> {
         .transpose()
 }
 
+fn estimated_visible_tokens(conversation: &Conversation) -> usize {
+    conversation
+        .messages()
+        .iter()
+        .filter(|message| message.is_agent_visible())
+        // One UTF-8 byte per token is deliberately conservative: real model
+        // tokenizers consume at least one byte per token, so this can fire
+        // early but cannot undercount the visible history.
+        .map(|message| goose_context_management::format_message_for_compacting(message).len())
+        .sum()
+}
+
 fn needs_compaction(
     provider_manages_context: bool,
     total_tokens: Option<i32>,
+    estimated_tokens: usize,
     context_limit: usize,
     threshold: f64,
 ) -> bool {
     if provider_manages_context || threshold <= 0.0 || threshold >= 1.0 {
         return false;
     }
-    context_limit > 0
-        && total_tokens.is_some_and(|tokens| {
-            let current_tokens = tokens.max(0) as f64;
-            current_tokens / context_limit as f64 > threshold
-        })
+    if context_limit == 0 {
+        return false;
+    }
+    let current_tokens = total_tokens
+        .map(|tokens| tokens.max(0) as usize)
+        .unwrap_or(estimated_tokens) as f64;
+    current_tokens / context_limit as f64 > threshold
 }
 
 fn compacted_conversation(conversation: &Conversation, summary: Message) -> Conversation {
@@ -545,6 +560,7 @@ fn compacted_conversation(conversation: &Conversation, summary: Message) -> Conv
 /// its own user-facing notification. In buzz a yield ends the turn and the
 /// notification would post into the channel, so a long conversation would stop
 /// mid-work and announce its own housekeeping to the humans watching.
+#[derive(Clone)]
 pub struct BuzzCompactionOperation {
     model: crate::model::SessionModel,
     mcp: Arc<McpRegistry>,
@@ -562,6 +578,46 @@ impl BuzzCompactionOperation {
             mcp,
             hook_extension,
         }
+    }
+
+    async fn compact(&self, conversation: &Conversation) -> Result<Vec<ConversationEffect>> {
+        let (provider, model_config, _model_id) = self.model.snapshot().await;
+        let visible_messages = conversation
+            .messages()
+            .iter()
+            .filter(|message| message.is_agent_visible() && !message.is_turn_context())
+            .cloned()
+            .collect::<Vec<_>>();
+        let model = goose_context_management::ProviderModel::new(provider, model_config);
+        let summary = goose_context_management::summarize(
+            &model,
+            None,
+            &goose_context_management::Templates::default(),
+            &visible_messages,
+        )
+        .await?;
+        let compacted = compacted_conversation(conversation, summary.message);
+
+        tracing::info!(target: "buzz_agent::compaction", "history compacted");
+        let mut effects = vec![ConversationEffect::ReplaceConversation(compacted)];
+        if let Some(extension) = &self.hook_extension {
+            if let Some(reported) = crate::hooks::post_compact_state(&self.mcp, extension).await {
+                effects.push(ConversationEffect::AppendMessage(
+                    Message::user()
+                        .with_text(format!("[PostCompact] {reported}"))
+                        .with_visibility(false, true),
+                ));
+            }
+        }
+        Ok(effects)
+    }
+
+    /// Compact immediately, bypassing the proactive occupancy gate.
+    ///
+    /// The loop uses this after a provider reports that the context is already
+    /// too large, matching Buzz main's reactive recovery path.
+    pub async fn force(&self, conversation: &Conversation) -> Result<Vec<ConversationEffect>> {
+        self.compact(conversation).await
     }
 }
 
@@ -586,50 +642,15 @@ impl Operation<TurnSession, ConversationEffect> for BuzzCompactionOperation {
         if !needs_compaction(
             provider.manages_own_context(),
             session.total_tokens,
+            estimated_visible_tokens(conversation),
             context_limit,
             threshold,
         ) {
             return not_applicable();
         }
 
-        let visible_messages = conversation
-            .messages()
-            .iter()
-            .filter(|message| message.is_agent_visible() && !message.is_turn_context())
-            .cloned()
-            .collect::<Vec<_>>();
-        let model = goose_context_management::ProviderModel::new(provider, model_config);
-        let summary = goose_context_management::summarize(
-            &model,
-            None,
-            &goose_context_management::Templates::default(),
-            &visible_messages,
-        )
-        .await?;
-        let compacted = compacted_conversation(conversation, summary.message);
-
-        tracing::info!(target: "buzz_agent::compaction", "history compacted");
-
-        // `ConversationEffect::ReplaceConversation` carries no usage figure, so
-        // the running total is reset by the driving loop's `apply_effects`
-        // instead: the old total described a conversation that no longer
-        // exists, and carrying it forward would re-trigger compaction at once.
-        let mut effects = vec![ConversationEffect::ReplaceConversation(compacted)];
-
-        if let Some(extension) = &self.hook_extension {
-            if let Some(reported) = crate::hooks::post_compact_state(&self.mcp, extension).await {
-                // `[PostCompact]` prefix preserved from the inline version:
-                // it is how the model tells re-injected state apart from a
-                // user turn, and dropping it would change what it reads.
-                effects.push(ConversationEffect::AppendMessage(
-                    Message::user()
-                        .with_text(format!("[PostCompact] {reported}"))
-                        .with_visibility(false, true),
-                ));
-            }
-        }
-
-        applied(effects)
+        // `compact` owns both the history replacement and Buzz's hook state.
+        applied(self.compact(conversation).await?)
     }
 }
 
@@ -741,14 +762,28 @@ mod tests {
     }
 
     #[test]
-    fn compaction_threshold_requires_reported_occupancy_above_the_boundary() {
-        assert!(!needs_compaction(false, None, 100_000, 0.8));
-        assert!(!needs_compaction(false, Some(80_000), 100_000, 0.8));
-        assert!(needs_compaction(false, Some(80_001), 100_000, 0.8));
-        assert!(!needs_compaction(true, Some(90_000), 100_000, 0.8));
-        assert!(!needs_compaction(false, Some(90_000), 100_000, 0.0));
-        assert!(!needs_compaction(false, Some(90_000), 100_000, 1.0));
-        assert!(!needs_compaction(false, Some(1), 0, 0.8));
+    fn compaction_threshold_uses_reported_or_estimated_occupancy() {
+        assert!(!needs_compaction(false, None, 80_000, 100_000, 0.8));
+        assert!(needs_compaction(false, None, 80_001, 100_000, 0.8));
+        assert!(!needs_compaction(false, Some(80_000), 90_000, 100_000, 0.8));
+        assert!(needs_compaction(false, Some(80_001), 1, 100_000, 0.8));
+        assert!(!needs_compaction(true, Some(90_000), 90_000, 100_000, 0.8));
+        assert!(!needs_compaction(false, Some(90_000), 90_000, 100_000, 0.0));
+        assert!(!needs_compaction(false, Some(90_000), 90_000, 100_000, 1.0));
+        assert!(!needs_compaction(false, Some(1), 1, 0, 0.8));
+    }
+
+    #[test]
+    fn missing_usage_estimate_counts_only_agent_visible_history() {
+        let visible = Message::user().with_text("visible");
+        let hidden = Message::assistant()
+            .with_text("this must not count")
+            .with_visibility(true, false);
+        let conversation = Conversation::new_unvalidated(vec![visible.clone(), hidden]);
+        assert_eq!(
+            estimated_visible_tokens(&conversation),
+            goose_context_management::format_message_for_compacting(&visible).len()
+        );
     }
 
     #[test]

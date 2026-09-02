@@ -352,6 +352,8 @@ function MessageComposerImpl({
     audiencePubkeys: persistentAudience.pubkeys,
     channelId,
     enabled: keepMentionedAgentsPinned,
+    getComposerRevision,
+    runComposerUpdate,
   });
   const mentionSendFlow = useMentionSendFlow({
     getComposerRevision,
@@ -458,7 +460,7 @@ function MessageComposerImpl({
     lockedAgents,
     lockedAgentPubkeys,
     removeAddressedAgent,
-    restoreAddressedAgentMentions,
+    restoreAddressedAgentMentions: restoreAgentMentions,
     selectMentionSuggestion,
     syncAddressedAgentsFromText,
     toggleAlwaysAddressAgent,
@@ -484,11 +486,11 @@ function MessageComposerImpl({
     richText,
   });
   addressedMentionRestore.restoreAddressedAgentMentionsRef.current =
-    restoreAddressedAgentMentions;
+    restoreAgentMentions;
   React.useLayoutEffect(() => {
     if (!audienceScope || editTarget != null) return;
-    restoreAddressedAgentMentions();
-  }, [audienceScope, editTarget, restoreAddressedAgentMentions]);
+    runComposerUpdate(() => restoreAgentMentions());
+  }, [audienceScope, editTarget, restoreAgentMentions, runComposerUpdate]);
   syncAddressedAgentsFromTextRef.current = syncAddressedAgentsFromText;
   const applyChannelInsert = React.useCallback(
     (suggestion: ChannelSuggestion) => {

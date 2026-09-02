@@ -7,6 +7,7 @@ import UserNotifications
 final class BuzzPushSnapshotBridge {
   private let appGroupIdentifier: String?
   private let endpointGrantStore: BuzzPushEndpointGrantKeychainStore
+  private let interactionDeletionDeadline: BuzzInteractionDeletionDeadline
   private let keychainAccessGroup: String?
   private let queue = DispatchQueue(
     label: "xyz.block.buzz.push-snapshot",
@@ -32,11 +33,25 @@ final class BuzzPushSnapshotBridge {
   init(
     appGroupIdentifier: String?,
     endpointGrantStore: BuzzPushEndpointGrantKeychainStore,
-    keychainAccessGroup: String?
+    keychainAccessGroup: String?,
+    interactionDeletionDeadline: BuzzInteractionDeletionDeadline =
+      BuzzInteractionDeletionDeadline(
+        timeout: 5,
+        deleteAllInteractions: { completion in
+          INInteraction.deleteAll(completion: completion)
+        },
+        scheduleTimeout: { delay, action in
+          DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + delay,
+            execute: action
+          )
+        }
+      )
   ) {
     self.appGroupIdentifier = appGroupIdentifier
     self.endpointGrantStore = endpointGrantStore
     self.keychainAccessGroup = keychainAccessGroup
+    self.interactionDeletionDeadline = interactionDeletionDeadline
   }
 
   @discardableResult
@@ -87,7 +102,10 @@ final class BuzzPushSnapshotBridge {
               signingKeys: [:],
               accessGroup: self.keychainAccessGroup
             )
-            INInteraction.deleteAll(completion: completion)
+            let center = UNUserNotificationCenter.current()
+            center.removeAllDeliveredNotifications()
+            center.removeAllPendingNotificationRequests()
+            self.interactionDeletionDeadline.deleteAll(completion: completion)
           },
           completion: { error in
             guard error == nil else {
@@ -101,12 +119,7 @@ final class BuzzPushSnapshotBridge {
               )
               return
             }
-            DispatchQueue.main.async {
-              let center = UNUserNotificationCenter.current()
-              center.removeAllDeliveredNotifications()
-              center.removeAllPendingNotificationRequests()
-              result(nil)
-            }
+            Self.complete(result, value: nil)
           }
         )
       } catch {
@@ -204,7 +217,10 @@ final class BuzzPushSnapshotBridge {
           try ageRestrictionFenceStore.performFencedAsyncCleanup(
             { completion in
               try replaceSnapshot()
-              INInteraction.deleteAll(completion: completion)
+              let center = UNUserNotificationCenter.current()
+              center.removeAllDeliveredNotifications()
+              center.removeAllPendingNotificationRequests()
+              self.interactionDeletionDeadline.deleteAll(completion: completion)
             },
             completion: { error in
               Self.complete(

@@ -563,27 +563,41 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
   func testCleanupReplaysProtectedEndpointAfterCurrentTokenChanges() async throws {
     let oldToken = Data(repeating: 0x07, count: 32)
     let newToken = Data(repeating: 0x08, count: 32)
-    let pending = BuzzPushPendingEnrollmentRecord(
-      gatewayOrigin: "http://old-gateway.example",
-      relayOrigin: "wss://relay.example",
-      relayPubkey: Self.relayPubkey,
-      endpoint: Self.hex(oldToken),
-      endpointHash: Self.hex(SHA256.hash(data: oldToken)),
-      appProfile: "buzz-ios-dogfood",
-      expiresAt: Self.expiresAt,
-      installationId: Self.installationId,
-      challengeId: Self.firstChallengeId,
-      challenge: Self.challenge,
-      keyId: Self.keyId,
-      attestation: Self.attestation
+    let oldGatewayURL = URL(string: "http://old-gateway.example")!
+    let store = MemoryGrantStore()
+    let oldDriver = try makeDriver(
+      gatewayBaseURL: oldGatewayURL,
+      store: store,
+      appAttest: RecordingAppAttest()
     )
-    let store = MemoryGrantStore(pending: [pending])
-    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    var challengeRequests = 0
+    var installationRequests = 0
     URLProtocolStub.handler = { request in
       switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/challenges"):
+        challengeRequests += 1
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": challengeRequests == 1 ? Self.firstChallengeId : Self.secondChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
       case ("POST", "http://old-gateway.example/v1/installations"):
+        installationRequests += 1
         let body = try Self.body(request)
         XCTAssertEqual(body["endpoint"] as? String, Self.hex(oldToken))
+        if installationRequests == 1 {
+          throw URLError(.networkConnectionLost)
+        }
         return Self.response(
           request,
           status: 201,
@@ -591,16 +605,6 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
             "installation_handle": Self.installationHandle,
             "endpoint_epoch": 1,
             "expires_at": Self.expiresAt,
-          ]
-        )
-      case ("POST", "http://old-gateway.example/v1/installations/challenges"):
-        return Self.response(
-          request,
-          status: 200,
-          json: [
-            "challenge_id": Self.secondChallengeId,
-            "challenge": Self.challenge,
-            "expires_at": Self.now + 300,
           ]
         )
       case ("POST", "http://old-gateway.example/v1/installations/revoke"):
@@ -611,8 +615,17 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       }
     }
 
-    try await driver.cleanRetiredGateways(deviceToken: newToken)
+    do {
+      _ = try await oldDriver.enroll(deviceToken: oldToken, relayURL: Self.relayURL)
+      XCTFail("Expected the committed enrollment response to be lost")
+    } catch {
+      XCTAssertEqual(store.pending.first?.endpoint, Self.hex(oldToken))
+    }
 
+    let currentDriver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    try await currentDriver.cleanRetiredGateways(deviceToken: newToken)
+
+    XCTAssertEqual(installationRequests, 2)
     XCTAssertTrue(store.cleanup.isEmpty)
   }
 
@@ -1330,6 +1343,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
   }
 
   private func makeDriver(
+    gatewayBaseURL: URL = BuzzDevPushEnrollmentDriverTests.gatewayURL,
     store: BuzzPushEndpointGrantStore,
     appAttest: BuzzDevAppAttesting,
     installationIdBytes: @escaping () throws -> Data = {
@@ -1339,7 +1353,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [URLProtocolStub.self]
     return try BuzzDevPushEnrollmentDriver(
-      gatewayBaseURL: Self.gatewayURL,
+      gatewayBaseURL: gatewayBaseURL,
       store: store,
       session: URLSession(configuration: configuration),
       appAttest: appAttest,

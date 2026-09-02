@@ -614,6 +614,7 @@ public final class BuzzDevPushEnrollmentDriver {
         gatewayOrigin: gatewayOrigin,
         relayOrigin: relayOrigin.text,
         relayPubkey: relayPubkey,
+        endpoint: endpoint,
         endpointHash: endpointHash,
         appProfile: Self.appProfile,
         expiresAt: expiresAt,

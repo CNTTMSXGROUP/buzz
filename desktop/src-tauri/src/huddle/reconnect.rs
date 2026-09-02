@@ -21,12 +21,13 @@ use crate::app_state::AppState;
 use super::relay_api::{self, AudioRelayConnectError};
 use super::state::{AudioLink, HuddleState};
 
-/// Redials continue until at least this long after the disconnect. Long
+/// Recovery, including pending dials, is bounded by this window. Long
 /// enough to ride out a relay deploy (pod drain + Service endpoint
 /// convergence) and a laptop Wi-Fi roam without dropping the huddle.
 pub(crate) const RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 /// First backoff step after a failed dial; doubles per failure up to the ceiling.
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// A `huddle_relay_draining` refusal means a replacement pod is coming up, so
 /// redial at the floor instead of growing the backoff.
@@ -38,6 +39,18 @@ pub(crate) struct ReconnectTarget {
     pub ephemeral_channel_id: String,
     pub parent_channel_id: Option<String>,
     huddle_generation: u64,
+    lifetime: CancellationToken,
+}
+
+impl ReconnectTarget {
+    pub(crate) fn capture(hs: &HuddleState, channel_id: &str, parent: Option<&str>) -> Self {
+        Self {
+            ephemeral_channel_id: channel_id.to_owned(),
+            parent_channel_id: parent.map(str::to_owned),
+            huddle_generation: hs.huddle_generation,
+            lifetime: hs.huddle_cancel.clone(),
+        }
+    }
 }
 
 pub(crate) type AudioConnection = (CancellationToken, tokio::sync::mpsc::Sender<Vec<u8>>);
@@ -50,12 +63,13 @@ pub(crate) type AudioConnection = (CancellationToken, tokio::sync::mpsc::Sender<
 /// edge to prove the future is `Send`.
 pub(crate) fn after_unexpected_disconnect(
     app: tauri::AppHandle,
+    target: ReconnectTarget,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
         use tauri::Manager;
         let state = app.state::<AppState>();
         let state: &AppState = &state;
-        run(state, |target: ReconnectTarget| async move {
+        run(state, target, |target: ReconnectTarget| async move {
             relay_api::connect_audio_relay(
                 &target.ephemeral_channel_id,
                 target.parent_channel_id.as_deref(),
@@ -67,56 +81,63 @@ pub(crate) fn after_unexpected_disconnect(
     })
 }
 
-/// Mark the link as reconnecting and capture the target, or `None` when the
-/// huddle is not live or a reconnect is already owned by another pipeline
-/// exit. This is the single guard against duplicate disconnect signals.
-fn claim_reconnect(hs: &mut HuddleState) -> Option<ReconnectTarget> {
-    if hs.audio_link != AudioLink::Live {
-        return None;
-    }
-    let ephemeral_channel_id = hs.ephemeral_channel_id.clone()?;
-    if !hs.is_current_huddle(&ephemeral_channel_id, hs.huddle_generation) {
-        return None;
+/// Claim recovery only for the pipeline that actually disconnected, never
+/// whichever huddle happens to be current when its callback runs.
+fn claim_reconnect(hs: &mut HuddleState, target: &ReconnectTarget) -> bool {
+    if hs.audio_link != AudioLink::Live
+        || target.lifetime.is_cancelled()
+        || !hs.is_current_huddle(&target.ephemeral_channel_id, target.huddle_generation)
+    {
+        return false;
     }
     hs.audio_link = AudioLink::Reconnecting {
         attempt: 0,
         draining: false,
     };
-    // The dead pipeline's sender would only buffer frames nobody encodes.
     hs.audio_relay_pcm_tx = None;
-    Some(ReconnectTarget {
-        ephemeral_channel_id,
-        parent_channel_id: hs.parent_channel_id.clone(),
-        huddle_generation: hs.huddle_generation,
-    })
+    true
 }
 
 /// Drive redials with `dial` until one succeeds, the huddle ends or is
 /// replaced, or the retry window is exhausted (`AudioLink::Lost`).
-pub(crate) async fn run<F, Fut>(state: &AppState, mut dial: F)
+pub(crate) async fn run<F, Fut>(state: &AppState, target: ReconnectTarget, mut dial: F)
 where
     F: FnMut(ReconnectTarget) -> Fut,
     Fut: Future<Output = Result<AudioConnection, AudioRelayConnectError>>,
 {
-    let Some(target) = state
+    if !state
         .huddle()
-        .ok()
-        .and_then(|mut hs| claim_reconnect(&mut hs))
-    else {
+        .map(|mut hs| claim_reconnect(&mut hs, &target))
+        .unwrap_or(false)
+    {
         return;
-    };
+    }
     state.emit_huddle_state_changed();
     let deadline = Instant::now() + RECONNECT_WINDOW;
     let mut failures: u32 = 0;
 
     loop {
-        let result = dial(target.clone()).await;
+        // Do not start another dial at the budget boundary. The whole future
+        // includes TCP/TLS/WS upgrade as well as the authenticated handshake.
+        let result = if Instant::now() >= deadline {
+            Err("audio recovery deadline elapsed".into())
+        } else {
+            tokio::select! {
+                biased;
+                result = tokio::time::timeout_at(
+                    deadline.min(Instant::now() + DIAL_TIMEOUT), dial(target.clone())
+                ) => result.unwrap_or_else(|_| Err("audio relay dial timed out".into())),
+                _ = target.lifetime.cancelled() => return,
+            }
+        };
 
         // Lock scope is a block, not `drop()`: the guard must provably end
         // before the sleep for the future to stay `Send`.
         let next_delay = {
             let Ok(mut hs) = state.huddle() else { return };
-            if !hs.is_current_huddle(&target.ephemeral_channel_id, target.huddle_generation) {
+            if target.lifetime.is_cancelled()
+                || !hs.is_current_huddle(&target.ephemeral_channel_id, target.huddle_generation)
+            {
                 // Leave or replacement won while we were dialing; never resurrect.
                 if let Ok((cancel, _)) = result {
                     cancel.cancel();
@@ -167,7 +188,11 @@ where
         };
         state.emit_huddle_state_changed();
         let Some(delay) = next_delay else { return };
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            biased;
+            _ = target.lifetime.cancelled() => return,
+            _ = tokio::time::sleep_until(deadline.min(Instant::now() + delay)) => {},
+        }
         if !is_current(state, &target) {
             return;
         }

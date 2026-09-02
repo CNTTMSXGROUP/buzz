@@ -159,6 +159,9 @@ pub struct HuddleState {
     /// generation, this changes only when a new start/join attempt begins.
     #[serde(skip)]
     pub huddle_generation: u64,
+    /// Ends recovery even while a dial is pending; distinct from one socket.
+    #[serde(skip)]
+    pub(crate) huddle_cancel: tokio_util::sync::CancellationToken,
     /// Session generation — incremented on every teardown. The transcription
     /// task captures this at spawn time and checks before each POST. If the
     /// generation has changed, the task silently drops the transcript.
@@ -232,6 +235,7 @@ impl Clone for HuddleState {
             stt_starting: Arc::clone(&self.stt_starting),
             last_agent_refresh: self.last_agent_refresh,
             huddle_generation: self.huddle_generation,
+            huddle_cancel: self.huddle_cancel.clone(),
             session_generation: Arc::clone(&self.session_generation),
             voice_input_mode: self.voice_input_mode.clone(),
             ptt_active: Arc::clone(&self.ptt_active),
@@ -270,6 +274,7 @@ impl Default for HuddleState {
             stt_starting: Arc::new(AtomicBool::new(false)),
             last_agent_refresh: None,
             huddle_generation: 0,
+            huddle_cancel: tokio_util::sync::CancellationToken::new(),
             session_generation: Arc::new(AtomicU64::new(0)),
             voice_input_mode: VoiceInputMode::default(),
             ptt_active: Arc::new(AtomicBool::new(false)),
@@ -297,6 +302,8 @@ impl HuddleState {
 
     /// Begin a new local huddle lifetime and return its identity.
     pub(crate) fn begin_huddle_lifetime(&mut self) -> u64 {
+        self.huddle_cancel.cancel();
+        self.huddle_cancel = tokio_util::sync::CancellationToken::new();
         self.huddle_generation = self.huddle_generation.wrapping_add(1);
         self.huddle_generation
     }
@@ -367,6 +374,7 @@ impl HuddleState {
     /// Used by start_huddle rollback, join_huddle rollback, and teardown_huddle
     /// to invalidate in-flight transcription tasks without losing the generation.
     pub(crate) fn reset_preserving_generation(&mut self) {
+        self.huddle_cancel.cancel();
         let gen = Arc::clone(&self.session_generation);
         let huddle_generation = self.huddle_generation;
         let tts_enabled = self.tts_enabled;

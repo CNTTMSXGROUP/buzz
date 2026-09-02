@@ -675,7 +675,7 @@ pub(crate) async fn run_playout_recv_loop(
         }
     }
 
-    human_floor.clear_remote();
+    // The supervisor clears this connection's floor after joining all children.
     if let Some(ref app) = app_handle {
         use tauri::Emitter;
         let _ = app.emit(
@@ -690,7 +690,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn continuous_dtx_does_not_extend_remote_floor_deadline() {
+    fn continuous_silence_does_not_extend_remote_floor_deadline() {
         let peer = 7;
         let started = tokio::time::Instant::now();
         let owners = std::collections::HashSet::from([peer]);

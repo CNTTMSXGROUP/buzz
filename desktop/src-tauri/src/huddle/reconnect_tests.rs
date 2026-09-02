@@ -25,6 +25,10 @@ fn live_huddle_state() -> Arc<AppState> {
     Arc::new(state)
 }
 
+fn target(state: &AppState) -> ReconnectTarget {
+    ReconnectTarget::capture(&state.huddle().unwrap(), HUDDLE, Some("parent"))
+}
+
 fn connection() -> AudioConnection {
     (CancellationToken::new(), tokio::sync::mpsc::channel(1).0)
 }
@@ -66,6 +70,7 @@ async fn recovers_after_a_thirty_five_second_outage_without_leaving() {
 
     run(
         &state,
+        target(&state),
         flaky_dial(Arc::clone(&dials), started, Some(Duration::from_secs(35))),
     )
     .await;
@@ -88,7 +93,7 @@ async fn draining_refusal_redials_promptly_instead_of_backing_off() {
     let dial_times = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
     let times = Arc::clone(&dial_times);
 
-    run(&state, move |_| {
+    run(&state, target(&state), move |_| {
         let mut t = times.lock().unwrap();
         t.push(Instant::now());
         let n = t.len();
@@ -123,7 +128,7 @@ async fn draining_is_visible_in_state_while_waiting() {
     let observer = Arc::clone(&seen);
     let observed_state = Arc::clone(&state);
 
-    run(&state, move |_| {
+    run(&state, target(&state), move |_| {
         observer.lock().unwrap().push(audio_link(&observed_state));
         let n = observer.lock().unwrap().len();
         std::future::ready(match n {
@@ -157,7 +162,7 @@ async fn leave_during_backoff_stops_the_loop_and_never_installs_a_socket() {
     let loop_dials = Arc::clone(&dials);
 
     let loop_task = tokio::spawn(async move {
-        run(&loop_state, move |_| {
+        run(&loop_state, target(&loop_state), move |_| {
             loop_dials.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Err::<AudioConnection, _>("connection refused".into()))
         })
@@ -172,7 +177,7 @@ async fn leave_during_backoff_stops_the_loop_and_never_installs_a_socket() {
         .expect("huddle lock")
         .reset_preserving_generation();
 
-    tokio::time::timeout(RECONNECT_WINDOW * 2, loop_task)
+    tokio::time::timeout(Duration::from_millis(1), loop_task)
         .await
         .expect("loop must exit on leave, not run out the window")
         .expect("loop task");
@@ -192,7 +197,7 @@ async fn replacement_huddle_during_backoff_is_left_untouched() {
     let returned_for_dial = Arc::clone(&returned);
 
     let loop_task = tokio::spawn(async move {
-        run(&loop_state, move |_| {
+        run(&loop_state, target(&loop_state), move |_| {
             let mut r = returned_for_dial.lock().unwrap();
             std::future::ready(if r.is_empty() {
                 // First dial fails so the loop sleeps; the huddle is swapped
@@ -219,7 +224,7 @@ async fn replacement_huddle_during_backoff_is_left_untouched() {
         hs.audio_ws_cancel = Some(replacement_cancel.clone());
     }
 
-    tokio::time::timeout(RECONNECT_WINDOW * 2, loop_task)
+    tokio::time::timeout(Duration::from_millis(1), loop_task)
         .await
         .expect("loop must exit when the huddle is replaced")
         .expect("loop task");
@@ -244,7 +249,7 @@ async fn leave_while_a_dial_is_in_flight_cancels_the_fresh_socket() {
     let fresh = CancellationToken::new();
     let fresh_for_dial = fresh.clone();
 
-    run(&state, move |_| {
+    run(&state, target(&state), move |_| {
         // The user leaves while the dial is on the wire; the dial still wins
         // a socket for the huddle that no longer exists.
         dial_state
@@ -274,7 +279,7 @@ async fn replacement_pipeline_dying_before_install_is_redialed_not_installed() {
     let installed = Arc::new(std::sync::Mutex::new(Vec::<CancellationToken>::new()));
     let handed_out = Arc::clone(&installed);
 
-    run(&state, move |_| {
+    run(&state, target(&state), move |_| {
         let (cancel, pcm_tx) = connection();
         let mut h = handed_out.lock().unwrap();
         if h.is_empty() {
@@ -311,6 +316,7 @@ async fn duplicate_disconnect_signals_do_not_start_a_second_loop() {
     let first = tokio::spawn(async move {
         run(
             &first_state,
+            target(&first_state),
             flaky_dial(first_dials, started, Some(Duration::from_secs(3))),
         )
         .await;
@@ -318,7 +324,12 @@ async fn duplicate_disconnect_signals_do_not_start_a_second_loop() {
     tokio::task::yield_now().await;
 
     let second_dials = Arc::new(AtomicU32::new(0));
-    run(&state, flaky_dial(Arc::clone(&second_dials), started, None)).await;
+    run(
+        &state,
+        target(&state),
+        flaky_dial(Arc::clone(&second_dials), started, None),
+    )
+    .await;
     assert_eq!(
         second_dials.load(Ordering::SeqCst),
         0,
@@ -337,15 +348,19 @@ async fn exhausting_the_window_marks_audio_lost_and_ends_the_loop() {
 
     tokio::time::timeout(
         RECONNECT_WINDOW * 2,
-        run(&state, flaky_dial(Arc::clone(&dials), started, None)),
+        run(
+            &state,
+            target(&state),
+            flaky_dial(Arc::clone(&dials), started, None),
+        ),
     )
     .await
     .expect("loop must terminate (no task leak)");
 
-    assert!(
-        started.elapsed() >= RECONNECT_WINDOW,
-        "{:?}",
-        started.elapsed()
+    assert_eq!(
+        started.elapsed(),
+        RECONNECT_WINDOW,
+        "backoff must not overshoot"
     );
     let hs = state.huddle().expect("huddle lock");
     assert_eq!(hs.audio_link, AudioLink::Lost);
@@ -359,7 +374,12 @@ async fn exhausting_the_window_marks_audio_lost_and_ends_the_loop() {
 async fn not_live_huddle_is_ignored() {
     let state = Arc::new(build_app_state());
     let dials = Arc::new(AtomicU32::new(0));
-    run(&state, flaky_dial(Arc::clone(&dials), Instant::now(), None)).await;
+    run(
+        &state,
+        target(&state),
+        flaky_dial(Arc::clone(&dials), Instant::now(), None),
+    )
+    .await;
     assert_eq!(dials.load(Ordering::SeqCst), 0);
     assert_eq!(audio_link(&state), AudioLink::Live);
 }
@@ -390,5 +410,114 @@ fn audio_link_serializes_as_tagged_status() {
     assert_eq!(
         reconnecting,
         serde_json::json!({ "status": "reconnecting", "attempt": 2, "draining": true })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_dials_stop_at_the_recovery_deadline() {
+    let state = live_huddle_state();
+    let started = Instant::now();
+    let dials = Arc::new(AtomicU32::new(0));
+    let calls = Arc::clone(&dials);
+    tokio::time::timeout(
+        RECONNECT_WINDOW + Duration::from_secs(1),
+        run(&state, target(&state), move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<AudioConnection, AudioRelayConnectError>>()
+        }),
+    )
+    .await
+    .expect("hung upgrade must be bounded");
+    assert_eq!(started.elapsed(), RECONNECT_WINDOW);
+    assert_eq!(audio_link(&state), AudioLink::Lost);
+    assert!(
+        dials.load(Ordering::SeqCst) > 1,
+        "per-dial cap must allow retries"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn leave_interrupts_a_hung_dial_immediately() {
+    let state = live_huddle_state();
+    let recovery = run(&state, target(&state), |_| {
+        std::future::pending::<Result<AudioConnection, AudioRelayConnectError>>()
+    });
+    tokio::pin!(recovery);
+    tokio::select! {
+        _ = &mut recovery => panic!("dial should be pending"),
+        _ = tokio::task::yield_now() => {},
+    }
+    let leaving = Instant::now();
+    state.huddle().unwrap().reset_preserving_generation();
+    tokio::time::timeout(Duration::from_millis(1), recovery)
+        .await
+        .expect("leave must wake pending recovery");
+    assert_eq!(leaving.elapsed(), Duration::ZERO);
+    assert_eq!(state.huddle().unwrap().phase, HuddlePhase::Idle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_disconnect_cannot_claim_a_replacement_on_the_same_channel() {
+    let state = live_huddle_state();
+    let stale = target(&state);
+    let replacement = CancellationToken::new();
+    {
+        let mut hs = state.huddle().unwrap();
+        hs.begin_huddle_lifetime();
+        hs.audio_ws_cancel = Some(replacement.clone());
+    }
+    run(&state, stale, |_| {
+        panic!("stale callback must never dial");
+        #[allow(unreachable_code)]
+        std::future::ready(Ok(connection()))
+    })
+    .await;
+    assert_eq!(audio_link(&state), AudioLink::Live);
+    assert!(!replacement.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn disconnect_identity_checks_channel_and_generation_even_with_a_live_token() {
+    let state = live_huddle_state();
+    for wrong_channel in [false, true] {
+        let mut stale = target(&state);
+        if wrong_channel {
+            stale.ephemeral_channel_id = "other-channel".into();
+        } else {
+            stale.huddle_generation = stale.huddle_generation.wrapping_sub(1);
+        }
+        run(&state, stale, |_| {
+            panic!("mismatched callback must not dial");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(connection()))
+        })
+        .await;
+        assert_eq!(audio_link(&state), AudioLink::Live);
+    }
+}
+
+#[test]
+fn huddle_lifetime_cancellation_tracks_begin_reset_not_transcription() {
+    let state = live_huddle_state();
+    let first = target(&state);
+    {
+        let mut hs = state.huddle().unwrap();
+        hs.invalidate_transcription_pipeline();
+        assert!(
+            !first.lifetime.is_cancelled(),
+            "transcription is not the huddle lifetime"
+        );
+        hs.begin_huddle_lifetime();
+    }
+    assert!(
+        first.lifetime.is_cancelled(),
+        "new lifetime must cancel pending old work"
+    );
+    let second = target(&state);
+    assert!(!second.lifetime.is_cancelled());
+    state.huddle().unwrap().reset_preserving_generation();
+    assert!(
+        second.lifetime.is_cancelled(),
+        "reset must wake pending work"
     );
 }

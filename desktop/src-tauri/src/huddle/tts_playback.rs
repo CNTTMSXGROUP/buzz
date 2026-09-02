@@ -75,7 +75,7 @@ pub(super) enum HumanFloorAuthorization {
 struct HumanFloorState {
     epoch: u64,
     local: bool,
-    remote: HashSet<u8>,
+    remote: HashSet<(uuid::Uuid, u8)>,
 }
 
 pub(super) struct SynthesisFlightGuard {
@@ -348,16 +348,19 @@ impl PlaybackCoordinator {
         self.lock().human_floor.local = false;
     }
 
-    pub(super) fn enter_remote_human_floor(&self, peer: u8) {
-        self.enter_human_floor(|floor| floor.remote.insert(peer));
+    pub(super) fn enter_remote_human_floor(&self, scope: uuid::Uuid, peer: u8) {
+        self.enter_human_floor(|floor| floor.remote.insert((scope, peer)));
     }
 
-    pub(super) fn leave_remote_human_floor(&self, peer: u8) {
-        self.lock().human_floor.remote.remove(&peer);
+    pub(super) fn leave_remote_human_floor(&self, scope: uuid::Uuid, peer: u8) {
+        self.lock().human_floor.remote.remove(&(scope, peer));
     }
 
-    pub(super) fn clear_remote_human_floor(&self) {
-        self.lock().human_floor.remote.clear();
+    pub(super) fn clear_remote_human_floor(&self, scope: uuid::Uuid) {
+        self.lock()
+            .human_floor
+            .remote
+            .retain(|(owner, _)| *owner != scope);
     }
 
     fn enter_human_floor(&self, enter: impl FnOnce(&mut HumanFloorState) -> bool) {
@@ -622,7 +625,7 @@ mod tests {
         let (playback, _unpulled_source) = coordinator();
         let delayed_tts_epoch = playback.human_floor_epoch();
 
-        playback.enter_remote_human_floor(7);
+        playback.enter_remote_human_floor(uuid::Uuid::nil(), 7);
 
         assert!(playback.human_floor_blocked());
         assert!(!playback.human_floor_permits(delayed_tts_epoch));
@@ -633,12 +636,12 @@ mod tests {
         let (playback, _unpulled_source) = coordinator();
         assert!(playback.enter_local_human_floor(true, false));
         let local_epoch = playback.human_floor_epoch();
-        playback.enter_remote_human_floor(7);
+        playback.enter_remote_human_floor(uuid::Uuid::nil(), 7);
         assert_ne!(playback.human_floor_epoch(), local_epoch);
 
         playback.leave_local_human_floor();
         assert!(playback.human_floor_blocked());
-        playback.leave_remote_human_floor(7);
+        playback.leave_remote_human_floor(uuid::Uuid::nil(), 7);
         assert!(!playback.human_floor_blocked());
     }
 

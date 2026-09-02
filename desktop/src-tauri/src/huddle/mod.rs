@@ -601,6 +601,7 @@ pub async fn leave_huddle(app: tauri::AppHandle, state: State<'_, AppState>) -> 
             return Ok(()); // Nothing to leave.
         }
         hs.phase = HuddlePhase::Leaving;
+        hs.huddle_cancel.cancel();
         (
             hs.parent_channel_id.clone().unwrap_or_default(),
             hs.ephemeral_channel_id.clone().unwrap_or_default(),
@@ -674,6 +675,7 @@ pub async fn end_huddle(
             return Err("only the huddle creator can end it — use leave_huddle instead".into());
         }
         hs.phase = HuddlePhase::Leaving;
+        hs.huddle_cancel.cancel();
         (
             hs.parent_channel_id.clone().unwrap_or_default(),
             hs.ephemeral_channel_id.clone().unwrap_or_default(),

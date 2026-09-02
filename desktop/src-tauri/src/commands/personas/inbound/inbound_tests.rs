@@ -11,6 +11,7 @@ const UUID: &str = "11111111-2222-3333-4444-555555555555"; // sadscan:disable sq
 /// IS its UUID id. Carries env_vars + source_team that must survive a patch.
 fn local_in_app() -> AgentDefinition {
     AgentDefinition {
+        description: None,
         id: UUID.to_string(),
         display_name: "Local".to_string(),
         avatar_url: None,
@@ -25,6 +26,7 @@ fn local_in_app() -> AgentDefinition {
         source_team: Some("team-1".to_string()),
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: BTreeMap::from([("API_KEY".to_string(), "secret".to_string())]),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -38,6 +40,7 @@ fn local_in_app() -> AgentDefinition {
 /// slug = Some(d-tag), empty env_vars, source_team None.
 fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
+        description: None,
         id: d_tag.to_string(),
         display_name: display_name.to_string(),
         avatar_url: Some("https://example.com/a.png".to_string()),
@@ -52,6 +55,7 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
         source_team: None,
         source_team_persona_slug: Some(d_tag.to_string()),
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -339,6 +343,7 @@ fn sami_probe_overlay_does_not_rehydrate_after_restart() {
 /// event must NEVER be able to overwrite.
 fn local_agent() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        description: None,
         pubkey: AGENT_PUBKEY.to_string(),
         name: "Local Agent".to_string(),
         persona_id: Some("persona-local".to_string()),
@@ -392,6 +397,7 @@ fn local_agent() -> ManagedAgentRecord {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -582,6 +588,8 @@ fn local_team() -> TeamRecord {
         instructions: None,
         persona_ids: vec!["p-local".to_string()],
         is_builtin: false,
+        shared: false,
+        catalog_source: None,
         source_dir: Some(std::path::PathBuf::from("/local/team/dir")),
         is_symlink: true,
         symlink_target: Some("/external".to_string()),

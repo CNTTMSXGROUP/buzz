@@ -476,6 +476,10 @@ pub async fn restore_managed_agents_on_launch(
                         pubkey: record.pubkey.clone(),
                         agent_command: effective_command,
                         persona_id: record.persona_id.clone(),
+                        about: crate::managed_agents::record_effective_description(
+                            record,
+                            &reconcile_personas,
+                        ),
                     },
                 ))
             })
@@ -543,7 +547,7 @@ fn finalize_restore_candidate(
 pub(crate) fn spawn_pending_profile_reconciliations(app: &tauri::AppHandle, workspace_relay: &str) {
     let state = app.state::<AppState>();
     if !state
-        .managed_agent_profile_reconcile_enabled
+        .managed_agent_profile_reconcile_enabled()
         .load(Ordering::Acquire)
     {
         return;
@@ -738,6 +742,7 @@ mod restore_fold_tests {
             id: "def-1".into(),
             display_name: "Definition".into(),
             avatar_url: None,
+            description: None,
             system_prompt: "definition prompt".into(),
             runtime: Some("goose".into()),
             model: Some("definition-model".into()),
@@ -749,6 +754,7 @@ mod restore_fold_tests {
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             env_vars: BTreeMap::new(),
             respond_to: None,
             respond_to_allowlist: vec![],

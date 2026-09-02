@@ -127,6 +127,7 @@ impl PrivateConfigPatch {
 
     fn fresh_record(&self) -> ManagedAgentRecord {
         let mut record = ManagedAgentRecord {
+            description: None,
             pubkey: String::new(),
             name: String::new(),
             persona_id: None,
@@ -177,6 +178,7 @@ impl PrivateConfigPatch {
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: vec![],
             definition_parallelism: None,
@@ -559,7 +561,7 @@ pub(crate) fn hydrate_from_retention(
 ) -> Result<PrivateConfigOverlay, String> {
     use buzz_core_pkg::kind::KIND_PRIVATE_MANAGED_AGENT;
 
-    let rows = crate::managed_agents::retention::get_retained_events_of_kind(
+    let rows = crate::managed_agents::retention::get_retained_events_by_kind(
         conn,
         KIND_PRIVATE_MANAGED_AGENT,
         &owner_keys.public_key().to_hex(),

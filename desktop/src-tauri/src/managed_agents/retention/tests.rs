@@ -1,8 +1,3 @@
-//! Unit tests for `managed_agents/retention.rs`.
-//!
-//! Kept in a sibling file so `retention.rs` stays under the 1000-line
-//! file-size ratchet; `#[path]`-included from its `tests` module.
-
 use super::*;
 
 #[test]
@@ -122,6 +117,66 @@ fn inbound_preflight_does_not_consume_event_before_commit() {
     assert_eq!(
         inbound_event_outcome(&conn, &inbound).unwrap(),
         InboundOutcome::Skipped
+    );
+}
+
+#[test]
+fn commit_inbound_advances_head_only_after_store_write_succeeds() {
+    // P1-1: a failing local-store save must NOT leave the durable head
+    // advanced — otherwise replay of the identical relay event reads it as
+    // stale and the projection is lost forever.
+    let conn = test_db();
+    let mut inbound = sample_event();
+    inbound.pending_sync = false;
+
+    // Store write fails: head stays un-advanced and the event does not skip.
+    let outcome = commit_inbound_with_store(&conn, &inbound, || Err("disk full".to_string()))
+        .expect_err("store failure propagates");
+    assert!(outcome.contains("disk full"));
+    assert!(
+        get_retained_event(&conn, inbound.kind, &inbound.pubkey, &inbound.d_tag)
+            .unwrap()
+            .is_none(),
+        "a failed store write must not advance the retention head"
+    );
+
+    // Replay after the failure: the store write now succeeds and the head
+    // advances, proving the event was never consumed by the failed attempt.
+    let store_ran = std::cell::Cell::new(false);
+    let outcome = commit_inbound_with_store(&conn, &inbound, || {
+        store_ran.set(true);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(outcome, InboundOutcome::Applied);
+    assert!(store_ran.get(), "the store write ran on replay");
+    assert!(
+        get_retained_event(&conn, inbound.kind, &inbound.pubkey, &inbound.d_tag)
+            .unwrap()
+            .is_some(),
+        "a successful store write advances the head"
+    );
+}
+
+#[test]
+fn commit_inbound_skips_stale_event_without_touching_the_store() {
+    // A no-newer event must be skipped before the store closure runs, so a
+    // superseded inbound event never rewrites the local store.
+    let conn = test_db();
+    let mut inbound = sample_event();
+    inbound.pending_sync = false;
+    retain_inbound_event(&conn, &inbound).unwrap();
+
+    let store_ran = std::cell::Cell::new(false);
+    let outcome = commit_inbound_with_store(&conn, &inbound, || {
+        store_ran.set(true);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(outcome, InboundOutcome::Skipped);
+    assert!(
+        !store_ran.get(),
+        "a skipped event must not run the fallible store mutation"
     );
 }
 
@@ -351,7 +406,7 @@ fn inbound_equal_second_skips_and_preserves_pending() {
     let local = sample_event();
     retain_event(&conn, &local).unwrap();
 
-    // Inbound at the SAME second with different content.
+    // Inbound at the SAME second with different content but the same id.
     let inbound = RetainedEvent {
         content: r#"{"display_name":"Remote"}"#.to_string(),
         pending_sync: false,
@@ -362,8 +417,8 @@ fn inbound_equal_second_skips_and_preserves_pending() {
         InboundOutcome::Skipped
     );
 
-    // Local pending row is untouched: flag preserved, content unchanged so
-    // the flush republishes and the relay resolves last-writer-wins.
+    // Local pending row is untouched: an undecidable tie never clears the
+    // flag, so the flush republishes and the relay resolves the winner.
     let row = get_retained_event(&conn, 30175, "abc123", "test-persona")
         .unwrap()
         .unwrap();
@@ -371,11 +426,11 @@ fn inbound_equal_second_skips_and_preserves_pending() {
     assert!(row.content.contains("Test"));
 }
 
-/// Issue-3 regression: two devices retain DISTINCT successors in the same
-/// second, then each receives the other's. Without a deterministic
-/// equal-second winner both sides skip forever and diverge permanently.
-/// The NIP-01 tiebreak (lowest event id wins) makes opposite delivery
-/// orders converge on the SAME head — the one the relay itself retains.
+/// Two devices retain DISTINCT successors in the same second, then each
+/// receives the other's. Without a deterministic equal-second winner both
+/// sides skip forever and diverge permanently. The NIP-01 tiebreak (lowest
+/// event id wins) makes opposite delivery orders converge on the SAME head —
+/// the one the relay itself retains.
 #[test]
 fn inbound_equal_second_opposite_delivery_orders_converge() {
     let event_low = RetainedEvent {
@@ -426,8 +481,8 @@ fn inbound_equal_second_opposite_delivery_orders_converge() {
 }
 
 /// A pending local edit that WINS the equal-second tie keeps its
-/// `pending_sync` (the flush republishes it); one that LOSES is superseded
-/// by the relay's head and stops republishing a refused event.
+/// `pending_sync` (the flush republishes it); one that LOSES is superseded by
+/// the relay's head and stops republishing a refused event.
 #[test]
 fn inbound_equal_second_pending_local_winner_and_loser() {
     // Local pending edit with the LOWER id: inbound loses, pending stays.
@@ -611,4 +666,179 @@ fn deferral_predicate_is_kind_and_pubkey_qualified() {
         "other-persona",
         &failed
     ));
+}
+
+/// Build an inbound kind:5 tombstone covering `(target_kind, "abc123",
+/// "test-persona")` at `created_at`.
+fn sample_tombstone(target_kind: u32, created_at: i64) -> RetainedEvent {
+    RetainedEvent {
+        kind: 5,
+        pubkey: "abc123".to_string(),
+        d_tag: tombstone_retention_d_tag(target_kind, "test-persona"),
+        content: String::new(),
+        created_at,
+        raw_event: r#"{"id":"tombstone"}"#.to_string(),
+        pending_sync: false,
+    }
+}
+
+/// A historical tombstone replayed AFTER a newer recreation must preserve the
+/// recreated record: the covered head is strictly newer than the tombstone, so
+/// the relay keeps it and the local store closure never runs.
+#[test]
+fn inbound_tombstone_skips_when_covered_head_is_newer() {
+    let conn = test_db();
+    // Recreation at t=2000 lands first.
+    let recreation = RetainedEvent {
+        created_at: 2000,
+        pending_sync: false,
+        ..sample_event()
+    };
+    retain_inbound_event(&conn, &recreation).unwrap();
+
+    // Older tombstone (t=1000) arrives late.
+    let tombstone = sample_tombstone(30175, 1000);
+    let removed = std::cell::Cell::new(false);
+    let outcome = commit_inbound_tombstone_covering(
+        &conn,
+        &tombstone,
+        &[30175],
+        "abc123",
+        "test-persona",
+        || {
+            removed.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(outcome, InboundOutcome::Skipped);
+    assert!(
+        !removed.get(),
+        "a newer recreation must not run the JSON removal"
+    );
+    assert!(
+        get_retained_event(&conn, 30175, "abc123", "test-persona")
+            .unwrap()
+            .is_some(),
+        "the recreated head must survive an older tombstone"
+    );
+    assert!(
+        get_retained_event(&conn, 5, "abc123", &tombstone.d_tag)
+            .unwrap()
+            .is_none(),
+        "the skipped tombstone must not be committed"
+    );
+}
+
+/// A tombstone that actually covers the head (head `created_at <= tombstone`)
+/// removes the JSON first, then commits the tombstone row and purges the
+/// covered head atomically.
+#[test]
+fn inbound_tombstone_purges_covered_head_after_json_removal() {
+    let conn = test_db();
+    let head = RetainedEvent {
+        created_at: 1000,
+        pending_sync: false,
+        ..sample_event()
+    };
+    retain_inbound_event(&conn, &head).unwrap();
+
+    let tombstone = sample_tombstone(30175, 1000);
+    let removed = std::cell::Cell::new(false);
+    let outcome = commit_inbound_tombstone_covering(
+        &conn,
+        &tombstone,
+        &[30175],
+        "abc123",
+        "test-persona",
+        || {
+            removed.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(outcome, InboundOutcome::Applied);
+    assert!(removed.get(), "the JSON removal must run before the commit");
+    assert!(
+        get_retained_event(&conn, 30175, "abc123", "test-persona")
+            .unwrap()
+            .is_none(),
+        "the covered head must be purged from retention"
+    );
+    assert!(
+        get_retained_event(&conn, 5, "abc123", &tombstone.d_tag)
+            .unwrap()
+            .is_some(),
+        "the tombstone row must be committed"
+    );
+}
+
+/// A failed JSON removal must advance NEITHER the tombstone row NOR the head
+/// deletion, so the identical relay tombstone remains retryable and succeeds
+/// on replay.
+#[test]
+fn inbound_tombstone_json_failure_leaves_replay_retryable() {
+    let conn = test_db();
+    let head = RetainedEvent {
+        created_at: 1000,
+        pending_sync: false,
+        ..sample_event()
+    };
+    retain_inbound_event(&conn, &head).unwrap();
+
+    let tombstone = sample_tombstone(30175, 2000);
+    let err = commit_inbound_tombstone_covering(
+        &conn,
+        &tombstone,
+        &[30175],
+        "abc123",
+        "test-persona",
+        || Err("disk full".to_string()),
+    )
+    .expect_err("a failed JSON removal propagates");
+    assert!(err.contains("disk full"));
+    assert!(
+        get_retained_event(&conn, 30175, "abc123", "test-persona")
+            .unwrap()
+            .is_some(),
+        "a failed removal must not purge the covered head"
+    );
+    assert!(
+        get_retained_event(&conn, 5, "abc123", &tombstone.d_tag)
+            .unwrap()
+            .is_none(),
+        "a failed removal must not commit the tombstone row"
+    );
+
+    // Replay: the removal now succeeds and both effects land, proving the
+    // failed attempt consumed nothing.
+    let removed = std::cell::Cell::new(false);
+    let outcome = commit_inbound_tombstone_covering(
+        &conn,
+        &tombstone,
+        &[30175],
+        "abc123",
+        "test-persona",
+        || {
+            removed.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome, InboundOutcome::Applied);
+    assert!(removed.get(), "the removal runs on replay");
+    assert!(
+        get_retained_event(&conn, 30175, "abc123", "test-persona")
+            .unwrap()
+            .is_none(),
+        "replay purges the covered head"
+    );
+    assert!(
+        get_retained_event(&conn, 5, "abc123", &tombstone.d_tag)
+            .unwrap()
+            .is_some(),
+        "replay commits the tombstone row"
+    );
 }

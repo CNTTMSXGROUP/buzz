@@ -42,6 +42,7 @@ import type { TimelineMessage } from "@/features/messages/types";
 import { useThreadRepliesForRoots } from "@/features/messages/useThreadReplies";
 import { useProfileQuery, useUsersBatchQuery } from "@/features/profile/hooks";
 import type { Project } from "@/features/projects/hooks";
+import { pickDefaultProjectsAgent } from "@/features/projects/lib/projectAgentSelection";
 import { AgentContextPayloadPreview } from "./AgentContextPayloadPreview";
 import {
   PROJECT_WORKSPACE_CONTEXT_MARKER,
@@ -86,6 +87,7 @@ import { UserAvatar } from "@/shared/ui/UserAvatar";
 export type AgentCandidate = {
   pubkey: string;
   name: string;
+  personaId?: string | null;
   /** Managed agents can be auto-started before the prompt is sent. */
   isManaged: boolean;
   isActive: boolean;
@@ -178,6 +180,7 @@ export function useAgentCandidates() {
     const candidates: AgentCandidate[] = managed.map((agent) => ({
       pubkey: normalizePubkey(agent.pubkey),
       name: agent.name,
+      personaId: agent.personaId,
       isManaged: true,
       isActive: isManagedAgentActive(agent),
     }));
@@ -472,8 +475,7 @@ export function ProjectsAgentPromptPage({
   const selectedAgent =
     conversation?.agent ??
     candidates.find((candidate) => candidate.pubkey === selectedPubkey) ??
-    candidates[0] ??
-    null;
+    pickDefaultProjectsAgent(candidates);
   const richText = useRichTextEditor({
     editable: !isSending,
     onEditLink: (info) => onEditLinkRef.current?.(info),
@@ -669,6 +671,7 @@ export function ProjectsAgentPromptPage({
                         avatarUrl={avatarUrlFor(selectedAgent.pubkey)}
                         className="shrink-0"
                         displayName={selectedAgent.name}
+                        shape="squircle"
                         size="xs"
                       />
                     ) : null}
@@ -695,6 +698,7 @@ export function ProjectsAgentPromptPage({
                           avatarUrl={avatarUrlFor(candidate.pubkey)}
                           className="mr-2 shrink-0"
                           displayName={candidate.name}
+                          shape="squircle"
                           size="xs"
                         />
                         <span className="min-w-0 truncate">

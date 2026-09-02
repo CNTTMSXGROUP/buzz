@@ -15,7 +15,7 @@ use crate::{
         CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
         DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
-    relay::{relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::relay_ws_url_with_override,
     util::now_iso,
 };
 
@@ -30,9 +30,7 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
 mod pending;
 #[cfg(test)]
 use pending::build_agent_archive_request;
-pub(crate) use pending::{
-    archive_managed_agent_pending, retain_managed_agent_pending, tombstone_managed_agent_pending,
-};
+pub(crate) use pending::{retain_managed_agent_pending, tombstone_managed_agent_pending};
 
 /// Build a summary from fresh disk state (personas, teams, global config).
 /// For one-shot command paths only — the 5s list poll calls
@@ -387,7 +385,7 @@ pub async fn create_managed_agent(
     };
 
     // ── Phase 3: save record (sync lock) ───────────────────────────────────────
-    let (agent, resolved_avatar_url) = {
+    let (agent, resolved_avatar_url, profile_about) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -538,10 +536,10 @@ pub async fn create_managed_agent(
             input.parallelism,
             linked_persona.as_ref(),
         )?;
-
         let record = ManagedAgentRecord {
             pubkey: pubkey.clone(),
             name: name.clone(),
+            description: None,
             persona_id: requested_persona_id.clone(),
             team_id,
             private_key_nsec: private_key_nsec.clone(),
@@ -612,6 +610,7 @@ pub async fn create_managed_agent(
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
@@ -639,9 +638,12 @@ pub async fn create_managed_agent(
         // before any .await — owner-authored, every agent (Will's ruling: no
         // is_builtin/persona-membership gate).
         retain_managed_agent_pending(&app, &state, record);
+        // Effective owner-authored description for the kind:0 `about`.
+        let profile_about = crate::managed_agents::record_effective_description(record, &personas);
         (
             summarize_from_disk(&app, record, &runtimes)?,
             resolved_avatar_url,
+            profile_about,
         )
     };
 
@@ -681,20 +683,16 @@ pub async fn create_managed_agent(
     // ── Phase 4: sync agent profile on relay (async, outside lock) ───────────
     // Use the avatar persisted on the record so the published profile and any
     // later reconciliation agree on the same value.
-    let profile_relay_url = crate::relay::effective_agent_relay_url(
-        &resolved_relay_url,
-        &relay_ws_url_with_override(&state),
-    );
-    let mut profile_sync_error = (sync_managed_agent_profile(
+    let mut profile_sync_error = profile::publish_agent_profile_with_about(
         &state,
-        &profile_relay_url,
+        &resolved_relay_url,
         &agent_keys,
         &name,
         resolved_avatar_url.as_deref(),
+        profile_about.as_deref(),
         auth_tag.as_deref(),
     )
-    .await)
-        .err();
+    .await;
     profile_sync_error =
         super::agent_models::flush_managed_agent_policy(&app, &state, profile_sync_error).await;
 
@@ -929,7 +927,7 @@ pub async fn start_managed_agent(
     // with no persisted avatar, this also backfills the avatar from the relay.
     if result.is_ok()
         && state
-            .managed_agent_profile_reconcile_enabled
+            .managed_agent_profile_reconcile_enabled()
             .load(std::sync::atomic::Ordering::Acquire)
     {
         let reconcile_pubkey = pubkey.clone();
@@ -1051,7 +1049,6 @@ pub async fn delete_managed_agent(
             for pubkey in &exited_pubkeys {
                 state.clear_agent_session_caches(pubkey);
             }
-
             // Guard: reject deletion of deployed remote agents unless explicitly forced.
             // This turns "don't orphan remote infra" from a UI convention into a backend
             // invariant — a buggy or compromised IPC caller cannot silently orphan a live
@@ -1081,9 +1078,6 @@ pub async fn delete_managed_agent(
                 }
             }
 
-            let persona_id = resolved_record
-                .as_ref()
-                .and_then(|record| record.persona_id.clone());
             if let Some(mut record) = resolved_record {
                 stop_managed_agent_process(&app, &mut record, &mut runtimes)?;
             }
@@ -1101,12 +1095,12 @@ pub async fn delete_managed_agent(
                 .remove(&pubkey);
             // Remove the agent's nsec from the keyring after the record is gone.
             crate::managed_agents::delete_agent_key(&pubkey);
-            // Tombstone after confirmed removal (inside lock; every published agent tombstones).
+            // Tombstone after confirmed removal (inside lock; every published
+            // agent tombstones). The NIP-IA kind:9035 archive request — which
+            // stops the identity appearing in member pickers and autocomplete —
+            // is enqueued in the SAME transaction, its `persona_id` derived from
+            // the retained 30177 head.
             tombstone_managed_agent_pending(&app, &state, &pubkey);
-            // NIP-IA: archive the deleted agent's identity on the relay so it
-            // stops appearing in member pickers and autocomplete. Same
-            // best-effort, inside-the-lock contract as the tombstone above.
-            archive_managed_agent_pending(&app, &state, &pubkey, persona_id.as_deref());
         }
         try_regenerate_nest(&app);
         Ok(())

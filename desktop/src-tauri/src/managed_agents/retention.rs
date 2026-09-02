@@ -70,7 +70,10 @@ pub fn scoped_retention_db_path(base_dir: &Path, relay_url: &str, owner_pubkey: 
 ///
 /// Callers keep the returned relay and keys alongside the path whenever work
 /// crosses an `.await`; a later workspace switch cannot retarget that work.
-pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<RetentionScope, String> {
+pub fn active_retention_scope<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+) -> Result<RetentionScope, String> {
     let relay_url = crate::relay::relay_ws_url_with_override(state);
     let owner_keys = state.signing_keys()?;
     let base_dir = super::managed_agents_base_dir(app)?;
@@ -95,8 +98,8 @@ pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<Reten
 /// returned scope is both the one that will be written to and the one the event
 /// arrived on. `Ok(None)` means the arrival community is no longer active and
 /// the caller must drop the event — see [`scope_for_arrival`].
-pub fn arrival_retention_scope(
-    app: &AppHandle,
+pub fn arrival_retention_scope<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     arrival_relay_url: &str,
 ) -> Result<Option<RetentionScope>, String> {
@@ -257,15 +260,16 @@ pub enum InboundOutcome {
 ///   the relay already superseded stops republishing instead of looping.
 /// - Equal `created_at`: NIP-01 addressable-event tiebreak — the event with
 ///   the lexicographically LOWEST id wins, exactly the head the relay itself
-///   retains. Nostr time is seconds-granularity, so two devices can retain
-///   distinct successors in the same second; without a shared deterministic
-///   winner each side skips the other's head on every replay and the devices
-///   diverge permanently. A pending local edit that WINS the tie stays
-///   pending and republishes; one that LOSES is superseded — the relay would
-///   refuse it as the head anyway, so clearing its `pending_sync` is what
-///   converges both devices onto the relay's answer. (A re-received echo has
-///   an equal id and stays a no-op; if either id is unavailable the inbound
-///   event is skipped, preserving any pending local publish.)
+///   retains (`buzz-db` rejects an incoming coordinate whose id is `>=` the
+///   accepted head's at equal time). Nostr time is seconds-granularity, so two
+///   devices can retain distinct successors in the same second; without a
+///   shared deterministic winner each side skips the other's head on every
+///   replay and the devices diverge permanently. A pending local edit that
+///   WINS the tie stays pending and republishes; one that LOSES is superseded —
+///   the relay would refuse it as the head anyway, so clearing its
+///   `pending_sync` converges both devices onto the relay's answer. (A
+///   re-received echo has an equal id and stays a no-op; if either id is
+///   unavailable the inbound event is skipped, preserving any pending publish.)
 /// - Inbound older: skip — nothing to change.
 ///
 /// Decide whether an inbound event is newer than the retained coordinate without
@@ -294,8 +298,8 @@ pub fn inbound_event_outcome(
 
 /// NIP-01 addressable-event tiebreak at equal `created_at`: the event with the
 /// lexicographically lowest id is the head the relay retains. Returns `true`
-/// only when BOTH ids are present and the inbound id is strictly lower —
-/// an undecidable or equal comparison must not clobber the retained row (or a
+/// only when BOTH ids are present and the inbound id is strictly lower — an
+/// undecidable or equal comparison must not clobber the retained row (or a
 /// pending local publish riding on it).
 fn equal_second_inbound_wins(inbound_raw: &str, retained_raw: &str) -> bool {
     match (raw_event_id(inbound_raw), raw_event_id(retained_raw)) {
@@ -311,6 +315,101 @@ fn raw_event_id(raw_event: &str) -> Option<String> {
         .get("id")?
         .as_str()
         .map(str::to_owned)
+}
+
+/// Apply an inbound event's fallible local-store mutation, then advance the
+/// durable retention head — never the other way around.
+///
+/// The head is the replay witness: `inbound_event_outcome` reports `Skipped`
+/// for an event no newer than the retained head (equal `created_at` reads as
+/// stale). If the head advanced before the JSON store write and that write then
+/// failed, replay of the identical relay event would see the head as already
+/// consumed and the projection would be lost forever. Ordering the commit after
+/// the store write means a failed `apply_store` leaves the head un-advanced, so
+/// the next replay retries and succeeds.
+///
+/// Returns `Skipped` without running `apply_store` when the event does not win
+/// the preflight; the caller leaves its store untouched.
+pub fn commit_inbound_with_store<F>(
+    conn: &Connection,
+    event: &RetainedEvent,
+    apply_store: F,
+) -> Result<InboundOutcome, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if inbound_event_outcome(conn, event)? == InboundOutcome::Skipped {
+        return Ok(InboundOutcome::Skipped);
+    }
+    apply_store()?;
+    retain_inbound_event(conn, event)
+}
+
+/// Resolve and commit an inbound NIP-09 tombstone against BOTH its own kind:5
+/// retention row AND every covered target head, matching the relay's
+/// coordinate-deletion contract (a deletion removes only target rows with
+/// `created_at <= tombstone.created_at`, `buzz-db`).
+///
+/// `covered_kinds` is usually the tombstone's own target kind. The two
+/// managed-agent kinds (public 30177 + private 30179) are one record locally,
+/// so a kind:5 naming either coordinate covers both heads — the sibling
+/// tombstone may be lost or unsent, and a surviving 30179 head would
+/// rematerialize the deleted secret-bearing config at the next boot hydration.
+///
+/// Order, so a crash or store failure never loses the recovery source:
+/// 1. A covered head strictly NEWER than the tombstone → `Skipped`: a
+///    historical delete replayed after a newer recreation; the relay keeps the
+///    head, so we must preserve the local record.
+/// 2. Tombstone-row preflight loses (re-received / superseded) → `Skipped`.
+/// 3. Run the fallible `remove_json` FIRST. On failure nothing durable advances,
+///    so replay of the identical tombstone retries.
+/// 4. Commit the tombstone row and purge the covered heads in ONE transaction. A
+///    kill between them would otherwise advance the tombstone row (making replay
+///    read as already-consumed) while leaving a covered head in retention with
+///    no witness to remove it.
+pub fn commit_inbound_tombstone_covering<F>(
+    conn: &Connection,
+    tombstone: &RetainedEvent,
+    covered_kinds: &[u32],
+    target_owner: &str,
+    target_d_tag: &str,
+    remove_json: F,
+) -> Result<InboundOutcome, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    for covered_kind in covered_kinds {
+        let covered_head = get_retained_event(conn, *covered_kind, target_owner, target_d_tag)?;
+        if covered_head
+            .as_ref()
+            .is_some_and(|head| head.created_at > tombstone.created_at)
+        {
+            return Ok(InboundOutcome::Skipped);
+        }
+    }
+    if inbound_event_outcome(conn, tombstone)? == InboundOutcome::Skipped {
+        return Ok(InboundOutcome::Skipped);
+    }
+    remove_json()?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("failed to begin inbound tombstone transaction: {e}"))?;
+    let result = (|| -> Result<(), String> {
+        retain_inbound_event(conn, tombstone)?;
+        for covered_kind in covered_kinds {
+            delete_retained_event(conn, *covered_kind, target_owner, target_d_tag)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("failed to commit inbound tombstone transaction: {e}"))?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+    Ok(InboundOutcome::Applied)
 }
 
 pub fn retain_inbound_event(
@@ -476,43 +575,6 @@ pub fn has_retained_personas(conn: &Connection, pubkey: &str) -> Result<bool, St
     .map_err(|e| format!("failed to check retained personas: {e}"))
 }
 
-/// Load every retained event at a given kind for one owner pubkey. Used by the
-/// boot-time overlay hydration: the inbound path only populates the in-memory
-/// overlay when an event is strictly newer than the retained row, so after a
-/// restart the re-delivered backfill dedupes to `Skipped` and the overlay would
-/// otherwise stay empty for the whole session.
-pub fn get_retained_events_of_kind(
-    conn: &Connection,
-    kind: u32,
-    pubkey: &str,
-) -> Result<Vec<RetainedEvent>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync
-             FROM persona_events
-             WHERE kind = ?1 AND pubkey = ?2
-             ORDER BY d_tag",
-        )
-        .map_err(|e| format!("failed to prepare retained-kind query: {e}"))?;
-
-    let rows = stmt
-        .query_map(params![kind, pubkey], |row| {
-            Ok(RetainedEvent {
-                kind: row.get(0)?,
-                pubkey: row.get(1)?,
-                d_tag: row.get(2)?,
-                content: row.get(3)?,
-                created_at: row.get(4)?,
-                raw_event: row.get(5)?,
-                pending_sync: row.get::<_, i32>(6)? != 0,
-            })
-        })
-        .map_err(|e| format!("failed to query retained events by kind: {e}"))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("failed to read retained event row: {e}"))
-}
-
 /// Look up a single retained event by its coordinate.
 pub fn get_retained_event(
     conn: &Connection,
@@ -539,6 +601,47 @@ pub fn get_retained_event(
     )
     .optional()
     .map_err(|e| format!("failed to get retained event: {e}"))
+}
+
+/// Return every retained event for `pubkey` at the given kind.
+///
+/// Used by the team-catalog reconcile, which enumerates retained 30178 heads
+/// as the authoritative worklist — not the current team store — so a shared
+/// head whose team was later deleted stays visible and can be tombstoned.
+/// Also used by the boot-time kind:30179 overlay hydration: the inbound path
+/// only populates the in-memory overlay when an event is strictly newer than
+/// the retained row, so after a restart the re-delivered backfill dedupes to
+/// `Skipped` and the overlay would otherwise stay empty for the whole session.
+pub fn get_retained_events_by_kind(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+) -> Result<Vec<RetainedEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync
+             FROM persona_events
+             WHERE kind = ?1 AND pubkey = ?2
+             ORDER BY d_tag",
+        )
+        .map_err(|e| format!("failed to prepare query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![kind, pubkey], |row| {
+            Ok(RetainedEvent {
+                kind: row.get(0)?,
+                pubkey: row.get(1)?,
+                d_tag: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+                raw_event: row.get(5)?,
+                pending_sync: row.get::<_, i32>(6)? != 0,
+            })
+        })
+        .map_err(|e| format!("failed to query retained events: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to read retained event row: {e}"))
 }
 
 #[cfg(test)]

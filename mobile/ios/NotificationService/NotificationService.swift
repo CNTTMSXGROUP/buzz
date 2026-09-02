@@ -10,6 +10,18 @@ final class NotificationService: UNNotificationServiceExtension {
   private var restrictedFallbackContent: UNMutableNotificationContent?
   private var restrictionFenceAtStart = BuzzAgeRestrictionFence.initial
   private let communicationPresenter = BuzzCommunicationNotificationPresenter()
+  private let interactionDeletionDeadline = BuzzInteractionDeletionDeadline(
+    timeout: 5,
+    deleteAllInteractions: { completion in
+      INInteraction.deleteAll(completion: completion)
+    },
+    scheduleTimeout: { delay, action in
+      DispatchQueue.global(qos: .utility).asyncAfter(
+        deadline: .now() + delay,
+        execute: action
+      )
+    }
+  )
   private lazy var appGroupIdentifier =
     Bundle.main.object(
       forInfoDictionaryKey: "BuzzAppGroupIdentifier"
@@ -108,7 +120,7 @@ final class NotificationService: UNNotificationServiceExtension {
       return
     }
 
-    INInteraction.deleteAll { [weak self, restrictedFallbackContent] error in
+    interactionDeletionDeadline.deleteAll { [weak self, restrictedFallbackContent] error in
       if error != nil {
         self?.activateRestrictionFence()
       }

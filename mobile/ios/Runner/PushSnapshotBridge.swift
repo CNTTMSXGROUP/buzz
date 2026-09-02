@@ -95,33 +95,27 @@ final class BuzzPushSnapshotBridge {
             ]
           )
         }
-        try ageRestrictionFenceStore.performFencedAsyncCleanup(
-          { completion in
-            try store.replaceCommunities([])
-            try BuzzPushKeychain.replace(
-              signingKeys: [:],
-              accessGroup: self.keychainAccessGroup
-            )
-            let center = UNUserNotificationCenter.current()
-            center.removeAllDeliveredNotifications()
-            center.removeAllPendingNotificationRequests()
-            self.interactionDeletionDeadline.deleteAll(completion: completion)
-          },
-          completion: { error in
-            guard error == nil else {
-              Self.complete(
-                result,
-                value: FlutterError(
-                  code: "age_restriction_purge_failed",
-                  message: "Unable to fence and purge restricted notifications.",
-                  details: error?.localizedDescription
-                )
-              )
-              return
-            }
-            Self.complete(result, value: nil)
-          }
+        try ageRestrictionFenceStore.begin()
+        try store.replaceCommunities([])
+        try BuzzPushKeychain.replace(
+          signingKeys: [:],
+          accessGroup: self.keychainAccessGroup
         )
+        let center = UNUserNotificationCenter.current()
+        center.removeAllDeliveredNotifications()
+        center.removeAllPendingNotificationRequests()
+        self.interactionDeletionDeadline.deleteAll { error in
+          Self.complete(
+            result,
+            value: error.map {
+              FlutterError(
+                code: "age_restriction_purge_failed",
+                message: "Unable to fence and purge restricted notifications.",
+                details: $0.localizedDescription
+              )
+            }
+          )
+        }
       } catch {
         Self.complete(
           result,
@@ -142,7 +136,8 @@ final class BuzzPushSnapshotBridge {
   ) {
     guard let communities = arguments["communities"] as? [[String: Any]],
       let signingKeys = arguments["signingKeys"] as? [String: String],
-      communities.count <= BuzzPushPresentationCacheStore.maximumCommunities
+      communities.count <= BuzzPushPresentationCacheStore.maximumCommunities,
+      !requiresStore || arguments["settleFence"] is Bool
     else {
       result(
         FlutterError(
@@ -197,6 +192,7 @@ final class BuzzPushSnapshotBridge {
         }
         let data = try JSONSerialization.data(withJSONObject: enriched, options: [.sortedKeys])
         let decoded = try JSONDecoder().decode([PushLeaseCommunity].self, from: data)
+        let settleFence = arguments["settleFence"] as? Bool ?? false
         let replaceSnapshot = {
           try store.replaceCommunities(decoded)
           try BuzzPushKeychain.replace(
@@ -214,31 +210,48 @@ final class BuzzPushSnapshotBridge {
               ]
             )
           }
-          try ageRestrictionFenceStore.performFencedAsyncCleanup(
-            { completion in
-              try replaceSnapshot()
-              let center = UNUserNotificationCenter.current()
-              center.removeAllDeliveredNotifications()
-              center.removeAllPendingNotificationRequests()
-              self.interactionDeletionDeadline.deleteAll(completion: completion)
-            },
-            completion: { error in
-              Self.complete(
-                result,
-                value: error.map {
-                  FlutterError(
-                    code: "snapshot_sync_failed",
-                    message: "Unable to sync push community state.",
-                    details: $0.localizedDescription
-                  )
-                }
-              )
-            }
-          )
+          let cleanup = { (completion: @escaping (Error?) -> Void) throws in
+            try replaceSnapshot()
+            let center = UNUserNotificationCenter.current()
+            center.removeAllDeliveredNotifications()
+            center.removeAllPendingNotificationRequests()
+            self.interactionDeletionDeadline.deleteAll(completion: completion)
+          }
+          let completion = { (error: Error?) in
+            Self.complete(
+              result,
+              value: error.map {
+                FlutterError(
+                  code: "snapshot_sync_failed",
+                  message: "Unable to sync push community state.",
+                  details: $0.localizedDescription
+                )
+              }
+            )
+          }
+          if settleFence {
+            try ageRestrictionFenceStore.performFencedAsyncCleanup(
+              cleanup,
+              completion: completion
+            )
+          } else {
+            try ageRestrictionFenceStore.begin()
+            try cleanup(completion)
+          }
           return
         } else {
           try replaceSnapshot()
           if requiresStore {
+            guard settleFence else {
+              throw NSError(
+                domain: "BuzzPushSnapshotBridge",
+                code: 3,
+                userInfo: [
+                  NSLocalizedDescriptionKey:
+                    "Only an allowed age-gate transition may restore push state."
+                ]
+              )
+            }
             // Only the acknowledged age-gate path may end a failed purge fence.
             // An older best-effort export must never reopen notification access.
             try ageRestrictionFenceStore?.settleIfFencing()

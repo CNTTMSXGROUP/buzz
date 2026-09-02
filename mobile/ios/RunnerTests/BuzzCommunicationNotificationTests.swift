@@ -299,6 +299,19 @@ final class BuzzCommunicationNotificationTests: XCTestCase {
 }
 
 final class BuzzPushSnapshotEnrichmentTests: XCTestCase {
+  func testLaunchBeginsAgeRestrictionFenceBeforeFlutterState() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    try AppDelegate.beginLaunchAgeRestrictionFence(containerURL: directory)
+
+    XCTAssertTrue(BuzzAgeRestrictionFenceStore(containerURL: directory).current().isFencing)
+  }
+
   func testStrictAgeGateWriteFailsWhenAppGroupStoreIsUnavailable() {
     let bridge = BuzzPushSnapshotBridge(
       appGroupIdentifier: nil,
@@ -315,6 +328,7 @@ final class BuzzPushSnapshotEnrichmentTests: XCTestCase {
             "section": "communities",
             "communities": [[String: Any]](),
             "signingKeys": [String: String](),
+            "settleFence": false,
           ]
         )
       ) { value in

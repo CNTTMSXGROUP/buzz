@@ -45,8 +45,33 @@ import os.log
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    do {
+      let container = appGroupIdentifier.flatMap {
+        FileManager.default.containerURL(
+          forSecurityApplicationGroupIdentifier: $0
+        )
+      }
+      try Self.beginLaunchAgeRestrictionFence(containerURL: container)
+    } catch {
+      fatalError(
+        "Unable to begin the launch age-restriction fence: \(error.localizedDescription)"
+      )
+    }
     UNUserNotificationCenter.current().delegate = self
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  static func beginLaunchAgeRestrictionFence(containerURL: URL?) throws {
+    guard let containerURL else {
+      throw NSError(
+        domain: "BuzzAppDelegate",
+        code: 1,
+        userInfo: [
+          NSLocalizedDescriptionKey: "The push app-group container is unavailable."
+        ]
+      )
+    }
+    try BuzzAgeRestrictionFenceStore(containerURL: containerURL).begin()
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {

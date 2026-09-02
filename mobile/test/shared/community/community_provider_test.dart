@@ -48,11 +48,20 @@ void main() {
       snapshots.add(List.of(communities));
     }
 
+    Future<void> writeAgeGateSnapshot(
+      List<Community> communities, {
+      required bool settleFence,
+    }) async {
+      snapshots.add(List.of(communities));
+    }
+
     return ProviderContainer(
       overrides: [
         communityStorageProvider.overrideWithValue(communityStorage),
         communitySnapshotWriterProvider.overrideWithValue(writeSnapshot),
-        ageGateCommunitySnapshotWriterProvider.overrideWithValue(writeSnapshot),
+        ageGateCommunitySnapshotWriterProvider.overrideWithValue(
+          writeAgeGateSnapshot,
+        ),
         communityPushLeaseDeactivatorProvider.overrideWithValue(deactivator),
         communityPushLeaseRevocationEnqueuerProvider.overrideWithValue((
           community,
@@ -80,6 +89,7 @@ void main() {
       () async {
         final ordinarySnapshots = <List<Community>>[];
         final ageGateSnapshots = <List<Community>>[];
+        final settleFenceValues = <bool>[];
         container = ProviderContainer(
           overrides: [
             communityStorageProvider.overrideWithValue(communityStorage),
@@ -89,9 +99,11 @@ void main() {
               ordinarySnapshots.add(List.of(communities));
             }),
             ageGateCommunitySnapshotWriterProvider.overrideWithValue((
-              communities,
-            ) async {
+              communities, {
+              required settleFence,
+            }) async {
               ageGateSnapshots.add(List.of(communities));
+              settleFenceValues.add(settleFence);
             }),
           ],
         );
@@ -101,6 +113,7 @@ void main() {
 
         expect(ordinarySnapshots, [isEmpty]);
         expect(ageGateSnapshots, [isEmpty]);
+        expect(settleFenceValues, [isFalse]);
       },
     );
 
@@ -113,10 +126,12 @@ void main() {
             communityStorageProvider.overrideWithValue(communityStorage),
             communitySnapshotWriterProvider.overrideWithValue((_) async {}),
             ageGateCommunitySnapshotWriterProvider.overrideWithValue((
-              communities,
-            ) async {
+              communities, {
+              required settleFence,
+            }) async {
               strictAttempts += 1;
               expect(communities, isEmpty);
+              expect(settleFence, isFalse);
               if (strictAttempts < 3) {
                 throw StateError('strict snapshot unavailable');
               }
@@ -554,9 +569,11 @@ void main() {
               completedSnapshots.add(captured);
             }),
             ageGateCommunitySnapshotWriterProvider.overrideWithValue((
-              communities,
-            ) async {
+              communities, {
+              required settleFence,
+            }) async {
               completedSnapshots.add(List.of(communities));
+              expect(settleFence, isFalse);
             }),
           ],
         );
@@ -585,6 +602,7 @@ void main() {
         final staleWriteStarted = Completer<void>();
         final releaseStaleWrite = Completer<void>();
         final completedSnapshots = <List<Community>>[];
+        final settleFenceValues = <bool>[];
         final community = Community.create(
           name: 'Age gated',
           relayUrl: 'https://age-gated.example.com',
@@ -606,9 +624,11 @@ void main() {
               completedSnapshots.add(captured);
             }),
             ageGateCommunitySnapshotWriterProvider.overrideWithValue((
-              communities,
-            ) async {
+              communities, {
+              required settleFence,
+            }) async {
               completedSnapshots.add(List.of(communities));
+              settleFenceValues.add(settleFence);
             }),
           ],
         );
@@ -624,10 +644,12 @@ void main() {
         await suspension;
 
         expect(completedSnapshots.last, isEmpty);
+        expect(settleFenceValues, [isFalse]);
 
         await container.read(resumeCommunitySnapshotAfterAgeCheckProvider)();
 
         expect(completedSnapshots.last.single.id, community.id);
+        expect(settleFenceValues, [isFalse, isTrue]);
       },
     );
 

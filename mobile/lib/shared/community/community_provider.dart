@@ -80,6 +80,12 @@ final communityStorageProvider = Provider<CommunityStorage>((ref) {
 typedef CommunitySnapshotWriter =
     Future<void> Function(List<Community> communities);
 
+typedef AgeGateCommunitySnapshotWriter =
+    Future<void> Function(
+      List<Community> communities, {
+      required bool settleFence,
+    });
+
 /// Writes the complete persisted community set to storage shared with the iOS
 /// notification service extension. Tests override this provider to verify that
 /// every persistence path refreshes (or clears) the native snapshot.
@@ -91,7 +97,7 @@ final communitySnapshotWriterProvider = Provider<CommunitySnapshotWriter>((
 
 /// Strict writer used only for security-sensitive launch age-gate transitions.
 final ageGateCommunitySnapshotWriterProvider =
-    Provider<CommunitySnapshotWriter>((ref) {
+    Provider<AgeGateCommunitySnapshotWriter>((ref) {
       return registerBuzzPushCommunitySnapshotStrict;
     });
 
@@ -228,7 +234,7 @@ class _CommunitySnapshotSync {
   _CommunitySnapshotSync(this._writer, this._ageGateWriter);
 
   final CommunitySnapshotWriter _writer;
-  final CommunitySnapshotWriter _ageGateWriter;
+  final AgeGateCommunitySnapshotWriter _ageGateWriter;
   final Set<Future<void>> _writesInFlight = {};
   String? _lastSuccessfulSnapshot;
   String? _lastSuccessfulAgeGateSnapshot;
@@ -260,7 +266,11 @@ class _CommunitySnapshotSync {
   Future<void> suspendForAgeCheck() => _serializeAgeGateMutation(() async {
     if (!_ageRestricted) _ageCheckSuspended = true;
     await _waitForWrites();
-    await write(const <Community>[], useAgeGateWriter: true);
+    await write(
+      const <Community>[],
+      useAgeGateWriter: true,
+      settleAgeGateFence: false,
+    );
   });
 
   Future<void> resumeAfterAgeCheck(List<Community> communities) =>
@@ -268,13 +278,18 @@ class _CommunitySnapshotSync {
         if (_ageRestricted) return;
         await _waitForWrites();
         _ageCheckSuspended = false;
-        await write(communities, useAgeGateWriter: true);
+        await write(
+          communities,
+          useAgeGateWriter: true,
+          settleAgeGateFence: true,
+        );
       });
 
   Future<void> write(
     List<Community> communities, {
     bool enforceAgeRestriction = false,
     bool useAgeGateWriter = false,
+    bool settleAgeGateFence = false,
   }) async {
     if (enforceAgeRestriction) {
       _ageRestricted = true;
@@ -290,7 +305,7 @@ class _CommunitySnapshotSync {
     final effectiveCommunities = _ageRestricted || _ageCheckSuspended
         ? const <Community>[]
         : communities;
-    final fingerprint = effectiveCommunities
+    final contentFingerprint = effectiveCommunities
         .map(
           (community) => [
             community.id,
@@ -305,15 +320,23 @@ class _CommunitySnapshotSync {
           ].join('\u0000'),
         )
         .join('\u0001');
+    final fingerprint = useAgeGateWriter
+        ? '$contentFingerprint\u0002${settleAgeGateFence ? 1 : 0}'
+        : contentFingerprint;
     final lastSuccessfulSnapshot = useAgeGateWriter
         ? _lastSuccessfulAgeGateSnapshot
         : _lastSuccessfulSnapshot;
     if (fingerprint == lastSuccessfulSnapshot) return;
 
     late final Future<void> writeFuture;
-    writeFuture = (useAgeGateWriter ? _ageGateWriter : _writer)(
-      effectiveCommunities,
-    ).whenComplete(() => _writesInFlight.remove(writeFuture));
+    writeFuture =
+        (useAgeGateWriter
+                ? _ageGateWriter(
+                    effectiveCommunities,
+                    settleFence: settleAgeGateFence,
+                  )
+                : _writer(effectiveCommunities))
+            .whenComplete(() => _writesInFlight.remove(writeFuture));
     _writesInFlight.add(writeFuture);
     await writeFuture;
     if (_ageRestricted && effectiveCommunities.isNotEmpty) {
@@ -346,7 +369,12 @@ Future<void> _enforceAgeRestrictedCommunitySnapshot(Ref ref) async {
   try {
     await ref
         .read(_communitySnapshotSyncProvider)
-        .write(const [], enforceAgeRestriction: true, useAgeGateWriter: true);
+        .write(
+          const [],
+          enforceAgeRestriction: true,
+          useAgeGateWriter: true,
+          settleAgeGateFence: false,
+        );
     pushCommunitySnapshotError.value = null;
   } catch (error, stackTrace) {
     reportPushCommunitySnapshotError(error, stackTrace);

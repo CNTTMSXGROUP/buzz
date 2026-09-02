@@ -66,7 +66,7 @@ void main() {
         .setMockMethodCallHandler(_channel, null);
 
     await expectLater(
-      registerBuzzPushCommunitySnapshotStrict(const []),
+      registerBuzzPushCommunitySnapshotStrict(const [], settleFence: false),
       throwsA(isA<MissingPluginException>()),
     );
   });
@@ -82,11 +82,15 @@ void main() {
               'section': 'communities',
               'communities': <Object?>[],
               'signingKeys': <String, String>{},
+              'settleFence': true,
             });
             return null;
           });
 
-      await registerBuzzPushCommunitySnapshotStrict(const []);
+      await registerBuzzPushCommunitySnapshotStrict(
+        const [],
+        settleFence: true,
+      );
     },
   );
 

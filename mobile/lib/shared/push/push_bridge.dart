@@ -257,8 +257,13 @@ Future<void> registerBuzzPushCommunitySnapshot(List<Community> communities) =>
 /// Writes the age-gate snapshot through a native path that must acknowledge
 /// both the app-group store and signing-key update.
 Future<void> registerBuzzPushCommunitySnapshotStrict(
-  List<Community> communities,
-) => _registerBuzzPushCommunitySnapshot(communities, strict: true);
+  List<Community> communities, {
+  required bool settleFence,
+}) => _registerBuzzPushCommunitySnapshot(
+  communities,
+  strict: true,
+  settleFence: settleFence,
+);
 
 /// Removes notifications rendered before a confirmed age restriction.
 Future<void> purgeAgeRestrictedBuzzNotifications() async {
@@ -269,6 +274,7 @@ Future<void> purgeAgeRestrictedBuzzNotifications() async {
 Future<void> _registerBuzzPushCommunitySnapshot(
   List<Community> communities, {
   required bool strict,
+  bool settleFence = false,
 }) async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
@@ -305,6 +311,7 @@ Future<void> _registerBuzzPushCommunitySnapshot(
         'section': 'communities',
         'communities': [for (final snapshot in snapshots) snapshot.toJson()],
         'signingKeys': signingKeys,
+        if (strict) 'settleFence': settleFence,
       },
     );
   } on MissingPluginException {

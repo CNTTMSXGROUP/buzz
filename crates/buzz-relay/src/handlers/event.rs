@@ -730,6 +730,25 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
                 return;
             }
         }
+        // B2: acquire effect permit immediately before the irreversible
+        // ephemeral publication (Redis/local fan-out or presence mutation).
+        // Off-mode (no gate): proceed unconditionally.
+        // [FI-TRACE-LEASE-BOUND, B2 seam: ephemeral EVENT]
+        let _event_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
+            match gate.acquire_effect().await {
+                Ok(permit) => Some(permit),
+                Err(crate::nip_fi_gate::SessionExpired) => {
+                    conn.send(RelayMessage::ok(
+                        &event_id_hex,
+                        false,
+                        "restricted: session expired",
+                    ));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         match handle_ephemeral_event(
             event,
             conn_id,
@@ -756,6 +775,26 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         scopes,
         channel_ids,
         conn_id,
+    };
+
+    // B2: acquire effect permit immediately before the persistent ingest call.
+    // The permit is held through ingest_event() (DB write + side effects +
+    // fan-out) and the OK send. Off-mode: proceed unconditionally.
+    // [FI-TRACE-LEASE-BOUND, B2 seam: persistent EVENT]
+    let _event_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
+        match gate.acquire_effect().await {
+            Ok(permit) => Some(permit),
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    "restricted: session expired",
+                ));
+                return;
+            }
+        }
+    } else {
+        None
     };
 
     match super::ingest::ingest_event(&state, &conn.tenant, event, ingest_auth).await {
@@ -1414,6 +1453,7 @@ mod tests {
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
+            nip_fi_gate: None,
         });
 
         super::handle_agent_observer_event(

@@ -295,26 +295,36 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
-            // B2: Fence admission against an already-expired NIP-FI session.
-            // Acquire the auth_state write lock FIRST so the cancel check and
-            // the state write are atomic with respect to the expiry task.
-            // The expiry task only calls cancel.cancel() — it never writes
-            // auth_state — so holding the write lock prevents a race between
-            // cancel() racing between check and commit here.
+            // B2: acquire a session effect permit before committing auth state.
             //
-            // Pattern: acquire lock → check cancel under lock → write or return.
-            // If cancelled: drop the guard and return; the expiry task's denial
-            // frame and Close are already queued in the terminal channel.
-            let mut auth_guard = conn.auth_state.write().await;
-            if conn.cancel.is_cancelled() {
-                return;
-            }
-            *auth_guard = AuthState::Authenticated(auth_ctx);
-            drop(auth_guard);
+            // Gate ordering: acquire_effect() obtains the fair read lock, then
+            // checks cancel and deadline. A permit is returned only when the
+            // session is still active — expiry cannot transition to Expired
+            // while any permit is held (the permit IS the read lock). This
+            // replaces the old "acquire write_lock → check cancel" fence with
+            // a stronger bound: no AUTH commit can start after the gate's
+            // deadline passes or after the expiry task's cancel.cancel() fires,
+            // and any AUTH commit that starts under a permit will complete before
+            // the gate's quiescence barrier allows teardown to proceed.
+            //
+            // Off-mode (no gate): no permit is needed; proceed unconditionally.
+            // [FI-TRACE-LEASE-BOUND, B2 seam: AUTH commit]
+            let _auth_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
+                match gate.acquire_effect().await {
+                    Ok(permit) => Some(permit),
+                    Err(crate::nip_fi_gate::SessionExpired) => return,
+                }
+            } else {
+                None
+            };
+            *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
+            // The permit is held through set_authenticated_pubkey and the OK send
+            // so the entire auth commit is atomic with respect to expiry.
             state
                 .conn_manager
                 .set_authenticated_pubkey(conn_id, pubkey.to_bytes().to_vec());
             conn.send(RelayMessage::ok(&event_id_hex, true, ""));
+            // _auth_permit drops here — expiry's write guard may proceed.
         }
         Err(e) => {
             warn!(conn_id = %conn_id, error = %e, "NIP-42 auth failed");
@@ -483,6 +493,7 @@ mod tests {
             grace_limit: 3,
             nip_fi_assertion: Some(assertion),
             session_deadline: None,
+            nip_fi_gate: None,
         });
 
         let state = auth_test_state().await;
@@ -603,6 +614,7 @@ mod tests {
             grace_limit: 3,
             nip_fi_assertion: Some(assertion),
             session_deadline: None,
+            nip_fi_gate: None,
         });
 
         let state = auth_test_state().await;

@@ -1768,6 +1768,7 @@ pub(crate) mod tests {
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
+            nip_fi_gate: None,
         };
 
         let mgr = ConnectionManager::new();

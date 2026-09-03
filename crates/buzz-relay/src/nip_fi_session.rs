@@ -155,26 +155,22 @@ pub(crate) fn authorization_denied_frame(route: NipFiWsRoute) -> WsMessage {
 
 /// Spawn the NIP-FI session-lifetime enforcement task for either route.
 ///
-/// At `deadline`, the task (in this exact order):
-/// 1. Enqueues [`authorization_denied_frame(route)`] on `terminal_ctrl_tx`
-///    (the dedicated one-slot channel, always available at expiry).
-/// 2. Increments `buzz_nip_fi_lease_expirations_total` and warns with route.
-/// 3. Calls `cancel.cancel()` — **unconditional**, regardless of queue success.
-///
-/// Using `terminal_ctrl_tx` instead of the ordinary `ctrl_tx` (capacity 8)
-/// ensures the denial frame is delivered even when the control queue is
-/// saturated with ordinary traffic (Pong, roster updates, etc.).
-///
-/// The queue-then-cancel ordering is contractual: the send loop drains
-/// `terminal_ctrl_rx` before `ctrl_rx` before writing `Close`, so the
-/// observable wire order is the route-specific denial frame followed by `Close`.
+/// At `deadline`, the task:
+/// 1. Calls `gate.expire(terminal)` with the route-specific terminal closure.
+///    Inside `gate.expire()`:
+///    a. The terminal closure enqueues the denial frame on `terminal_ctrl_tx`
+///       and increments the lease-expiration metric.
+///    b. `cancel.cancel()` — socket termination starts immediately.
+///    c. The gate acquires the write guard (quiescence barrier) — blocks until
+///       all outstanding effect permits are released, then records `Expired`.
+/// 2. The task then returns, allowing connection teardown to proceed.
 ///
 /// Equality at deadline is expired; already-expired deadlines fire immediately.
 /// No in-band renewal is added. [FI-TRACE-LEASE-BOUND]
 pub(crate) fn spawn_nip_fi_expiry_task(
     deadline: chrono::DateTime<chrono::Utc>,
+    gate: std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>,
     terminal_ctrl_tx: mpsc::Sender<WsMessage>,
-    cancel: CancellationToken,
     route: NipFiWsRoute,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -189,19 +185,26 @@ pub(crate) fn spawn_nip_fi_expiry_task(
         };
         tokio::select! {
             _ = tokio::time::sleep(remaining) => {
-                // 1. Queue denial frame on the dedicated terminal channel BEFORE
-                //    cancel so the send loop delivers it ahead of Close.
-                let _ = terminal_ctrl_tx.try_send(authorization_denied_frame(route));
-                // 2. Metric + warning (no private assertion fields).
-                metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
-                warn!(
-                    route = ?route,
-                    "NIP-FI session lease expired — closing connection"
-                );
-                // 3. Cancel — unconditional.
-                cancel.cancel();
+                // gate.expire() ordering (per contract [6d3b75a5]):
+                //   1. terminal() — queues denial frame before any lock is held.
+                //   2. cancel.cancel() — socket termination at the deadline.
+                //   3. write guard — quiescence barrier; blocks until all pre-expiry
+                //      effect permits are released, then records Expired.
+                // The task's await on gate.expire() completes only after the write
+                // guard is released, so connection teardown (which awaits this task
+                // handle before remove_connection) cannot start until pre-expiry
+                // effects have finished their bounded commits.
+                gate.expire(|| {
+                    let _ = terminal_ctrl_tx.try_send(authorization_denied_frame(route));
+                    metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
+                    warn!(
+                        route = ?route,
+                        "NIP-FI session lease expired — closing connection"
+                    );
+                })
+                .await;
             }
-            _ = cancel.cancelled() => {}
+            _ = gate.cancelled() => {}
         }
     })
 }
@@ -272,6 +275,7 @@ mod tests {
             grace_limit: 3,
             nip_fi_assertion: Some(assertion),
             session_deadline: None,
+            nip_fi_gate: None,
         });
 
         // Use a different key as the proven pubkey → forced mismatch.
@@ -325,12 +329,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let already_expired = Utc::now() - chrono::Duration::seconds(1);
 
-        let handle = spawn_nip_fi_expiry_task(
-            already_expired,
-            terminal_tx,
-            cancel.clone(),
-            NipFiWsRoute::Root,
-        );
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(already_expired, cancel.clone());
+        let handle =
+            spawn_nip_fi_expiry_task(already_expired, gate, terminal_tx, NipFiWsRoute::Root);
         handle.await.expect("expiry task must complete");
 
         assert!(

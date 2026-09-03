@@ -32,7 +32,6 @@ use uuid::Uuid;
 
 use buzz_auth::{generate_challenge, VerifiedAssertion};
 use buzz_core::tenant::TenantContext;
-use buzz_db::channel::MemberRole;
 
 use buzz_core::StoredEvent;
 use buzz_pubsub::EventTopic;
@@ -328,29 +327,28 @@ pub(crate) async fn handle_active_audio_connection(
     // B1: Arm the NIP-FI expiry task HERE — before any persisting side effect
     // (relay membership, room join, roster events, PARTICIPANT_JOINED).
     //
+    // Create the session admission gate when in enforce mode. The gate is the
+    // quiescence barrier: commit_participant_join acquires an effect permit
+    // before committing the 48101 + membership transaction. The expiry task's
+    // gate.expire() holds the write guard until all pre-expiry permits finish.
+    //
     // The terminal channel is created before the send_loop exists so that the
     // denial frame is available to drain via ws_send (still owned) if expiry
     // fires during the admission sequence. Once the send_loop spawns, it owns
-    // the receiver and drains it on cancellation.
-    //
-    // Rejection path for already-expired leases: the synchronous point-in-time
-    // check below fires before the task has a chance to run; both send directly
-    // on ws_send (still owned pre-send_task).
-    //
-    // Rejection path for mid-admission expiry: the expiry task writes the
-    // denial frame to terminal_ctrl_tx, then calls cancel.cancel(). Each async
-    // boundary in the admission sequence checks cancel.is_cancelled(); on
-    // detection the handler drains terminal_ctrl_rx, sends the denial frame
-    // via ws_send (still owned), cleans up any partial state, and returns.
-    // [FI-TRACE-LEASE-BOUND]
+    // the receiver and drains it on cancellation. [FI-TRACE-LEASE-BOUND]
     let (terminal_ctrl_tx, mut terminal_ctrl_rx) =
         tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+
+    let audio_gate = audio_session_deadline
+        .map(|deadline| crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone()));
 
     let _nip_fi_admission_expiry = audio_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
+            audio_gate
+                .clone()
+                .expect("gate is Some when deadline is Some"),
             terminal_ctrl_tx.clone(),
-            cancel.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         )
     });
@@ -426,7 +424,7 @@ pub(crate) async fn handle_active_audio_connection(
     check_cancel!();
 
     // ── Step 3: membership check / auto-add ───────────────────────────────────
-    let parent_id_for_event = match ensure_membership(
+    let membership_admission = match check_membership_for_admission(
         &state,
         &tenant,
         channel_id,
@@ -435,7 +433,7 @@ pub(crate) async fn handle_active_audio_connection(
     )
     .await
     {
-        Ok(parent_id) => parent_id,
+        Ok(admission) => admission,
         Err(e) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
             let _ = ws_send
@@ -447,6 +445,14 @@ pub(crate) async fn handle_active_audio_connection(
                 .await;
             return;
         }
+    };
+    // Derive parent_id_for_event from the membership admission result.
+    // This is the channel ID that lifecycle events (48101/48102/48103) belong to.
+    let parent_id_for_event = match &membership_admission {
+        MembershipAdmission::Existing { parent_channel_id } => *parent_channel_id,
+        MembershipAdmission::AutoAddRequired {
+            parent_channel_id, ..
+        } => *parent_channel_id,
     };
     check_cancel!();
 
@@ -866,38 +872,81 @@ pub(crate) async fn handle_active_audio_connection(
         room.broadcast_control(joined_msg);
     }
 
-    // ── Step 6: emit kind:48101 (PARTICIPANT_JOINED) ──────────────────────────
+    // ── Step 6: commit kind:48101 (PARTICIPANT_JOINED) atomically ────────────
+    // commit_participant_join takes one DB transaction containing:
+    //   - auto-membership insert (if AutoAddRequired and still absent), and
+    //   - the 48101 event insert
+    // Both commit under a single session effect permit, or both roll back on
+    // expiry. Fan-out happens while the permit is still held.
     let lifecycle_revision = if remote_session.is_some() {
         roster_revision
     } else {
         admission_revision
     };
-    emit_participant_event(
+
+    match commit_participant_join(
         &state,
         &tenant,
         channel_id,
         parent_id_for_event,
-        ParticipantLifecycle {
-            kind: Kind::Custom(48101),
-            participant_pubkey: &pubkey_hex,
-            roster_revision: Some(lifecycle_revision),
-            admission_id: Some(peer_id),
-        },
+        &pubkey_hex,
+        &pubkey_bytes,
+        peer_id,
+        lifecycle_revision,
+        &membership_admission,
+        audio_gate.as_ref(),
     )
-    .await;
-
-    // B1: final pre-send_loop check — after PARTICIPANT_JOINED emission.
-    // After this point the send_loop owns terminal_ctrl_rx and drains it on
-    // cancel; no further check_cancel! calls are needed.
-    check_cancel!(cleanup: {
-        room.remove_peer(peer_id);
-        state.audio_rooms.cleanup_if_empty(tenant.community(), channel_id);
-        if let (Some(session), Some(ref mut stream)) = (remote_session.as_ref(), remote_stream.as_mut()) {
-            let s = session.fenced();
-            let pk = session.pubkey().to_string();
-            crate::audio::join::send_clean_close(stream, s, &pk).await;
+    .await
+    {
+        Ok(_stored) => {}
+        Err(JoinCommitError::Expired) => {
+            // Gate denied — expiry fired before commit. Clean up and return.
+            // The expiry task already queued the denial frame and cancelled.
+            room.remove_peer(peer_id);
+            state
+                .audio_rooms
+                .cleanup_if_empty(tenant.community(), channel_id);
+            if let (Some(session), Some(ref mut stream)) =
+                (remote_session.as_ref(), remote_stream.as_mut())
+            {
+                let s = session.fenced();
+                let pk = session.pubkey().to_string();
+                crate::audio::join::send_clean_close(stream, s, &pk).await;
+            }
+            // Drain the terminal denial frame (already queued by expiry task).
+            use futures_util::SinkExt as _;
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            return;
         }
-    });
+        Err(JoinCommitError::Db(e)) => {
+            // DB failure during join commit — treat same as pre-admission error.
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "48101 commit failed: {e}");
+            room.remove_peer(peer_id);
+            state
+                .audio_rooms
+                .cleanup_if_empty(tenant.community(), channel_id);
+            if let (Some(session), Some(ref mut stream)) =
+                (remote_session.as_ref(), remote_stream.as_mut())
+            {
+                let s = session.fenced();
+                let pk = session.pubkey().to_string();
+                crate::audio::join::send_clean_close(stream, s, &pk).await;
+            }
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type":"error","message":"error: join commit failed"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+    }
+
+    // B1: After commit_participant_join, the admission is committed. No further
+    // check_cancel! is needed — the send_loop owns terminal_ctrl_rx from here.
 
     let missed_pongs = Arc::new(AtomicU8::new(0));
 
@@ -1477,15 +1526,41 @@ async fn heartbeat_loop(
     }
 }
 
-async fn ensure_membership(
+/// Outcome of [`check_membership_for_admission`].
+///
+/// `Existing` means the caller is already a member; no write is needed at join
+/// time. `AutoAddRequired` means a membership write is still needed; it is
+/// deferred into the same DB transaction that inserts the `48101` event, so
+/// neither can commit without the other.
+#[derive(Debug, Clone)]
+pub(crate) enum MembershipAdmission {
+    /// Caller is already a member of the audio channel.
+    Existing { parent_channel_id: Uuid },
+    /// Caller is a member of the parent channel and needs auto-add to the
+    /// audio channel. The write is deferred into `commit_participant_join`.
+    AutoAddRequired {
+        parent_channel_id: Uuid,
+        channel_created_by: Vec<u8>,
+    },
+}
+
+/// Validate membership for audio admission — **no durable write**.
+///
+/// Loads the channel, checks archival status, resolves the parent-channel
+/// linkage for ephemeral channels, and checks existing membership and parent
+/// membership. Returns [`MembershipAdmission`] describing what still needs
+/// to happen at commit time.
+///
+/// Performs zero DB writes. Any needed auto-add write is deferred into the
+/// caller-owned transaction inside `commit_participant_join`.
+async fn check_membership_for_admission(
     state: &AppState,
     tenant: &TenantContext,
     channel_id: Uuid,
     pubkey_bytes: &[u8],
     parent_channel_id: Option<Uuid>,
-) -> Result<Uuid, String> {
+) -> Result<MembershipAdmission, String> {
     // Load channel first — reject archived channels before any membership check.
-    // This ensures auto-ended huddles can't be rejoined by existing members.
     let channel = state
         .db
         .get_channel(tenant.community(), channel_id)
@@ -1497,8 +1572,6 @@ async fn ensure_membership(
     }
 
     // Lifecycle events for an ephemeral huddle belong in its parent channel.
-    // Resolve that parent from a creator-signed kind:48100 event instead of
-    // trusting the UUID supplied by the client during audio auth.
     let lifecycle_parent_id = if channel.ttl_seconds.is_some() {
         let parent_id = parent_channel_id.ok_or("ephemeral channel requires parent linkage")?;
         let linked = state
@@ -1526,11 +1599,15 @@ async fn ensure_membership(
         .map_err(|e| format!("db error: {e}"))?;
 
     if is_member {
-        return Ok(lifecycle_parent_id);
+        return Ok(MembershipAdmission::Existing {
+            parent_channel_id: lifecycle_parent_id,
+        });
     }
 
     if channel.visibility == "open" {
-        return Ok(lifecycle_parent_id);
+        return Ok(MembershipAdmission::Existing {
+            parent_channel_id: lifecycle_parent_id,
+        });
     }
 
     // Auto-add path: private ephemeral channel + caller is member of parent.
@@ -1541,24 +1618,224 @@ async fn ensure_membership(
             .map_err(|e| format!("db error: {e}"))?;
 
         if parent_member {
-            state
-                .db
-                .add_member(
-                    tenant.community(),
-                    channel_id,
-                    pubkey_bytes,
-                    MemberRole::Member,
-                    Some(&channel.created_by),
-                )
-                .await
-                .map_err(|e| format!("auto-add failed: {e}"))?;
-            state.invalidate_membership(tenant, channel_id, pubkey_bytes);
-
-            return Ok(lifecycle_parent_id);
+            return Ok(MembershipAdmission::AutoAddRequired {
+                parent_channel_id: lifecycle_parent_id,
+                channel_created_by: channel.created_by.clone(),
+            });
         }
     }
 
     Err("not a member".into())
+}
+
+/// Error returned by [`commit_participant_join`].
+#[derive(Debug)]
+pub(crate) enum JoinCommitError {
+    /// DB transaction setup or commit failed.
+    Db(buzz_db::DbError),
+    /// The session gate rejected the permit (session expired before commit).
+    Expired,
+}
+
+impl std::fmt::Display for JoinCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinCommitError::Db(e) => write!(f, "db error: {e}"),
+            JoinCommitError::Expired => write!(f, "session expired before commit"),
+        }
+    }
+}
+
+impl From<buzz_db::DbError> for JoinCommitError {
+    fn from(e: buzz_db::DbError) -> Self {
+        JoinCommitError::Db(e)
+    }
+}
+
+/// Atomically commit the participant join: auto-add membership (if needed) +
+/// kind `48101` event, in one DB transaction, under a session effect permit.
+///
+/// Ordering (per B1 contract [e5bc0382]):
+/// 1. Sign the `48101` event synchronously.
+/// 2. Begin a caller-owned DB transaction.
+/// 3. Under the channel membership lock: re-read membership state and auto-add
+///    if `AutoAddRequired` and membership is still absent. A concurrent
+///    legitimate add is observed as existing and is not overwritten.
+/// 4. Insert kind `48101` in the same transaction (uncommitted).
+/// 5. Acquire a session effect permit (or rollback + return `Err(Expired)`).
+/// 6. Commit the transaction while holding the permit. On commit error, roll
+///    back explicitly and return `Err(Db(...))`.
+/// 7. While the same permit is held: mark the event locally, fan out to local
+///    subscribers, publish to Redis. Errors here use existing handling (warn,
+///    invalidate local mark). Drop the permit after fan-out.
+///
+/// Never cancels or drops the commit future once started — commit returns a
+/// known outcome and that outcome drives success or the pre-admission cleanup.
+///
+/// Argument count reflects the join's natural surface; a param struct would
+/// obscure more than it clarifies at this single call site.
+#[allow(clippy::too_many_arguments)]
+async fn commit_participant_join(
+    state: &AppState,
+    tenant: &TenantContext,
+    channel_id: Uuid,
+    parent_channel_id: Uuid,
+    pubkey_hex: &str,
+    pubkey_bytes: &[u8],
+    peer_id: Uuid,
+    roster_revision: u64,
+    membership_admission: &MembershipAdmission,
+    gate: Option<&std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>>,
+) -> Result<StoredEvent, JoinCommitError> {
+    // 1. Sign the 48101 event synchronously.
+    let content = serde_json::json!({
+        "ephemeral_channel_id": channel_id.to_string(),
+        "roster_revision": roster_revision,
+        "admission_id": peer_id.to_string(),
+    })
+    .to_string();
+
+    let h_tag = Tag::parse(["h", &parent_channel_id.to_string()]).map_err(|e| {
+        JoinCommitError::Db(buzz_db::DbError::InvalidData(format!(
+            "failed to build h tag: {e}"
+        )))
+    })?;
+    let p_tag = Tag::parse(["p", pubkey_hex]).map_err(|e| {
+        JoinCommitError::Db(buzz_db::DbError::InvalidData(format!(
+            "failed to build p tag: {e}"
+        )))
+    })?;
+    let event = EventBuilder::new(Kind::Custom(48101), content)
+        .tags(vec![h_tag, p_tag])
+        .sign_with_keys(&state.relay_keypair)
+        .map_err(|e| {
+            JoinCommitError::Db(buzz_db::DbError::InvalidData(format!(
+                "failed to sign 48101: {e}"
+            )))
+        })?;
+    let event_id_hex = event.id.to_hex();
+
+    // 2. Begin a caller-owned DB transaction.
+    let mut tx = state.db.begin_event_write_transaction().await?;
+
+    // 3. Under the channel membership lock: auto-add if still absent.
+    if let MembershipAdmission::AutoAddRequired {
+        channel_created_by, ..
+    } = membership_admission
+    {
+        buzz_db::channel_members::acquire_channel_membership_lock_in_transaction(
+            &mut tx,
+            tenant.community(),
+            channel_id,
+        )
+        .await?;
+
+        // Re-read membership — a concurrent add may have already provided access.
+        let still_absent = !buzz_db::channel_members::is_member_in_transaction(
+            &mut tx,
+            tenant.community(),
+            channel_id,
+            pubkey_bytes,
+        )
+        .await?;
+
+        if still_absent {
+            buzz_db::channel_members::insert_auto_membership_in_transaction(
+                &mut tx,
+                tenant.community(),
+                channel_id,
+                pubkey_bytes,
+                channel_created_by.as_slice(),
+            )
+            .await?;
+        }
+        // If not still_absent: a concurrent legitimate add already committed.
+        // The joint transaction observes it; we do not need to compensate later.
+    }
+
+    // 4. Insert kind `48101` uncommitted.
+    let (stored, was_inserted) = buzz_db::event::insert_event_in_transaction(
+        &mut tx,
+        tenant.community(),
+        &event,
+        Some(parent_channel_id),
+    )
+    .await?;
+
+    // 5. Acquire effect permit or rollback.
+    let _permit = if let Some(g) = gate {
+        match g.acquire_effect().await {
+            Ok(permit) => Some(permit),
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                // Rollback explicitly — no 48101 or membership write committed.
+                let _ = tx.rollback().await;
+                return Err(JoinCommitError::Expired);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 6. Commit while holding the permit.
+    if let Err(e) = tx.commit().await {
+        return Err(JoinCommitError::Db(e.into()));
+    }
+
+    // 7. Fan-out while permit is still held — expiry cannot complete between
+    //    row visibility and fan-out.
+    if was_inserted {
+        state.mark_local_event(tenant.community(), &event.id);
+        crate::handlers::event::fan_out_event_to_local_subscribers(
+            state,
+            tenant.community(),
+            &stored,
+        )
+        .await;
+
+        if let Err(e) = state
+            .pubsub
+            .publish_event(tenant, EventTopic::Channel(parent_channel_id), &event)
+            .await
+        {
+            state
+                .local_event_ids
+                .invalidate(&(tenant.community(), event.id.to_bytes()));
+            warn!(
+                event_id = %event_id_hex,
+                channel_id = %parent_channel_id,
+                "audio: failed to publish 48101: {e}"
+            );
+        }
+
+        // Best-effort mention insertion — outside the gate, failure is a warn.
+        if let Err(e) = buzz_db::insert_mentions(
+            state.db.pool(),
+            tenant.community(),
+            &event,
+            Some(parent_channel_id),
+        )
+        .await
+        {
+            warn!(event_id = %event_id_hex, "audio: failed to insert 48101 mentions: {e}");
+        }
+    } else {
+        debug!(
+            event_id = %event_id_hex,
+            channel_id = %parent_channel_id,
+            "audio: 48101 already persisted — skipping fan-out"
+        );
+    }
+    // _permit drops here — gate quiescence barrier may proceed.
+
+    // After commit, invalidate the membership cache if we auto-added.
+    if matches!(
+        membership_admission,
+        MembershipAdmission::AutoAddRequired { .. }
+    ) {
+        state.invalidate_membership(tenant, channel_id, pubkey_bytes);
+    }
+
+    Ok(stored)
 }
 
 #[derive(Clone, Copy)]
@@ -2573,10 +2850,11 @@ mod tests {
         // deadline. Queue-then-cancel is synchronous: the send loop's cancellation
         // branch drains the terminal frame before writing Close.
         let already_expired = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(already_expired, cancel.clone());
         let expiry_handle = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             already_expired,
+            gate,
             terminal_tx,
-            cancel.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         );
         expiry_handle.await.expect("expiry task must complete");

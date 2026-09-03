@@ -110,6 +110,17 @@ pub struct ConnectionState {
     /// `restricted: authorization denied` + cancels. Equality is expired.
     /// [FI-TRACE-LEASE-BOUND]
     pub session_deadline: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// The NIP-FI session admission gate, present only in enforce mode.
+    ///
+    /// Handlers that perform irreversible side effects (AUTH state commit,
+    /// EVENT persistence, REQ subscription registration, COUNT query) must
+    /// call `gate.acquire_effect()` at the irreversible seam. The gate's
+    /// quiescence barrier ensures connection teardown (subscription removal,
+    /// peer cleanup) cannot start until all pre-expiry effects finish their
+    /// bounded commits. `None` in off-mode (no assertion presented at upgrade).
+    /// [FI-TRACE-LEASE-BOUND]
+    pub(crate) nip_fi_gate: Option<std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>>,
 }
 
 impl ConnectionState {
@@ -288,6 +299,16 @@ async fn handle_active_connection(
         )
     });
 
+    // Create the NIP-FI session admission gate when in enforce mode.
+    //
+    // The gate is the lifetime authority for this connection: handlers acquire
+    // an effect permit at each irreversible seam, and the expiry task uses
+    // gate.expire() so the quiescence barrier (write lock) prevents teardown
+    // from starting until all pre-expiry effects finish their bounded commits.
+    // Off-mode (no assertion) → None, with zero overhead. [FI-TRACE-LEASE-BOUND]
+    let nip_fi_gate = session_deadline
+        .map(|deadline| crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone()));
+
     let conn = Arc::new(ConnectionState {
         conn_id,
         tenant,
@@ -304,6 +325,7 @@ async fn handle_active_connection(
         grace_limit: state.config.slow_client_grace_limit,
         nip_fi_assertion,
         session_deadline,
+        nip_fi_gate: nip_fi_gate.clone(),
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -386,15 +408,14 @@ async fn handle_active_connection(
 
     // NIP-FI session-lifetime enforcement task.
     //
-    // Fires at `session_deadline`, queues the exact Nostr text for
-    // `authorization_denied` on the dedicated terminal channel (always
-    // available — capacity 1, only one terminal event per connection),
-    // then cancels. No in-band renewal. [FI-TRACE-LEASE-BOUND]
+    // Uses gate.expire() so the quiescence barrier (write lock) ensures
+    // connection teardown cannot start until all pre-expiry effects have
+    // finished. [FI-TRACE-LEASE-BOUND]
     let nip_fi_expiry_task = conn.session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
+            nip_fi_gate.expect("gate is Some when session_deadline is Some"),
             conn.terminal_ctrl_tx.clone(),
-            cancel.clone(),
             crate::nip_fi_session::NipFiWsRoute::Root,
         )
     });
@@ -837,6 +858,7 @@ pub(crate) mod tests {
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
+            nip_fi_gate: None,
         };
         (Arc::new(conn), send_rx)
     }
@@ -1364,36 +1386,40 @@ pub(crate) mod tests {
         assert_eq!(deadline, exp, "no lifetime → upstream (exp) only");
     }
 
-    // ── NIP-FI expiry notice delivered on ctrl_tx before cancel ───────────────
+    // ── NIP-FI expiry notice delivered on terminal_ctrl_tx before cancel ─────
     //
-    // The expiry task queues `restricted: authorization denied` on `ctrl_tx`
-    // BEFORE cancellation. This test invokes the production
+    // The expiry task queues `restricted: authorization denied` on
+    // `terminal_ctrl_tx` (capacity-1, prioritised) BEFORE cancellation via the
+    // gate. This test invokes the production
     // `nip_fi_session::spawn_nip_fi_expiry_task` constructor (Root route):
-    // an already-expired deadline fires immediately; the ctrl channel carries
-    // the Nostr NOTICE; the cancel fires afterward.
+    // an already-expired deadline fires immediately; the terminal channel carries
+    // the denial frame; the cancel fires afterward.
     //
     // Mutation evidence:
-    //   A) Delete/change the Root enqueue in `spawn_nip_fi_expiry_task` →
-    //      `ctrl_rx.try_recv()` returns `Err`; test panics at "ctrl channel
-    //      must contain the notice frame".
-    //   B) Delete `cancel.cancel()` → `cancel.is_cancelled()` is false; test
-    //      panics at "expiry task must cancel the connection".
+    //   A) Change the enqueue in `spawn_nip_fi_expiry_task` back to `ctrl_tx` →
+    //      `terminal_rx.try_recv()` returns `Err`; test panics at "terminal
+    //      channel must contain the denial frame".
+    //   B) Delete `cancel.cancel()` inside gate.expire() →
+    //      `cancel.is_cancelled()` is false; test panics at "expiry task must
+    //      cancel the connection".
 
     #[tokio::test]
     async fn expiry_notice_queued_on_ctrl_before_cancel() {
         use tokio::sync::mpsc;
 
-        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<WsMessage>(8);
+        let (terminal_ctrl_tx, mut terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
 
         // Already-expired deadline → fires immediately.
         let deadline = chrono::Utc::now() - chrono::Duration::seconds(10);
 
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
         // Invoke the production shared constructor — Root route.
         let expiry_task = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
-            ctrl_tx,
-            cancel.clone(),
+            gate,
+            terminal_ctrl_tx,
             crate::nip_fi_session::NipFiWsRoute::Root,
         );
 
@@ -1402,24 +1428,24 @@ pub(crate) mod tests {
             .expect("expiry task must complete within 2s")
             .expect("expiry task must not panic");
 
-        // ctrl_rx must contain the notice frame.
-        let ctrl_frame = ctrl_rx
+        // terminal_ctrl_rx must contain the denial frame.
+        let terminal_frame = terminal_ctrl_rx
             .try_recv()
-            .expect("ctrl channel must contain the notice frame before cancel");
-        match ctrl_frame {
+            .expect("terminal channel must contain the denial frame before cancel");
+        match terminal_frame {
             WsMessage::Text(text) => {
-                // NOTICE serialises as ["NOTICE", <message>] — index position 1.
+                // Root route: NOTICE format ["NOTICE", <message>].
                 let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
                 let payload = v.get(1).and_then(|c| c.as_str()).unwrap_or("");
                 assert_eq!(
                     payload,
                     buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
-                    "ctrl frame must carry the exact authorization_denied text"
+                    "terminal frame must carry the exact authorization_denied text"
                 );
             }
-            other => panic!("ctrl frame must be Text, got {other:?}"),
+            other => panic!("terminal frame must be Text, got {other:?}"),
         }
-        // Cancel must have fired after the ctrl send.
+        // Cancel must have fired after the terminal send.
         assert!(
             cancel.is_cancelled(),
             "expiry task must cancel the connection"
@@ -1479,6 +1505,7 @@ pub(crate) mod tests {
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
+            nip_fi_gate: None,
         });
 
         let state = crate::state::tests::test_state().await;
@@ -1598,12 +1625,9 @@ pub(crate) mod tests {
         // immediately enqueue the denial frame on the terminal channel and
         // cancel the token.
         let already_expired = Utc::now() - chrono::Duration::seconds(1);
-        let expiry_handle = spawn_nip_fi_expiry_task(
-            already_expired,
-            terminal_ctrl_tx,
-            cancel.clone(),
-            NipFiWsRoute::Root,
-        );
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(already_expired, cancel.clone());
+        let expiry_handle =
+            spawn_nip_fi_expiry_task(already_expired, gate, terminal_ctrl_tx, NipFiWsRoute::Root);
         // Wait for the expiry task to fire before we run the send_loop.
         expiry_handle.await.expect("expiry task must complete");
 

@@ -334,44 +334,25 @@ async fn nip11_or_ws_handler(
         return Json(nip11_document(&state, raw_host).await).into_response();
     }
 
-    // Row zero: bind the connection to its community from the request host
-    // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
-    // connection. The host is the authoritative selector; an unmapped host or a
-    // lookup failure fails closed with a generic rejection — never a default
-    // tenant. NIP-11 above is served before binding and stays fail-open: an
-    // unmapped host still gets the document (with host-scoped fields like
-    // `icon` simply absent), so the doc cannot leak which hosts are mapped.
-    let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
-        Ok(ctx) => ctx,
-        Err(_) => {
-            // Generic rejection: do not distinguish "unmapped" from "lookup
-            // error", and never echo the host, so an unauthenticated caller
-            // cannot probe which communities exist on this deployment.
-            return (
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-                .into_response();
-        }
-    };
-
-    let max_frame_bytes = state.config.max_frame_bytes;
-
-    // NIP-FI assertion check at upgrade — gated to genuine WebSocket upgrade
-    // requests (requests carrying both `Upgrade: websocket` and a `Connection`
-    // header with the `Upgrade` token) so plain browser GET / and NIP-11
-    // fallback requests are never intercepted by the enforcement gate.
-    // Requiring both headers matches RFC 6455 §4.1 and avoids intercepting a
-    // request that carries only one header and would be rejected by Axum's
-    // WebSocketUpgrade extractor anyway.
+    // NIP-FI assertion check at upgrade — runs BEFORE `bind_community` so that:
+    // (a) a denied upgrade pays zero DB cost [FI-TRACE-TRANSPORT-CLOSED], and
+    // (b) tests that assert 401/503 are not pre-empted by a 404 from an
+    //     unseeded DB — the gate exercises its own seam without coupling to
+    //     host-resolution fixture state.
+    //
+    // Gated to genuine WebSocket upgrade requests (requests carrying both
+    // `Upgrade: websocket` and a `Connection` header with the `Upgrade` token)
+    // so plain browser GET / and NIP-11 fallback requests are never intercepted
+    // by the enforcement gate.  Requiring both headers matches RFC 6455 §4.1
+    // and avoids intercepting a request that carries only one header and would
+    // be rejected by Axum's WebSocketUpgrade extractor anyway.
     //
     // Keying on the header pair (not on `Accept`) means an HTML Accept header
     // on a real WS upgrade is still gated correctly.
     //
     // This pre-check runs BEFORE `WebSocketUpgrade::from_request` so that the
     // denial response is returned on the raw HTTP connection, not inside the
-    // upgrade callback. Running pre-community-active-check means a denied
-    // upgrade pays zero DB cost. [FI-TRACE-TRANSPORT-CLOSED]
+    // upgrade callback.
     let nip_fi_assertion = {
         let is_ws_upgrade = headers
             .get(axum::http::header::UPGRADE)
@@ -402,6 +383,32 @@ async fn nip11_or_ws_handler(
             None
         }
     };
+
+    // Row zero: bind the connection to its community from the request host
+    // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
+    // connection. The host is the authoritative selector; an unmapped host or a
+    // lookup failure fails closed with a generic rejection — never a default
+    // tenant. NIP-11 above is served before binding and stays fail-open: an
+    // unmapped host still gets the document (with host-scoped fields like
+    // `icon` simply absent), so the doc cannot leak which hosts are mapped.
+    //
+    // NIP-FI gate runs above (before bind_community) so denied upgrades pay
+    // zero DB cost and the gate seam is testable without a seeded-DB fixture.
+    let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            // Generic rejection: do not distinguish "unmapped" from "lookup
+            // error", and never echo the host, so an unauthenticated caller
+            // cannot probe which communities exist on this deployment.
+            return (
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+                .into_response();
+        }
+    };
+
+    let max_frame_bytes = state.config.max_frame_bytes;
 
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
@@ -1461,6 +1468,11 @@ mod tests {
     /// startup with no JWKS yet warmed). The verifier is `None` because
     /// `jwks_configs` is empty and `ProductionJwksSource::new` returns `None`
     /// for an empty list; the mode field is set directly so no env is needed.
+    ///
+    /// The NIP-FI gate runs before `bind_community`, so these tests exercise
+    /// the gate seam independently of DB / host-resolution state. The lazy
+    /// PG pool is kept so `AppState::new` compiles; it is never queried by
+    /// any of these router tests.
     async fn nip_fi_enforce_state() -> Arc<AppState> {
         use crate::nip_fi_config::NipFiRelayConfig;
         use buzz_auth::{IssuerRegistry, NipFiMode};
@@ -1614,9 +1626,15 @@ mod tests {
     // the NIP-11 fallback path, never the enforcement gate. The gate fires only
     // on genuine WebSocket upgrades (Connection/Upgrade headers present).
     //
+    // Because the gate runs before bind_community, these tests are DB-free —
+    // the lazy pool is never queried and no host seeding is required. Adding a
+    // DB-dependent fixture here would hide a regression where the gate fires
+    // only because the unseeded-host 404 has not yet been reached.
+    //
     // Mutation evidence:
-    //   A) Move the NIP-FI gate back before the WebSocket check → plain GET
-    //      returns 401/503 instead of the NIP-11/fallback response → panics.
+    //   A) Move the NIP-FI gate back after bind_community → without a seeded
+    //      DB, plain-GET tests return 404 (not 200); the assertion panics.
+    //      With a seeded DB the gate returns 401/503, also panics.
     //   B) Key the gate on the Accept header → a WS request with Accept:
     //      text/html bypasses it → the 401/503 test below returns 101 → panics.
 

@@ -101,6 +101,22 @@ pub async fn handle_count(
         accessible_channels.retain(|channel_id| allowed.contains(channel_id));
     }
 
+    // B2: acquire effect permit immediately before the first DB count query.
+    // The permit is held through all count queries and the COUNT response.
+    // Off-mode: proceed unconditionally.
+    // [FI-TRACE-LEASE-BOUND, B2 seam: COUNT query]
+    let _count_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
+        match gate.acquire_effect().await {
+            Ok(permit) => Some(permit),
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                conn.send(RelayMessage::closed(&sub_id, "restricted: session expired"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // For each filter, count matching events with channel access enforcement.
     let mut total: u64 = 0;
     for (filter, requested_channels) in filters.iter().zip(requested_channel_sets) {
@@ -314,4 +330,98 @@ pub async fn handle_count(
         }
     }
     conn.send(RelayMessage::count(&sub_id, total));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── W4: B2 COUNT gate — expired session cannot issue a count query ────────
+    //
+    // The COUNT handler acquires an effect permit before the first DB count
+    // query. When the gate's cancellation token is pre-cancelled, `acquire_effect`
+    // returns `Err(SessionExpired)` and the handler sends CLOSED without issuing
+    // any query or modifying any state.
+    //
+    // Mutation evidence:
+    //   A) Remove the `acquire_effect` call from the COUNT handler → the handler
+    //      falls through to the DB path. With a lazy pool the query errors out
+    //      (returning a CLOSED or notice), but the gate boundary is gone — the
+    //      `ctrl_rx` message changes from "session expired" to something else
+    //      → the `session expired` assertion panics.
+    //   B) Supply `nip_fi_gate: None` (off-mode) → handler proceeds normally,
+    //      sends no CLOSED at all → `try_recv()` returns `Err` → assertion panics.
+
+    #[tokio::test]
+    async fn w4_b2_expired_gate_prevents_count_query() {
+        use nostr::Keys;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let keys = Keys::generate();
+
+        // Build a gate whose cancel token is already cancelled.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                "test.local".to_string(),
+            ),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+            )),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: Some(gate),
+        });
+
+        let state = crate::state::tests::test_state().await;
+        let sub_id = "w4-b2-test".to_string();
+        // Use kind:1 (TextNote) — not a p-gated kind — so the filter passes all
+        // pre-gate authorization checks and reaches the COUNT gate boundary.
+        let filters = vec![nostr::Filter::new().kind(nostr::Kind::TextNote).limit(1)];
+
+        handle_count(sub_id, filters, Arc::clone(&conn), state).await;
+
+        // A CLOSED frame must have been sent to send_tx with the session-expired
+        // message — the gate returned before any DB query was attempted.
+        let frame = send_rx
+            .try_recv()
+            .expect("W4/B2: handler must send CLOSED on expired gate");
+        match frame {
+            axum::extract::ws::Message::Text(t) => {
+                assert!(
+                    t.contains("session expired"),
+                    "W4/B2: CLOSED message must contain 'session expired'; got: {t}"
+                );
+            }
+            other => panic!("W4/B2: expected Text CLOSED frame, got {other:?}"),
+        }
+    }
 }

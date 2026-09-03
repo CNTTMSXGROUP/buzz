@@ -269,6 +269,22 @@ pub async fn handle_req(
         return;
     }
 
+    // B2: acquire effect permit immediately before the first subscription-map
+    // mutation. The permit is held through map insert, sub_registry registration,
+    // topic retain, historical delivery, and EOSE. Off-mode: proceed
+    // unconditionally. [FI-TRACE-LEASE-BOUND, B2 seam: REQ registration]
+    let _req_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
+        match gate.acquire_effect().await {
+            Ok(permit) => Some(permit),
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                conn.send(RelayMessage::closed(&sub_id, "restricted: session expired"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     {
         let mut subs = conn.subscriptions.lock().await;
         subs.insert(sub_id.clone(), filters.clone());
@@ -2370,5 +2386,100 @@ mod tests {
         ));
         // No #p tag — fallback required.
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+
+    // ── W3: B2 REQ gate — expired session cannot register a subscription ──────
+    //
+    // The REQ handler acquires an effect permit before the first subscription-map
+    // mutation. When the gate's cancellation token is pre-cancelled, `acquire_effect`
+    // returns `Err(SessionExpired)` and the handler sends CLOSED without modifying
+    // the subscription map.
+    //
+    // Mutation evidence:
+    //   A) Remove the `acquire_effect` call from the REQ handler → the handler
+    //      inserts the subscription even on a cancelled gate → the `subs.len()`
+    //      assertion panics.
+    //   B) Change `nip_fi_gate` from `None` to a live gate → the permit succeeds
+    //      → the subscription IS inserted → the opposite assertion panics.
+
+    #[tokio::test]
+    async fn w3_b2_expired_gate_prevents_req_subscription_registration() {
+        use nostr::{Filter, Keys};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let keys = Keys::generate();
+
+        // Build a gate whose cancel token is already cancelled.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                "test.local".to_string(),
+            ),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+            )),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: Some(gate),
+        });
+
+        let state = crate::state::tests::test_state().await;
+        let sub_id = "w3-b2-test".to_string();
+        // Use kind:1 (TextNote) — not a p-gated kind — so the filter passes all
+        // pre-gate authorization checks and reaches the gate boundary.
+        let filters = vec![Filter::new().kind(nostr::Kind::TextNote).limit(1)];
+
+        handle_req(sub_id, filters, Arc::clone(&conn), state).await;
+
+        // The subscription map must be empty — the gate blocked the handler
+        // before any map insertion.
+        let subs = subscriptions.lock().await;
+        assert!(
+            subs.is_empty(),
+            "W3/B2: expired gate must prevent subscription registration; subs = {subs:?}"
+        );
+
+        // A CLOSED frame must have been sent to send_tx with the session-expired message.
+        let frame = send_rx
+            .try_recv()
+            .expect("W3/B2: handler must send CLOSED on expired gate");
+        match frame {
+            axum::extract::ws::Message::Text(t) => {
+                assert!(
+                    t.contains("session expired"),
+                    "W3/B2: CLOSED message must contain 'session expired'; got: {t}"
+                );
+            }
+            other => panic!("W3/B2: expected Text CLOSED frame, got {other:?}"),
+        }
     }
 }

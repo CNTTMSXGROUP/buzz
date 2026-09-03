@@ -16,6 +16,18 @@ import 'push_relay_capability_provider.dart';
 import 'push_subscription.dart';
 
 const _pushBootstrapRetryDelay = Duration(seconds: 5);
+const _maxGatewayInitializationRetries = 6;
+
+@visibleForTesting
+Duration? buzzPushGatewayInitializationRetryDelay(int failureCount) {
+  if (failureCount < 1) {
+    throw ArgumentError.value(failureCount, 'failureCount', 'must be positive');
+  }
+  if (failureCount > _maxGatewayInitializationRetries) return null;
+  return Duration(
+    seconds: _pushBootstrapRetryDelay.inSeconds << (failureCount - 1),
+  );
+}
 
 @visibleForTesting
 class BuzzPushAttemptGate {
@@ -118,6 +130,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     final tombstoneAttempt = useMemoized(BuzzPushAttemptGate.new);
     final registrationRetry = useState(0);
     final gatewayInitializationRetry = useState(0);
+    final gatewayInitializationFailures = useRef(0);
     final publicationRetry = useState(0);
     final tombstoneRetry = useState(0);
     final revocationOutbox = ref.watch(buzzPushLeaseRevocationOutboxProvider);
@@ -149,15 +162,31 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       unawaited(() async {
         try {
           await initializeBuzzPushGateway();
+          gatewayInitializationFailures.value = 0;
           gatewayInitializationAttempt.complete(attempt);
         } catch (error, stack) {
-          gatewayInitializationAttempt.failed(
-            attempt,
-            retry: () {
-              if (context.mounted) gatewayInitializationRetry.value += 1;
-            },
+          gatewayInitializationFailures.value += 1;
+          final retryDelay = buzzPushGatewayInitializationRetryDelay(
+            gatewayInitializationFailures.value,
           );
+          if (retryDelay == null) {
+            gatewayInitializationAttempt.complete(attempt);
+          } else {
+            gatewayInitializationAttempt.retryAfter(
+              attempt,
+              delay: retryDelay,
+              retry: () {
+                if (context.mounted) gatewayInitializationRetry.value += 1;
+              },
+            );
+          }
           debugPrint('Push gateway initialization failed: $error');
+          if (retryDelay == null) {
+            debugPrint(
+              'Push gateway cleanup is deferred until the next app launch '
+              'or APNs registration callback.',
+            );
+          }
           debugPrintStack(stackTrace: stack);
         }
       }());

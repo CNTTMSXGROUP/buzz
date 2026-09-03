@@ -5,6 +5,28 @@ import 'package:buzz/shared/push/push_subscription.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('gateway cleanup retries exponentially and then stops', () {
+    expect(
+      [
+        for (var failure = 1; failure <= 7; failure++)
+          buzzPushGatewayInitializationRetryDelay(failure),
+      ],
+      const [
+        Duration(seconds: 5),
+        Duration(seconds: 10),
+        Duration(seconds: 20),
+        Duration(seconds: 40),
+        Duration(seconds: 80),
+        Duration(seconds: 160),
+        null,
+      ],
+    );
+    expect(
+      () => buzzPushGatewayInitializationRetryDelay(0),
+      throwsArgumentError,
+    );
+  });
+
   test('failed bootstrap attempt becomes retryable after the delay', () async {
     final gate = BuzzPushAttemptGate(retryDelay: Duration.zero);
     addTearDown(gate.dispose);

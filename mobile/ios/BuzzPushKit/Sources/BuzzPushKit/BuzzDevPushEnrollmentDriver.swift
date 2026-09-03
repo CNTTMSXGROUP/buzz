@@ -428,7 +428,6 @@ public final class BuzzDevPushEnrollmentDriver {
     deviceToken: Data,
     relayURL: URL
   ) async throws -> BuzzPushEndpointGrantRecord {
-    try await cleanRetiredGateways(deviceToken: deviceToken)
     return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
   }
 

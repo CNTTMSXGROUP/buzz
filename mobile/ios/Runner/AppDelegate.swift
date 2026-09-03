@@ -538,9 +538,6 @@ import os.log
       enrollmentTask = Task { [weak self] in
         defer { self?.enrollmentTask = nil }
         do {
-          if let cleanupTask = self?.gatewayCleanupTask {
-            try await cleanupTask.value
-          }
           let record = try await driver.enroll(
             deviceToken: deviceToken,
             relayURL: relayURL

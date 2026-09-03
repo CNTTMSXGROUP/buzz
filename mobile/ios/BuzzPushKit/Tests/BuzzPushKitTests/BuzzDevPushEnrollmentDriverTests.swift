@@ -654,11 +654,8 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     }
 
     do {
-      _ = try await driver.enroll(
-        deviceToken: Data((1...32).map(UInt8.init)),
-        relayURL: Self.relayURL
-      )
-      XCTFail("Expected retired gateway cleanup to block replacement enrollment")
+      try await driver.cleanRetiredGateways(deviceToken: Data((1...32).map(UInt8.init)))
+      XCTFail("Expected retired gateway cleanup to remain queued")
     } catch {
       XCTAssertEqual(
         error as? BuzzDevPushEnrollmentError,
@@ -921,7 +918,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     }
   }
 
-  func testReusesPersistedUnexpiredGrant() async throws {
+  func testEnrollmentContinuesWhileRetiredGatewayCleanupRemainsQueued() async throws {
     let existing = BuzzPushEndpointGrantRecord(
       gatewayOrigin: Self.gatewayOrigin,
       relayOrigin: "wss://relay.example",
@@ -937,6 +934,13 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       expiresAt: Self.expiresAt
     )
     let store = MemoryGrantStore(records: [existing])
+    store.cleanup = [
+      BuzzPushGatewayCleanupState(
+        gatewayOrigin: "http://retired-gateway.example",
+        grants: [],
+        pendingEnrollments: []
+      )
+    ]
     let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
     URLProtocolStub.handler = { request in
       guard request.httpMethod == "GET" else {
@@ -960,6 +964,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     XCTAssertEqual(record, existing)
     XCTAssertEqual(store.saved, [existing])
+    XCTAssertEqual(store.cleanup.map(\.gatewayOrigin), ["http://retired-gateway.example"])
     XCTAssertEqual(URLProtocolStub.requests.count, 1)
   }
 

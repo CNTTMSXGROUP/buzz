@@ -463,23 +463,51 @@ public final class BuzzDevPushEnrollmentDriver {
       pending.relayPubkey != relayPubkey || pending.endpointHash != endpointHash
         || pending.expiresAt <= nowSeconds
     {
-      var cleanupState = BuzzPushGatewayCleanupState(
-        gatewayOrigin: gatewayOrigin,
-        grants: [],
-        pendingEnrollments: [pending]
-      )
-      guard await cleanStaleGateway(&cleanupState, deviceToken: deviceToken) else {
-        if let reconciled = cleanupState.pendingEnrollments.first {
-          try store.savePendingEnrollment(reconciled)
+      let referencedInstallation = pending.gatewayInstallationHandle.flatMap { handle in
+        storedRecords.first {
+          $0.gatewayInstallationHandle == handle && $0.expiresAt > nowSeconds
         }
-        throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
+      }
+      if let handleText = pending.gatewayInstallationHandle,
+        let handle = UUID(uuidString: handleText),
+        handleText == handle.uuidString.lowercased(),
+        let keyId = pending.keyId,
+        pending.endpointHash == endpointHash,
+        referencedInstallation != nil
+      {
+        if pending.delegationGeneration > 0 {
+          do {
+            try await revokeDelegation(
+              installationHandle: handle,
+              relayPubkey: pending.relayPubkey,
+              generation: pending.delegationGeneration,
+              appAttestKeyId: keyId
+            )
+          } catch BuzzDevPushEnrollmentError.unexpectedStatus(
+            route: "v1/delegations/revoke", _, actual: 404, _
+          ) {
+            // No committed delegation remains to clean up.
+          }
+        }
+      } else {
+        var cleanupState = BuzzPushGatewayCleanupState(
+          gatewayOrigin: gatewayOrigin,
+          grants: [],
+          pendingEnrollments: [pending]
+        )
+        guard await cleanStaleGateway(&cleanupState, deviceToken: deviceToken) else {
+          if let reconciled = cleanupState.pendingEnrollments.first {
+            try store.savePendingEnrollment(reconciled)
+          }
+          throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
+        }
+        try store.removeGatewayCleanupState(gatewayOrigin: gatewayOrigin)
       }
       try store.removePendingEnrollment(
         gatewayOrigin: gatewayOrigin,
         relayOrigin: relayOrigin.text,
         appProfile: Self.appProfile
       )
-      try store.removeGatewayCleanupState(gatewayOrigin: gatewayOrigin)
       pendingEnrollment = nil
     }
     if let current = storedForOrigin,
@@ -1046,6 +1074,43 @@ public final class BuzzDevPushEnrollmentDriver {
     }
   }
 
+  private func revokeDelegation(
+    installationHandle: UUID,
+    relayPubkey: String,
+    generation: Int64,
+    appAttestKeyId: String
+  ) async throws {
+    let revokeChallenge = try await challenge()
+    let clientData = try BuzzPushTranscript.revokeDelegation(
+      gatewayOrigin: gatewayBaseURL,
+      challengeId: revokeChallenge.id,
+      challenge: revokeChallenge.value,
+      installationHandle: installationHandle,
+      relayPubkey: relayPubkey,
+      generation: generation
+    )
+    let assertion = try await appAttest.assertion(
+      keyId: appAttestKeyId,
+      clientData: clientData
+    )
+    let response: MutationResponse = try await post(
+      route: "v1/delegations/revoke",
+      expectedStatus: 200,
+      body: RevokeDelegationRequest(
+        v: 1,
+        challengeId: revokeChallenge.id.uuidString.lowercased(),
+        challenge: revokeChallenge.value,
+        installationHandle: installationHandle.uuidString.lowercased(),
+        relayPubkey: relayPubkey,
+        generation: generation,
+        assertion: assertion
+      )
+    )
+    guard response.status == "revoked" else {
+      throw BuzzDevPushEnrollmentError.invalidResponse(route: "v1/delegations/revoke")
+    }
+  }
+
   private func fetchCurrentRelayKeys(from relayOrigin: URL) async throws -> RelayKeys {
     var request = URLRequest(url: relayOrigin)
     request.httpMethod = "GET"
@@ -1262,6 +1327,24 @@ private struct DelegationRequest: Encodable {
 private struct DelegationResponse: Decodable {
   let endpointGrant: String
   enum CodingKeys: String, CodingKey { case endpointGrant = "endpoint_grant" }
+}
+private struct RevokeDelegationRequest: Encodable {
+  let v: Int
+  let challengeId: String
+  let challenge: String
+  let installationHandle: String
+  let relayPubkey: String
+  let generation: Int64
+  let assertion: String
+  enum CodingKeys: String, CodingKey {
+    case v
+    case challengeId = "challenge_id"
+    case challenge
+    case installationHandle = "installation_handle"
+    case relayPubkey = "relay_pubkey"
+    case generation
+    case assertion
+  }
 }
 private struct RevokeInstallationRequest: Encodable {
   let v: Int

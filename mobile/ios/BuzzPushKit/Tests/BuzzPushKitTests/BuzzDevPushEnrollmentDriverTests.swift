@@ -555,6 +555,98 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertTrue(store.cleanup.isEmpty)
   }
 
+  func testRelayRotationRevokesPendingDelegationWithoutRevokingSharedInstallation() async throws {
+    let newRelayPubkey = String(repeating: "b", count: 64)
+    let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
+    let existing = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      relayMetadataPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: Self.installationId,
+      endpointGrant: "existing-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let pending = BuzzPushPendingEnrollmentRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      endpoint: Self.endpoint,
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      expiresAt: Self.expiresAt,
+      installationId: Self.installationId,
+      gatewayInstallationHandle: Self.installationHandle,
+      keyId: Self.keyId,
+      delegationGeneration: 2
+    )
+    let store = MemoryGrantStore(records: [existing], pending: [pending])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    var challengeRequests = 0
+    var delegationRevoked = false
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "self": newRelayPubkey,
+            "push": ["keys": [["pubkey": newRelayPubkey, "current": true]]],
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/challenges"):
+        challengeRequests += 1
+        guard challengeRequests == 1 else {
+          return Self.response(request, status: 503, json: ["error": "injected"])
+        }
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.secondChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://push.example/v1/delegations/revoke"):
+        let body = try Self.body(request)
+        XCTAssertEqual(body["installation_handle"] as? String, Self.installationHandle)
+        XCTAssertEqual(body["relay_pubkey"] as? String, Self.relayPubkey)
+        XCTAssertEqual(body["generation"] as? Int, 2)
+        delegationRevoked = true
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      _ = try await driver.enroll(
+        deviceToken: Data((1...32).map(UInt8.init)),
+        relayURL: Self.relayURL
+      )
+      XCTFail("Expected the injected replacement delegation challenge failure")
+    } catch BuzzDevPushEnrollmentError.unexpectedStatus(
+      route: "v1/installations/challenges", expected: 200, actual: 503, _
+    ) {
+      // The old delegation was revoked before replacement began.
+    }
+
+    XCTAssertTrue(delegationRevoked)
+    XCTAssertEqual(store.saved, [existing])
+    XCTAssertEqual(store.pending.count, 1)
+    XCTAssertEqual(store.pending.first?.relayPubkey, newRelayPubkey)
+    XCTAssertEqual(store.pending.first?.gatewayInstallationHandle, Self.installationHandle)
+  }
+
   func testCleanupRevokesAndDeletesStaleGatewaysWithoutRelayEnrollment() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     let current = BuzzPushEndpointGrantRecord(

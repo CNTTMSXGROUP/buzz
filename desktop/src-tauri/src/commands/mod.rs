@@ -17,6 +17,7 @@ mod channel_reconnect_repair;
 mod channel_templates;
 mod channel_window;
 mod channels;
+pub mod msx_brain;
 mod clipboard;
 mod dms;
 mod engrams;

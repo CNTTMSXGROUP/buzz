@@ -58,6 +58,28 @@ test("nút 🧠 trong composer mở picker não, chọn file chèn token [nao:]"
   await expect(composer).toContainText("[nao:2. Tinh Lọc/demo.md]");
 });
 
+test("PICKER: menu chọn file nằm trong viewport, không tràn phải", async ({ page }) => {
+  await page.goto("/");
+  await page.setViewportSize({ width: 1280, height: 800 });
+  // vào kênh general có composer
+  await page.getByText("general", { exact: true }).first().click();
+  const attachBtn = page.getByRole("button", { name: "Đính kèm tài liệu từ Não MSX" });
+  await expect(attachBtn).toBeVisible();
+  await attachBtn.click();
+  const menu = page.getByText("Não MSX — chọn tài liệu");
+  await expect(menu).toBeVisible();
+  const menuBox = await menu.boundingBox();
+  const vp = page.viewportSize()!;
+  expect(menuBox!.x).toBeGreaterThanOrEqual(0);
+  expect(menuBox!.x + menuBox!.width, "menu tràn phải viewport").toBeLessThanOrEqual(vp.width);
+  expect(menuBox!.y, "menu tràn đỉnh").toBeGreaterThanOrEqual(0);
+  // chọn file vẫn hoạt động sau clamp
+  await page.getByText("2. Tinh Lọc").click();
+  await page.getByText("demo.md").click();
+  const composer = page.getByTestId("message-composer").locator(".ProseMirror");
+  await expect(composer).toContainText("[nao:2. Tinh Lọc/demo.md]");
+});
+
 test("chuột phải tên Não MSX hiện input đổi tên", async ({ page }) => {
   await openBrain(page);
   const title = page.locator("span.select-none", { hasText: "Não MSX" });

@@ -61,7 +61,15 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
     setOpen(next);
     if (next) {
       const rect = ref.current?.getBoundingClientRect();
-      if (rect) setMenuPos({ left: rect.left, bottom: window.innerHeight - rect.top + 6 });
+      if (rect) {
+        const MENU_W = 320;
+        const MARGIN = 8;
+        // clamp ngang: ưu tiên thẳng hàng mép trái nút, tràn phải thì lùi vào
+        const left = Math.max(MARGIN, Math.min(rect.left, window.innerWidth - MENU_W - MARGIN));
+        // clamp dọc: menu mở lên trên; nếu không đủ chỗ thì mở xuống dưới nút
+        const bottom = window.innerHeight - rect.top + 6;
+        setMenuPos({ left, bottom });
+      }
       if (entries === null) await loadDir("");
     }
   }
@@ -88,7 +96,7 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
       </button>
       {open && menuPos && (
         <div
-          className="fixed z-[100] w-80 rounded-lg border bg-popover shadow-lg"
+          className="fixed z-[100] w-80 max-h-[60vh] overflow-y-auto rounded-lg border bg-popover shadow-lg"
           style={{ left: menuPos.left, bottom: menuPos.bottom }}
         >
           <div className="border-b px-3 py-2 text-xs font-semibold">

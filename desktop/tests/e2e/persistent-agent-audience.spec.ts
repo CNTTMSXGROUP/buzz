@@ -571,13 +571,34 @@ test("primary+Shift+M favors the most recently mentioned eligible agent", async 
 }) => {
   await installAudienceFixtures(page);
   await openGeneral(page);
+  await expect
+    .poll(() => page.evaluate(() => !!window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__))
+    .toBe(true);
   await emitMockMessage(page, "Please ask Vogue", [AGENT_B]);
+  await expect(
+    page.getByTestId("message-row").filter({ hasText: "Please ask Vogue" }),
+  ).toBeVisible();
 
   const input = channelComposer(page).getByTestId("message-input");
-  await input.fill("draft text");
+  await input.click();
+  await input.pressSequentially("draft text", { delay: 30 });
   await input.press("ArrowLeft");
   await input.press("ArrowLeft");
   await expect.poll(() => readComposerCaret(input)).toBe(8);
+  // Native ArrowLeft updates the DOM before ProseMirror's selection observer.
+  // Wait for both sides of the actual editor boundary before the shortcut.
+  await expect
+    .poll(() =>
+      input.evaluate((element) => {
+        const editor = (
+          element as HTMLElement & {
+            editor: { state: { selection: { anchor: number } } };
+          }
+        ).editor;
+        return editor.state.selection.anchor - 1;
+      }),
+    )
+    .toBe(8);
   await pressPrimaryShiftM(page);
 
   await expect(input).toHaveText("@Vogue draft text");

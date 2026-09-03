@@ -1849,7 +1849,7 @@ test("relay-agent directory errors fail closed and recover after a fresh fetch",
   page,
 }) => {
   await installMockBridge(page, {
-    relayAgentListErrors: ["mock directory unavailable", null],
+    relayAgentListErrors: Array(20).fill("mock directory unavailable"),
     relayAgents: [
       {
         pubkey: ALLOWLIST_RELAY_AGENT_PUBKEY,
@@ -1864,13 +1864,18 @@ test("relay-agent directory errors fail closed and recover after a fresh fetch",
   await page.getByTestId("channel-general").click();
   const input = page.getByTestId("message-input");
   await input.fill("@quinn");
-  await expect(autocomplete(page)).toHaveCount(0);
+  await expect(
+    page.getByRole("status").filter({ hasText: "No mentions found" }),
+  ).toBeVisible();
 
   await page.evaluate(async () => {
+    window.__BUZZ_E2E__.mock!.relayAgentListErrors = [];
     await window.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries({
       queryKey: ["relay-agents"],
     });
   });
+  await input.press("Escape");
+  await input.fill("@quin");
   await expect(autocomplete(page).getByText("quinn")).toBeVisible();
 
   await page.evaluate(() => {

@@ -849,6 +849,69 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertTrue(appAttest.preparedAttestations.isEmpty)
   }
 
+  func testCleanupCheckpointsEachRevokedInstallationBeforeLaterFailure() async throws {
+    let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
+    func staleRecord(handle: String, relayOrigin: String) -> BuzzPushEndpointGrantRecord {
+      BuzzPushEndpointGrantRecord(
+        gatewayOrigin: "http://old-gateway.example",
+        relayOrigin: relayOrigin,
+        relayPubkey: Self.relayPubkey,
+        gatewayInstallationHandle: handle,
+        appAttestKeyId: Self.keyId,
+        installationId: Self.installationId,
+        endpointGrant: "stale-grant-\(handle)",
+        endpointHash: endpointHash,
+        appProfile: "buzz-ios-dogfood",
+        endpointEpoch: 1,
+        generation: 1,
+        expiresAt: Self.expiresAt
+      )
+    }
+    let revokedHandle = "44444444-4444-4444-8444-444444444444"
+    let failedHandle = "55555555-5555-4555-8555-555555555555"
+    let revoked = staleRecord(handle: revokedHandle, relayOrigin: "wss://first.example")
+    let failed = staleRecord(handle: failedHandle, relayOrigin: "wss://second.example")
+    let store = MemoryGrantStore(records: [revoked, failed])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("POST", "http://old-gateway.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/revoke"):
+        let body = try Self.body(request)
+        if body["installation_handle"] as? String == revokedHandle {
+          return Self.response(request, status: 200, json: ["status": "revoked"])
+        }
+        XCTAssertEqual(body["installation_handle"] as? String, failedHandle)
+        return Self.response(request, status: 503, json: ["error": "unavailable"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      try await driver.cleanRetiredGateways()
+      XCTFail("Expected the later revocation failure to keep cleanup queued")
+    } catch {
+      XCTAssertEqual(
+        error as? BuzzDevPushEnrollmentError,
+        .retiredGatewayCleanupIncomplete
+      )
+    }
+
+    XCTAssertTrue(store.saved.isEmpty)
+    XCTAssertEqual(try XCTUnwrap(store.cleanup.first).grants, [failed])
+  }
+
   func testCleanupContinuesAfterAnEarlierRetiredGatewayFails() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     func staleRecord(origin: String, handle: String) -> BuzzPushEndpointGrantRecord {

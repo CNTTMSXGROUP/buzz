@@ -929,7 +929,8 @@ public final class BuzzDevPushEnrollmentDriver {
         return false
       }
     }
-    for (handleText, installation) in handles {
+    for handleText in handles.keys.sorted() {
+      guard let installation = handles[handleText] else { return false }
       guard let handle = UUID(uuidString: handleText) else { return false }
       do {
         try await oldDriver.revokeInstallation(
@@ -940,7 +941,15 @@ public final class BuzzDevPushEnrollmentDriver {
       } catch BuzzDevPushEnrollmentError.unexpectedStatus(
         route: "v1/installations/revoke", _, actual: 404, _
       ) {
-        continue
+        // A missing installation is already terminal, so checkpoint it just
+        // like a successful revocation before attempting another handle.
+      } catch {
+        return false
+      }
+      state.grants.removeAll { $0.gatewayInstallationHandle == handleText }
+      state.pendingEnrollments.removeAll { $0.gatewayInstallationHandle == handleText }
+      do {
+        try store.saveGatewayCleanupState(state)
       } catch {
         return false
       }

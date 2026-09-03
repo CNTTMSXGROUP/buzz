@@ -938,11 +938,6 @@ public final class BuzzDevPushEnrollmentDriver {
           endpointEpoch: installation.endpointEpoch,
           appAttestKeyId: installation.keyId
         )
-      } catch BuzzDevPushEnrollmentError.unexpectedStatus(
-        route: "v1/installations/revoke", _, actual: 404, _
-      ) {
-        // A missing installation is already terminal, so checkpoint it just
-        // like a successful revocation before attempting another handle.
       } catch {
         return false
       }

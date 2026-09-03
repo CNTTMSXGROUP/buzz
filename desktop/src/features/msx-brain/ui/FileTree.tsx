@@ -1,47 +1,44 @@
-import { File, Folder, FolderOpen } from "lucide-react";
-import { useState } from "react";
+import { ChevronDown, ChevronRight, File, Folder } from "lucide-react";
+import { Fragment, useState } from "react";
 import type { BrainEntry } from "../types";
 
-function TreeRow({
-  entry,
-  depth,
-  selectedPath,
-  onOpen,
-}: {
+type TreeProps = {
   entry: BrainEntry;
   depth: number;
   selectedPath: string | null;
   onOpen: (e: BrainEntry) => void;
-}) {
-  const [expanded, setExpanded] = useState(depth < 1);
+  expanded: Set<string>;
+  onToggle: (relPath: string) => void;
+};
+
+function TreeRow({ entry, depth, selectedPath, onOpen, expanded, onToggle }: TreeProps) {
   const isMd = entry.name.toLowerCase().endsWith(".md");
+  const isOpen = expanded.has(entry.rel_path);
   const active = selectedPath === entry.rel_path;
   return (
-    <>
-      <button
-        type="button"
-        onClick={() => {
-          if (entry.is_dir) setExpanded((v) => !v);
-          else onOpen(entry);
-        }}
-        className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent ${
-          active ? "bg-accent font-medium" : ""
-        }`}
-        style={{ paddingLeft: `${8 + depth * 14}px` }}
-        title={entry.name}
-      >
-        {entry.is_dir ? (
-          expanded ? (
-            <FolderOpen className="h-4 w-4 shrink-0 text-amber-500" />
-          ) : (
-            <Folder className="h-4 w-4 shrink-0 text-amber-500" />
-          )
+    <button
+      type="button"
+      onClick={() => (entry.is_dir ? onToggle(entry.rel_path) : onOpen(entry))}
+      className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent ${
+        active ? "bg-accent font-medium" : ""
+      }`}
+      style={{ paddingLeft: `${8 + depth * 14}px` }}
+      title={entry.name}
+    >
+      {entry.is_dir ? (
+        isOpen ? (
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
         ) : (
-          <File className={`h-4 w-4 shrink-0 ${isMd ? "text-sky-500" : "text-muted-foreground"}`} />
-        )}
-        <span className="truncate">{entry.name}</span>
-      </button>
-    </>
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+        )
+      ) : null}
+      {entry.is_dir ? (
+        <Folder className="h-4 w-4 shrink-0 text-amber-500" />
+      ) : (
+        <File className={`h-4 w-4 shrink-0 ${isMd ? "text-sky-500" : "text-muted-foreground"}`} />
+      )}
+      <span className="truncate">{entry.name}</span>
+    </button>
   );
 }
 
@@ -54,41 +51,46 @@ export function FileTree({
   selectedPath: string | null;
   onOpen: (e: BrainEntry) => void;
 }) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
   const byParent = new Map<string, BrainEntry[]>();
   for (const e of entries) {
-    const parent = e.rel_path.includes("/") ? e.rel_path.slice(0, e.rel_path.lastIndexOf("/")) : "";
+    const parent = e.rel_path.includes("/")
+      ? e.rel_path.slice(0, e.rel_path.lastIndexOf("/"))
+      : "";
     if (!byParent.has(parent)) byParent.set(parent, []);
     byParent.get(parent)!.push(e);
   }
-  const roots = byParent.get("") ?? [];
 
-  function renderLevel(parent: string, depth: number): React.ReactNode {
-    return (byParent.get(parent) ?? []).map((e) => (
-      <TreeRowWithChildren key={e.rel_path} entry={e} depth={depth} />
-    ));
+  function toggle(relPath: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(relPath)) next.delete(relPath);
+      else next.add(relPath);
+      return next;
+    });
   }
 
-  function TreeRowWithChildren({
-    entry,
-    depth,
-  }: {
-    entry: BrainEntry;
-    depth: number;
-  }) {
-    return (
-      <>
-        <TreeRow entry={entry} depth={depth} selectedPath={selectedPath} onOpen={onOpen} />
-        {entry.is_dir && byParent.has(entry.rel_path)
-          ? renderLevel(entry.rel_path, depth + 1)
-          : null}
-      </>
-    );
+  function renderLevel(parent: string, depth: number): React.ReactNode[] {
+    return (byParent.get(parent) ?? []).map((e) => (
+      <Fragment key={e.rel_path}>
+        <TreeRow
+          entry={e}
+          depth={depth}
+          selectedPath={selectedPath}
+          onOpen={onOpen}
+          expanded={expanded}
+          onToggle={toggle}
+        />
+        {e.is_dir && expanded.has(e.rel_path) ? renderLevel(e.rel_path, depth + 1) : null}
+      </Fragment>
+    ));
   }
 
   return (
     <div className="flex h-full flex-col overflow-y-auto p-2">
       {renderLevel("", 0)}
-      {roots.length === 0 && (
+      {(byParent.get("") ?? []).length === 0 && (
         <div className="p-4 text-sm text-muted-foreground">Không có tài liệu nào bạn được xem.</div>
       )}
     </div>

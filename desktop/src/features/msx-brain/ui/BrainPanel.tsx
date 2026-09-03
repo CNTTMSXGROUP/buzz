@@ -17,6 +17,7 @@ export function BrainPanel({
   const [status, setStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
   const [channels, setChannels] = useState<Array<{ id: string; name: string }>>([]);
+  const [shareNote, setShareNote] = useState("");
   const shareRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -82,7 +83,13 @@ export function BrainPanel({
               <ChevronDown className="h-3 w-3" />
             </button>
             {shareOpen && (
-              <div className="absolute right-0 top-full z-50 mt-1 max-h-64 w-56 overflow-y-auto rounded-md border bg-popover shadow-md">
+              <div className="absolute right-0 top-full z-50 mt-1 max-h-64 w-64 overflow-y-auto rounded-md border bg-popover p-1 shadow-md">
+                <input
+                  value={shareNote}
+                  onChange={(ev) => setShareNote(ev.target.value)}
+                  placeholder="Ghi chú kèm tài liệu (tuỳ chọn)…"
+                  className="mb-1 w-full rounded border bg-transparent px-2 py-1.5 text-xs outline-none focus:ring-1 focus:ring-ring"
+                />
                 {channels.map((c) => (
                   <button
                     key={c.id}

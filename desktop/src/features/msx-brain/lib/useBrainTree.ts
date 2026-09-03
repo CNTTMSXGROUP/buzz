@@ -37,7 +37,7 @@ export function useBrainTree(vaultRoot: string, myPubkey: string) {
         console.log("[msx-brain] open", { rel: e.rel_path, khu });
         const txt = await invoke<string>("brain_read_file", {
           root: vaultRoot,
-          rel_path: e.rel_path,
+          relPath: e.rel_path,
           khu,
         });
         setContent(txt);

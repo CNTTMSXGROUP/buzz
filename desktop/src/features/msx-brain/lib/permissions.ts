@@ -37,7 +37,7 @@ export async function loadBrainRole(root: string, pubkey: string): Promise<Brain
   try {
     const raw = await invoke<string>("brain_read_file", {
       root,
-      rel_path: "_meta/nguoi-dung.json",
+      relPath: "_meta/nguoi-dung.json",
       khu: "*",
     });
     const cfg = JSON.parse(raw) as { nguoi?: BrainConfigUser[] };

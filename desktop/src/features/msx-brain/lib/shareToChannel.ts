@@ -19,6 +19,12 @@ export async function shareToChannel(
   channelId: string,
   fileName: string,
   content: string,
+  opts?: { note?: string },
 ): Promise<void> {
-  await sendChannelMessage(channelId, `📄 **${fileName}**\n\n${clipForChannel(content)}`);
+  const note = opts?.note?.trim();
+  const noteBlock = note ? `\n\n💬 **Ghi chú:** ${note}\n` : "";
+  await sendChannelMessage(
+    channelId,
+    `📄 **${fileName}** — từ Não MSX\n\n${clipForChannel(content)}${noteBlock}\n\n→ Reply trực tiếp tin này để thảo luận, hoặc mở panel **Não MSX** trên sidebar để xem bản gốc.`,
+  );
 }

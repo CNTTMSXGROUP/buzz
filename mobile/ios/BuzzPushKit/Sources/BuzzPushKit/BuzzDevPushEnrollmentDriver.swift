@@ -778,11 +778,22 @@ public final class BuzzDevPushEnrollmentDriver {
 
   private func cleanStaleGateways(deviceToken: Data?) async throws {
     let states = try store.gatewayCleanupStates()
+    var cleanupIncomplete = false
+    var persistenceError: Error?
     for var state in states where state.gatewayOrigin != gatewayOrigin {
       guard await cleanStaleGateway(&state, deviceToken: deviceToken) else {
-        throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
+        cleanupIncomplete = true
+        continue
       }
-      try store.removeGatewayCleanupState(gatewayOrigin: state.gatewayOrigin)
+      do {
+        try store.removeGatewayCleanupState(gatewayOrigin: state.gatewayOrigin)
+      } catch {
+        if persistenceError == nil { persistenceError = error }
+      }
+    }
+    if let persistenceError { throw persistenceError }
+    if cleanupIncomplete {
+      throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
     }
   }
 

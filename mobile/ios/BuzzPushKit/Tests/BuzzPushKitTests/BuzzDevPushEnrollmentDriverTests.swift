@@ -668,6 +668,87 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertTrue(appAttest.preparedAttestations.isEmpty)
   }
 
+  func testCleanupContinuesAfterAnEarlierRetiredGatewayFails() async throws {
+    let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
+    func staleRecord(origin: String, handle: String) -> BuzzPushEndpointGrantRecord {
+      BuzzPushEndpointGrantRecord(
+        gatewayOrigin: origin,
+        relayOrigin: "wss://relay.example",
+        relayPubkey: Self.relayPubkey,
+        gatewayInstallationHandle: handle,
+        appAttestKeyId: Self.keyId,
+        installationId: Self.installationId,
+        endpointGrant: "stale-grant",
+        endpointHash: endpointHash,
+        appProfile: "buzz-ios-dogfood",
+        endpointEpoch: 1,
+        generation: 1,
+        expiresAt: Self.expiresAt
+      )
+    }
+    let offlineOrigin = "http://offline-gateway.example"
+    let reachableOrigin = "http://reachable-gateway.example"
+    let offline = BuzzPushGatewayCleanupState(
+      gatewayOrigin: offlineOrigin,
+      grants: [
+        staleRecord(
+          origin: offlineOrigin,
+          handle: "44444444-4444-4444-8444-444444444444"
+        )
+      ],
+      pendingEnrollments: []
+    )
+    let reachable = BuzzPushGatewayCleanupState(
+      gatewayOrigin: reachableOrigin,
+      grants: [
+        staleRecord(
+          origin: reachableOrigin,
+          handle: "55555555-5555-4555-8555-555555555555"
+        )
+      ],
+      pendingEnrollments: []
+    )
+    let store = MemoryGrantStore()
+    store.cleanup = [offline, reachable]
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    var reachableRevoked = false
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("POST", "http://offline-gateway.example/v1/installations/challenges"):
+        return Self.response(request, status: 503, json: ["error": "unavailable"])
+      case ("POST", "http://reachable-gateway.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://reachable-gateway.example/v1/installations/revoke"):
+        reachableRevoked = true
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      try await driver.cleanRetiredGateways()
+      XCTFail("Expected the offline gateway cleanup to remain queued")
+    } catch {
+      XCTAssertEqual(
+        error as? BuzzDevPushEnrollmentError,
+        .retiredGatewayCleanupIncomplete
+      )
+    }
+
+    XCTAssertTrue(reachableRevoked)
+    XCTAssertEqual(store.cleanup, [offline])
+  }
+
   func testRealAppAttestFailsLoudlyWhenUnsupported() async throws {
     let service = RecordingDCAppAttestService(isSupported: false)
     let provider = BuzzDCAppAttestProvider(

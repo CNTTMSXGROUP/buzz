@@ -14,16 +14,21 @@ public enum BuzzPushGatewayStateReset {
     var nextRecords = records
     var nextPending = pendingEnrollments
     let restoredState = cleanupStates.first { $0.gatewayOrigin == gatewayOrigin }
+    let revocationPendingHandles = Set(
+      restoredState?.revocationPendingInstallationHandles ?? []
+    )
     if let restoredState {
       for record in restoredState.grants
-      where !nextRecords.contains(where: {
+      where record.gatewayInstallationHandle.map(revocationPendingHandles.contains) != true
+        && !nextRecords.contains(where: {
         $0.gatewayOrigin == record.gatewayOrigin && $0.relayOrigin == record.relayOrigin
           && $0.appProfile == record.appProfile
       }) {
         nextRecords.append(record)
       }
       for pending in restoredState.pendingEnrollments
-      where !nextPending.contains(where: {
+      where pending.gatewayInstallationHandle.map(revocationPendingHandles.contains) != true
+        && !nextPending.contains(where: {
         $0.gatewayOrigin == pending.gatewayOrigin && $0.relayOrigin == pending.relayOrigin
           && $0.appProfile == pending.appProfile
       }) {
@@ -65,8 +70,25 @@ public enum BuzzPushGatewayStateReset {
         nextPending.filter { $0.gatewayOrigin == gatewayOrigin }
       )
     }
-    if restoredState != nil {
-      try removeCleanupState(gatewayOrigin)
+    if let restoredState {
+      let retainedGrants = restoredState.grants.filter {
+        $0.gatewayInstallationHandle.map(revocationPendingHandles.contains) == true
+      }
+      let retainedPending = restoredState.pendingEnrollments.filter {
+        $0.gatewayInstallationHandle.map(revocationPendingHandles.contains) == true
+      }
+      if retainedGrants.isEmpty && retainedPending.isEmpty {
+        try removeCleanupState(gatewayOrigin)
+      } else {
+        try saveCleanupState(
+          BuzzPushGatewayCleanupState(
+            gatewayOrigin: gatewayOrigin,
+            grants: retainedGrants,
+            pendingEnrollments: retainedPending,
+            revocationPendingInstallationHandles: Array(revocationPendingHandles).sorted()
+          )
+        )
+      }
     }
   }
 }

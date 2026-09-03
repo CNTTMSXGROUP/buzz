@@ -72,16 +72,21 @@ public struct BuzzPushGatewayCleanupState: Codable, Equatable, Sendable {
   public var grants: [BuzzPushEndpointGrantRecord]
   /// Crash-recovery journals, including response-loss enrollments that may need replay.
   public var pendingEnrollments: [BuzzPushPendingEnrollmentRecord]
+  /// Handles whose revocation intent was persisted before the remote mutation.
+  /// These records must never be restored as usable grants after a gateway rollback.
+  public var revocationPendingInstallationHandles: [String]?
 
   /// Creates one durable cleanup snapshot for a retired gateway.
   public init(
     gatewayOrigin: String,
     grants: [BuzzPushEndpointGrantRecord],
-    pendingEnrollments: [BuzzPushPendingEnrollmentRecord]
+    pendingEnrollments: [BuzzPushPendingEnrollmentRecord],
+    revocationPendingInstallationHandles: [String]? = nil
   ) {
     self.gatewayOrigin = gatewayOrigin
     self.grants = grants
     self.pendingEnrollments = pendingEnrollments
+    self.revocationPendingInstallationHandles = revocationPendingInstallationHandles
   }
 }
 
@@ -820,7 +825,7 @@ public final class BuzzDevPushEnrollmentDriver {
     let states = try store.gatewayCleanupStates()
     var cleanupIncomplete = false
     var persistenceError: Error?
-    for var state in states where state.gatewayOrigin != gatewayOrigin {
+    for var state in states {
       guard await cleanStaleGateway(&state, deviceToken: deviceToken) else {
         cleanupIncomplete = true
         continue
@@ -932,6 +937,17 @@ public final class BuzzDevPushEnrollmentDriver {
     for handleText in handles.keys.sorted() {
       guard let installation = handles[handleText] else { return false }
       guard let handle = UUID(uuidString: handleText) else { return false }
+      if state.revocationPendingInstallationHandles?.contains(handleText) != true {
+        var pendingHandles = state.revocationPendingInstallationHandles ?? []
+        pendingHandles.append(handleText)
+        pendingHandles.sort()
+        state.revocationPendingInstallationHandles = pendingHandles
+        do {
+          try store.saveGatewayCleanupState(state)
+        } catch {
+          return false
+        }
+      }
       do {
         try await oldDriver.revokeInstallation(
           installationHandle: handle,
@@ -943,6 +959,10 @@ public final class BuzzDevPushEnrollmentDriver {
       }
       state.grants.removeAll { $0.gatewayInstallationHandle == handleText }
       state.pendingEnrollments.removeAll { $0.gatewayInstallationHandle == handleText }
+      state.revocationPendingInstallationHandles?.removeAll { $0 == handleText }
+      if state.revocationPendingInstallationHandles?.isEmpty == true {
+        state.revocationPendingInstallationHandles = nil
+      }
       do {
         try store.saveGatewayCleanupState(state)
       } catch {

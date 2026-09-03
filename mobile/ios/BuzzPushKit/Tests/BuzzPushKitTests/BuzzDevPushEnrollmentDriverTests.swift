@@ -964,6 +964,69 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(try XCTUnwrap(store.cleanup.first).grants, [stale])
   }
 
+  func testRollbackCannotRestoreGrantAfterRevocationCheckpointFailure() async throws {
+    let stale = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: "http://old-gateway.example",
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: "44444444-4444-4444-8444-444444444444",
+      appAttestKeyId: Self.keyId,
+      installationId: Self.installationId,
+      endpointGrant: "stale-grant",
+      endpointHash: String(repeating: "b", count: 64),
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    // Reset journals the retired gateway on save 1, revocation intent is save
+    // 2, and save 3 is the injected post-revocation checkpoint failure.
+    let store = MemoryGrantStore(records: [stale], cleanupSaveFailureCalls: [3])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("POST", "http://old-gateway.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/revoke"):
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      try await driver.cleanRetiredGateways()
+      XCTFail("Expected the post-revocation checkpoint to fail")
+    } catch {
+      XCTAssertEqual(
+        error as? BuzzDevPushEnrollmentError,
+        .retiredGatewayCleanupIncomplete
+      )
+    }
+
+    let cleanup = try XCTUnwrap(store.cleanup.first)
+    XCTAssertEqual(cleanup.grants, [stale])
+    XCTAssertEqual(
+      cleanup.revocationPendingInstallationHandles,
+      [try XCTUnwrap(stale.gatewayInstallationHandle)]
+    )
+
+    store.cleanupSaveFailureCalls = []
+    try store.reset(forGatewayOrigin: stale.gatewayOrigin)
+
+    XCTAssertTrue(store.saved.isEmpty)
+    XCTAssertEqual(store.cleanup.first?.grants, [stale])
+  }
+
   func testCleanupContinuesAfterAnEarlierRetiredGatewayFails() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     func staleRecord(origin: String, handle: String) -> BuzzPushEndpointGrantRecord {
@@ -1852,14 +1915,18 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   var cleanup: [BuzzPushGatewayCleanupState] = []
   var resetOperations: [String] = []
   var grantSaveFailuresRemaining: Int
+  var cleanupSaveFailureCalls: Set<Int>
+  private var cleanupSaveCallCount = 0
   init(
     records: [BuzzPushEndpointGrantRecord] = [],
     pending: [BuzzPushPendingEnrollmentRecord] = [],
-    grantSaveFailuresRemaining: Int = 0
+    grantSaveFailuresRemaining: Int = 0,
+    cleanupSaveFailureCalls: Set<Int> = []
   ) {
     saved = records
     self.pending = pending
     self.grantSaveFailuresRemaining = grantSaveFailuresRemaining
+    self.cleanupSaveFailureCalls = cleanupSaveFailureCalls
   }
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
     try BuzzPushGatewayStateReset.run(
@@ -1926,6 +1993,10 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   }
   func gatewayCleanupStates() throws -> [BuzzPushGatewayCleanupState] { cleanup }
   func saveGatewayCleanupState(_ state: BuzzPushGatewayCleanupState) throws {
+    cleanupSaveCallCount += 1
+    if cleanupSaveFailureCalls.contains(cleanupSaveCallCount) {
+      throw NSError(domain: "MemoryGrantStore", code: 2)
+    }
     cleanup.removeAll { $0.gatewayOrigin == state.gatewayOrigin }
     cleanup.append(state)
   }

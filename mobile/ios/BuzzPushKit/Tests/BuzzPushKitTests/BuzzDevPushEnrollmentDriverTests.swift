@@ -466,6 +466,95 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(store.resetOperations, ["records", "cleanup-removed:https://gateway-a.example"])
   }
 
+  func testRestoredResponseLostEnrollmentIsRevokedBeforeReplacement() async throws {
+    let oldToken = Data(repeating: 0x07, count: 32)
+    let newToken = Data(repeating: 0x08, count: 32)
+    let pending = BuzzPushPendingEnrollmentRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      endpoint: Self.hex(oldToken),
+      endpointHash: Self.hex(SHA256.hash(data: oldToken)),
+      appProfile: "buzz-ios-dogfood",
+      expiresAt: Self.expiresAt,
+      installationId: Self.installationId,
+      challengeId: Self.firstChallengeId,
+      challenge: Self.challenge,
+      keyId: Self.keyId,
+      attestation: Self.attestation
+    )
+    let store = MemoryGrantStore()
+    store.cleanup = [
+      BuzzPushGatewayCleanupState(
+        gatewayOrigin: Self.gatewayOrigin,
+        grants: [],
+        pendingEnrollments: [pending]
+      )
+    ]
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    var challengeRequests = 0
+    var replayedOldEndpoint = false
+    var revoked = false
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "self": Self.relayPubkey,
+            "push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]],
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations"):
+        replayedOldEndpoint = try Self.body(request)["endpoint"] as? String == Self.hex(oldToken)
+        return Self.response(
+          request,
+          status: 201,
+          json: [
+            "installation_handle": Self.installationHandle,
+            "endpoint_epoch": 1,
+            "expires_at": Self.expiresAt,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/challenges"):
+        challengeRequests += 1
+        guard challengeRequests == 1 else {
+          return Self.response(request, status: 503, json: ["error": "injected"])
+        }
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.secondChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/revoke"):
+        revoked = true
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      _ = try await driver.enroll(deviceToken: newToken, relayURL: Self.relayURL)
+      XCTFail("Expected the injected replacement challenge failure")
+    } catch BuzzDevPushEnrollmentError.unexpectedStatus(
+      route: "v1/installations/challenges", expected: 200, actual: 503, _
+    ) {
+      // The old installation was reconciled before replacement began.
+    }
+
+    XCTAssertTrue(replayedOldEndpoint)
+    XCTAssertTrue(revoked)
+    XCTAssertTrue(store.pending.isEmpty)
+    XCTAssertTrue(store.cleanup.isEmpty)
+  }
+
   func testCleanupRevokesAndDeletesStaleGatewaysWithoutRelayEnrollment() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     let current = BuzzPushEndpointGrantRecord(

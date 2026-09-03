@@ -463,11 +463,23 @@ public final class BuzzDevPushEnrollmentDriver {
       pending.relayPubkey != relayPubkey || pending.endpointHash != endpointHash
         || pending.expiresAt <= nowSeconds
     {
+      var cleanupState = BuzzPushGatewayCleanupState(
+        gatewayOrigin: gatewayOrigin,
+        grants: [],
+        pendingEnrollments: [pending]
+      )
+      guard await cleanStaleGateway(&cleanupState, deviceToken: deviceToken) else {
+        if let reconciled = cleanupState.pendingEnrollments.first {
+          try store.savePendingEnrollment(reconciled)
+        }
+        throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
+      }
       try store.removePendingEnrollment(
         gatewayOrigin: gatewayOrigin,
         relayOrigin: relayOrigin.text,
         appProfile: Self.appProfile
       )
+      try store.removeGatewayCleanupState(gatewayOrigin: gatewayOrigin)
       pendingEnrollment = nil
     }
     if let current = storedForOrigin,

@@ -11751,6 +11751,26 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
     switch (command) {
+      case "brain_list_tree": {
+        return [
+          { name: "1. Thu Thập", rel_path: "1. Thu Thập", is_dir: true, area: "1. Thu Thập" },
+          { name: "2. Tinh Lọc", rel_path: "2. Tinh Lọc", is_dir: true, area: "2. Tinh Lọc" },
+          { name: "demo.md", rel_path: "2. Tinh Lọc/demo.md", is_dir: false, area: "2. Tinh Lọc" },
+        ];
+      }
+      case "brain_read_file": {
+        const p = payload as { relPath?: string };
+        if (p?.relPath === "_meta/nguoi-dung.json") {
+          return JSON.stringify({
+            vai_tro: { chu: { doc: ["*"], ghi: ["*"], duyet: true } },
+            nguoi: [{ ten: "E2E Owner", pubkey: MOCK_IDENTITY_PUBKEY, vai_tro: "chu", khu: "*" }],
+          });
+        }
+        return "# Demo\n\nnội dung demo não";
+      }
+      case "brain_write_meta": {
+        return "/tmp/vault/_meta/nguoi-dung.json";
+      }
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
         const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;

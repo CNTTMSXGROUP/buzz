@@ -523,6 +523,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::msx_brain::brain_list_tree,
             commands::msx_brain::brain_read_file,
+            commands::msx_brain::brain_write_meta,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,

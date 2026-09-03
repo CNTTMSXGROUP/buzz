@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 const BLOCKED_DIRS: &[&str] = &[
     "_mat",
+    "_meta",
     ".git",
     ".obsidian",
     ".claude",
@@ -115,5 +116,28 @@ pub fn brain_read_file(root: String, rel_path: String, khu: String) -> Result<St
     }
 }
 
+
+#[tauri::command]
+pub fn brain_write_meta(root: String, content: String) -> Result<String, String> {
+    // chỉ cho phép ghi đúng 1 file: _meta/nguoi-dung.json
+    let full = Path::new(&root).join("_meta/nguoi-dung.json");
+    let root_canon = Path::new(&root).canonicalize().unwrap_or_default();
+    // file có thể chưa tồn tại — kiểm tra qua thư mục cha
+    let parent_canon = full
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_default();
+    if !parent_canon.starts_with(&root_canon) {
+        return Err("forbidden".into());
+    }
+    // validate JSON trước khi ghi
+    let cfg: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("JSON lỗi: {e}"))?;
+    if cfg.get("nguoi").and_then(|v| v.as_array()).is_none() {
+        return Err("config thiếu mảng 'nguoi'".into());
+    }
+    fs::write(&full, &content).map_err(|e| e.to_string())?;
+    Ok(full.to_string_lossy().to_string())
+}
 #[path = "msx_brain_tests.rs"]
 mod tests;

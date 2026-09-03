@@ -70,6 +70,25 @@ fn test_read_file_chong_path_traversal() {
 }
 
 #[test]
+fn test_write_meta_chi_ghi_dung_file_va_validate_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("_meta")).unwrap();
+    // JSON thiếu mảng "nguoi" -> từ chối
+    let bad = super::brain_write_meta(
+        tmp.path().to_string_lossy().to_string(),
+        r#"{"vai_tro":{}}"#.to_string(),
+    );
+    assert!(bad.is_err());
+    // JSON hợp lệ -> ghi OK
+    let ok = super::brain_write_meta(
+        tmp.path().to_string_lossy().to_string(),
+        r#"{"nguoi":[]}"#.to_string(),
+    );
+    assert!(ok.is_ok());
+    assert!(tmp.path().join("_meta/nguoi-dung.json").exists());
+}
+
+#[test]
 #[ignore] // chạy manual: cargo test verify_real_vault -- --ignored (cần vault thật trên máy)
 fn verify_real_vault() {
     let root = "/Users/qthang/Library/CloudStorage/GoogleDrive-aios.msxgroup@gmail.com/Drive của tôi/MSXGROUP_AIOS_BRAIN";

@@ -186,11 +186,9 @@ impl NipFiRelayConfig {
         let mut command_configs = Vec::new();
 
         for entry in &issuer_entries {
+            let idx = jwks_configs.len(); // 0-based issuer index for error messages
             let (policy, jwks_config) = build_issuer(entry).map_err(|e| {
-                ConfigError::InvalidValue(format!(
-                    "BUZZ_NIP_FI_ISSUERS: issuer {:?}: {e}",
-                    entry.issuer
-                ))
+                ConfigError::InvalidValue(format!("BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: {e}"))
             })?;
             registry.insert(policy);
             jwks_configs.push(jwks_config);
@@ -201,12 +199,35 @@ impl NipFiRelayConfig {
                 // Malformed S4 fields in enforce mode must reject startup.
                 if principals.is_empty() {
                     return Err(ConfigError::InvalidValue(format!(
-                        "BUZZ_NIP_FI_ISSUERS: issuer {:?}: \
+                        "BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: \
                          maximum_command_age_seconds is set but authorized_principals is \
-                         absent or empty — command API requires at least one authorized principal",
-                        entry.issuer
+                         absent or empty — command API requires at least one authorized principal"
                     )));
                 }
+                if cmd_age == 0 || cmd_age > 60 {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: \
+                         maximum_command_age_seconds must be in [1, 60]; got {cmd_age}"
+                    )));
+                }
+                let capacity = entry
+                    .deny_set_capacity
+                    .unwrap_or(crate::api::nip_fi::DEFAULT_DENY_SET_CAPACITY);
+                if capacity == 0 {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: \
+                         deny_set_capacity must be positive (non-zero)"
+                    )));
+                }
+                // Validate that CommandIssuerPolicy can be constructed — this is the
+                // same gate the builder uses, so a startup rejection here is tight.
+                crate::api::nip_fi::validate_command_issuer_config(
+                    idx,
+                    cmd_age,
+                    &principals,
+                    capacity,
+                )
+                .map_err(|e| ConfigError::InvalidValue(e))?;
                 command_configs.push((
                     entry.issuer.clone(),
                     crate::api::nip_fi::CommandIssuerEnvConfig {

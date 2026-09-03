@@ -32,7 +32,7 @@ pub use config::{
     NOSTR_PUBKEY_CLAIM, OAUTH_CLIENT_ID_CLAIM,
 };
 pub use denial::DenialClass;
-pub use deny_map::{DenySetFull, IssuerCapacity, NipFiDenyMap};
+pub use deny_map::{CrossPodMergeResult, DenySetFull, IssuerCapacity, NipFiDenyMap};
 pub use discovery::{
     AssertionFreshnessDiscovery, FederatedIdentityDiscovery, FreshnessClassDiscovery,
 };

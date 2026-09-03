@@ -8,7 +8,7 @@
 //! 1. Bounded decode + `typ` check (`nip-fi-command+jwt` only).
 //! 2. Select issuer policy; verify signature with authenticated JWKS.
 //! 3. Validate all pure claims: iss, aud, time bounds, method/path/cmd,
-//!   target_pubkey, and until ceiling.
+//!    target_pubkey, and until ceiling.
 //! 4. Principal authorization (issuer-configured authorized `sub` list).
 //! 5. Signed-target / request-body agreement.
 //! 6. Atomic jti reservation + deny-entry insertion (both-or-neither).

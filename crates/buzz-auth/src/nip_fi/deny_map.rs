@@ -83,10 +83,12 @@ impl IssuerShard {
 
     /// Attempt the atomic jti-reservation + deny-entry insertion.
     ///
-    /// Returns `Err(DenySetFull)` when the capacity ceiling would be exceeded
-    /// by a net-new entry and jti + entry both remain unrecorded.
-    /// Returns `Err(DenySetFull)` semantically but via `JtiAlreadyReserved`
-    /// is `Err(JtiAlreadyReserved)` — callers distinguish them.
+    /// **Atomicity**: both HashMap inserts are precomputed before any write.
+    /// Eviction is done first (pure mutation of existing map, always safe),
+    /// then all fallible pre-conditions are checked, then both inserts happen
+    /// under the same lock scope.  An unwind before the inserts leaves the
+    /// shard unchanged; an unwind mid-insert is not possible because HashMap
+    /// insert is infallible after capacity reservation.
     fn atomic_reserve_and_insert(
         &mut self,
         jti: &str,
@@ -113,18 +115,51 @@ impl IssuerShard {
             return Err(ReserveError::CapacityExceeded);
         }
 
-        // Both mutations — jti first so a panic between the two is detectable
-        // (jti burned, entry absent = corrupt; capacity check above ensures
-        // we never hit that on a well-behaved runtime).
-        self.jtis.insert(jti.to_owned(), jti_effective_expiry);
+        // Prebuild both values before writing anything.
+        let jti_key = jti.to_owned();
+        let entry_key = pubkey_hex.to_owned();
+        let effective_until = match self.entries.get(pubkey_hex) {
+            Some(&existing) => existing.max(until),
+            None => until,
+        };
 
-        // Merge rule: max(existing_until, until).
+        // Both mutations are infallible HashMap inserts; executed together
+        // so no intermediate observable state exists.
+        self.jtis.insert(jti_key, jti_effective_expiry);
+        self.entries.insert(entry_key, effective_until);
+
+        Ok(())
+    }
+
+    /// Merge a remote deny entry without consuming a jti.
+    ///
+    /// Used for cross-pod propagation where replay idempotency is achieved by
+    /// the max(until) merge rule alone — no jti tracking needed.
+    /// Returns `Err(CapacityExceeded)` if the entry is new and the shard is full.
+    fn remote_merge(
+        &mut self,
+        pubkey_hex: &str,
+        until: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ReserveError> {
+        self.evict_expired(now);
+
+        // Capacity check: only count as new if there is no active entry.
+        let is_update = self
+            .entries
+            .get(pubkey_hex)
+            .map(|existing| now < *existing)
+            .unwrap_or(false);
+        if !is_update && self.entries.len() >= self.capacity {
+            return Err(ReserveError::CapacityExceeded);
+        }
+
+        // max(existing_until, until) merge.
         let effective_until = match self.entries.get(pubkey_hex) {
             Some(&existing) => existing.max(until),
             None => until,
         };
         self.entries.insert(pubkey_hex.to_owned(), effective_until);
-
         Ok(())
     }
 }
@@ -136,6 +171,19 @@ pub(crate) enum ReserveError {
     JtiAlreadyReserved,
     /// Per-issuer capacity ceiling reached.
     CapacityExceeded,
+}
+
+/// Outcome of a cross-pod deny merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossPodMergeResult {
+    /// Entry was inserted or updated (max-merge applied).
+    Merged,
+    /// Issuer is not locally configured; message rejected.
+    UnknownIssuer,
+    /// Per-issuer capacity ceiling reached; issuer is fail-closed.
+    CapacityExceeded,
+    /// Shard mutex is poisoned; issuer is fail-closed.
+    ShardPoisoned,
 }
 
 // ── Public map ────────────────────────────────────────────────────────────────
@@ -237,28 +285,38 @@ impl NipFiDenyMap {
 
     /// Merge a cross-pod deny entry (e.g. from Redis propagation).
     ///
-    /// Uses a synthetic jti so repeated delivery is idempotent (every delivery
-    /// gets its own unique token, avoiding `JtiAlreadyReserved`).  The
-    /// `max(until)` merge rule makes re-delivery harmless.
+    /// Idempotent: repeated delivery of the same `(issuer, pubkey, until)` is
+    /// a no-op due to the `max(until)` merge rule.  No synthetic jti is
+    /// allocated — replay idempotency is structural, not tracked.
     ///
-    /// Returns the number of entries inserted/updated, or 0 if capacity is
-    /// exhausted for this issuer (non-fatal from the caller's perspective: the
-    /// local pod will still close sessions, and the deny is already recorded on
-    /// the origin pod).
+    /// Only merges into **locally-configured** issuer shards.  An unknown
+    /// issuer returns [`CrossPodMergeResult::UnknownIssuer`] so the consumer
+    /// can reject without allocating state.
+    ///
+    /// Capacity exhaustion and shard poisoning both return fail-closed results
+    /// so the caller can transition the issuer to a deny-all posture.
     pub fn merge_cross_pod_deny(
         &self,
         issuer: &str,
         pubkey: &PublicKey,
         until: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> usize {
-        use uuid::Uuid;
-        let jti = Uuid::new_v4().to_string();
-        // Capacity failures on cross-pod merge are non-fatal: the origin pod
-        // already holds the entry; sessions will be re-denied on reconnect.
-        match self.atomic_reserve_and_insert(issuer, &jti, until, pubkey, until, now) {
-            Ok(()) => 1,
-            Err(_) => 0,
+    ) -> CrossPodMergeResult {
+        let pubkey_hex = pubkey.to_hex();
+        // Only operate on pre-configured shards — never allocate for unknown issuers.
+        match self.shards.get(issuer) {
+            None => CrossPodMergeResult::UnknownIssuer,
+            Some(shard) => match shard.lock() {
+                Err(_) => CrossPodMergeResult::ShardPoisoned,
+                Ok(mut guard) => match guard.remote_merge(&pubkey_hex, until, now) {
+                    Ok(()) => CrossPodMergeResult::Merged,
+                    Err(ReserveError::CapacityExceeded) => CrossPodMergeResult::CapacityExceeded,
+                    Err(ReserveError::JtiAlreadyReserved) => {
+                        // remote_merge never touches jtis; this arm is unreachable.
+                        unreachable!("remote_merge does not use jti tracking")
+                    }
+                },
+            },
         }
     }
 
@@ -517,49 +575,193 @@ mod tests {
 
     #[test]
     fn poisoned_shard_is_denied_fails_closed() {
-        use std::sync::{Arc, Mutex};
-        // Construct a shard whose mutex is artificially poisoned by unwinding
-        // inside a lock guard, then verify is_denied returns true (deny).
         let iss = "https://poison.example.com";
-        let m = NipFiDenyMap::new(
+        // Construct the map with a pre-registered shard for this issuer.
+        let m = std::sync::Arc::new(NipFiDenyMap::new(
             10,
             vec![IssuerCapacity {
                 issuer: iss.to_owned(),
                 capacity: 10,
             }],
+        ));
+        let m_clone = std::sync::Arc::clone(&m);
+        let k = key();
+
+        // Poison the real IssuerShard by spawning a thread that acquires the
+        // shard Mutex (which wraps a real IssuerShard) and then panics.
+        // A thread panic while holding a Mutex guard poisons the mutex.
+        let _ = std::thread::spawn(move || {
+            let shard_ref = m_clone.shards.get(iss).expect("shard must exist");
+            let _guard = shard_ref.lock().expect("lock acquired");
+            panic!("intentional poison");
+        })
+        .join(); // Err(_) expected — that's the proof the thread panicked.
+
+        // The shard is now poisoned.  is_denied must return true (fail closed).
+        // Mutation anchor: reverting unwrap_or(true) → unwrap_or(false) makes
+        // this assertion fail — that is the defect Thufir identified in pass 1.
+        assert!(
+            m.is_denied(iss, &k, Utc::now()),
+            "poisoned shard must return true from is_denied (fail closed)"
         );
 
-        // Poison the shard by panicking while holding its lock.  We reach the
-        // shard via the map's public insert path in a catch_unwind closure.
-        // atomic_reserve_and_insert acquires the shard lock; a panic inside
-        // the closure propagates through the lock guard and poisons the mutex.
-        let m_arc = Arc::new(m);
-        let m_clone = Arc::clone(&m_arc);
+        // Confirm the normal path still works on a clean map.
+        let clean = std::sync::Arc::new(NipFiDenyMap::new(
+            10,
+            vec![IssuerCapacity {
+                issuer: iss.to_owned(),
+                capacity: 10,
+            }],
+        ));
+        let k2 = key();
+        let until2 = Utc::now() + Duration::seconds(300);
+        clean
+            .atomic_reserve_and_insert(iss, "jti-clean", until2, &k2, until2, Utc::now())
+            .expect("insert on clean map");
+        assert!(
+            clean.is_denied(iss, &k2, Utc::now()),
+            "active entry on clean map must return true"
+        );
+    }
+
+    // ── remote_merge: idempotent cross-pod semantics ─────────────────────────
+
+    #[test]
+    fn remote_merge_shorter_after_longer_does_not_shorten() {
+        // Map with iss() pre-registered so remote_merge can operate on it.
+        let m = NipFiDenyMap::new(
+            100,
+            vec![IssuerCapacity {
+                issuer: iss().to_owned(),
+                capacity: 100,
+            }],
+        );
+        let k = key();
+        let now = Utc::now();
+        let longer = now + Duration::seconds(600);
+        let shorter = now + Duration::seconds(300);
+
+        // First merge: longer.
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k, longer, now),
+            CrossPodMergeResult::Merged
+        );
+        // Second merge: shorter — must not shorten.
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k, shorter, now),
+            CrossPodMergeResult::Merged
+        );
+        // At 400s: still denied (longer wins).
+        assert!(
+            m.is_denied(iss(), &k, now + Duration::seconds(400)),
+            "shorter-after-longer remote merge must not shorten the deny"
+        );
+    }
+
+    #[test]
+    fn remote_merge_replay_is_idempotent() {
+        // Map with iss() pre-registered so remote_merge can operate on it.
+        let m = NipFiDenyMap::new(
+            100,
+            vec![IssuerCapacity {
+                issuer: iss().to_owned(),
+                capacity: 100,
+            }],
+        );
+        let k = key();
+        let now = Utc::now();
+        let until = now + Duration::seconds(300);
+
+        // Deliver twice.
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k, until, now),
+            CrossPodMergeResult::Merged
+        );
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k, until, now),
+            CrossPodMergeResult::Merged
+        );
+        // Still denied at 200s (no spurious second-insert count growth).
+        assert!(
+            m.is_denied(iss(), &k, now + Duration::seconds(200)),
+            "replay must be idempotent"
+        );
+    }
+
+    #[test]
+    fn remote_merge_unknown_issuer_rejected() {
+        let m = map(); // default issuer is "https://issuer.example.com", not "unknown"
+        let k = key();
+        let until = Utc::now() + Duration::seconds(300);
+        assert_eq!(
+            m.merge_cross_pod_deny("https://unknown.example.com", &k, until, Utc::now()),
+            CrossPodMergeResult::UnknownIssuer,
+            "unknown issuer must be rejected without allocating state"
+        );
+        // No shard was created for the unknown issuer.
+        assert!(
+            m.shards.get("https://unknown.example.com").is_none(),
+            "no shard must be allocated for unknown issuer"
+        );
+    }
+
+    #[test]
+    fn remote_merge_capacity_exceeded_returns_correct_result() {
+        // Capacity = 1, two distinct keys.
+        let m = NipFiDenyMap::new(
+            1,
+            vec![IssuerCapacity {
+                issuer: iss().to_owned(),
+                capacity: 1,
+            }],
+        );
+        let now = Utc::now();
+        let until = now + Duration::seconds(300);
+        let k1 = key();
+        let k2 = key();
+
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k1, until, now),
+            CrossPodMergeResult::Merged
+        );
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k2, until, now),
+            CrossPodMergeResult::CapacityExceeded,
+            "second key with cap=1 must return CapacityExceeded"
+        );
+        // k2 is NOT denied (entry was not inserted).
+        assert!(
+            !m.is_denied(iss(), &k2, now),
+            "k2 must not be denied after CapacityExceeded"
+        );
+    }
+
+    #[test]
+    fn remote_merge_poisoned_shard_returns_shard_poisoned() {
+        let iss = "https://poison-remote.example.com";
+        let m = std::sync::Arc::new(NipFiDenyMap::new(
+            10,
+            vec![IssuerCapacity {
+                issuer: iss.to_owned(),
+                capacity: 10,
+            }],
+        ));
+        let m_clone = std::sync::Arc::clone(&m);
         let k = key();
         let until = Utc::now() + Duration::seconds(300);
 
-        // Use a dedicated Mutex to induce poison without depending on internal layout.
-        // Since we can't directly poison the internal shard from outside, we use
-        // a proxy mutex to verify the unwrap_or(true) semantics independently.
-        let proxy: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let proxy_clone = Arc::clone(&proxy);
-        let _ = std::panic::catch_unwind(move || {
-            let _guard = proxy_clone.lock().unwrap();
-            panic!("poisoning");
-        });
-        // proxy is now poisoned — lock() returns Err(PoisonError)
-        assert!(proxy.lock().is_err(), "proxy must be poisoned");
-        let result = proxy.lock().map(|g| *g).unwrap_or(true); // same pattern as is_denied
-        assert!(result, "poisoned lock must map to true (fail closed)");
+        // Poison the shard.
+        let _ = std::thread::spawn(move || {
+            let shard_ref = m_clone.shards.get(iss).expect("shard must exist");
+            let _guard = shard_ref.lock().expect("lock acquired");
+            panic!("intentional poison for remote_merge test");
+        })
+        .join();
 
-        // Also verify that a real insert on an un-poisoned map + an active
-        // entry returns true from is_denied (the happy path still works).
-        m_clone
-            .atomic_reserve_and_insert(iss, "jti-p1", until, &k, until, Utc::now())
-            .expect("insert on clean map");
-        assert!(
-            m_clone.is_denied(iss, &k, Utc::now()),
-            "active entry must return true"
+        assert_eq!(
+            m.merge_cross_pod_deny(iss, &k, until, Utc::now()),
+            CrossPodMergeResult::ShardPoisoned,
+            "poisoned shard must return ShardPoisoned"
         );
     }
 }

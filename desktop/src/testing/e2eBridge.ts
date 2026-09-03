@@ -11756,10 +11756,13 @@ export function maybeInstallE2eTauriMocks() {
           { name: "1. Thu Thập", rel_path: "1. Thu Thập", is_dir: true, area: "1. Thu Thập" },
           { name: "2. Tinh Lọc", rel_path: "2. Tinh Lọc", is_dir: true, area: "2. Tinh Lọc" },
           { name: "demo.md", rel_path: "2. Tinh Lọc/demo.md", is_dir: false, area: "2. Tinh Lọc" },
+          { name: "notes.txt", rel_path: "1. Thu Thập/notes.txt", is_dir: false, area: "1. Thu Thập" },
+          { name: "ảnh.png", rel_path: "1. Thu Thập/ảnh.png", is_dir: false, area: "1. Thu Thập" },
         ];
       }
       case "brain_read_file": {
         const p = payload as { relPath?: string };
+        if (p?.relPath === "1. Thu Thập/notes.txt") return "dòng 1 ghi chú\ndòng 2";
         if (p?.relPath === "_meta/nguoi-dung.json") {
           return JSON.stringify({
             vai_tro: { chu: { doc: ["*"], ghi: ["*"], duyet: true } },
@@ -11767,6 +11770,9 @@ export function maybeInstallE2eTauriMocks() {
           });
         }
         return "# Demo\n\nnội dung demo não";
+      }
+      case "brain_stat": {
+        return { size: 123, is_dir: false };
       }
       case "brain_write_meta": {
         return "/tmp/vault/_meta/nguoi-dung.json";

@@ -145,5 +145,49 @@ pub fn brain_write_meta(root: String, content: String) -> Result<String, String>
     fs::write(&full, &content).map_err(|e| e.to_string())?;
     Ok(full.to_string_lossy().to_string())
 }
+
+#[tauri::command]
+pub fn brain_read_bytes(root: String, rel_path: String, khu: String) -> Result<String, String> {
+    if !khu_ok(&rel_path, &khu) || !can_read(&rel_path) {
+        return Err("forbidden".into());
+    }
+    let full = Path::new(&root).join(&rel_path);
+    let root_canon = Path::new(&root).canonicalize().unwrap_or_default();
+    match full.canonicalize() {
+        Ok(canon) if canon.starts_with(&root_canon) => {
+            let bytes = fs::read(&full).map_err(|e| e.to_string())?;
+            use base64::Engine as _;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+            as Result<String, String>
+        }
+        _ => Err("forbidden".into()),
+    }
+}
+
+#[tauri::command]
+pub fn brain_stat(root: String, rel_path: String, khu: String) -> Result<BrainStat, String> {
+    if !khu_ok(&rel_path, &khu) || !can_read(&rel_path) {
+        return Err("forbidden".into());
+    }
+    let full = Path::new(&root).join(&rel_path);
+    let root_canon = Path::new(&root).canonicalize().unwrap_or_default();
+    match full.canonicalize() {
+        Ok(canon) if canon.starts_with(&root_canon) => {
+            let meta = fs::metadata(&full).map_err(|e| e.to_string())?;
+            Ok(BrainStat {
+                size: meta.len(),
+                is_dir: meta.is_dir(),
+            })
+        }
+        _ => Err("forbidden".into()),
+    }
+}
+
+#[derive(Serialize)]
+pub struct BrainStat {
+    pub size: u64,
+    pub is_dir: bool,
+}
+
 #[path = "msx_brain_tests.rs"]
 mod tests;

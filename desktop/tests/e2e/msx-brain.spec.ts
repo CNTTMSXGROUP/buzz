@@ -110,3 +110,54 @@ test("link [nao:...] trong tin nhắn render thành chip 📎 bấm được", a
     test.skip(true, "seam inject message chưa có trong e2e bridge");
   }
 });
+
+test("LAYOUT: panel + pane trái nằm trong viewport (chẩn đoán tràn)", async ({ page }) => {
+  await openBrain(page);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const panel = page.locator("main, [data-sidebar='inset']").first();
+  const brain = page.locator("text=Não MSX").first();
+  const treePane = page.locator(".w-80");
+  const paneBox = await treePane.boundingBox();
+  const vp = page.viewportSize()!;
+  // pane phải nằm trong viewport
+  expect(paneBox!.x).toBeGreaterThanOrEqual(-1);
+  expect(paneBox!.x + paneBox!.width).toBeLessThanOrEqual(vp.width + 1);
+  // đo các element tràn ngang viewport (nguyên nhân scroll ngang)
+  const overflowing = await page.evaluate(() => {
+    const vw = document.documentElement.clientWidth;
+    const bad: string[] = [];
+    document.querySelectorAll("*").forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.right > vw + 2 && !el.closest("[data-allow-overflow]")) {
+        const cls = (el as HTMLElement).className;
+        bad.push(`${el.tagName}.${typeof cls === "string" ? cls.slice(0, 60) : ""} right=${Math.round(r.right)}`);
+      }
+    });
+    return bad.slice(0, 12);
+  });
+  console.log("PHẦN TỬ TRÀN VIEWPORT:", JSON.stringify(overflowing, null, 1));
+  await page.screenshot({ path: "/tmp/msx-brain-layout.png", fullPage: false });
+});
+
+test("VSCode: mở md + txt → 2 tab, chuyển + đóng tab", async ({ page }) => {
+  await openBrain(page);
+  await page.getByText("2. Tinh Lọc").click();
+  await page.getByText("demo.md").click();
+  await page.getByText("1. Thu Thập").click();
+  await page.getByText("notes.txt").click();
+  // 2 tab
+  await expect(page.getByRole("button", { name: "demo.md" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "notes.txt" })).toBeVisible();
+  // nội dung text viewer
+  await expect(page.getByText("dòng 1 ghi chú")).toBeVisible();
+  // đóng tab active → quay về tab còn lại
+  await page.getByLabel("Đóng notes.txt").click();
+  await expect(page.getByRole("button", { name: "demo.md" })).toBeVisible();
+});
+
+test("mock ảnh mở viewer ảnh", async ({ page }) => {
+  await openBrain(page);
+  await page.getByText("1. Thu Thập").click();
+  await page.getByText("ảnh.png").click();
+  await expect(page.locator("img[alt='ảnh.png']")).toBeVisible();
+});

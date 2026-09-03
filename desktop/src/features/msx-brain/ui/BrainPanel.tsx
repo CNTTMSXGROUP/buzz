@@ -1,8 +1,8 @@
-import { Brain, Check, ChevronDown, FolderOpen, Send, Settings } from "lucide-react";
+import { Brain, Check, ChevronDown, File as FileIcon, FolderOpen, Send, Settings, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { sendApprove } from "../lib/approve";
 import { listShareableChannels, shareToChannel } from "../lib/shareToChannel";
-import { useBrainTree } from "../lib/useBrainTree";
+import { useBrainTabs } from "../lib/useBrainTabs";
 import { BrainAdmin } from "./BrainAdmin";
 import { FileTree } from "./FileTree";
 import { MarkdownPreview } from "./MarkdownPreview";
@@ -14,11 +14,13 @@ export function BrainPanel({
   vaultRoot: string;
   myPubkey: string;
 }) {
-  const { entries, selected, content, error, open } = useBrainTree(vaultRoot, myPubkey);
+  const { entries, tabs, activePath, error, open, close, openByName, setActivePath } =
+    useBrainTabs(vaultRoot, myPubkey);
   const [status, setStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
-  const [channels, setChannels] = useState<Array<{ id: string; name: string }>>([]);
   const [shareNote, setShareNote] = useState("");
+  const [channels, setChannels] = useState<Array<{ id: string; name: string }>>([]);
+  const [adminOpen, setAdminOpen] = useState(false);
   const [label, setLabel] = useState<string>(() => {
     try {
       return localStorage.getItem("msx-brain-label") ?? "Não MSX";
@@ -28,7 +30,6 @@ export function BrainPanel({
   });
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState("");
-  const [adminOpen, setAdminOpen] = useState(false);
   const shareRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -39,25 +40,34 @@ export function BrainPanel({
     return () => document.removeEventListener("mousedown", onDocClick);
   }, []);
 
-  // mở file từ hyperlink [nao:...] trong tin nhắn
+  // chip [nao:...] / [[wiki]] từ tin nhắn hoặc preview → mở tab
   useEffect(() => {
     async function onOpenFile(ev: Event) {
       const rel = (ev as CustomEvent<{ rel: string }>).detail?.rel;
-      if (!rel) return;
-      setAdminOpen(false);
-      await open({ name: rel.split("/").pop() ?? rel, rel_path: rel, is_dir: false, area: rel.split("/")[0] ?? "" });
+      if (rel) {
+        setAdminOpen(false);
+        await open(rel);
+      }
+    }
+    async function onOpenWiki(ev: Event) {
+      const name = (ev as CustomEvent<{ name: string }>).detail?.name;
+      if (name) openByName(name);
     }
     window.addEventListener("msx-brain-open-file", onOpenFile);
-    return () => window.removeEventListener("msx-brain-open-file", onOpenFile);
-  }, [open]);
+    window.addEventListener("msx-brain-open-wiki", onOpenWiki);
+    return () => {
+      window.removeEventListener("msx-brain-open-file", onOpenFile);
+      window.removeEventListener("msx-brain-open-wiki", onOpenWiki);
+    };
+  }, [open, openByName]);
 
-  const isInThuThap = selected?.rel_path.startsWith("1. Thu Thập") ?? false;
-  const isMd = selected?.name.toLowerCase().endsWith(".md") ?? false;
+  const active = tabs.find((t) => t.relPath === activePath) ?? null;
+  const isInThuThap = active?.relPath.startsWith("1. Thu Thập") ?? false;
 
   async function handleApprove() {
-    if (!selected) return;
+    if (!active) return;
     try {
-      await sendApprove(selected.name);
+      await sendApprove(active.name);
       setStatus("Đã gửi lệnh duyệt — bridge xử lý trong ~1 phút.");
     } catch (err) {
       setStatus(`Lỗi: ${String(err)}`);
@@ -76,18 +86,19 @@ export function BrainPanel({
   }
 
   async function handleShare(channelId: string, channelName: string) {
-    if (!selected) return;
+    if (!active) return;
     setShareOpen(false);
     try {
-      await shareToChannel(channelId, selected.name, content);
-      setStatus(`Đã gửi "${selected.name}" vào #${channelName}.`);
+      await shareToChannel(channelId, active.name, active.content, { note: shareNote });
+      setStatus(`Đã gửi "${active.name}" vào #${channelName}.`);
+      setShareNote("");
     } catch (err) {
       setStatus(`Lỗi: ${String(err)}`);
     }
   }
 
   return (
-    <div className="flex h-full w-full flex-col">
+    <div className="flex h-full w-full flex-col overflow-hidden">
       <div className="flex items-center gap-2 border-b px-3 py-2">
         <Brain className="h-4 w-4 text-amber-500" />
         {renaming ? (
@@ -97,7 +108,11 @@ export function BrainPanel({
               const v = renameValue.trim();
               if (v) {
                 setLabel(v);
-                try { localStorage.setItem("msx-brain-label", v); } catch { /* ignore */ }
+                try {
+                  localStorage.setItem("msx-brain-label", v);
+                } catch {
+                  /* ignore */
+                }
               }
               setRenaming(false);
             }}
@@ -112,12 +127,12 @@ export function BrainPanel({
           </form>
         ) : (
           <span
-            className="text-sm font-semibold select-none"
+            className="select-none text-sm font-semibold"
             onContextMenu={(ev) => {
               ev.preventDefault();
               setRenameValue(label);
               setRenaming(true);
-              }}
+            }}
           >
             {label}
           </span>
@@ -133,7 +148,7 @@ export function BrainPanel({
         >
           <Settings className="h-4 w-4" />
         </button>
-        {selected && !selected.is_dir && isMd && (
+        {active && active.kind === "md" && (
           <div className="relative" ref={shareRef}>
             <button
               type="button"
@@ -170,7 +185,7 @@ export function BrainPanel({
             )}
           </div>
         )}
-        {selected && !selected.is_dir && isMd && isInThuThap && (
+        {active && active.kind === "md" && isInThuThap && (
           <button
             type="button"
             data-testid="msx-approve-button"
@@ -187,30 +202,80 @@ export function BrainPanel({
           <BrainAdmin vaultRoot={vaultRoot} />
         </div>
       ) : (
-      <div className="flex min-h-0 flex-1">
-        <div className="w-80 min-w-0 max-w-[20rem] shrink-0 overflow-hidden border-r">
-          <FileTree entries={entries} selectedPath={selected?.rel_path ?? null} onOpen={open} />
-        </div>
-        <div className="min-w-0 flex-1 overflow-y-auto">
-          {error && <div className="p-4 text-sm text-destructive">{error}</div>}
-          {selected ? (
-            isMd ? (
-              <MarkdownPreview content={content} />
-            ) : (
-              <div className="flex h-full items-center justify-center p-6 text-center text-sm text-muted-foreground">
-                Chỉ xem trước được file .md.
-                <br />
-                File "{selected.name}" hãy mở bằng ứng dụng khác (Obsidian/Drive).
+        <div className="flex min-h-0 flex-1">
+          <div className="w-80 min-w-0 max-w-[20rem] shrink-0 overflow-hidden border-r">
+            <FileTree
+              entries={entries}
+              selectedPath={activePath}
+              onOpen={(e) => void open(e.rel_path)}
+            />
+          </div>
+          <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+            {tabs.length > 0 && (
+              <div className="flex items-center gap-1 overflow-x-auto border-b bg-muted/30 px-1 py-1">
+                {tabs.map((t) => (
+                  <div
+                    key={t.relPath}
+                    className={`group flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-xs ${
+                      activePath === t.relPath
+                        ? "bg-background font-medium"
+                        : "bg-transparent text-muted-foreground hover:bg-accent"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      className="max-w-48 truncate"
+                      onClick={() => setActivePath(t.relPath)}
+                    >
+                      {t.name}
+                      {t.kind === "other" ? " •" : ""}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Đóng ${t.name}`}
+                    className="rounded p-0.5 opacity-0 transition-opacity hover:bg-accent group-hover:opacity-100"
+                    onClick={() => close(t.relPath)}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
               </div>
-            )
-          ) : (
-            <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
-              <FolderOpen className="h-8 w-8" />
-              <span className="text-sm">Chọn một tài liệu để xem</span>
+            )}
+            <div className="min-h-0 flex-1 overflow-hidden">
+              {error && <div className="p-4 text-sm text-destructive">{error}</div>}
+              {active ? (
+                active.kind === "md" ? (
+                  <MarkdownPreview
+                    content={active.content}
+                    onOpenFile={(rel) => void open(rel)}
+                    onOpenWiki={(n) => openByName(n)}
+                  />
+                ) : active.kind === "image" ? (
+                  <div className="flex h-full items-center justify-center p-4">
+                    <img src={active.content} alt={active.name} className="max-h-full max-w-full object-contain" />
+                  </div>
+                ) : active.kind === "text" ? (
+                  <pre className="h-full overflow-auto p-4 font-mono text-xs leading-relaxed">
+                    {active.content.slice(0, 20000)}
+                    {active.content.length > 20000 ? "\n… (cắt bớt — mở bằng Obsidian để xem đầy đủ)" : null}
+                  </pre>
+                ) : (
+                  <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-sm text-muted-foreground">
+                    <FileIcon className="h-8 w-8" />
+                    <span>"{active.name}" — định dạng chưa xem trước được ({(active.size / 1024).toFixed(0)} KB).</span>
+                    <span>Hãy mở bằng Obsidian / Google Drive.</span>
+                  </div>
+                )
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
+                  <FolderOpen className="h-8 w-8" />
+                  <span className="text-sm">Chọn một tài liệu để xem</span>
+                </div>
+              )}
             </div>
-          )}
+          </div>
         </div>
-      </div>
       )}
     </div>
   );

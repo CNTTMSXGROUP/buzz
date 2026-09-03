@@ -24,13 +24,15 @@ afterEach(async () => {
 after(() => dom.window.close());
 
 test("agent picker preference skips people", async () => {
-  const { act, renderHook } = await import("@testing-library/react");
+  const { renderHook } = await import("@testing-library/react");
   const { useMentionSelection } = await import(
     "@/features/messages/lib/useMentionSelection"
   );
+  const request = { firstAgent: true };
   const view = renderHook(
-    ({ suggestions }) => useMentionSelection(suggestions),
-    { initialProps: { suggestions: [] } },
+    ({ suggestions, ready }) =>
+      useMentionSelection(request, suggestions, ready),
+    { initialProps: { suggestions: [], ready: false } },
   );
   const suggestions = [
     { displayName: "Alice", pubkey: "person" },
@@ -39,13 +41,12 @@ test("agent picker preference skips people", async () => {
     { displayName: "Agent Bea", isAgent: true, pubkey: "agent-b" },
   ];
 
-  act(() => view.result.current.prepareSelectionPreference("first-agent"));
-  view.rerender({ suggestions });
+  view.rerender({ suggestions, ready: true });
   assert.equal(view.result.current.mentionSelectedIndex, 1);
 });
 
 test("primary+Shift+M addresses the default agent or toggles the tray selection in place", async () => {
-  const { act, renderHook } = await import("@testing-library/react");
+  const { renderHook } = await import("@testing-library/react");
   const { useAlwaysAddressShortcut } = await import(
     "./useAlwaysAddressShortcut.ts"
   );
@@ -94,7 +95,7 @@ test("primary+Shift+M addresses the default agent or toggles the tray selection 
 });
 
 test("primary+Shift+M removes the current locked agent before choosing a new default", async () => {
-  const { act, renderHook } = await import("@testing-library/react");
+  const { renderHook } = await import("@testing-library/react");
   const { useAlwaysAddressShortcut } = await import(
     "./useAlwaysAddressShortcut.ts"
   );
@@ -145,7 +146,7 @@ test("primary+Shift+M removes the current locked agent before choosing a new def
 });
 
 test("primary+Shift+M opens the picker when no default agent is ready", async () => {
-  const { act, renderHook } = await import("@testing-library/react");
+  const { renderHook } = await import("@testing-library/react");
   const { useAlwaysAddressShortcut } = await import(
     "./useAlwaysAddressShortcut.ts"
   );

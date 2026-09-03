@@ -113,9 +113,11 @@ class BuzzPushBootstrap extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     useListenable(apnsDeviceToken);
     final registrationAttempt = useMemoized(BuzzPushAttemptGate.new);
+    final gatewayInitializationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final publicationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final tombstoneAttempt = useMemoized(BuzzPushAttemptGate.new);
     final registrationRetry = useState(0);
+    final gatewayInitializationRetry = useState(0);
     final publicationRetry = useState(0);
     final tombstoneRetry = useState(0);
     final revocationOutbox = ref.watch(buzzPushLeaseRevocationOutboxProvider);
@@ -141,9 +143,31 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       return null;
     }, [revocationOutbox, session.status]);
 
+    useEffect(() {
+      const attempt = 'configured-gateway';
+      if (!gatewayInitializationAttempt.tryBegin(attempt)) return null;
+      unawaited(() async {
+        try {
+          await initializeBuzzPushGateway();
+          gatewayInitializationAttempt.complete(attempt);
+        } catch (error, stack) {
+          gatewayInitializationAttempt.failed(
+            attempt,
+            retry: () {
+              if (context.mounted) gatewayInitializationRetry.value += 1;
+            },
+          );
+          debugPrint('Push gateway initialization failed: $error');
+          debugPrintStack(stackTrace: stack);
+        }
+      }());
+      return null;
+    }, [gatewayInitializationRetry.value]);
+
     useEffect(
       () => () {
         registrationAttempt.dispose();
+        gatewayInitializationAttempt.dispose();
         publicationAttempt.dispose();
         tombstoneAttempt.dispose();
       },

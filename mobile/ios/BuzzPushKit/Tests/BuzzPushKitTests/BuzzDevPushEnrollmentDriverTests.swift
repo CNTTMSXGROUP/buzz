@@ -553,7 +553,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       }
     }
 
-    try await driver.cleanRetiredGateways(deviceToken: Data((1...32).map(UInt8.init)))
+    try await driver.cleanRetiredGateways()
 
     XCTAssertEqual(store.saved, [current])
     XCTAssertTrue(store.cleanup.isEmpty)

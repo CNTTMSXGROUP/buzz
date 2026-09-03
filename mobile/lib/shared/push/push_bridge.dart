@@ -136,6 +136,19 @@ Future<void> syncPendingBuzzPushNotificationResponse() async {
   }
 }
 
+/// Initializes native gateway migration and cleanup without requiring a relay,
+/// notification authorization, or an APNs device token.
+Future<void> initializeBuzzPushGateway() async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return;
+  try {
+    await _channel.invokeMethod<void>('initializeGateway', {
+      'gatewayUrl': Env.pushGatewayUrl,
+    });
+  } on MissingPluginException {
+    // Flutter tests and non-Runner embeddings do not install the native bridge.
+  }
+}
+
 /// Starts the independent iOS notification-authorization and APNs-registration
 /// requests. Display authorization is intentionally not returned or persisted:
 /// APNs registration and enrollment remain valid while display is denied.

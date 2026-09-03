@@ -47,6 +47,21 @@ void main() {
   });
 
   test(
+    'initializes native gateway cleanup without starting APNs registration',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_channel, (call) async {
+            expect(call.method, 'initializeGateway');
+            expect(call.arguments, {'gatewayUrl': Env.pushGatewayUrl});
+            return null;
+          });
+
+      await initializeBuzzPushGateway();
+    },
+  );
+
+  test(
     'starts native permission and APNs registration without a result gate',
     () async {
       debugDefaultTargetPlatformOverride = TargetPlatform.iOS;

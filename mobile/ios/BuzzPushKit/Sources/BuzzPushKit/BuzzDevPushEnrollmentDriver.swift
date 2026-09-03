@@ -433,8 +433,8 @@ public final class BuzzDevPushEnrollmentDriver {
   }
 
   /// Revokes durable installations from gateways that are no longer configured.
-  public func cleanRetiredGateways(deviceToken: Data) async throws {
-    precondition(!deviceToken.isEmpty, "The APNs device token must not be empty")
+  public func cleanRetiredGateways(deviceToken: Data? = nil) async throws {
+    precondition(deviceToken?.isEmpty != true, "The APNs device token must not be empty")
     try await cleanStaleGateways(deviceToken: deviceToken)
   }
 
@@ -777,7 +777,7 @@ public final class BuzzDevPushEnrollmentDriver {
     return record
   }
 
-  private func cleanStaleGateways(deviceToken: Data) async throws {
+  private func cleanStaleGateways(deviceToken: Data?) async throws {
     let states = try store.gatewayCleanupStates()
     for var state in states where state.gatewayOrigin != gatewayOrigin {
       guard await cleanStaleGateway(&state, deviceToken: deviceToken) else {
@@ -789,7 +789,7 @@ public final class BuzzDevPushEnrollmentDriver {
 
   private func cleanStaleGateway(
     _ state: inout BuzzPushGatewayCleanupState,
-    deviceToken: Data
+    deviceToken: Data?
   ) async -> Bool {
     guard let oldURL = URL(string: state.gatewayOrigin),
       let oldDriver = try? BuzzDevPushEnrollmentDriver(
@@ -804,8 +804,10 @@ public final class BuzzDevPushEnrollmentDriver {
       )
     else { return false }
     let nowSeconds = Int64(now().timeIntervalSince1970)
-    let currentEndpoint = Self.lowercaseHex(deviceToken)
-    let currentEndpointHash = Self.lowercaseHex(Data(SHA256.hash(data: deviceToken)))
+    let currentEndpoint = deviceToken.map(Self.lowercaseHex)
+    let currentEndpointHash = deviceToken.map {
+      Self.lowercaseHex(Data(SHA256.hash(data: $0)))
+    }
     var handles = [String: CleanupInstallation]()
     func mergeHandle(_ handle: String, endpointEpoch: Int64, keyId: String) -> Bool {
       if let existing = handles[handle] {
@@ -836,7 +838,7 @@ public final class BuzzDevPushEnrollmentDriver {
         if let protectedEndpoint = pending.endpoint {
           guard Self.endpointHash(protectedEndpoint) == pending.endpointHash else { return false }
           replayEndpoint = protectedEndpoint
-        } else if pending.endpointHash == currentEndpointHash {
+        } else if let currentEndpoint, pending.endpointHash == currentEndpointHash {
           replayEndpoint = currentEndpoint
         } else {
           // Pre-endpoint journals cannot be replayed after token rotation. They

@@ -347,11 +347,31 @@ import os.log
       return
     }
     switch call.method {
+    case "initializeGateway":
+      guard let gatewayURL = gatewayURL(from: call) else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Push initialization requires gatewayUrl.",
+            details: nil
+          )
+        )
+        return
+      }
+      do {
+        try initializePushGateway(gatewayURL)
+        result(nil)
+      } catch {
+        result(
+          FlutterError(
+            code: "push_gateway_configuration_failed",
+            message: "Push gateway configuration is invalid.",
+            details: error.localizedDescription
+          )
+        )
+      }
     case "startRegistration":
-      guard let arguments = call.arguments as? [String: Any],
-        let gatewayText = arguments["gatewayUrl"] as? String,
-        let gatewayURL = URL(string: gatewayText)
-      else {
+      guard let gatewayURL = gatewayURL(from: call) else {
         result(
           FlutterError(
             code: "invalid_arguments",
@@ -362,10 +382,7 @@ import os.log
         return
       }
       do {
-        let gatewayOrigin = try BuzzPushTranscript.canonicalGatewayOrigin(gatewayURL)
-        try endpointGrantStore.reset(forGatewayOrigin: gatewayOrigin.text)
-        pushGatewayURL = gatewayOrigin.url
-        scheduleRetiredGatewayCleanup()
+        try initializePushGateway(gatewayURL)
         startPushRegistration(result: result)
       } catch {
         result(
@@ -551,8 +568,6 @@ import os.log
 
   private func scheduleRetiredGatewayCleanup() {
     guard gatewayCleanupTask == nil,
-      let deviceToken = apnsDeviceToken,
-      !deviceToken.isEmpty,
       let gatewayURL = pushGatewayURL
     else { return }
     do {
@@ -564,7 +579,7 @@ import os.log
       gatewayCleanupTask = Task { [weak self] in
         defer { self?.gatewayCleanupTask = nil }
         do {
-          try await driver.cleanRetiredGateways(deviceToken: deviceToken)
+          try await driver.cleanRetiredGateways(deviceToken: self?.apnsDeviceToken)
         } catch {
           os_log(
             "Retired push gateway cleanup remains queued: %{public}@",
@@ -580,6 +595,24 @@ import os.log
         error.localizedDescription
       )
     }
+  }
+
+  private func gatewayURL(from call: FlutterMethodCall) -> URL? {
+    guard let arguments = call.arguments as? [String: Any],
+      let gatewayText = arguments["gatewayUrl"] as? String
+    else { return nil }
+    return URL(string: gatewayText)
+  }
+
+  private func initializePushGateway(_ gatewayURL: URL) throws {
+    let gatewayOrigin = try BuzzPushTranscript.canonicalGatewayOrigin(gatewayURL)
+    guard pushGatewayURL != gatewayOrigin.url else {
+      scheduleRetiredGatewayCleanup()
+      return
+    }
+    try endpointGrantStore.reset(forGatewayOrigin: gatewayOrigin.text)
+    pushGatewayURL = gatewayOrigin.url
+    scheduleRetiredGatewayCleanup()
   }
 
   private func handleMediaUploadMethodCall(

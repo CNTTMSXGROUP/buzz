@@ -22,6 +22,10 @@ void main() {
       isValidPushGatewayOrigin('http://localhost:8080', requireHttps: true),
       isFalse,
     );
+    expect(
+      isValidPushGatewayOrigin('https://push.example:8443', requireHttps: true),
+      isFalse,
+    );
   });
 
   test('rejects malformed or non-origin gateway URLs', () {

@@ -13,6 +13,7 @@ bool isValidPushGatewayOrigin(String value, {bool requireHttps = false}) {
     }
     if (uri.path.isNotEmpty && uri.path != '/') return false;
     if (uri.hasQuery || uri.hasFragment) return false;
+    if (requireHttps && uri.hasPort) return false;
     final port = uri.port;
     return port >= 1 && port <= 65535;
   } on FormatException {
@@ -28,8 +29,9 @@ void main(List<String> arguments) {
       isValidPushGatewayOrigin(values.single, requireHttps: requireHttps)) {
     return;
   }
-  stderr.writeln(
-    'error: BUZZ_PUSH_GATEWAY_URL must be ${requireHttps ? 'an HTTPS' : 'an HTTP(S)'} origin without credentials, path, query, or fragment.',
-  );
+  final requirement = requireHttps
+      ? 'an HTTPS origin without an explicit port, credentials, path, query, or fragment'
+      : 'an HTTP(S) origin without credentials, path, query, or fragment';
+  stderr.writeln('error: BUZZ_PUSH_GATEWAY_URL must be $requirement.');
   exitCode = 1;
 }

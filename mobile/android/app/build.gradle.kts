@@ -40,7 +40,7 @@ fun isValidPushGatewayOrigin(value: String, requireHttps: Boolean): Boolean {
         (uri.rawPath.isNullOrEmpty() || uri.rawPath == "/") &&
         uri.rawQuery == null &&
         uri.rawFragment == null &&
-        (uri.port == -1 || uri.port in 1..65535)
+        (if (requireHttps) uri.port == -1 else uri.port == -1 || uri.port in 1..65535)
 }
 
 tasks.matching { it.name.startsWith("compileFlutterBuild") }.configureEach {
@@ -53,7 +53,7 @@ tasks.matching { it.name.startsWith("compileFlutterBuild") }.configureEach {
             throw GradleException(
                 "BUZZ_PUSH_GATEWAY_URL must be supplied as an " +
                     (if (requireHttps) "HTTPS" else "HTTP(S)") +
-                    " origin without " +
+                    " origin without " + (if (requireHttps) "an explicit port, " else "") +
                     "credentials, path, query, or fragment for every mobile build.",
             )
         }

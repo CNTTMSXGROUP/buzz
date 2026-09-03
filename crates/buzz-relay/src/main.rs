@@ -1216,7 +1216,10 @@ async fn main() -> anyhow::Result<()> {
                                 // Close matching sessions.
                                 let closed = state_for_nip_fi
                                     .conn_manager
-                                    .disconnect_nip_fi(&msg.pubkey_bytes);
+                                    .disconnect_nip_fi(&msg.pubkey_bytes)
+                                    + state_for_nip_fi
+                                        .community_connections
+                                        .disconnect_nip_fi(&msg.pubkey_bytes);
                                 if closed > 0 {
                                     // [FI-TRACE-PRIVACY-NONPUBLIC]: no iss or pubkey in logs
                                     tracing::debug!(closed, "nip-fi cross-pod: closed sessions");
@@ -1238,7 +1241,10 @@ async fn main() -> anyhow::Result<()> {
                                 );
                                 let closed = state_for_nip_fi
                                     .conn_manager
-                                    .disconnect_nip_fi(&msg.pubkey_bytes);
+                                    .disconnect_nip_fi(&msg.pubkey_bytes)
+                                    + state_for_nip_fi
+                                        .community_connections
+                                        .disconnect_nip_fi(&msg.pubkey_bytes);
                                 if closed > 0 {
                                     tracing::debug!(
                                         closed,
@@ -1256,7 +1262,10 @@ async fn main() -> anyhow::Result<()> {
                                 );
                                 let closed = state_for_nip_fi
                                     .conn_manager
-                                    .disconnect_nip_fi(&msg.pubkey_bytes);
+                                    .disconnect_nip_fi(&msg.pubkey_bytes)
+                                    + state_for_nip_fi
+                                        .community_connections
+                                        .disconnect_nip_fi(&msg.pubkey_bytes);
                                 if closed > 0 {
                                     tracing::debug!(
                                         closed,

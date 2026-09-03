@@ -131,7 +131,8 @@ pub async fn disconnect(
         Ok(cmd) => {
             // ── Deny entry inserted; close sessions synchronously ─────────
             let pubkey_bytes = cmd.target_pubkey.to_bytes();
-            let closed = state.conn_manager.disconnect_nip_fi(&pubkey_bytes);
+            let closed = state.conn_manager.disconnect_nip_fi(&pubkey_bytes)
+                + state.community_connections.disconnect_nip_fi(&pubkey_bytes);
             if closed > 0 {
                 // [FI-TRACE-PRIVACY-NONPUBLIC]: raw `iss` MUST NOT appear in
                 // logs, metrics, or traces.  Log only a count.

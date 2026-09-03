@@ -44,6 +44,8 @@ pub(crate) type ScopedPubkeyKey = (CommunityId, [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommunityDisconnectReason {
     CommunityDeleted,
+    /// NIP-FI: the connection's proven pubkey was added to the deny set.
+    AuthorizationDenied,
 }
 
 impl CommunityDisconnectReason {
@@ -52,6 +54,10 @@ impl CommunityDisconnectReason {
             Self::CommunityDeleted => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
                 code: axum::extract::ws::close_code::POLICY,
                 reason: WsUtf8Bytes::from_static("community deleted"),
+            })),
+            Self::AuthorizationDenied => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::POLICY,
+                reason: WsUtf8Bytes::from_static("authorization denied"),
             })),
         }
     }
@@ -62,12 +68,20 @@ impl CommunityDisconnectReason {
 pub(crate) struct CommunityConnectionControl {
     cancel: CancellationToken,
     reason_tx: watch::Sender<Option<CommunityDisconnectReason>>,
+    /// Pubkey proven by NIP-42 auth after the connection's active phase starts.
+    /// Written once by the handler immediately after successful auth; the
+    /// registry's `disconnect_nip_fi` scan reads it to match targeted closures.
+    proven_pubkey: Arc<std::sync::RwLock<Option<Vec<u8>>>>,
 }
 
 impl CommunityConnectionControl {
     pub(crate) fn new(cancel: CancellationToken) -> Self {
         let (reason_tx, _reason_rx) = watch::channel(None);
-        Self { cancel, reason_tx }
+        Self {
+            cancel,
+            reason_tx,
+            proven_pubkey: Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
@@ -78,9 +92,23 @@ impl CommunityConnectionControl {
         self.reason_tx.subscribe()
     }
 
+    /// Records the NIP-42-proven pubkey for this connection so the registry
+    /// can close it by pubkey via `disconnect_nip_fi`.
+    pub(crate) fn set_proven_pubkey(&self, pubkey: Vec<u8>) {
+        if let Ok(mut slot) = self.proven_pubkey.write() {
+            *slot = Some(pubkey);
+        }
+    }
+
     fn disconnect_community(&self) {
         self.reason_tx
             .send_replace(Some(CommunityDisconnectReason::CommunityDeleted));
+        self.cancel.cancel();
+    }
+
+    fn disconnect_nip_fi(&self) {
+        self.reason_tx
+            .send_replace(Some(CommunityDisconnectReason::AuthorizationDenied));
         self.cancel.cancel();
     }
 }
@@ -155,6 +183,35 @@ impl CommunityConnectionRegistry {
         for entry in self.connections.iter() {
             if entry.value().0 == community_id {
                 entry.value().1.disconnect_community();
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    /// Disconnects every registered socket whose proven pubkey matches `pubkey`.
+    ///
+    /// Called by `AppState::disconnect_nip_fi` to close huddle audio connections
+    /// alongside the Nostr relay connections already handled by `ConnectionManager`.
+    /// A match fires `AuthorizationDenied`, which the send loop turns into a 1008
+    /// close frame before the socket shuts down.  Sockets that completed auth but
+    /// are not yet key-proven (pre-auth phase) are not matched — they will fail
+    /// the subsequent NIP-42 check on the next event and be closed then.
+    ///
+    /// Returns the number of connections closed.
+    pub fn disconnect_nip_fi(&self, pubkey: &[u8]) -> usize {
+        let mut closed = 0;
+        for entry in self.connections.iter() {
+            let matches = entry
+                .value()
+                .1
+                .proven_pubkey
+                .read()
+                .ok()
+                .and_then(|v| v.as_ref().map(|stored| stored.as_slice() == pubkey))
+                .unwrap_or(false);
+            if matches {
+                entry.value().1.disconnect_nip_fi();
                 closed += 1;
             }
         }
@@ -2588,5 +2645,98 @@ pub(crate) mod tests {
             }
             other => panic!("expected a restart close frame, got {other:?}"),
         }
+    }
+
+    // ── F9: NIP-FI targeted disconnect also closes huddle audio sockets ───────
+
+    #[test]
+    fn nip_fi_disconnect_closes_proven_audio_socket_and_sends_policy_close_reason() {
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xca));
+        let target_pubkey = vec![0x42u8; 32];
+
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        let reason_rx = control.disconnect_reason();
+        control.set_proven_pubkey(target_pubkey.clone());
+        let _guard = registry.register(Uuid::new_v4(), community, control);
+
+        assert_eq!(registry.disconnect_nip_fi(&target_pubkey), 1);
+        assert!(cancel.is_cancelled(), "audio socket must be cancelled");
+        assert_eq!(
+            *reason_rx.borrow(),
+            Some(CommunityDisconnectReason::AuthorizationDenied),
+            "close reason must be AuthorizationDenied so send_loop sends 1008"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_does_not_close_unproven_audio_socket() {
+        // A socket that registered but has not yet completed NIP-42 auth (no
+        // proven pubkey) must not be touched by a targeted disconnect.
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xcb));
+        let target_pubkey = vec![0x42u8; 32];
+
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        // Intentionally skip set_proven_pubkey — simulates pre-auth state.
+        let _guard = registry.register(Uuid::new_v4(), community, control);
+
+        assert_eq!(registry.disconnect_nip_fi(&target_pubkey), 0);
+        assert!(
+            !cancel.is_cancelled(),
+            "pre-auth socket must not be touched"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_does_not_close_different_pubkey_audio_socket() {
+        // A socket whose proven pubkey is different from the target must not
+        // be closed — the scan must be key-exact.
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xcc));
+        let target_pubkey = vec![0x42u8; 32];
+        let other_pubkey = vec![0x99u8; 32];
+
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        control.set_proven_pubkey(other_pubkey);
+        let _guard = registry.register(Uuid::new_v4(), community, control);
+
+        assert_eq!(registry.disconnect_nip_fi(&target_pubkey), 0);
+        assert!(
+            !cancel.is_cancelled(),
+            "different-key socket must not be touched"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_closes_target_audio_only_and_preserves_collocated_peer() {
+        // Two audio sockets in the same community: only the target's is closed.
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xcd));
+        let target_pubkey = vec![0x42u8; 32];
+        let peer_pubkey = vec![0x55u8; 32];
+
+        let target_cancel = CancellationToken::new();
+        let target_control = CommunityConnectionControl::new(target_cancel.clone());
+        target_control.set_proven_pubkey(target_pubkey.clone());
+        let _target_guard = registry.register(Uuid::new_v4(), community, target_control);
+
+        let peer_cancel = CancellationToken::new();
+        let peer_control = CommunityConnectionControl::new(peer_cancel.clone());
+        peer_control.set_proven_pubkey(peer_pubkey);
+        let _peer_guard = registry.register(Uuid::new_v4(), community, peer_control);
+
+        assert_eq!(registry.disconnect_nip_fi(&target_pubkey), 1);
+        assert!(
+            target_cancel.is_cancelled(),
+            "target audio socket must be cancelled"
+        );
+        assert!(
+            !peer_cancel.is_cancelled(),
+            "collocated peer must remain connected"
+        );
     }
 }

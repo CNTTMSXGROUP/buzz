@@ -247,6 +247,10 @@ async fn handle_active_audio_connection(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
     let parent_channel_id = auth_msg.parent_channel_id;
 
+    // Register the proven pubkey with the registry so that a NIP-FI targeted
+    // disconnect can reach this audio socket alongside its Nostr relay peers.
+    control.set_proven_pubkey(pubkey_bytes.clone());
+
     if crate::api::relay_members::enforce_relay_membership(
         &state,
         tenant.community(),

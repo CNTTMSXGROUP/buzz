@@ -16,7 +16,7 @@ import os.log
     accessGroup: Bundle.main.object(forInfoDictionaryKey: "BuzzKeychainAccessGroup") as? String
   )
   private var enrollmentTask: Task<Void, Never>?
-  private var gatewayCleanupTask: Task<Void, Never>?
+  private var gatewayCleanupTask: Task<Void, Error>?
   private var pushGatewayURL: URL?
   private var appGroupIdentifier: String? {
     Bundle.main.object(forInfoDictionaryKey: "BuzzAppGroupIdentifier") as? String
@@ -358,17 +358,19 @@ import os.log
         )
         return
       }
-      do {
-        try initializePushGateway(gatewayURL)
-        result(nil)
-      } catch {
-        result(
-          FlutterError(
-            code: "push_gateway_configuration_failed",
-            message: "Push gateway configuration is invalid.",
-            details: error.localizedDescription
+      Task {
+        do {
+          try await initializePushGateway(gatewayURL)
+          result(nil)
+        } catch {
+          result(
+            FlutterError(
+              code: "push_gateway_initialization_failed",
+              message: "Push gateway initialization failed.",
+              details: error.localizedDescription
+            )
           )
-        )
+        }
       }
     case "startRegistration":
       guard let gatewayURL = gatewayURL(from: call) else {
@@ -382,7 +384,8 @@ import os.log
         return
       }
       do {
-        try initializePushGateway(gatewayURL)
+        try configurePushGateway(gatewayURL)
+        scheduleRetiredGatewayCleanup()
         startPushRegistration(result: result)
       } catch {
         result(
@@ -536,7 +539,7 @@ import os.log
         defer { self?.enrollmentTask = nil }
         do {
           if let cleanupTask = self?.gatewayCleanupTask {
-            await cleanupTask.value
+            try await cleanupTask.value
           }
           let record = try await driver.enroll(
             deviceToken: deviceToken,
@@ -566,20 +569,28 @@ import os.log
     }
   }
 
+  private func retiredGatewayCleanupTask() throws -> Task<Void, Error>? {
+    if let gatewayCleanupTask { return gatewayCleanupTask }
+    guard let gatewayURL = pushGatewayURL else { return nil }
+    let driver = try BuzzDevPushEnrollmentDriver(
+      gatewayBaseURL: gatewayURL,
+      store: endpointGrantStore,
+      appAttestKeychainAccessGroup: pushKeychainAccessGroup
+    )
+    let task = Task { [weak self] in
+      defer { self?.gatewayCleanupTask = nil }
+      try await driver.cleanRetiredGateways(deviceToken: self?.apnsDeviceToken)
+    }
+    gatewayCleanupTask = task
+    return task
+  }
+
   private func scheduleRetiredGatewayCleanup() {
-    guard gatewayCleanupTask == nil,
-      let gatewayURL = pushGatewayURL
-    else { return }
     do {
-      let driver = try BuzzDevPushEnrollmentDriver(
-        gatewayBaseURL: gatewayURL,
-        store: endpointGrantStore,
-        appAttestKeychainAccessGroup: pushKeychainAccessGroup
-      )
-      gatewayCleanupTask = Task { [weak self] in
-        defer { self?.gatewayCleanupTask = nil }
+      guard let task = try retiredGatewayCleanupTask() else { return }
+      Task {
         do {
-          try await driver.cleanRetiredGateways(deviceToken: self?.apnsDeviceToken)
+          try await task.value
         } catch {
           os_log(
             "Retired push gateway cleanup remains queued: %{public}@",
@@ -604,15 +615,18 @@ import os.log
     return URL(string: gatewayText)
   }
 
-  private func initializePushGateway(_ gatewayURL: URL) throws {
+  private func configurePushGateway(_ gatewayURL: URL) throws {
     let gatewayOrigin = try BuzzPushTranscript.canonicalGatewayOrigin(gatewayURL)
-    guard pushGatewayURL != gatewayOrigin.url else {
-      scheduleRetiredGatewayCleanup()
-      return
-    }
+    guard pushGatewayURL != gatewayOrigin.url else { return }
     try endpointGrantStore.reset(forGatewayOrigin: gatewayOrigin.text)
     pushGatewayURL = gatewayOrigin.url
-    scheduleRetiredGatewayCleanup()
+  }
+
+  private func initializePushGateway(_ gatewayURL: URL) async throws {
+    try configurePushGateway(gatewayURL)
+    if let cleanupTask = try retiredGatewayCleanupTask() {
+      try await cleanupTask.value
+    }
   }
 
   private func handleMediaUploadMethodCall(

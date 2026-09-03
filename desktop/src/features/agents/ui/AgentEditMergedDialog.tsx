@@ -556,6 +556,8 @@ export function AgentEditMergedDialog({
     onUpdated,
     effortLevel,
     effortTouched,
+    originalEffortLevel:
+      configSurfaceQuery.data?.normalized.thinkingEffort?.value ?? null,
   } satisfies AgentEditSubmitState;
 
   const {
@@ -621,6 +623,8 @@ export function AgentEditMergedDialog({
     setAgentArgs,
     runtimeTouched,
     setIsAddHarnessOpen,
+    setEffortLevel,
+    effortTouched,
     runtimes,
     selectedRuntime,
     open,

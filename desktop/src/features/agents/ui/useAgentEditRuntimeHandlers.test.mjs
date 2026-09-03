@@ -84,6 +84,8 @@ function makeInput(overrides = {}) {
     setAgentArgs: (v) => calls.setAgentArgs.push(v),
     runtimeTouched,
     setIsAddHarnessOpen: noop,
+    setEffortLevel: noop,
+    effortTouched: { current: false },
     runtimes: [{ id: "buzz-agent", command: "", defaultArgs: [] }],
     selectedRuntime: { id: "goose", command: "", defaultArgs: [] },
     open: true,

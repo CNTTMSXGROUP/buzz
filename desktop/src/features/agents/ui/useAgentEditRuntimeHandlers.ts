@@ -58,6 +58,9 @@ export type RuntimeHandlersInput = {
   setAgentArgs: (v: string) => void;
   runtimeTouched: React.RefObject<boolean>;
   setIsAddHarnessOpen: (v: boolean) => void;
+  /** Reset effort selection when the instance runtime changes (IMPORTANT-3). */
+  setEffortLevel: (v: string | null) => void;
+  effortTouched: React.RefObject<boolean>;
   runtimes: readonly AcpRuntimeCatalogEntry[];
   selectedRuntime: AcpRuntimeCatalogEntry | undefined;
   open: boolean;
@@ -103,6 +106,8 @@ export function useAgentEditRuntimeHandlers(input: RuntimeHandlersInput) {
     setAgentArgs,
     runtimeTouched,
     setIsAddHarnessOpen,
+    setEffortLevel,
+    effortTouched,
     runtimes,
     selectedRuntime,
     open,
@@ -196,6 +201,11 @@ export function useAgentEditRuntimeHandlers(input: RuntimeHandlersInput) {
         lockedRuntimeReset: "full",
       }),
     );
+    // Reset pending effort: the new runtime uses a different vocabulary and the
+    // old selection is meaningless. Clear both the displayed value and the
+    // touched flag so resolveEffortSubmission skips effort on the next Save.
+    setEffortLevel(null);
+    effortTouched.current = false;
   }
 
   const selectSavedHarness = usePendingHarnessSelection(

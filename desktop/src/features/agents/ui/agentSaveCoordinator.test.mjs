@@ -2433,3 +2433,132 @@ test("test_description_trim_and_preserve_existing_settles_correctly", async () =
     "onDone must be called when trimmed description matches observed",
   );
 });
+
+// ── Test family 14: effort settlement (Thufir round-1 IMPORTANT-1) ────────────
+//
+// `observedStateMatchesAgentInput` must compare effortLevel against the
+// persisted record column (ManagedAgent.effortLevel) with tri-state semantics:
+//   absent submission → skip comparison (field not being written)
+//   null submission   → clear; settled when observed column is null/absent
+//   string submission → set; settled when observed column equals submitted value
+//
+// The backend can reject before persistence (e.g. non-local agent rejects
+// effort write). Without the comparison, a rejected effort edit settles as
+// success and closes the dialog — the exact defect Thufir's probe confirmed.
+
+test("test_effort_set_settles_when_observed_matches_submitted", async () => {
+  // Submit effortLevel:"high" — backend persists it. Observed agent has
+  // effortLevel:"high". Settlement must recognise the write succeeded.
+  const inst = makeInstance({ effortLevel: "high" });
+  const opts = makeOpts({
+    ctx: { kind: "instance-only", instance: makeInstance() },
+    agentInput: makeAgentInput({ effortLevel: "high" }),
+    refetchStores: async () => ({ persona: null, agent: inst }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(result, true, "effort set must settle when observed matches");
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called on effort set success",
+  );
+});
+
+test("test_effort_clear_settles_when_observed_is_null", async () => {
+  // Submit effortLevel:null — a clear. Observed agent has no effortLevel.
+  // Settlement must recognise the clear succeeded.
+  const inst = makeInstance({ effortLevel: null });
+  const opts = makeOpts({
+    ctx: {
+      kind: "instance-only",
+      instance: makeInstance({ effortLevel: "low" }),
+    },
+    agentInput: makeAgentInput({ effortLevel: null }),
+    refetchStores: async () => ({ persona: null, agent: inst }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "effort clear must settle when observed is null/absent",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called on effort clear success",
+  );
+});
+
+test("test_rejected_effort_ordinary_save_does_not_close", async () => {
+  // Backend rejects the effort write before persistence — agent store is
+  // unchanged (effortLevel:null). observedStateMatchesAgentInput must detect
+  // the mismatch (submitted "high" ≠ observed null) and NOT close the dialog.
+  const cap = captureToasts();
+  try {
+    const originalInst = makeInstance({ effortLevel: null });
+    const opts = makeOpts({
+      ctx: { kind: "instance-only", instance: makeInstance() },
+      agentInput: makeAgentInput({ effortLevel: "high" }),
+      updateManagedAgent: async () => {
+        throw new Error("effort write rejected — non-local agent");
+      },
+      refetchStores: async () => ({ persona: null, agent: originalInst }),
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(result, false, "rejected effort edit must not succeed");
+    assert.equal(
+      opts._calls.onDone,
+      0,
+      "dialog must not close when effort was rejected by the backend",
+    );
+  } finally {
+    cap.restore();
+  }
+});
+
+test("test_rejected_effort_combined_di_does_not_advance_to_instance_write", async () => {
+  // Combined D+I save: rejected effort (I-side) must report failure; the D
+  // write succeeds but the coordinator must not report overall success.
+  const cap = captureToasts();
+  try {
+    const persistedPersona = makeDefinition({ displayName: "Alice-renamed" });
+    const originalInst = makeInstance({ effortLevel: null });
+    const opts = makeOpts({
+      ctx: {
+        kind: "instance-with-definition",
+        definition: makeDefinition(),
+        instance: makeInstance(),
+      },
+      personaInput: makePersonaInput({ displayName: "Alice-renamed" }),
+      agentInput: makeAgentInput({ effortLevel: "high" }),
+      updateManagedAgent: async () => {
+        throw new Error("effort write rejected — non-local agent");
+      },
+      refetchStores: async () => ({
+        persona: persistedPersona,
+        agent: originalInst,
+      }),
+    });
+
+    const result = await runAgentSaveCoordinator(opts);
+
+    assert.equal(
+      result,
+      false,
+      "combined D+I with rejected effort must not succeed",
+    );
+    assert.equal(
+      opts._calls.onDone,
+      0,
+      "dialog must not close when I effort was rejected",
+    );
+  } finally {
+    cap.restore();
+  }
+});

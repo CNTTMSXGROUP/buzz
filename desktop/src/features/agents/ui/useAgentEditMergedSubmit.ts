@@ -34,6 +34,7 @@ import {
 } from "./agentFormModel";
 import { runAgentSaveCoordinator } from "./agentSaveCoordinator";
 import { parsePersonaNamePoolText } from "./personaDialogState";
+import { resolveEffortSubmission } from "./personaRuntimeModel";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -97,6 +98,13 @@ export type AgentEditSubmitState = {
   effortLevel: string | null;
   /** Ref tracking whether the user has made an explicit effort selection. */
   effortTouched: React.RefObject<boolean>;
+  /**
+   * The persisted effort level from the config surface at seed time
+   * (`configSurfaceQuery.data?.normalized.thinkingEffort?.value ?? null`).
+   * Used by `resolveEffortSubmission` to suppress unchanged selections so a
+   * name-only edit never rewrites the effort column.
+   */
+  originalEffortLevel: string | null;
 };
 
 export type AgentEditSubmitHookReturn = {
@@ -281,12 +289,23 @@ export function useAgentEditMergedSubmit(
           policySets,
         } = emitAgentFormDiff(seed, next, s.ctx);
 
-        // Effort write: when touched, resolve and include in the locked update
-        // (atomic with any access-policy change — PR #4625 semantics).
+        // Effort write: when touched, resolve via resolveEffortSubmission
+        // (mirrors the deleted AgentInstanceEditDialog's PR #4625 semantics):
+        //   - suppresses when agentCommand="" (pin→inherit) so the inherit
+        //     transition does not restore the effort column it just cleared
+        //   - suppresses unchanged selections (no-op save never rewrites the column)
+        // Only includes effortLevel in the locked update when persist=true.
         let agentInput = rawAgentInput;
         if (s.effortTouched.current && inst) {
-          agentInput = agentInput ?? { pubkey: inst.pubkey };
-          agentInput = { ...agentInput, effortLevel: s.effortLevel };
+          const effortSubmission = resolveEffortSubmission({
+            effortLevel: s.effortLevel,
+            originalEffortLevel: s.originalEffortLevel,
+            inheritTransition: rawAgentInput?.agentCommand === "",
+          });
+          if (effortSubmission.persist) {
+            agentInput = agentInput ?? { pubkey: inst.pubkey };
+            agentInput = { ...agentInput, effortLevel: effortSubmission.level };
+          }
         }
 
         const refetchStores = () => refetchAgentStores(queryClient, def, inst);

@@ -716,6 +716,17 @@ function observedStateMatchesAgentInput(
   ) {
     return false;
   }
+  // Effort level — tri-state:
+  //   absent submission (undefined) → skip (field not being written)
+  //   null submission               → clear; settled when observed column is null/absent
+  //   string submission             → set; settled when observed column equals submitted
+  // Mirrors the backend's canonical storage semantics (no byte stripping here —
+  // a prohibited-byte value must NOT launder into apparent success).
+  if (submitted.effortLevel !== undefined) {
+    const submittedEffort = submitted.effortLevel ?? null;
+    const observedEffort = observed.effortLevel ?? null;
+    if (submittedEffort !== observedEffort) return false;
+  }
   return true;
 }
 

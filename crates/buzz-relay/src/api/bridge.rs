@@ -747,11 +747,11 @@ pub async fn submit_event(
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory —
     // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
-    // [NIP-FI.md:547-567, FI-TRACE-HTTP-INGRESS]
+    // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
     let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
     // POST /events carries an authorization-relevant body (the event determines
     // resource, effect, and state change), so a payload tag is required in
-    // NIP-FI enforce mode. [NIP-FI.md:579-597]
+    // NIP-FI enforce mode. [NIP-FI.md:619-637]
     let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
     let VerifiedBridgeAuth {
         pubkey,
@@ -1054,11 +1054,11 @@ pub async fn query_events(
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
-    // [NIP-FI.md:547-567, FI-TRACE-HTTP-INGRESS]
+    // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
     let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
     // POST /query carries an authorization-relevant body (filter selects the
     // resources returned), so a payload tag is required in enforce mode.
-    // [NIP-FI.md:579-597]
+    // [NIP-FI.md:619-637]
     let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
     let VerifiedBridgeAuth {
         pubkey,
@@ -1614,11 +1614,11 @@ pub async fn count_events(
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
-    // [NIP-FI.md:547-567, FI-TRACE-HTTP-INGRESS]
+    // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
     let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
     // POST /count carries an authorization-relevant body (filter selects what
     // is counted), so a payload tag is required in enforce mode.
-    // [NIP-FI.md:579-597]
+    // [NIP-FI.md:619-637]
     let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
     let VerifiedBridgeAuth {
         pubkey,
@@ -2431,7 +2431,7 @@ async fn authorize_moderation_read(
     let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
     // In NIP-FI enforce/deny-protected mode a real NIP-98 event is mandatory —
     // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
-    // [NIP-FI.md:547-578, FI-TRACE-HTTP-INGRESS]
+    // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
     let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
     let VerifiedBridgeAuth {
         pubkey,
@@ -4374,7 +4374,9 @@ mod postgres_tests {
     //   PUT  /upload / /media/upload          (media — upload_blob; covered by media.rs seam test)
     //   GET  /media/{sha256}                  (media — get_blob; Blossom GET auth + relay membership)
     //   HEAD /media/{sha256}                  (media — head_blob; Blossom GET auth + relay membership)
-    //   git  info/refs, upload-pack, receive-pack  (git transport; covered by git/transport.rs)
+    //   git  info/refs, upload-pack, receive-pack  (git transport; covered by git/transport.rs;
+    //        credential-helper proof pattern exempt from method/endpoint/payload binding per
+    //        NIP-FI.md:545-583, merged as #7268 / c328202cb)
     //   POST /api/invites   (invites — mint_invite; NIP-98 mint requires admin key)
     //
     // EXEMPT — explicitly excluded, reason given:

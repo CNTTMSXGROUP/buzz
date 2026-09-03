@@ -62,7 +62,7 @@ use nostr::PublicKey;
 /// one-liner: replace `AlwaysAdmitStubDenyMap` with the shared map.
 ///
 /// `(issuer, pubkey, now)` are required because the deny set is issuer-
-/// scoped per `NIP-FI.md:584-587`.  Passing only pubkey would collide
+/// scoped per `NIP-FI.md:624-627`.  Passing only pubkey would collide
 /// across issuers — a deny for `(iss-A, k)` must not block `(iss-B, k)`.
 ///
 /// Sealed: only implementations in this crate are accepted.
@@ -193,7 +193,7 @@ pub(crate) fn check_nip_fi_http<S: IssuerKeySource, D: HttpDenyMap>(
 
     // Deny-map check: (iss, pubkey) must not be in an active deny window.
     // The issuer comes from the already-verified assertion; `now` is used by
-    // the real map for TTL comparison.  [FI-INV-14] [NIP-FI.md:584-587]
+    // the real map for TTL comparison.  [FI-INV-14] [NIP-FI.md:624-627]
     let issuer = assertion.identity().issuer();
     if deny_map.is_denied(issuer, proven_pubkey, Utc::now()) {
         metrics::counter!(

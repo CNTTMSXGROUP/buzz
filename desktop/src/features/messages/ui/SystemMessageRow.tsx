@@ -25,7 +25,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
-  addedToChannelActionPrefix,
+  addedActionPrefix,
   addedByActionPrefix,
   describeChannelTextFieldChange,
   toInlineName,
@@ -486,20 +486,20 @@ function describeGroupedArrivals({
     if (isAllAdditionGroup) {
       return {
         title: membershipTitle,
-        action: addedToChannelActionPrefix(isTargetCurrentUser),
+        action: addedActionPrefix(isTargetCurrentUser),
       };
     }
 
     if (isAllSelfJoinGroup) {
       return {
         title: membershipTitle,
-        action: "joined the channel",
+        action: "joined",
       };
     }
 
     return {
       title: membershipTitle,
-      action: "arrived in the channel",
+      action: "arrived",
     };
   }
 
@@ -530,7 +530,7 @@ function describeGroupedArrivals({
       title: membershipTitle,
       action: (
         <>
-          {addedToChannelActionPrefix(isTargetCurrentUser)} along with{" "}
+          {addedActionPrefix(isTargetCurrentUser)} along with{" "}
           <MemberNamesInlineList
             agentPubkeys={agentPubkeys}
             currentPubkey={currentPubkey}
@@ -548,7 +548,7 @@ function describeGroupedArrivals({
       title: membershipTitle,
       action: (
         <>
-          joined the channel along with{" "}
+          joined along with{" "}
           <MemberNamesInlineList
             agentPubkeys={agentPubkeys}
             currentPubkey={currentPubkey}
@@ -565,7 +565,7 @@ function describeGroupedArrivals({
     title: membershipTitle,
     action: (
       <>
-        arrived in the channel along with{" "}
+        arrived along with{" "}
         <MemberNamesInlineList
           agentPubkeys={agentPubkeys}
           currentPubkey={currentPubkey}

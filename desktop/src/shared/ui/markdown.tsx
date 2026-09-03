@@ -1293,6 +1293,27 @@ export function createMarkdownComponents(
       );
     }
 
+    // MSX Brain token link: [nao:path] → chip mở panel Não tại file đó.
+    if (href && href.startsWith("msx-brain://open?file=")) {
+      const rel = decodeURIComponent(href.replace("msx-brain://open?file=", ""));
+      const fname = rel.split("/").pop() ?? rel;
+      return (
+        <button
+          type="button"
+          className="msx-brain-link inline-flex max-w-full items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-sm font-medium text-amber-700 align-baseline transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+          title={`Mở trong Não MSX: ${rel}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            window.dispatchEvent(
+              new CustomEvent("msx-brain-open-file", { detail: { rel } }),
+            );
+            window.dispatchEvent(new CustomEvent("msx-brain-activate"));
+          }}
+        >
+          📎 {fname}
+        </button>
+      );
+    }
     // Keep Buzz channel/message navigation in-app.
     if (href) {
       if (parseChannelLink(href).ok) {

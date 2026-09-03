@@ -39,6 +39,18 @@ export function BrainPanel({
     return () => document.removeEventListener("mousedown", onDocClick);
   }, []);
 
+  // mở file từ hyperlink [nao:...] trong tin nhắn
+  useEffect(() => {
+    async function onOpenFile(ev: Event) {
+      const rel = (ev as CustomEvent<{ rel: string }>).detail?.rel;
+      if (!rel) return;
+      setAdminOpen(false);
+      await open({ name: rel.split("/").pop() ?? rel, rel_path: rel, is_dir: false, area: rel.split("/")[0] ?? "" });
+    }
+    window.addEventListener("msx-brain-open-file", onOpenFile);
+    return () => window.removeEventListener("msx-brain-open-file", onOpenFile);
+  }, [open]);
+
   const isInThuThap = selected?.rel_path.startsWith("1. Thu Thập") ?? false;
   const isMd = selected?.name.toLowerCase().endsWith(".md") ?? false;
 

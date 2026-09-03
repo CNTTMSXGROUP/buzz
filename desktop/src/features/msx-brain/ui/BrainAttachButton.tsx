@@ -20,6 +20,7 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
   const [cwd, setCwd] = useState("");
   const [loading, setLoading] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; bottom: number } | null>(null);
 
   useEffect(() => {
     function onDoc(ev: MouseEvent) {
@@ -58,7 +59,11 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
   async function toggle() {
     const next = !open;
     setOpen(next);
-    if (next && entries === null) await loadDir("");
+    if (next) {
+      const rect = ref.current?.getBoundingClientRect();
+      if (rect) setMenuPos({ left: rect.left, bottom: window.innerHeight - rect.top + 6 });
+      if (entries === null) await loadDir("");
+    }
   }
 
   function pick(e: BrainEntry) {
@@ -81,8 +86,11 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
       >
         {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Brain className="h-4 w-4" />}
       </button>
-      {open && (
-        <div className="absolute bottom-full left-0 z-50 mb-2 w-80 rounded-lg border bg-popover shadow-lg">
+      {open && menuPos && (
+        <div
+          className="fixed z-[100] w-80 rounded-lg border bg-popover shadow-lg"
+          style={{ left: menuPos.left, bottom: menuPos.bottom }}
+        >
           <div className="border-b px-3 py-2 text-xs font-semibold">
             {cwd === "" ? "Não MSX — chọn tài liệu" : `Não MSX / ${cwd}`}
             {cwd !== "" && (

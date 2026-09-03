@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 const BLOCKED_DIRS: &[&str] = &[
     "_mat",
-    "_meta",
     ".git",
     ".obsidian",
     ".claude",
@@ -22,6 +21,9 @@ pub struct BrainEntry {
     pub area: String,
 }
 
+/// Thư mục ẩn khỏi cây (không phải cấm đọc — `_meta` cần cho config/app).
+const HIDDEN_DIRS: &[&str] = &["_meta"];
+
 /// Lớp chặn cứng: thư mục hệ thống và `_mat` không bao giờ đọc được, mọi vai trò.
 pub fn can_read(rel_path: &str) -> bool {
     let first = rel_path.split('/').next().unwrap_or("");
@@ -37,6 +39,10 @@ pub fn can_read(rel_path: &str) -> bool {
 /// Khu: `"*"` thấy hết; vai khác thấy khu chung MindMirror/PARA + khu riêng của mình.
 pub fn khu_ok(rel_path: &str, khu: &str) -> bool {
     if khu == "*" {
+        return true;
+    }
+    // config phân quyền: mọi người đều phải đọc được để biết quyền của mình
+    if rel_path == "_meta/nguoi-dung.json" {
         return true;
     }
     let first = rel_path.split('/').next().unwrap_or("");
@@ -66,7 +72,7 @@ fn walk(root: &Path, dir: &Path, khu: &str, out: &mut Vec<BrainEntry>) {
     };
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if BLOCKED_DIRS.contains(&name.as_str()) {
+        if BLOCKED_DIRS.contains(&name.as_str()) || HIDDEN_DIRS.contains(&name.as_str()) {
             continue;
         }
         let p: PathBuf = entry.path();

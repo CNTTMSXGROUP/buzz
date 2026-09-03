@@ -35,3 +35,56 @@
 /* The app persists its selected theme on the root `.dark` class. Use that
    class, rather than the system preference, for every `dark:` utility. */
 @custom-variant dark (&:where(.dark, .dark *));
+
+/* === MSX Brain — kiểu chữ markdown "cho con người đọc" === */
+.msx-md {
+  font-size: 0.975rem;
+  line-height: 1.75;
+  color: var(--foreground, inherit);
+  word-wrap: break-word;
+}
+.msx-md h1 { font-size: 1.6em; font-weight: 700; margin: 1.2em 0 0.5em; line-height: 1.3; }
+.msx-md h1:first-child { margin-top: 0; }
+.msx-md h2 { font-size: 1.3em; font-weight: 700; margin: 1.4em 0 0.45em; line-height: 1.35; }
+.msx-md h3 { font-size: 1.12em; font-weight: 600; margin: 1.2em 0 0.4em; }
+.msx-md h4, .msx-md h5, .msx-md h6 { font-size: 1em; font-weight: 600; margin: 1em 0 0.35em; }
+.msx-md p { margin: 0.65em 0; }
+.msx-md ul, .msx-md ol { margin: 0.6em 0; padding-left: 1.6em; }
+.msx-md ul { list-style: disc; }
+.msx-md ol { list-style: decimal; }
+.msx-md li { margin: 0.3em 0; }
+.msx-md li > ul, .msx-md li > ol { margin: 0.25em 0; }
+.msx-md a { color: #2563eb; text-decoration: underline; text-underline-offset: 2px; }
+.dark .msx-md a { color: #60a5fa; }
+.msx-md blockquote {
+  border-left: 3px solid var(--muted-foreground, #999);
+  padding: 0.15em 0 0.15em 1em;
+  margin: 0.8em 0;
+  color: var(--muted-foreground, #666);
+}
+.msx-md code {
+  font-family: ui-monospace, "JetBrains Mono", monospace;
+  font-size: 0.875em;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  border-radius: 4px;
+  padding: 0.15em 0.4em;
+}
+.msx-md pre {
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  border-radius: 8px;
+  padding: 0.9em 1.1em;
+  overflow-x: auto;
+  margin: 0.9em 0;
+}
+.msx-md pre code { background: transparent; padding: 0; font-size: 0.85em; }
+.msx-md table { border-collapse: collapse; margin: 0.9em 0; width: 100%; font-size: 0.9em; }
+.msx-md th, .msx-md td {
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  padding: 0.45em 0.75em;
+  text-align: left;
+}
+.msx-md th { font-weight: 600; background: color-mix(in srgb, currentColor 5%, transparent); }
+.msx-md hr { border: 0; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); margin: 1.6em 0; }
+.msx-md img { max-width: 100%; border-radius: 8px; }
+.msx-md .task-list-item { list-style: none; margin-left: -1.2em; }

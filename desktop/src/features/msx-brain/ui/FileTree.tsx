@@ -19,10 +19,10 @@ function TreeRow({ entry, depth, selectedPath, onOpen, expanded, onToggle }: Tre
     <button
       type="button"
       onClick={() => (entry.is_dir ? onToggle(entry.rel_path) : onOpen(entry))}
-      className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent ${
+      className={`flex w-full min-w-0 max-w-full items-center gap-1.5 overflow-hidden rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent ${
         active ? "bg-accent font-medium" : ""
       }`}
-      style={{ paddingLeft: `${8 + depth * 14}px` }}
+      style={{ paddingLeft: `${8 + depth * 14}px`, width: "100%", maxWidth: "100%", boxSizing: "border-box" }}
       title={entry.name}
     >
       {entry.is_dir ? (
@@ -37,7 +37,7 @@ function TreeRow({ entry, depth, selectedPath, onOpen, expanded, onToggle }: Tre
       ) : (
         <File className={`h-4 w-4 shrink-0 ${isMd ? "text-sky-500" : "text-muted-foreground"}`} />
       )}
-      <span className="truncate">{entry.name}</span>
+      <span className="min-w-0 flex-1 truncate">{entry.name}</span>
     </button>
   );
 }
@@ -88,7 +88,7 @@ export function FileTree({
   }
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-2">
+    <div className="flex h-full w-full flex-col overflow-y-auto overflow-x-hidden p-2">
       {renderLevel("", 0)}
       {(byParent.get("") ?? []).length === 0 && (
         <div className="p-4 text-sm text-muted-foreground">Không có tài liệu nào bạn được xem.</div>

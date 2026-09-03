@@ -188,7 +188,7 @@ export function BrainPanel({
         </div>
       ) : (
       <div className="flex min-h-0 flex-1">
-        <div className="w-80 shrink-0 overflow-y-auto border-r">
+        <div className="w-80 min-w-0 max-w-[20rem] shrink-0 overflow-hidden border-r">
           <FileTree entries={entries} selectedPath={selected?.rel_path ?? null} onOpen={open} />
         </div>
         <div className="min-w-0 flex-1 overflow-y-auto">

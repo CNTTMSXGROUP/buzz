@@ -70,6 +70,22 @@ test("chuột phải tên Não MSX hiện input đổi tên", async ({ page }) =
   await expect(page.getByText("Não Công Ty")).toBeVisible();
 });
 
+test("cây thư mục không tràn ra ngoài pane (width clip)", async ({ page }) => {
+  await openBrain(page);
+  // mở rộng 1 thư mục sâu để có row padding lớn
+  const treePane = page.locator(".w-80");
+  await expect(treePane).toBeVisible();
+  const paneBox = await treePane.boundingBox();
+  const rows = treePane.locator("button[title]");
+  const n = await rows.count();
+  for (let i = 0; i < n; i++) {
+    const box = await rows.nth(i).boundingBox();
+    if (!box) continue;
+    expect(box.x, `row ${i} tràn trái`).toBeGreaterThanOrEqual(paneBox!.x - 1);
+    expect(box.x + box.width, `row ${i} tràn phải pane`).toBeLessThanOrEqual(paneBox!.x + paneBox!.width + 1);
+  }
+});
+
 test("admin đọc được config (bản vá _meta)", async ({ page }) => {
   await openBrain(page);
   await page.getByTestId("msx-admin-button").click();

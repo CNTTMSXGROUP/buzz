@@ -7,7 +7,6 @@ export type BrainTab = {
   relPath: string;
   name: string;
   kind: "md" | "text" | "image" | "other";
-  /** md/text: nội dung text; image: data URL base64; other: null */
   content: string;
   size: number;
 };
@@ -26,15 +25,37 @@ export function kindOf(name: string): BrainTab["kind"] {
   return "other";
 }
 
+/** Danh sách não con từ config (fallback mặc định). */
+export async function loadNaoCon(root: string): Promise<string[]> {
+  try {
+    const raw = await invoke<string>("brain_read_file", {
+      root,
+      relPath: "_meta/nguoi-dung.json",
+      khu: "*",
+    });
+    const cfg = JSON.parse(raw) as { nao_con?: { danh_sach?: string[] } };
+    if (cfg.nao_con?.danh_sach?.length) return cfg.nao_con.danh_sach;
+  } catch {
+    /* fallback */
+  }
+  return ["chung", "mkt", "tech", "sale"];
+}
+
 export function useBrainTabs(vaultRoot: string, myPubkey: string) {
   const [entries, setEntries] = useState<BrainEntry[]>([]);
   const [tabs, setTabs] = useState<BrainTab[]>([]);
   const [activePath, setActivePath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [naoCon, setNaoCon] = useState<string[]>([]);
+  const [naoChon, setNaoChon] = useState<string>("chung");
 
   const refresh = useCallback(async () => {
     try {
-      const role = await loadBrainRole(vaultRoot, myPubkey);
+      const [role, nao] = await Promise.all([
+        loadBrainRole(vaultRoot, myPubkey),
+        loadNaoCon(vaultRoot),
+      ]);
+      setNaoCon(nao);
       const khu = role?.khu ?? "__khong_co_quyen__";
       setEntries(await invoke<BrainEntry[]>("brain_list_tree", { root: vaultRoot, khu }));
       setError(null);
@@ -69,9 +90,15 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
           content = await invoke<string>("brain_read_file", { root: vaultRoot, relPath, khu });
         }
         try {
-          const st = await invoke<{ size: number; is_dir: boolean }>("brain_stat", { root: vaultRoot, relPath, khu });
+          const st = await invoke<{ size: number; is_dir: boolean }>("brain_stat", {
+            root: vaultRoot,
+            relPath,
+            khu,
+          });
           size = st.size;
-        } catch { /* size là phụ */ }
+        } catch {
+          /* size phụ */
+        }
         setTabs((prev) => [...prev, { relPath, name, kind, content, size }]);
         setActivePath(relPath);
         setError(null);
@@ -96,7 +123,6 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
     [activePath],
   );
 
-  /** Mở file từ wikilink [[Tên]] — tìm khớp theo tên (không cần path đầy đủ). */
   const openByName = useCallback(
     (name: string) => {
       const clean = name.replace(/\.md$/, "").trim().toLowerCase();
@@ -110,5 +136,18 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
     [entries, open],
   );
 
-  return { entries, tabs, activePath, error, open, close, openByName, refresh, setActivePath };
+  return {
+    entries,
+    tabs,
+    activePath,
+    error,
+    open,
+    close,
+    openByName,
+    refresh,
+    setActivePath,
+    naoCon,
+    naoChon,
+    setNaoChon,
+  };
 }

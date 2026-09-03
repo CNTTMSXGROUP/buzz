@@ -46,15 +46,27 @@ export function FileTree({
   entries,
   selectedPath,
   onOpen,
+  naoChon,
 }: {
   entries: BrainEntry[];
   selectedPath: string | null;
   onOpen: (e: BrainEntry) => void;
+  naoChon?: string | null;
 }) {
+  // lọc theo não con đang chọn: chỉ hiện "Nao Bo Phan/<naoChon>/..." + mọi thứ ngoài Nao Bo Phan
+  const visible = naoChon
+    ? entries.filter(
+        (e) =>
+          !e.rel_path.startsWith("Nao Bo Phan/") ||
+          e.rel_path.startsWith(`Nao Bo Phan/${naoChon}/`) ||
+          e.rel_path === "Nao Bo Phan" ||
+          e.rel_path === `Nao Bo Phan/${naoChon}`,
+      )
+    : entries;
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const byParent = new Map<string, BrainEntry[]>();
-  for (const e of entries) {
+  for (const e of visible) {
     const parent = e.rel_path.includes("/")
       ? e.rel_path.slice(0, e.rel_path.lastIndexOf("/"))
       : "";

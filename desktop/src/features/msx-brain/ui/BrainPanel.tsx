@@ -14,7 +14,7 @@ export function BrainPanel({
   vaultRoot: string;
   myPubkey: string;
 }) {
-  const { entries, tabs, activePath, error, open, close, openByName, setActivePath } =
+  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoCon, naoChon, setNaoChon } =
     useBrainTabs(vaultRoot, myPubkey);
   const [status, setStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
@@ -202,12 +202,31 @@ export function BrainPanel({
           <BrainAdmin vaultRoot={vaultRoot} />
         </div>
       ) : (
+        <>
+        <div className="flex items-center gap-1.5 border-b px-3 py-1.5">
+          <span className="text-xs text-muted-foreground">Não con:</span>
+          {naoCon.map((n) => (
+            <button
+              key={n}
+              type="button"
+              className={`rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors ${
+                naoChon === n
+                  ? "bg-amber-500/20 text-amber-700 dark:text-amber-400"
+                  : "text-muted-foreground hover:bg-accent"
+              }`}
+              onClick={() => setNaoChon(n)}
+            >
+              {n}
+            </button>
+          ))}
+        </div>
         <div className="flex min-h-0 flex-1">
           <div className="w-80 min-w-0 max-w-[20rem] shrink-0 overflow-hidden border-r">
             <FileTree
               entries={entries}
               selectedPath={activePath}
               onOpen={(e) => void open(e.rel_path)}
+              naoChon={naoChon}
             />
           </div>
           <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -276,6 +295,7 @@ export function BrainPanel({
             </div>
           </div>
         </div>
+        </>
       )}
     </div>
   );

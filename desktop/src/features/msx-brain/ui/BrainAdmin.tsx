@@ -1,6 +1,7 @@
 import { Pencil, Plus, Save, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { loadNaoCon } from "../lib/useBrainTabs";
 import { useMyPubkey } from "../lib/useMyPubkey";
 
 type BrainUser = {
@@ -8,12 +9,14 @@ type BrainUser = {
   pubkey: string;
   vai_tro: string;
   khu: string;
+  nao?: string[];
 };
 
 type BrainConfig = {
   vai_tro?: Record<string, unknown>;
   nguoi?: BrainUser[];
   agents?: Array<{ ten: string; doc?: string[] }>;
+  nao_con?: { danh_sach?: string[] };
 };
 
 async function readMeta(root: string): Promise<BrainConfig | null> {
@@ -36,6 +39,7 @@ async function writeMeta(root: string, cfg: BrainConfig): Promise<void> {
 export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
   const myPubkey = useMyPubkey();
   const [cfg, setCfg] = useState<BrainConfig | null>(null);
+  const [naoList, setNaoList] = useState<string[]>([]);
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState<BrainUser | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -43,8 +47,9 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
 
   useEffect(() => {
     void (async () => {
-      const loaded = await readMeta(vaultRoot);
+      const [loaded, nao] = await Promise.all([readMeta(vaultRoot), loadNaoCon(vaultRoot)]);
       setCfg(loaded);
+      setNaoList(nao);
       const me = loaded?.nguoi?.find((u) => u.pubkey === myPubkey);
       setIsOwner(me?.vai_tro === "chu");
     })();
@@ -54,13 +59,22 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
     if (!cfg) return;
     try {
       await writeMeta(vaultRoot, cfg);
-      setStatus("Đã lưu phân quyền vào _meta/nguoi-dung.json.");
+      setStatus("Đã lưu phân quyền.");
     } catch (err) {
       setStatus(`Lỗi: ${String(err)}`);
     }
   }
 
-  if (!cfg) return <div className="p-4 text-sm text-muted-foreground">Không đọc được config.</div>;
+  function toggleNaoFor(draftUser: BrainUser, nao: string): BrainUser {
+    const cur = draftUser.nao ?? [];
+    return {
+      ...draftUser,
+      nao: cur.includes(nao) ? cur.filter((n) => n !== nao) : [...cur, nao],
+    };
+  }
+
+  if (!cfg)
+    return <div className="p-4 text-sm text-muted-foreground">Không đọc được config.</div>;
 
   return (
     <div className="p-4 text-sm">
@@ -83,19 +97,20 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
           Chỉ chủ não (vai trò "chu") mới được sửa. Xem ở chế độ chỉ đọc.
         </div>
       )}
+
       <table className="w-full border-collapse">
         <thead>
           <tr className="border-b text-left text-xs text-muted-foreground">
             <th className="py-1.5 pr-2">Tên</th>
             <th className="py-1.5 pr-2">Vai trò</th>
-            <th className="py-1.5 pr-2">Khu</th>
+            <th className="py-1.5 pr-2">Não con được xem</th>
             <th className="py-1.5 pr-2">Pubkey</th>
             {isOwner && <th />}
           </tr>
         </thead>
         <tbody>
           {(cfg.nguoi ?? []).map((u, i) => (
-            <tr key={u.pubkey} className="border-b">
+            <tr key={u.pubkey} className="border-b align-top">
               {editing === i && draft ? (
                 <>
                   <td className="py-1 pr-2">
@@ -117,35 +132,79 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
                     </select>
                   </td>
                   <td className="py-1 pr-2">
-                    <input
-                      className="w-16 rounded border bg-transparent px-1.5 py-0.5"
-                      value={draft.khu}
-                      onChange={(ev) => setDraft({ ...draft, khu: ev.target.value })}
-                    />
+                    <div className="flex flex-wrap gap-1.5">
+                      {naoList.map((n) => {
+                        const on = (draft.nao ?? []).includes(n) || draft.khu === "*";
+                        return (
+                          <label
+                            key={n}
+                            className={`cursor-pointer rounded-full px-2 py-0.5 text-xs ${
+                              on
+                                ? "bg-amber-500/20 text-amber-700 dark:text-amber-400"
+                                : "border text-muted-foreground"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              className="mr-1 hidden"
+                              checked={on}
+                              onChange={() => setDraft(toggleNaoFor(draft, n))}
+                            />
+                            {n}
+                          </label>
+                        );
+                      })}
+                    </div>
                   </td>
-                  <td className="max-w-[16rem] truncate py-1 pr-2 text-xs text-muted-foreground">
-                    {u.pubkey}
+                  <td className="max-w-[14rem] py-1 pr-2">
+                    <input
+                      className="w-full rounded border bg-transparent px-1.5 py-0.5 text-xs"
+                      value={draft.pubkey}
+                      placeholder="Dán pubkey của người đó…"
+                      onChange={(ev) => setDraft({ ...draft, pubkey: ev.target.value })}
+                    />
                   </td>
                 </>
               ) : (
                 <>
                   <td className="py-1 pr-2">{u.ten}</td>
                   <td className="py-1 pr-2">{u.vai_tro}</td>
-                  <td className="py-1 pr-2">{u.khu}</td>
-                  <td className="max-w-[16rem] truncate py-1 pr-2 text-xs text-muted-foreground">
+                  <td className="py-1 pr-2">
+                    {u.khu === "*" ? (
+                      <span className="text-xs">tất cả</span>
+                    ) : (
+                      <div className="flex flex-wrap gap-1">
+                        {(u.nao ?? [u.khu]).map((n) => (
+                          <span
+                            key={n}
+                            className="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-400"
+                          >
+                            {n}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </td>
+                  <td className="max-w-[14rem] truncate py-1 pr-2 text-xs text-muted-foreground">
                     {u.pubkey}
                   </td>
                 </>
               )}
               {isOwner && (
-                <td className="py-1 text-right">
+                <td className="whitespace-nowrap py-1 text-right">
                   {editing === i ? (
                     <button
                       type="button"
                       className="mr-1 rounded border px-1.5 py-0.5 text-xs"
                       onClick={() => {
                         const next = [...(cfg.nguoi ?? [])];
-                        next[i] = draft!;
+                        const d = draft!;
+                        // đồng bộ khu = danh sách não (chu = "*")
+                        const synced: BrainUser = {
+                          ...d,
+                          khu: d.vai_tro === "chu" ? "*" : (d.nao ?? []).join(","),
+                        };
+                        next[i] = synced;
                         setCfg({ ...cfg, nguoi: next });
                         setEditing(null);
                       }}
@@ -159,7 +218,7 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
                         className="mr-1 rounded px-1 py-0.5 hover:bg-accent"
                         onClick={() => {
                           setEditing(i);
-                          setDraft({ ...u });
+                          setDraft({ ...u, nao: u.nao ?? (u.khu === "*" ? ["*"] : u.khu.split(",")) });
                         }}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -167,9 +226,9 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
                       <button
                         type="button"
                         className="rounded px-1 py-0.5 text-destructive hover:bg-accent"
-                        onClick={() => {
-                          setCfg({ ...cfg, nguoi: (cfg.nguoi ?? []).filter((_, j) => j !== i) });
-                        }}
+                        onClick={() =>
+                          setCfg({ ...cfg, nguoi: (cfg.nguoi ?? []).filter((_, j) => j !== i) })
+                        }
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -186,15 +245,16 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
           type="button"
           className="mt-3 flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent"
           onClick={() => {
-            setCfg({
-              ...cfg,
-              nguoi: [
-                ...(cfg.nguoi ?? []),
-                { ten: "Người mới", pubkey: "PASTE_PUBKEY", vai_tro: "nhan-vien", khu: "mkt" },
-              ],
-            });
+            const nguoiMoi: BrainUser = {
+              ten: "Người mới",
+              pubkey: "PASTE_PUBKEY",
+              vai_tro: "nhan-vien",
+              khu: "chung",
+              nao: ["chung"],
+            };
+            setCfg({ ...cfg, nguoi: [...(cfg.nguoi ?? []), nguoiMoi] });
             setEditing((cfg.nguoi ?? []).length);
-            setDraft({ ten: "Người mới", pubkey: "PASTE_PUBKEY", vai_tro: "nhan-vien", khu: "mkt" });
+            setDraft(nguoiMoi);
           }}
         >
           <Plus className="h-3.5 w-3.5" /> Thêm người

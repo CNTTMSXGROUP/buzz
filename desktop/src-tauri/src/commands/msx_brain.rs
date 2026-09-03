@@ -46,7 +46,7 @@ pub fn khu_ok(rel_path: &str, khu: &str) -> bool {
         return true;
     }
     let first = rel_path.split('/').next().unwrap_or("");
-    matches!(
+    let common = matches!(
         first,
         "0. Bắt Đầu"
             | "1. Thu Thập"
@@ -56,7 +56,21 @@ pub fn khu_ok(rel_path: &str, khu: &str) -> bool {
             | "5. Hộp Công Cụ"
             | "5. Công Cụ"
             | "MSX Knowledge"
-    ) || rel_path.starts_with(khu)
+    );
+    if common {
+        return true;
+    }
+    // nhiều não con / khu: "chung,mkt" — khớp prefix "Nao Bo Phan/<ten>/"
+    for k in khu.split(',') {
+        let k = k.trim();
+        if k.is_empty() {
+            continue;
+        }
+        if rel_path.starts_with(k) || rel_path.starts_with(&format!("Nao Bo Phan/{k}/")) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn filter_entries(root: &Path, khu: &str) -> Vec<BrainEntry> {

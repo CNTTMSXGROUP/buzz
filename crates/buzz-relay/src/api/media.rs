@@ -62,6 +62,7 @@ fn upload_route_mode(path: &str) -> Result<UploadRouteMode, MediaError> {
 
 struct MediaReadAuth {
     tenant: TenantContext,
+    pubkey: nostr::PublicKey,
 }
 
 const MEDIA_UPLOAD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -578,7 +579,8 @@ async fn authenticate_media_read(
     .await
     .map_err(|_| MediaError::RelayMembershipRequired)?;
 
-    Ok(MediaReadAuth { tenant })
+    let pubkey = auth_event.pubkey;
+    Ok(MediaReadAuth { tenant, pubkey })
 }
 
 fn blob_cache_control() -> &'static str {
@@ -671,6 +673,13 @@ pub async fn get_blob(
 ) -> Result<Response, MediaError> {
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &req_headers, &sha256_ext).await?;
+    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
+    use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
+    if let NipFiHttpOutcome::Denied(resp) =
+        check_nip_fi_http_on_state(&state, &req_headers, &media_auth.pubkey)
+    {
+        return Ok(resp);
+    }
     serve_blob_for_tenant(&state, &media_auth.tenant, &sha256_ext, &req_headers).await
 }
 
@@ -936,6 +945,13 @@ pub async fn head_blob(
 ) -> Result<Response, MediaError> {
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &headers, &sha256_ext).await?;
+    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
+    use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
+    if let NipFiHttpOutcome::Denied(resp) =
+        check_nip_fi_http_on_state(&state, &headers, &media_auth.pubkey)
+    {
+        return Ok(resp);
+    }
     let tenant = media_auth.tenant;
     let cache_control = blob_cache_control();
 

@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 use buzz_core::TenantContext;
 
+use buzz_auth::NipFiMode;
+
 use crate::{
     api::{api_error, bridge, internal_error},
     nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome},
@@ -64,12 +66,22 @@ async fn authorize_workflow_read(
 
     let path_with_query = request_path(path, raw_query);
     let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
+    // In NIP-FI enforce/deny-protected mode a real NIP-98 event is mandatory —
+    // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
+    // [NIP-FI.md:547-578, FI-TRACE-HTTP-INGRESS]
+    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
     let bridge::VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
         signed_created_at,
-    } = bridge::verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)
-        .map_err(|e| e.into_response())?;
+    } = bridge::verify_bridge_auth(
+        headers,
+        "GET",
+        &url,
+        None,
+        state.config.require_auth_token || nip_fi_active,
+    )
+    .map_err(|e| e.into_response())?;
 
     // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
     if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(state, headers, &pubkey) {
@@ -141,6 +153,13 @@ async fn workflow_runs_inner(
     raw_query: Option<String>,
     query: RunsQuery,
 ) -> Result<Json<Value>, Response> {
+    // Admission first: NIP-98 + NIP-FI must fire before any application-level
+    // validation so the denial contract wins over request-validation errors.
+    // [FI-TRACE-HTTP-INGRESS]
+    let path = format!("/workflows/{workflow_id}/runs");
+    let tenant =
+        authorize_workflow_read(&state, &headers, &path, raw_query.as_deref(), workflow_id).await?;
+
     if query.before.is_some() != query.before_id.is_some() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -155,9 +174,6 @@ async fn workflow_runs_inner(
         );
     }
 
-    let path = format!("/workflows/{workflow_id}/runs");
-    let tenant =
-        authorize_workflow_read(&state, &headers, &path, raw_query.as_deref(), workflow_id).await?;
     let mut rows = state
         .db
         .list_workflow_runs_page(

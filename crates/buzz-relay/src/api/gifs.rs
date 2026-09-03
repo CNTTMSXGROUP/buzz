@@ -289,12 +289,16 @@ async fn search_inner(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, Response> {
+    // Admission first: NIP-98 + NIP-FI must fire before any application-level
+    // check (including provider availability) so the denial contract wins over
+    // config or request-validation errors. [FI-TRACE-HTTP-INGRESS]
+    let (tenant, pubkey) = authenticate(&state, &headers, SEARCH_PATH, &body).await?;
+
     let Some(config) = state.config.klipy.as_ref() else {
         return Err(
             api_error(StatusCode::NOT_FOUND, "GIF search is not configured").into_response(),
         );
     };
-    let (tenant, pubkey) = authenticate(&state, &headers, SEARCH_PATH, &body).await?;
     let request: SearchRequest = serde_json::from_slice(&body).map_err(|_| {
         api_error(StatusCode::BAD_REQUEST, "invalid GIF search JSON").into_response()
     })?;
@@ -360,12 +364,15 @@ async fn share_inner(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<StatusCode, Response> {
+    // Admission first: NIP-98 + NIP-FI must fire before provider availability
+    // check. [FI-TRACE-HTTP-INGRESS]
+    authenticate(&state, &headers, SHARE_PATH, &body).await?;
+
     let Some(config) = state.config.klipy.as_ref() else {
         return Err(
             api_error(StatusCode::NOT_FOUND, "GIF search is not configured").into_response(),
         );
     };
-    authenticate(&state, &headers, SHARE_PATH, &body).await?;
     let request: ShareRequest = serde_json::from_slice(&body).map_err(|_| {
         api_error(StatusCode::BAD_REQUEST, "invalid GIF share JSON").into_response()
     })?;

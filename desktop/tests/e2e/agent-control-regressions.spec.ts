@@ -258,7 +258,22 @@ test.describe("agent control browser regressions", () => {
         },
       ],
     });
-    await page.clock.install({ time: new Date("2026-08-30T17:00:00.000Z") });
+    await page.clock.install({
+      time: new Date("2026-08-30T17:00:00.000Z"),
+      // Only fake Date and timer APIs. Leaving requestAnimationFrame on real
+      // time lets the DropdownMenuContent's CSS enter-animation (zoom-in-95,
+      // duration-150) complete normally so Playwright's stability check can
+      // observe a settled bounding box before the click.
+      toFake: [
+        "Date",
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "queueMicrotask",
+        "performance",
+      ],
+    });
     await openAgentActivity(page, CHANNEL_AGENTS);
 
     await clickStop(page);

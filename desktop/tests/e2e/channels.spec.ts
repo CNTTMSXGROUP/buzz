@@ -1061,6 +1061,16 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
     "open_dm",
   );
 
+  // The error toast that appeared with the first failed send can cover the
+  // send button for the retry. The cursor may still be parked over the
+  // bottom-right toast/send-button region; Sonner pauses its dismiss timer
+  // while the toaster is hovered. Move the cursor away first, then wait for
+  // the toast to clear — the established pattern used by the adjacent test.
+  await page.mouse.move(0, 0);
+  await expect(page.locator("[data-sonner-toast]")).toHaveCount(0, {
+    timeout: 10_000,
+  });
+
   await input.fill(retryMessage);
   const retryBaseline = commandsAfterFailure.length;
   await page.getByTestId("send-message").click();

@@ -5,6 +5,10 @@ import { JSDOM } from "jsdom";
 import { makeHookStubs } from "./sidebarSyncTestHelpers.mjs";
 import { runWholeBlobHookSuite } from "./wholeBlobHook.shared.test.mjs";
 import { runWholeBlobP2aSuite } from "./wholeBlobSyncP2a.shared.test.mjs";
+import {
+  runWholeBlobCarlSuite,
+  runWholeBlobP2bSuite,
+} from "./wholeBlobSyncCarl.shared.test.mjs";
 
 const { act, cleanup, renderHook } = await import("@testing-library/react");
 const { relayClient } = await import("@/shared/api/relayClient");
@@ -139,5 +143,24 @@ runWholeBlobP2aSuite({
   makeNonEmptyStore: () => ({ version: 1, groups: { s1: "recent" } }),
   makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
   makeMountStore: () => ({ version: 1, groups: { mount: "recent" } }),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+});
+
+runWholeBlobCarlSuite({
+  label: "sort",
+  Manager: ChannelSortSyncManager,
+  publishEdit: (m, store) => m.publishSortPrefs(store),
+  publishReplay: (m, store) => m.publishSortPrefs(store, true),
+  subscribe: (m, cb) => m.subscribeToSortPrefs(cb),
+  makeNonEmptyStore: () => ({ version: 1, groups: { s1: "recent" } }),
+  makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+});
+
+runWholeBlobP2bSuite({
+  label: "sort",
+  Manager: ChannelSortSyncManager,
+  publishEdit: (m, store) => m.publishSortPrefs(store),
+  makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
   makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
 });

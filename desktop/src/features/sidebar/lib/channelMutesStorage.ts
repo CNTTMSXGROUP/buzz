@@ -338,11 +338,38 @@ export function clearChannelMutesOutbox(
  * both to reclaim a subsumed foreign key and to skip a redundant boot-time
  * replay publish of a fold the head already carries (e.g. only the
  * never-deleted legacy key lingers).
+ *
+ * When `preservedKey` is provided the check is precise: `head` must contain an
+ * entry for `preservedKey` with `rev >= candidate.channels[preservedKey].rev`.
+ * This avoids using capacity-bounded `mergeStores` as the subsumption proof:
+ * without a preserved key, mergeStores can evict the clicked entry at the
+ * 500-cap boundary and return the truncated head unchanged, incorrectly
+ * certifying retention of a click the relay never kept (Carl P3).
+ *
+ * When `preservedKey` is not provided (no click reservation active) the
+ * bounded merge proof is still semantically safe — no specific entry needs to
+ * survive eviction — so we fall back to the merge-equality check.
  */
 export function isMutesStoreSubsumedBy(
   candidate: ChannelMuteStore,
   head: ChannelMuteStore,
+  preservedKey?: string,
 ): boolean {
+  if (preservedKey !== undefined) {
+    const candidateEntry = candidate.channels[preservedKey];
+    if (candidateEntry === undefined) {
+      return muteStoresEqual(mergeStores(head, candidate), head);
+    }
+    const headEntry = head.channels[preservedKey];
+    if (!headEntry) return false;
+    if (headEntry.updatedAt < candidateEntry.updatedAt) return false;
+    if (
+      headEntry.updatedAt === candidateEntry.updatedAt &&
+      headEntry.rev < candidateEntry.rev
+    )
+      return false;
+    return muteStoresEqual(mergeStores(head, candidate, preservedKey), head);
+  }
   return muteStoresEqual(mergeStores(head, candidate), head);
 }
 

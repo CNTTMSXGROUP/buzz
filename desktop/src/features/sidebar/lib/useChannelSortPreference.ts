@@ -186,7 +186,10 @@ export function useChannelSortPreference(
           // crash after resumes it from the v2 key. The marker is what stops the
           // never-deleted legacy key republishing above the head every boot
           // (Thufir pass-2 resurrection finding).
-          const durable = managerRef.current?.publishSortPrefs(outbox.store);
+          const durable = managerRef.current?.publishSortPrefs(
+            outbox.store,
+            true,
+          );
           if (durable && outbox.legacyRawToConsume !== null) {
             markChannelSortLegacyConsumed(
               pubkey,

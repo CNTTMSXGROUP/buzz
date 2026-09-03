@@ -125,7 +125,11 @@ export function useChannelStars(
         // noise only.
         const subsumed =
           result.action === "apply-remote" &&
-          isStarsStoreSubsumedBy(outboxMeta.store, result.data.store);
+          isStarsStoreSubsumedBy(
+            outboxMeta.store,
+            result.data.store,
+            outboxMeta.preservedKey ?? undefined,
+          );
         if (!subsumed) {
           // Forward the preserved key so the clicked channel's capacity
           // reservation survives remount and restart. The key is selected

@@ -124,7 +124,11 @@ export function useChannelMutes(
         // noise only.
         const subsumed =
           result.action === "apply-remote" &&
-          isMutesStoreSubsumedBy(outboxMeta.store, result.data.store);
+          isMutesStoreSubsumedBy(
+            outboxMeta.store,
+            result.data.store,
+            outboxMeta.preservedKey ?? undefined,
+          );
         if (!subsumed) {
           // Forward the preserved key so the clicked channel's capacity
           // reservation survives remount and restart. The key is selected

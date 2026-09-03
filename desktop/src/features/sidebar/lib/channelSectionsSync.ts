@@ -57,8 +57,11 @@ export class ChannelSectionSyncManager extends WholeBlobSyncManager<ChannelSecti
   }
 
   /** Publish a sections store, debounced to 2s. Returns whether the intent is durably held. */
-  publishSections(store: ChannelSectionStore): boolean {
-    return this.publish(store);
+  publishSections(
+    store: ChannelSectionStore,
+    isRestoredReplay = false,
+  ): boolean {
+    return this.publish(store, isRestoredReplay);
   }
 
   /** Fetch the current remote head for this pubkey's sections blob. */

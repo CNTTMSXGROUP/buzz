@@ -65,8 +65,13 @@ export type MergeLaneConfig<S> = {
    * a successful publish without a strict id match (the relay OKs superseded
    * NIP-33 writes as no-ops, so two windows can both receive OK while only one
    * blob is retained).
+   *
+   * `preservedKey` is the channelId that was clicked and must survive the
+   * capacity-bounded subsumption proof (Carl P3): a 500-cap merge without this
+   * key can evict the clicked entry and certify retention of a click the relay
+   * never kept.
    */
-  isSubsumedBy: (attempted: S, retained: S) => boolean;
+  isSubsumedBy: (attempted: S, retained: S, preservedKey?: string) => boolean;
   /**
    * True when `a` is identical to `b` (used to skip no-op publishes against
    * the last-published head).
@@ -355,7 +360,11 @@ export class MergeLaneSyncManager<S> {
       const remote = await this.decryptAndParse(event);
       if (!remote) return false;
       this.observe(remote.store);
-      return this.config.isSubsumedBy(store, remote.store);
+      return this.config.isSubsumedBy(
+        store,
+        remote.store,
+        this.pendingPreservedKey,
+      );
     } catch {
       return false;
     }

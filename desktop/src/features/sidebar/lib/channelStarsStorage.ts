@@ -340,11 +340,46 @@ export function clearChannelStarsOutbox(
  * both to reclaim a subsumed foreign key and to skip a redundant boot-time
  * replay publish of a fold the head already carries (e.g. only the
  * never-deleted legacy key lingers).
+ *
+ * When `preservedKey` is provided the check is precise: `head` must contain an
+ * entry for `preservedKey` with `rev >= candidate.channels[preservedKey].rev`.
+ * This avoids using capacity-bounded `mergeStores` as the subsumption proof:
+ * without a preserved key, mergeStores can evict the clicked entry at the
+ * 500-cap boundary and return the truncated head unchanged, incorrectly
+ * certifying retention of a click the relay never kept (Carl P3).
+ *
+ * When `preservedKey` is not provided (no click reservation active) the
+ * bounded merge proof is still semantically safe — no specific entry needs to
+ * survive eviction — so we fall back to the merge-equality check.
  */
 export function isStarsStoreSubsumedBy(
   candidate: ChannelStarStore,
   head: ChannelStarStore,
+  preservedKey?: string,
 ): boolean {
+  if (preservedKey !== undefined) {
+    // Direct membership proof: head must carry the preserved channel with a
+    // revision at least as high as the candidate's. If head is missing the
+    // entry entirely, it cannot subsume the click regardless of other entries.
+    const candidateEntry = candidate.channels[preservedKey];
+    if (candidateEntry === undefined) {
+      // Candidate has no entry for the key — subsumption reduces to the
+      // boundless equality check (no click to protect).
+      return starStoresEqual(mergeStores(head, candidate), head);
+    }
+    const headEntry = head.channels[preservedKey];
+    if (!headEntry) return false;
+    if (headEntry.updatedAt < candidateEntry.updatedAt) return false;
+    if (
+      headEntry.updatedAt === candidateEntry.updatedAt &&
+      headEntry.rev < candidateEntry.rev
+    )
+      return false;
+    // Head has the preserved entry at or above the candidate's revision.
+    // Now verify the rest of the candidate is also subsumed, using a
+    // preservedKey-aware merge so no other eviction can mask a real difference.
+    return starStoresEqual(mergeStores(head, candidate, preservedKey), head);
+  }
   return starStoresEqual(mergeStores(head, candidate), head);
 }
 

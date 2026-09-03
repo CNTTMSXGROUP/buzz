@@ -5,6 +5,10 @@ import { JSDOM } from "jsdom";
 import { makeHookStubs } from "./sidebarSyncTestHelpers.mjs";
 import { runWholeBlobHookSuite } from "./wholeBlobHook.shared.test.mjs";
 import { runWholeBlobP2aSuite } from "./wholeBlobSyncP2a.shared.test.mjs";
+import {
+  runWholeBlobCarlSuite,
+  runWholeBlobP2bSuite,
+} from "./wholeBlobSyncCarl.shared.test.mjs";
 
 const { act, cleanup, renderHook } = await import("@testing-library/react");
 const { relayClient } = await import("@/shared/api/relayClient");
@@ -218,6 +222,45 @@ runWholeBlobP2aSuite({
   makeMountStore: () => ({
     version: 1,
     sections: [{ id: "mount", name: "Mount", order: 0 }],
+    assignments: {},
+  }),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
+});
+
+runWholeBlobCarlSuite({
+  label: "sections",
+  Manager: ChannelSectionSyncManager,
+  publishEdit: (m, store) => m.publishSections(store),
+  publishReplay: (m, store) => m.publishSections(store, true),
+  subscribe: (m, cb) => m.subscribeToSections(cb),
+  makeNonEmptyStore: () => ({
+    version: 1,
+    sections: [{ id: "s1", name: "Work", order: 0 }],
+    assignments: {},
+  }),
+  makeEditStore: () => ({
+    version: 1,
+    sections: [{ id: "click", name: "Click", order: 0 }],
+    assignments: {},
+  }),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
+});
+
+runWholeBlobP2bSuite({
+  label: "sections",
+  Manager: ChannelSectionSyncManager,
+  publishEdit: (m, store) => m.publishSections(store),
+  makeEditStore: () => ({
+    version: 1,
+    sections: [{ id: "click", name: "Click", order: 0 }],
     assignments: {},
   }),
   makeRemoteStore: () => ({

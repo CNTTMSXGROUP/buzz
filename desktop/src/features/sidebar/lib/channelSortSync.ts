@@ -38,8 +38,8 @@ export class ChannelSortSyncManager extends WholeBlobSyncManager<ChannelSortStor
   }
 
   /** Publish a sort prefs store, debounced to 2s. Returns whether the intent is durably held. */
-  publishSortPrefs(store: ChannelSortStore): boolean {
-    return this.publish(store);
+  publishSortPrefs(store: ChannelSortStore, isRestoredReplay = false): boolean {
+    return this.publish(store, isRestoredReplay);
   }
 
   /** Fetch the current remote head for this pubkey's sort-prefs blob. */

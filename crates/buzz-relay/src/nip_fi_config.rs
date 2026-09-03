@@ -227,7 +227,7 @@ impl NipFiRelayConfig {
                     &principals,
                     capacity,
                 )
-                .map_err(|e| ConfigError::InvalidValue(e))?;
+                .map_err(ConfigError::InvalidValue)?;
                 command_configs.push((
                     entry.issuer.clone(),
                     crate::api::nip_fi::CommandIssuerEnvConfig {
@@ -236,6 +236,24 @@ impl NipFiRelayConfig {
                         deny_set_capacity: entry.deny_set_capacity,
                     },
                 ));
+            } else {
+                // No maximum_command_age_seconds: S4 command API is not enabled for
+                // this issuer.  Reject orphan S4 fields that would be silently ignored,
+                // since their presence almost certainly indicates a misconfiguration.
+                if entry.authorized_principals.is_some() {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: \
+                         authorized_principals is set but maximum_command_age_seconds is absent — \
+                         S4 command API requires maximum_command_age_seconds"
+                    )));
+                }
+                if entry.deny_set_capacity.is_some() {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: \
+                         deny_set_capacity is set but maximum_command_age_seconds is absent — \
+                         S4 command API requires maximum_command_age_seconds"
+                    )));
+                }
             }
         }
 
@@ -474,6 +492,76 @@ mod tests {
         assert!(
             msg.contains("authorized_principals"),
             "error names the missing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn orphan_authorized_principals_without_command_age_fails_closed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(NIP_FI_VARS);
+
+        std::env::set_var("BUZZ_NIP_FI_MODE", "enforce");
+        std::env::set_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600");
+        // authorized_principals without maximum_command_age_seconds — orphan field.
+        std::env::set_var(
+            "BUZZ_NIP_FI_ISSUERS",
+            r#"[{
+                "issuer": "https://idp.example.com",
+                "audiences": ["https://relay.example.com"],
+                "token_class": "nip-fi+jwt",
+                "algorithms": ["ES256"],
+                "maximum_assertion_age_seconds": 3600,
+                "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+                "jwks_refresh_interval_seconds": 300,
+                "jwks_hard_deadline_seconds": 86400,
+                "authorized_principals": ["admin@idp.example.com"]
+            }]"#,
+        );
+        let err = NipFiRelayConfig::from_env()
+            .expect_err("orphan authorized_principals must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("authorized_principals"),
+            "error names the orphan field: {msg}"
+        );
+        assert!(
+            msg.contains("maximum_command_age_seconds"),
+            "error names the missing dependency: {msg}"
+        );
+    }
+
+    #[test]
+    fn orphan_deny_set_capacity_without_command_age_fails_closed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(NIP_FI_VARS);
+
+        std::env::set_var("BUZZ_NIP_FI_MODE", "enforce");
+        std::env::set_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600");
+        // deny_set_capacity without maximum_command_age_seconds — orphan field.
+        std::env::set_var(
+            "BUZZ_NIP_FI_ISSUERS",
+            r#"[{
+                "issuer": "https://idp.example.com",
+                "audiences": ["https://relay.example.com"],
+                "token_class": "nip-fi+jwt",
+                "algorithms": ["ES256"],
+                "maximum_assertion_age_seconds": 3600,
+                "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+                "jwks_refresh_interval_seconds": 300,
+                "jwks_hard_deadline_seconds": 86400,
+                "deny_set_capacity": 1000
+            }]"#,
+        );
+        let err =
+            NipFiRelayConfig::from_env().expect_err("orphan deny_set_capacity must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deny_set_capacity"),
+            "error names the orphan field: {msg}"
+        );
+        assert!(
+            msg.contains("maximum_command_age_seconds"),
+            "error names the missing dependency: {msg}"
         );
     }
 }

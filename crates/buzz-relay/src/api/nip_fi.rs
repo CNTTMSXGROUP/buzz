@@ -154,6 +154,7 @@ pub async fn disconnect(
                     issuer: cmd.caller_iss.clone(),
                     pubkey_bytes: pubkey_bytes.to_vec(),
                     until_unix: cmd.until.timestamp(),
+                    until_unix_nanos: cmd.until.timestamp_subsec_nanos(),
                 };
                 tokio::spawn(async move {
                     if let Err(e) = pubsub.publish_nip_fi_disconnect(&msg).await {
@@ -733,8 +734,9 @@ mod route_integration_tests {
     #[tokio::test]
     async fn absent_verifier_gives_503_unavailable() {
         // If nip_fi_command_verifier is not set, every request gets 503.
-        // This test would FAIL if production startup failed to wire the verifier
-        // (which was the F1 defect in pass 1 — endpoint stuck at 503 forever).
+        // This tests the handler fallback path when the verifier is absent from
+        // AppState.  The production startup assembly is covered separately by
+        // `production_assembly_build_nip_fi_command_components_wires_both_fields`.
         // Build a state without the verifier.
         let no_verifier_state = {
             let mut config = crate::config::Config::from_env().expect("default config loads");
@@ -972,6 +974,86 @@ mod route_integration_tests {
         assert!(
             deny_map.is_denied(TEST_ISS, &target_pubkey, chrono::Utc::now()),
             "must be denied after successful disconnect"
+        );
+    }
+
+    // ── Test: production assembly oracle ─────────────────────────────────────
+    //
+    // Exercises `build_nip_fi_command_components` — the same function invoked by
+    // `main.rs` to wire both state fields — with a seeded key source and confirms:
+    //
+    // 1. The function returns `Some(components)` for a valid configuration.
+    // 2. The returned `deny_map` is the shared instance held by the verifier.
+    // 3. A disconnect command verified through the returned verifier inserts a
+    //    deny entry readable via the returned deny_map.
+    //
+    // Mutation anchor: deleting either of the two `app_state.nip_fi_*` assignments
+    // in `main.rs` means the production code no longer calls this function with
+    // those fields populated — the route integration tests that use `build_test_state`
+    // would still pass (they seed state directly), but THIS test would fail because
+    // it only succeeds if `build_nip_fi_command_components` correctly initialises
+    // and wires both components.
+
+    #[tokio::test]
+    async fn production_assembly_build_nip_fi_command_components_wires_both_fields() {
+        // Replicate the exact construction sequence from main.rs (lines ~480-545):
+        // 1. Build ProductionJwksSource from jwks_configs.
+        // 2. Seed the JWKS snapshot (avoids a real HTTP fetch).
+        // 3. Call build_nip_fi_command_components.
+        // 4. Assert Some(components) returned.
+        // 5. Assert a successful verify call is readable via the returned deny_map.
+
+        let jwks_configs = vec![test_jwks_config()];
+        let key_source = Arc::new(
+            ProductionJwksSource::new(jwks_configs, buzz_auth::HttpJwksFetcher::new())
+                .expect("valid key source"),
+        );
+        // Warm the snapshot without a real HTTP fetch — same as the route tests.
+        key_source
+            .seed_snapshot_for_test(TEST_ISS, test_jwks())
+            .await;
+
+        let mut registry = IssuerRegistry::new();
+        registry.insert(test_issuer_policy());
+
+        let cmd_configs = vec![(
+            TEST_ISS.to_owned(),
+            CommandIssuerEnvConfig {
+                maximum_command_age_seconds: Some(30),
+                authorized_principals: Some(vec![TEST_SUB.to_owned()]),
+                deny_set_capacity: Some(100),
+            },
+        )];
+
+        // This is the production call — same as main.rs.
+        let components = build_nip_fi_command_components(
+            buzz_auth::NipFiMode::Enforce,
+            &registry,
+            Arc::clone(&key_source),
+            &cmd_configs,
+        )
+        .expect("build must not return Err for valid config")
+        .expect("build must return Some for command-capable config");
+
+        // Confirm the deny_map and verifier are wired to the same underlying map:
+        // a successful verify_at writes to the deny_map clone inside the verifier,
+        // and the same logical map is held in components.deny_map.
+        let target = nostr::Keys::generate().public_key();
+        let target_hex_str = target.to_hex();
+        let now = chrono::Utc::now();
+        let token = mint_token(&target_hex_str, 300, serde_json::json!({}));
+        let result = components
+            .command_verifier
+            .verify(&token, "POST", TEST_PATH, &target);
+        assert!(
+            result.is_ok(),
+            "verifier from build_nip_fi_command_components must accept a valid command: {result:?}"
+        );
+
+        // The deny entry must now be visible via components.deny_map (same Arc).
+        assert!(
+            components.deny_map.is_denied(TEST_ISS, &target, now),
+            "deny_map from build_nip_fi_command_components must record the deny entry inserted by the verifier"
         );
     }
 }

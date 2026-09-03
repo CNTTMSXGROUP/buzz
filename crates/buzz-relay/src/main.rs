@@ -1172,7 +1172,10 @@ async fn main() -> anyhow::Result<()> {
                         }
 
                         // Validate timestamp representability.
-                        let until = match chrono::DateTime::from_timestamp(msg.until_unix, 0) {
+                        let until = match chrono::DateTime::from_timestamp(
+                            msg.until_unix,
+                            msg.until_unix_nanos,
+                        ) {
                             Some(t) => t,
                             None => {
                                 tracing::warn!(

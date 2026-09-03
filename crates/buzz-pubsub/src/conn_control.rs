@@ -54,8 +54,13 @@ pub struct NipFiDisconnect {
     pub issuer: String,
     /// 32 raw bytes of the target Nostr public key.
     pub pubkey_bytes: Vec<u8>,
-    /// `until` as a Unix timestamp (seconds since epoch).
+    /// `until` seconds since the Unix epoch (whole-second component).
     pub until_unix: i64,
+    /// Nanosecond sub-second component of `until` (0..1_000_000_000).
+    /// Transmitted alongside `until_unix` so the full sub-second precision of
+    /// the signed command JWT is preserved across pod boundaries.
+    #[serde(default)]
+    pub until_unix_nanos: u32,
 }
 
 /// Parse a connection-control Redis channel into its scoped community id.
@@ -329,10 +334,23 @@ mod tests {
             issuer: "https://idp.example.com".to_string(),
             pubkey_bytes: vec![0xabu8; 32],
             until_unix: 9_999_999_999,
+            until_unix_nanos: 500_000_000,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: NipFiDisconnect = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, cmd);
+    }
+
+    #[test]
+    fn nip_fi_disconnect_nanos_default_to_zero_when_absent() {
+        // Old messages (without the until_unix_nanos field) must still deserialize.
+        let legacy_json = r#"{"issuer":"https://idp.example.com","pubkey_bytes":[171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171],"until_unix":9999999999}"#;
+        let decoded: NipFiDisconnect = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            decoded.until_unix_nanos, 0,
+            "missing nanos field must default to 0"
+        );
+        assert_eq!(decoded.until_unix, 9_999_999_999);
     }
 
     #[test]
@@ -353,6 +371,7 @@ mod tests {
             issuer: "https://a.example.com".to_string(),
             pubkey_bytes: vec![1u8; 32],
             until_unix: 1_000_000,
+            until_unix_nanos: 0,
         })
         .unwrap();
         assert!(serde_json::from_str::<NipFiDisconnect>(&good).is_ok());

@@ -27,6 +27,7 @@
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use dashmap::DashSet;
 use nostr::PublicKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -54,8 +55,13 @@ struct IssuerShard {
     /// Reserved jtis: jti string → effective_expiry.  Expired jtis are evicted
     /// lazily on each write so the map never grows to replay-corpus size.
     jtis: HashMap<String, DateTime<Utc>>,
-    /// Maximum number of live entries for this issuer.
+    /// Maximum number of live deny entries for this issuer.
     capacity: usize,
+    /// Maximum number of live jti reservations for this issuer.
+    /// Bounded separately so an issuer cannot exhaust memory by replaying
+    /// distinct jtis faster than they expire, even for already-denied keys.
+    /// Set equal to `capacity` at construction: one slot per potential deny entry.
+    max_jti_count: usize,
 }
 
 impl IssuerShard {
@@ -64,6 +70,11 @@ impl IssuerShard {
             entries: HashMap::new(),
             jtis: HashMap::new(),
             capacity,
+            // JTI resource bound: allow up to 2× capacity JTI reservations.
+            // This gives one active command per entry slot plus headroom for
+            // one in-flight update command per already-denied key without
+            // blocking normal operation.  Still O(capacity) memory.
+            max_jti_count: capacity.saturating_mul(2).max(1),
         }
     }
 
@@ -104,8 +115,16 @@ impl IssuerShard {
             return Err(ReserveError::JtiAlreadyReserved);
         }
 
-        // Capacity check: only count an insert if this pubkey has no active
-        // entry already.  The merge rule never increases live entry count.
+        // JTI resource bound: cap live jti reservations at max_jti_count so an
+        // issuer cannot exhaust memory by sending distinct jtis for already-denied
+        // keys faster than they expire.  Uses CapacityExceeded so the caller
+        // responds 503 and the command remains replayable (jti not burned).
+        if self.jtis.len() >= self.max_jti_count {
+            return Err(ReserveError::CapacityExceeded);
+        }
+
+        // Deny-entry capacity check: only count as new if no active entry exists.
+        // The merge rule never increases live entry count.
         let is_update = self
             .entries
             .get(pubkey_hex)
@@ -202,6 +221,16 @@ pub struct NipFiDenyMap {
     shards: Arc<DashMap<String, Mutex<IssuerShard>>>,
     /// Default per-issuer capacity, used when no issuer-specific override exists.
     default_capacity: usize,
+    /// Issuers whose deny shard is in a fail-closed state due to capacity
+    /// exhaustion or shard poisoning on a cross-pod merge.
+    ///
+    /// When an issuer is in this set, `is_denied` returns `true` for every
+    /// key regardless of shard contents — the pod cannot safely admit any
+    /// key under that issuer until restart.  This satisfies the spec requirement
+    /// that every serving process receive the deny entry (NIP-FI.md:328-336):
+    /// when the remote shard is full, blocking the whole issuer is the only
+    /// fail-closed posture available without a durable store.
+    blocked_issuers: Arc<DashSet<String>>,
 }
 
 /// A per-issuer capacity override supplied at construction time.
@@ -229,6 +258,7 @@ impl NipFiDenyMap {
         Self {
             shards: Arc::new(shards),
             default_capacity,
+            blocked_issuers: Arc::new(DashSet::new()),
         }
     }
 
@@ -239,7 +269,17 @@ impl NipFiDenyMap {
     ///
     /// Fails **closed**: a poisoned shard lock returns `true` (deny) so that a
     /// damaged shard cannot silently admit a denied pubkey.
+    ///
+    /// Also fails closed for issuers that are in the `blocked_issuers` set —
+    /// these are issuers whose remote deny shard was at capacity or poisoned
+    /// during a cross-pod merge.  Every key under a blocked issuer is denied
+    /// until restart.  [NIP-FI.md:328-336]
     pub fn is_denied(&self, issuer: &str, pubkey: &PublicKey, now: DateTime<Utc>) -> bool {
+        // Issuer-level block: capacity/poison on a cross-pod merge transitions
+        // the whole issuer to deny-all until restart.
+        if self.blocked_issuers.contains(issuer) {
+            return true;
+        }
         let pubkey_hex = pubkey.to_hex();
         match self.shards.get(issuer) {
             Some(shard) => shard
@@ -294,7 +334,10 @@ impl NipFiDenyMap {
     /// can reject without allocating state.
     ///
     /// Capacity exhaustion and shard poisoning both return fail-closed results
-    /// so the caller can transition the issuer to a deny-all posture.
+    /// **and** mark the issuer as blocked in `blocked_issuers`.  Once blocked,
+    /// `is_denied` returns `true` for every key under that issuer — the pod
+    /// cannot safely admit any key when it cannot record the deny entry.
+    /// The blocked state persists until restart.  [NIP-FI.md:328-336]
     pub fn merge_cross_pod_deny(
         &self,
         issuer: &str,
@@ -307,10 +350,21 @@ impl NipFiDenyMap {
         match self.shards.get(issuer) {
             None => CrossPodMergeResult::UnknownIssuer,
             Some(shard) => match shard.lock() {
-                Err(_) => CrossPodMergeResult::ShardPoisoned,
+                Err(_) => {
+                    // Shard is poisoned — mark the issuer blocked so admission
+                    // fails closed for all keys under this issuer.
+                    self.blocked_issuers.insert(issuer.to_owned());
+                    CrossPodMergeResult::ShardPoisoned
+                }
                 Ok(mut guard) => match guard.remote_merge(&pubkey_hex, until, now) {
                     Ok(()) => CrossPodMergeResult::Merged,
-                    Err(ReserveError::CapacityExceeded) => CrossPodMergeResult::CapacityExceeded,
+                    Err(ReserveError::CapacityExceeded) => {
+                        // Cannot record the deny entry — mark the issuer blocked
+                        // so the target key (and all keys under this issuer)
+                        // cannot reconnect on this pod.  [NIP-FI.md:328-336]
+                        self.blocked_issuers.insert(issuer.to_owned());
+                        CrossPodMergeResult::CapacityExceeded
+                    }
                     Err(ReserveError::JtiAlreadyReserved) => {
                         // remote_merge never touches jtis; this arm is unreachable.
                         unreachable!("remote_merge does not use jti tracking")
@@ -493,6 +547,69 @@ mod tests {
     // ── Capacity ─────────────────────────────────────────────────────────────
 
     #[test]
+    fn jti_resource_bound_limits_replay_state_for_already_denied_keys() {
+        // max_jti_count = capacity * 2 = 4 (for capacity=2).
+        // Fill all 4 JTI slots across 2 keys, then verify a fifth jti is rejected.
+        // This proves the bound is enforced even though entry capacity is not
+        // exhausted (only 2 entries for 2 keys, entry capacity is 2 — no new
+        // entries would be inserted).
+        //
+        // Mutation anchor: removing the JTI resource-bound check would let
+        // the jtis map grow without limit even though no new deny entries are
+        // added (because the update path bypasses the entry-capacity check).
+        let m = NipFiDenyMap::new(
+            2,
+            vec![IssuerCapacity {
+                issuer: iss().to_owned(),
+                capacity: 2,
+            }],
+        );
+        let now = Utc::now();
+        let until = now + Duration::seconds(300);
+        let k1 = key();
+        let k2 = key();
+
+        // 4 commands across 2 keys: fills all 4 JTI slots (2 per key, 2*2=4).
+        m.atomic_reserve_and_insert(iss(), "jti-k1-a", until, &k1, until, now)
+            .expect("k1 first command");
+        m.atomic_reserve_and_insert(
+            iss(),
+            "jti-k1-b",
+            until + Duration::seconds(1),
+            &k1,
+            until + Duration::seconds(1),
+            now,
+        )
+        .expect("k1 second command (update, within jti bound)");
+        m.atomic_reserve_and_insert(iss(), "jti-k2-a", until, &k2, until, now)
+            .expect("k2 first command");
+        m.atomic_reserve_and_insert(
+            iss(),
+            "jti-k2-b",
+            until + Duration::seconds(1),
+            &k2,
+            until + Duration::seconds(1),
+            now,
+        )
+        .expect("k2 second command (update, within jti bound)");
+
+        // 5th JTI: max_jti_count=4 exhausted → CapacityExceeded.
+        let result = m.atomic_reserve_and_insert(
+            iss(),
+            "jti-k1-c",
+            until + Duration::seconds(2),
+            &k1,
+            until + Duration::seconds(2),
+            now,
+        );
+        assert_eq!(
+            result,
+            Err(ReserveError::CapacityExceeded),
+            "jti resource bound must reject the fifth jti (max_jti_count=4 exhausted)"
+        );
+    }
+
+    #[test]
     fn capacity_exceeded_returns_error_without_inserting() {
         // Capacity = 2, three distinct pubkeys.
         let m = NipFiDenyMap::new(2, vec![]);
@@ -518,8 +635,13 @@ mod tests {
     }
 
     #[test]
-    fn update_to_existing_key_does_not_count_against_capacity() {
-        let m = NipFiDenyMap::new(1, vec![]);
+    fn update_to_existing_key_does_not_count_against_entry_capacity() {
+        // capacity=2: two entry slots, but only one is used.
+        // An update to the existing key uses the second JTI slot but does NOT
+        // add a second entry — verifies the entry-capacity check allows updates.
+        // (JTI capacity is a separate bound: capacity=2 gives max_jti_count=2,
+        // so the second JTI fits without hitting the JTI resource bound either.)
+        let m = NipFiDenyMap::new(2, vec![]);
         let now = Utc::now();
         let k = key();
         let until_a = now + Duration::seconds(300);
@@ -527,9 +649,9 @@ mod tests {
 
         m.atomic_reserve_and_insert(iss(), "jti-a", until_a, &k, until_a, now)
             .expect("first insert");
-        // Same key, longer until — should succeed even though capacity=1.
+        // Same key, longer until — entry count stays at 1 (update), jti count goes to 2.
         m.atomic_reserve_and_insert(iss(), "jti-b", until_b, &k, until_b, now)
-            .expect("update same key at capacity");
+            .expect("update same key must succeed: only one entry used, entry-capacity is 2");
 
         assert!(
             m.is_denied(iss(), &k, now + Duration::seconds(400)),
@@ -706,6 +828,57 @@ mod tests {
     }
 
     #[test]
+    fn remote_merge_capacity_exceeded_marks_issuer_blocked_and_denies_all_keys() {
+        // Capacity = 1, two distinct keys.  After capacity exhaustion the issuer
+        // is blocked: is_denied returns true for ALL keys under that issuer,
+        // not just the target.  This satisfies NIP-FI.md:328-336: every serving
+        // process must receive the deny entry; when the shard is full the only
+        // fail-closed posture is to block the issuer.
+        let m = NipFiDenyMap::new(
+            1,
+            vec![IssuerCapacity {
+                issuer: iss().to_owned(),
+                capacity: 1,
+            }],
+        );
+        let now = Utc::now();
+        let until = now + Duration::seconds(300);
+        let k1 = key();
+        let k2 = key();
+        let k_unrelated = key(); // a key that was never targeted
+
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k1, until, now),
+            CrossPodMergeResult::Merged
+        );
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k2, until, now),
+            CrossPodMergeResult::CapacityExceeded,
+            "second key with cap=1 must return CapacityExceeded"
+        );
+        // k2 was NOT inserted — but the issuer is now blocked.
+        assert!(
+            !m.shards
+                .get(iss())
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_denied(&k2.to_hex(), now),
+            "k2 has no deny entry in the shard (entry was not inserted)"
+        );
+        // is_denied returns true for k2 via the issuer-level block.
+        assert!(
+            m.is_denied(iss(), &k2, now),
+            "k2 must be denied via issuer-level block after CapacityExceeded"
+        );
+        // is_denied returns true for an unrelated key too — whole issuer is blocked.
+        assert!(
+            m.is_denied(iss(), &k_unrelated, now),
+            "unrelated key must also be denied under blocked issuer"
+        );
+    }
+
+    #[test]
     fn remote_merge_capacity_exceeded_returns_correct_result() {
         // Capacity = 1, two distinct keys.
         let m = NipFiDenyMap::new(
@@ -729,10 +902,11 @@ mod tests {
             CrossPodMergeResult::CapacityExceeded,
             "second key with cap=1 must return CapacityExceeded"
         );
-        // k2 is NOT denied (entry was not inserted).
+        // k2's shard entry was NOT inserted (capacity guard held), but is_denied
+        // returns true because the issuer-level block was set.
         assert!(
-            !m.is_denied(iss(), &k2, now),
-            "k2 must not be denied after CapacityExceeded"
+            m.is_denied(iss(), &k2, now),
+            "k2 must be denied after CapacityExceeded (issuer-level block)"
         );
     }
 

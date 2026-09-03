@@ -46,6 +46,7 @@ import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
 import { focusMentionOptionsTrigger } from "./MentionAutocomplete";
 import { MessageComposerAutocompletes } from "./MessageComposerAutocompletes";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
+import { BrainAttachButton } from "@/features/msx-brain/ui/BrainAttachButton";
 import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
 import { useComposerVoiceNote } from "./useComposerVoiceNote";
@@ -950,7 +951,22 @@ function MessageComposerImpl({
               layoutMode={layoutMode}
               composerDisabled={composerDisabled}
               editor={richText.editor}
-              extraActions={toolbarExtraActions}
+              extraActions={
+                toolbarExtraActions ?? (
+                  <BrainAttachButton
+                    disabled={
+                      composerDisabled || media.isUploading
+                    }
+                    onPick={(entry) =>
+                      richText.editor
+                        ?.chain()
+                        .focus()
+                        .insertContent(`[nao:${entry.rel_path}]`)
+                        .run()
+                    }
+                  />
+                )
+              }
               formattingDisabled={composerDisabled}
               gifMediaController={media}
               isEmojiPickerOpen={isEmojiPickerOpen}

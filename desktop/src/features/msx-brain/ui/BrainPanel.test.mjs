@@ -51,8 +51,10 @@ test("BrainPanel hiển thị cây + mở file khi click", async () => {
   const { render, screen, fireEvent } = await import("@testing-library/react");
   const { BrainPanel } = await import("./BrainPanel.tsx");
   render(React.createElement(BrainPanel, { vaultRoot: "/tmp/vault", myPubkey: "PK1" }));
-  assert.ok(await screen.findByText("1. Thu Thập"));
-  fireEvent.click(screen.getByText(/a\.md/));
+  const dirBtn = await screen.findByText("1. Thu Thập");
+  fireEvent.click(dirBtn); // expand thư mục
+  const fileBtn = await screen.findByText(/a\.md/);
+  fireEvent.click(fileBtn);
   assert.ok(await screen.findByText("nội dung"));
 });
 

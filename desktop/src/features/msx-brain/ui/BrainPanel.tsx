@@ -1,8 +1,9 @@
-import { Brain, Check, ChevronDown, FolderOpen, Send } from "lucide-react";
+import { Brain, Check, ChevronDown, FolderOpen, Send, Settings } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { sendApprove } from "../lib/approve";
 import { listShareableChannels, shareToChannel } from "../lib/shareToChannel";
 import { useBrainTree } from "../lib/useBrainTree";
+import { BrainAdmin } from "./BrainAdmin";
 import { FileTree } from "./FileTree";
 import { MarkdownPreview } from "./MarkdownPreview";
 
@@ -18,6 +19,16 @@ export function BrainPanel({
   const [shareOpen, setShareOpen] = useState(false);
   const [channels, setChannels] = useState<Array<{ id: string; name: string }>>([]);
   const [shareNote, setShareNote] = useState("");
+  const [label, setLabel] = useState<string>(() => {
+    try {
+      return localStorage.getItem("msx-brain-label") ?? "Não MSX";
+    } catch {
+      return "Não MSX";
+    }
+  });
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [adminOpen, setAdminOpen] = useState(false);
   const shareRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -67,9 +78,49 @@ export function BrainPanel({
     <div className="flex h-full w-full flex-col">
       <div className="flex items-center gap-2 border-b px-3 py-2">
         <Brain className="h-4 w-4 text-amber-500" />
-        <span className="text-sm font-semibold">Não MSX</span>
+        {renaming ? (
+          <form
+            onSubmit={(ev) => {
+              ev.preventDefault();
+              const v = renameValue.trim();
+              if (v) {
+                setLabel(v);
+                try { localStorage.setItem("msx-brain-label", v); } catch { /* ignore */ }
+              }
+              setRenaming(false);
+            }}
+          >
+            <input
+              autoFocus
+              value={renameValue}
+              onChange={(ev) => setRenameValue(ev.target.value)}
+              onBlur={() => setRenaming(false)}
+              className="w-40 rounded border bg-transparent px-1.5 py-0.5 text-sm outline-none focus:ring-1 focus:ring-ring"
+            />
+          </form>
+        ) : (
+          <span
+            className="text-sm font-semibold select-none"
+            onContextMenu={(ev) => {
+              ev.preventDefault();
+              setRenameValue(label);
+              setRenaming(true);
+              }}
+          >
+            {label}
+          </span>
+        )}
         <div className="flex-1" />
         {status && <span className="truncate text-xs text-muted-foreground">{status}</span>}
+        <button
+          type="button"
+          aria-label="Quản trị phân quyền Não"
+          data-testid="msx-admin-button"
+          className={`rounded-md p-1.5 transition-colors hover:bg-accent ${adminOpen ? "bg-accent" : ""}`}
+          onClick={() => setAdminOpen((v) => !v)}
+        >
+          <Settings className="h-4 w-4" />
+        </button>
         {selected && !selected.is_dir && isMd && (
           <div className="relative" ref={shareRef}>
             <button
@@ -119,6 +170,11 @@ export function BrainPanel({
           </button>
         )}
       </div>
+      {adminOpen ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <BrainAdmin vaultRoot={vaultRoot} />
+        </div>
+      ) : (
       <div className="flex min-h-0 flex-1">
         <div className="w-80 shrink-0 overflow-y-auto border-r">
           <FileTree entries={entries} selectedPath={selected?.rel_path ?? null} onOpen={open} />
@@ -143,6 +199,7 @@ export function BrainPanel({
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

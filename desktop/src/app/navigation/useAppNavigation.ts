@@ -186,6 +186,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goBrain = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/msx-brain",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goWorkflow = React.useCallback(
     (workflowId: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -474,6 +485,7 @@ export function useAppNavigation() {
     goSettings,
     goWorkflow,
     goWorkflows,
+    goBrain,
     openSearchHit,
   };
 }

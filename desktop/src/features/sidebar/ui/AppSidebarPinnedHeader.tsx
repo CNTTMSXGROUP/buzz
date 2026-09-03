@@ -1,4 +1,4 @@
-import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
+import { Brain, Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
@@ -44,6 +44,7 @@ type AppSidebarPrimaryMenuProps = {
   onSelectAgents: () => void;
   onSelectHome: () => void;
   onSelectProjects: () => void;
+  onSelectBrain: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;
   projectsOverviewActive: boolean;
@@ -94,6 +95,7 @@ export function AppSidebarPrimaryMenu({
   onSelectAgents,
   onSelectHome,
   onSelectProjects,
+  onSelectBrain,
   onSelectPulse,
   onSelectWorkflows,
   projectsOverviewActive,
@@ -169,6 +171,17 @@ export function AppSidebarPrimaryMenu({
             </SidebarMenuButton>
           </SidebarMenuItem>
           <ProtectedBestieSidebarEntry />
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              data-testid="open-msx-brain-view"
+              onClick={onSelectBrain}
+              tooltip="Não MSX"
+              type="button"
+            >
+              <Brain className="h-4 w-4" />
+              <SidebarMenuLabel>Não MSX</SidebarMenuLabel>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
           <FeatureGate feature="workflows">
             <SidebarMenuItem>
               <SidebarMenuButton

@@ -174,7 +174,7 @@ function Mutations() {
 }
 function Composer() {
   mention = useMentions(state.channelId, undefined, undefined, {
-    channelType: "stream",
+    channelType: state.channelType ?? "stream",
   });
   picker = useAgentAddressLockPicker({
     mentions: mention,
@@ -633,6 +633,60 @@ const person = (pubkey, name = "Scout") => ({
   display_name: name,
   is_agent: false,
 });
+
+for (const channelType of ["stream", "dm"]) {
+  test(`${channelType} without a destination does not wait for a disabled roster`, async () => {
+    await setup({
+      channelId: null,
+      channelType,
+      searchUsers: [person(OTHER, "Alice")],
+    });
+    assert.equal(
+      client.getQueryState(["channels", "none", "members"]).status,
+      "pending",
+    );
+    assert.equal(
+      client.getQueryState(["channels", "none", "members"]).fetchStatus,
+      "idle",
+    );
+    await act(async () => mention.updateMentionQuery("@Alice", 6));
+    await settle();
+    assert.equal(mention.isMentionLoading, false);
+    const choice = mention.handleMentionKeyDown(keyboard("Tab")).suggestion;
+    assert.equal(choice.pubkey, OTHER);
+    let edit;
+    await act(async () => {
+      edit = mention.insertMention(choice, 6);
+    });
+    assert.equal(mention.getDraftMentionRefs(edit.insertText)[0].pubkey, OTHER);
+  });
+
+  test(`${channelType} with a real pending roster still waits before admitting choices`, async () => {
+    let release;
+    await setup({
+      channelType,
+      heldRoster: new Promise((resolve) => {
+        release = resolve;
+      }),
+      searchUsers: [person(OTHER, "Alice")],
+    });
+    await act(async () => mention.updateMentionQuery("@Alice", 6));
+    await settle();
+    assert.equal(mention.isMentionLoading, true);
+    assert.deepEqual(mention.suggestions, []);
+    assert.equal(
+      mention.handleMentionKeyDown(keyboard("Tab")).suggestion,
+      undefined,
+    );
+    await act(async () => release({ members: [] }));
+    await settle();
+    assert.equal(mention.isMentionLoading, false);
+    assert.equal(
+      mention.handleMentionKeyDown(keyboard("Tab")).suggestion.pubkey,
+      OTHER,
+    );
+  });
+}
 
 test("background membership/search updates leave visible same-name rows and Tab identity fixed", async () => {
   await setup({

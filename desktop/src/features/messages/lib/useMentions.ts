@@ -404,7 +404,8 @@ export function useMentions(
   // Search hooks are keyed by the requested text. Wait for that request's
   // first page and initial directories, then keep exactly one displayed set.
   const resultsReady =
-    (!!externalMembers ||
+    (channelId === null ||
+      !!externalMembers ||
       (!membersQuery.isPending && !membersQuery.isFetching)) &&
     !managedAgentsQuery.isPending &&
     !managedAgentsQuery.isFetching &&

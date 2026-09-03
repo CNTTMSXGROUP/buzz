@@ -68,3 +68,20 @@ fn test_read_file_chong_path_traversal() {
     );
     assert!(r.is_err());
 }
+
+#[test]
+#[ignore] // chạy manual: cargo test verify_real_vault -- --ignored (cần vault thật trên máy)
+fn verify_real_vault() {
+    let root = "/Users/qthang/Library/CloudStorage/GoogleDrive-aios.msxgroup@gmail.com/Drive của tôi/MSXGROUP_AIOS_BRAIN";
+    if !std::path::Path::new(root).exists() {
+        eprintln!("vault không có trên máy này — bỏ qua");
+        return;
+    }
+    let entries = filter_entries(std::path::Path::new(root), "*");
+    let dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).map(|e| e.name.clone()).collect();
+    println!("tổng entries: {}", entries.len());
+    println!("thư mục (12 đầu): {:?}", &dirs[..dirs.len().min(12)]);
+    assert!(!dirs.iter().any(|d| d == "_mat" || d == ".git" || d == ".obsidian"), "_mat/.git/.obsidian lộ!");
+    let r = super::brain_read_file(root.to_string(), "_meta/nguoi-dung.json".to_string(), "*".to_string());
+    assert!(r.is_ok(), "không đọc được nguoi-dung.json: {:?}", r.err());
+}

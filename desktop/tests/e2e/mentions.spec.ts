@@ -723,6 +723,9 @@ for (const separator of [" ", "\u00a0"]) {
     await page.keyboard.type(`run \`deploy\`${separator}@ALICE`);
     await waitForCompleteMentionSearch(page, "alice");
     await expect(input.locator("code")).toHaveText("deploy");
+    await expect(
+      autocomplete(page).getByText("alice", { exact: true }),
+    ).toBeVisible();
     await page.keyboard.press(" ");
     await page.keyboard.type("now");
 
@@ -916,18 +919,7 @@ test("defers agent mentions until DM members finish loading", async ({
 
   const threadPanel = page.getByTestId("message-thread-panel");
   const input = threadPanel.getByTestId("message-input");
-  await input.fill("Ask @ali");
-  await expect(
-    threadPanel
-      .getByTestId("mention-autocomplete")
-      .locator("button", { hasText: "alice" }),
-  ).toBeVisible();
-  await threadPanel
-    .getByTestId("mention-autocomplete")
-    .locator("button", { hasText: "alice" })
-    .click();
-  await expect(input).toHaveText("Ask @alice ");
-  await page.keyboard.type(" before members resolve");
+  await input.fill("Ask @alice before members resolve");
   const baselineCommands = await readCommandLog(page);
   await threadPanel.getByTestId("send-message").click();
 
@@ -956,10 +948,7 @@ test("defers agent mentions until DM members finish loading", async ({
   await expect(input).toHaveText("");
   await expect(threadPanel).toContainText("before members resolve");
   expect(
-    await readOutgoingMentionPubkeys(
-      page,
-      "Ask @alice  before members resolve",
-    ),
+    await readOutgoingMentionPubkeys(page, "Ask @alice before members resolve"),
   ).toEqual([TEST_IDENTITIES.alice.pubkey]);
 });
 
@@ -1572,7 +1561,12 @@ test("other-owned agents without a shared channel are hidden from mentions", asy
   await input.fill("@mira");
 
   const dropdown = autocomplete(page);
-  await expect(dropdown).not.toBeVisible();
+  await expect(
+    page.getByRole("status").filter({ hasText: "No mentions found" }),
+  ).toBeVisible();
+  await expect(
+    dropdown.locator("[data-testid^=mention-suggestion-]"),
+  ).toHaveCount(0);
   await expect(input.locator(".mention-chip")).toHaveCount(0);
 });
 
@@ -1587,7 +1581,12 @@ test("stale channel-member agents absent from managed and relay directories stay
   const input = page.getByTestId("message-input");
   await input.fill("@mira");
 
-  await expect(autocomplete(page)).toHaveCount(0);
+  await expect(
+    page.getByRole("status").filter({ hasText: "No mentions found" }),
+  ).toBeVisible();
+  await expect(
+    autocomplete(page).locator("[data-testid^=mention-suggestion-]"),
+  ).toHaveCount(0);
 });
 
 test("managed relay agents are visible in channel mentions regardless of relay policy", async ({
@@ -1631,13 +1630,18 @@ test("relay-only shared agents stay hidden from DM mentions", async ({
 
   await page.getByTestId("message-input").fill("@alice");
 
-  await expect(autocomplete(page)).toHaveCount(0);
+  await expect(
+    page.getByRole("status").filter({ hasText: "No mentions found" }),
+  ).toBeVisible();
+  await expect(
+    autocomplete(page).locator("[data-testid^=mention-suggestion-]"),
+  ).toHaveCount(0);
 });
 
-test("cached relay-agent suggestions are removed when channel authorization disappears", async ({
+test("cached relay-agent choices cannot insert when channel authorization disappears", async ({
   page,
 }) => {
-  await installMockBridge(page, { userSearchDelayMs: 10_000 });
+  await installMockBridge(page, { userSearchDelayMs: 100 });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -1670,7 +1674,9 @@ test("cached relay-agent suggestions are removed when channel authorization disa
     await bridge.__BUZZ_E2E_INVALIDATE_CHANNELS__?.();
   }, GENERAL_CHANNEL_ID);
 
-  await expect(aliceSuggestion).toHaveCount(0);
+  await expect(aliceSuggestion).toBeVisible();
+  await input.press("Tab");
+  await expect(input).toHaveText("@alice");
 });
 
 test("relay-only shared agents appear in forum mentions", async ({ page }) => {
@@ -2332,7 +2338,12 @@ test("relay-only allowlisted agents stay hidden outside their channel", async ({
 
   await page.getByTestId("message-input").fill("@quinn");
 
-  await expect(autocomplete(page)).toHaveCount(0);
+  await expect(
+    page.getByRole("status").filter({ hasText: "No mentions found" }),
+  ).toBeVisible();
+  await expect(
+    autocomplete(page).locator("[data-testid^=mention-suggestion-]"),
+  ).toHaveCount(0);
 });
 
 test("owner-only builds admit cross-owner relay agents authorized for anyone", async ({
@@ -2387,7 +2398,12 @@ test("relay-only excluded agents stay hidden from channel mentions", async ({
 
   await page.getByTestId("message-input").fill("@quinn");
 
-  await expect(autocomplete(page)).toHaveCount(0);
+  await expect(
+    page.getByRole("status").filter({ hasText: "No mentions found" }),
+  ).toBeVisible();
+  await expect(
+    autocomplete(page).locator("[data-testid^=mention-suggestion-]"),
+  ).toHaveCount(0);
 });
 
 test("shared agents wait for initial directory authorization", async ({
@@ -2411,7 +2427,10 @@ test("shared agents wait for initial directory authorization", async ({
 
   await page.getByTestId("message-input").fill("@quinn");
 
-  await expect(autocomplete(page)).toHaveCount(0);
+  await expect(
+    page.getByRole("status").filter({ hasText: "Loading mentions" }),
+  ).toBeVisible();
+  await expect(autocomplete(page).getByText("quinn")).toHaveCount(0);
   await expect(autocomplete(page).getByText("quinn")).toBeVisible({
     timeout: 3_000,
   });
@@ -3119,8 +3138,15 @@ test("distinct same-name global people remain independently selectable", async (
   const dropdown = autocomplete(page);
   const keys = [CASEY_PROFILE_PUBKEY, "2".repeat(64)];
   await waitForCompleteMentionSearch(page, "pip");
+  const displayedKey = await dropdown
+    .locator("[data-testid^=mention-suggestion-]")
+    .first()
+    .getAttribute("data-testid");
   await input.press("Tab");
-  await expect(input).toHaveText("@pip");
+  await expect(input).toHaveText("@Pip ");
+  expect(keys.some((key) => displayedKey === `mention-suggestion-${key}`)).toBe(
+    true,
+  );
   for (const key of keys) {
     await input.fill("@pip");
     const row = dropdown.getByTestId(`mention-suggestion-${key}`);

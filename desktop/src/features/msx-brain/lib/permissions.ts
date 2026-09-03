@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-const BLOCKED = ["_mat", ".git", ".obsidian", ".claude", ".agents", ".codex", ".trash", "node_modules"];
+const BLOCKED = ["_mat", "_meta", ".git", ".obsidian", ".claude", ".agents", ".codex", ".trash", "node_modules"];
 const COMMON_AREAS = [
   "0. Bắt Đầu",
   "1. Thu Thập",

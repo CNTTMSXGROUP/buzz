@@ -13,7 +13,9 @@ export function useBrainTree(vaultRoot: string, myPubkey: string) {
     try {
       const role = await loadBrainRole(vaultRoot, myPubkey);
       const khu = role?.khu ?? "__khong_co_quyen__";
+      console.log("[msx-brain] refresh", { myPubkey: myPubkey.slice(0, 8), khu, root: vaultRoot });
       const list = await invoke<BrainEntry[]>("brain_list_tree", { root: vaultRoot, khu });
+      console.log("[msx-brain] tree entries:", list.length);
       setEntries(list);
       setError(null);
     } catch (err) {
@@ -32,6 +34,7 @@ export function useBrainTree(vaultRoot: string, myPubkey: string) {
       try {
         const role = await loadBrainRole(vaultRoot, myPubkey);
         const khu = role?.khu ?? "__khong_co_quyen__";
+        console.log("[msx-brain] open", { rel: e.rel_path, khu });
         const txt = await invoke<string>("brain_read_file", {
           root: vaultRoot,
           rel_path: e.rel_path,

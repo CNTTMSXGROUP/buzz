@@ -555,7 +555,9 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertTrue(store.cleanup.isEmpty)
   }
 
-  func testRelayRotationRevokesPendingDelegationWithoutRevokingSharedInstallation() async throws {
+  func testRelayRotationRevokesKnownCommittedGenerationWhenReservedGenerationDidNotCommit()
+    async throws
+  {
     let newRelayPubkey = String(repeating: "b", count: 64)
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     let existing = BuzzPushEndpointGrantRecord(
@@ -589,7 +591,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     let store = MemoryGrantStore(records: [existing], pending: [pending])
     let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
     var challengeRequests = 0
-    var delegationRevoked = false
+    var revokedGenerations: [Int] = []
     URLProtocolStub.handler = { request in
       switch (request.httpMethod, request.url?.absoluteString) {
       case ("GET", "https://relay.example/"):
@@ -603,14 +605,15 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
         )
       case ("POST", "http://push.example/v1/installations/challenges"):
         challengeRequests += 1
-        guard challengeRequests == 1 else {
+        guard challengeRequests <= 2 else {
           return Self.response(request, status: 503, json: ["error": "injected"])
         }
         return Self.response(
           request,
           status: 200,
           json: [
-            "challenge_id": Self.secondChallengeId,
+            "challenge_id":
+              challengeRequests == 1 ? Self.firstChallengeId : Self.secondChallengeId,
             "challenge": Self.challenge,
             "expires_at": Self.now + 300,
           ]
@@ -619,8 +622,12 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
         let body = try Self.body(request)
         XCTAssertEqual(body["installation_handle"] as? String, Self.installationHandle)
         XCTAssertEqual(body["relay_pubkey"] as? String, Self.relayPubkey)
-        XCTAssertEqual(body["generation"] as? Int, 2)
-        delegationRevoked = true
+        let generation = try XCTUnwrap(body["generation"] as? Int)
+        revokedGenerations.append(generation)
+        if generation == 2 {
+          return Self.response(request, status: 404, json: ["error": "not_authorized"])
+        }
+        XCTAssertEqual(generation, 1)
         return Self.response(request, status: 200, json: ["status": "revoked"])
       default:
         XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
@@ -637,10 +644,10 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     } catch BuzzDevPushEnrollmentError.unexpectedStatus(
       route: "v1/installations/challenges", expected: 200, actual: 503, _
     ) {
-      // The old delegation was revoked before replacement began.
+      // The known committed generation was revoked before replacement began.
     }
 
-    XCTAssertTrue(delegationRevoked)
+    XCTAssertEqual(revokedGenerations, [2, 1])
     XCTAssertEqual(store.saved, [existing])
     XCTAssertEqual(store.pending.count, 1)
     XCTAssertEqual(store.pending.first?.relayPubkey, newRelayPubkey)

@@ -478,21 +478,34 @@ public final class BuzzDevPushEnrollmentDriver {
         handleText == handle.uuidString.lowercased(),
         let keyId = pending.keyId,
         pending.endpointHash == endpointHash,
-        referencedInstallation != nil
+        let referencedInstallation
       {
-        if pending.delegationGeneration > 0 {
+        let candidateGenerations = [
+          pending.delegationGeneration,
+          referencedInstallation.generation,
+        ].filter { $0 > 0 }.reduce(into: [Int64]()) { generations, generation in
+          if !generations.contains(generation) { generations.append(generation) }
+        }
+        var revoked = false
+        for generation in candidateGenerations {
           do {
             try await revokeDelegation(
               installationHandle: handle,
               relayPubkey: pending.relayPubkey,
-              generation: pending.delegationGeneration,
+              generation: generation,
               appAttestKeyId: keyId
             )
+            revoked = true
+            break
           } catch BuzzDevPushEnrollmentError.unexpectedStatus(
             route: "v1/delegations/revoke", _, actual: 404, _
           ) {
-            // No committed delegation remains to clean up.
+            // The reserved generation may not have committed. Try the last
+            // generation known to have produced a durable grant as well.
           }
+        }
+        guard revoked else {
+          throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
         }
       } else {
         var cleanupState = BuzzPushGatewayCleanupState(

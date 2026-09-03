@@ -469,9 +469,15 @@ public final class BuzzDevPushEnrollmentDriver {
         || pending.expiresAt <= nowSeconds
     {
       let referencedInstallation = pending.gatewayInstallationHandle.flatMap { handle in
-        storedRecords.first {
-          $0.gatewayInstallationHandle == handle && $0.expiresAt > nowSeconds
-        }
+        storedRecords
+          .filter {
+            $0.gatewayOrigin == pending.gatewayOrigin
+              && $0.gatewayInstallationHandle == handle
+              && $0.relayPubkey == pending.relayPubkey
+              && $0.appProfile == pending.appProfile
+              && $0.expiresAt > nowSeconds
+          }
+          .max { $0.generation < $1.generation }
       }
       if let handleText = pending.gatewayInstallationHandle,
         let handle = UUID(uuidString: handleText),

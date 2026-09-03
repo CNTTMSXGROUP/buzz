@@ -588,7 +588,25 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       keyId: Self.keyId,
       delegationGeneration: 2
     )
-    let store = MemoryGrantStore(records: [existing], pending: [pending])
+    let unrelatedHigherGeneration = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://other-relay.example",
+      relayPubkey: newRelayPubkey,
+      relayMetadataPubkey: newRelayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: "101112131415161718191a1b1c1d1e1f",
+      endpointGrant: "other-relay-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 7,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore(
+      records: [unrelatedHigherGeneration, existing],
+      pending: [pending]
+    )
     let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
     var challengeRequests = 0
     var revokedGenerations: [Int] = []
@@ -648,7 +666,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     }
 
     XCTAssertEqual(revokedGenerations, [2, 1])
-    XCTAssertEqual(store.saved, [existing])
+    XCTAssertEqual(store.saved, [unrelatedHigherGeneration, existing])
     XCTAssertEqual(store.pending.count, 1)
     XCTAssertEqual(store.pending.first?.relayPubkey, newRelayPubkey)
     XCTAssertEqual(store.pending.first?.gatewayInstallationHandle, Self.installationHandle)

@@ -41,4 +41,11 @@ if [ -z "$dart_bin" ]; then
   echo "error: Dart is required to validate BUZZ_PUSH_GATEWAY_URL." >&2
   exit 1
 fi
-"$dart_bin" "$script_dir/validate_push_gateway_origin.dart" "$gateway_origin"
+case ${CONFIGURATION:-Release} in
+  Debug*)
+    "$dart_bin" "$script_dir/validate_push_gateway_origin.dart" "$gateway_origin"
+    ;;
+  *)
+    "$dart_bin" "$script_dir/validate_push_gateway_origin.dart" --require-https "$gateway_origin"
+    ;;
+esac

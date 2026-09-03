@@ -1,9 +1,13 @@
 import 'dart:io';
 
-bool isValidPushGatewayOrigin(String value) {
+bool isValidPushGatewayOrigin(String value, {bool requireHttps = false}) {
   try {
     final uri = Uri.parse(value);
-    if (uri.scheme != 'http' && uri.scheme != 'https') return false;
+    if (requireHttps
+        ? uri.scheme != 'https'
+        : uri.scheme != 'http' && uri.scheme != 'https') {
+      return false;
+    }
     if (!uri.hasAuthority || uri.host.isEmpty || uri.userInfo.isNotEmpty) {
       return false;
     }
@@ -17,11 +21,15 @@ bool isValidPushGatewayOrigin(String value) {
 }
 
 void main(List<String> arguments) {
-  if (arguments.length == 1 && isValidPushGatewayOrigin(arguments.single)) {
+  final requireHttps =
+      arguments.isNotEmpty && arguments.first == '--require-https';
+  final values = requireHttps ? arguments.skip(1).toList() : arguments;
+  if (values.length == 1 &&
+      isValidPushGatewayOrigin(values.single, requireHttps: requireHttps)) {
     return;
   }
   stderr.writeln(
-    'error: BUZZ_PUSH_GATEWAY_URL must be an HTTP(S) origin without credentials, path, query, or fragment.',
+    'error: BUZZ_PUSH_GATEWAY_URL must be ${requireHttps ? 'an HTTPS' : 'an HTTP(S)'} origin without credentials, path, query, or fragment.',
   );
   exitCode = 1;
 }

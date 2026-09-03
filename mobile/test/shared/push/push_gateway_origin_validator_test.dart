@@ -13,6 +13,17 @@ void main() {
     }
   });
 
+  test('requires HTTPS for release and profile builds', () {
+    expect(
+      isValidPushGatewayOrigin('https://push.example', requireHttps: true),
+      isTrue,
+    );
+    expect(
+      isValidPushGatewayOrigin('http://localhost:8080', requireHttps: true),
+      isFalse,
+    );
+  });
+
   test('rejects malformed or non-origin gateway URLs', () {
     for (final value in [
       '',

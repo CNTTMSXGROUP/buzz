@@ -31,10 +31,10 @@ val pushGatewayOrigins =
             ?.takeIf { it.startsWith(pushGatewayDefinePrefix) }
             ?.removePrefix(pushGatewayDefinePrefix)
     }
-fun isValidPushGatewayOrigin(value: String): Boolean {
+fun isValidPushGatewayOrigin(value: String, requireHttps: Boolean): Boolean {
     val uri = runCatching { URI(value) }.getOrNull() ?: return false
     val scheme = uri.scheme?.lowercase()
-    return (scheme == "http" || scheme == "https") &&
+    return (scheme == "https" || (!requireHttps && scheme == "http")) &&
         !uri.host.isNullOrBlank() &&
         uri.rawUserInfo == null &&
         (uri.rawPath.isNullOrEmpty() || uri.rawPath == "/") &&
@@ -42,14 +42,18 @@ fun isValidPushGatewayOrigin(value: String): Boolean {
         uri.rawFragment == null &&
         (uri.port == -1 || uri.port in 1..65535)
 }
-val hasValidPushGatewayOrigin =
-    pushGatewayOrigins.size == 1 && isValidPushGatewayOrigin(pushGatewayOrigins.single())
 
 tasks.matching { it.name.startsWith("compileFlutterBuild") }.configureEach {
     doFirst {
+        val requireHttps = !name.endsWith("Debug", ignoreCase = true)
+        val hasValidPushGatewayOrigin =
+            pushGatewayOrigins.size == 1 &&
+                isValidPushGatewayOrigin(pushGatewayOrigins.single(), requireHttps)
         if (!hasValidPushGatewayOrigin) {
             throw GradleException(
-                "BUZZ_PUSH_GATEWAY_URL must be supplied as an HTTP(S) origin without " +
+                "BUZZ_PUSH_GATEWAY_URL must be supplied as an " +
+                    (if (requireHttps) "HTTPS" else "HTTP(S)") +
+                    " origin without " +
                     "credentials, path, query, or fragment for every mobile build.",
             )
         }

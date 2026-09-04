@@ -1293,26 +1293,9 @@ export function createMarkdownComponents(
       );
     }
 
-    // MSX Brain token link: [nao:path] → chip mở panel Não tại file đó.
+    // MSX Brain token link: [nao:path] → chip mở panel Não tại file đó (từ mọi nơi).
     if (href && href.startsWith("msx-brain://open?file=")) {
-      const rel = decodeURIComponent(href.replace("msx-brain://open?file=", ""));
-      const fname = rel.split("/").pop() ?? rel;
-      return (
-        <button
-          type="button"
-          className="msx-brain-link inline-flex max-w-full items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-sm font-medium text-amber-700 align-baseline transition-colors hover:bg-amber-500/20 dark:text-amber-400"
-          title={`Mở trong Não MSX: ${rel}`}
-          onClick={(event) => {
-            event.stopPropagation();
-            window.dispatchEvent(
-              new CustomEvent("msx-brain-open-file", { detail: { rel } }),
-            );
-            window.dispatchEvent(new CustomEvent("msx-brain-activate"));
-          }}
-        >
-          📎 {fname}
-        </button>
-      );
+      return <MsxBrainChip href={href} />;
     }
     // Keep Buzz channel/message navigation in-app.
     if (href) {
@@ -1922,3 +1905,42 @@ export const Markdown = React.memo(
 );
 Markdown.displayName = "Markdown";
 export { SyntaxHighlightedCode } from "./markdown/CodeBlock";
+
+import { useRouter as MsxUseTanstackRouter } from "@tanstack/react-router";
+
+function MsxUseRouter() {
+  return { navigate: MsxUseTanstackRouter().navigate };
+}
+
+/** Chip file não: bấm từ bất kỳ đâu → lưu pending, navigate /msx-brain, panel tự mở file. */
+function MsxBrainChip({ href }: { href: string }) {
+  const rel = decodeURIComponent(href.replace("msx-brain://open?file=", ""));
+  const fname = rel.split("/").pop() ?? rel;
+  let navigate: { navigate: (opts: { to: string }) => Promise<void> } | null = null;
+  try {
+    navigate = MsxUseRouter();
+  } catch {
+    navigate = null;
+  }
+  return (
+    <button
+      type="button"
+      className="msx-brain-link inline-flex max-w-full items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 align-baseline text-sm font-medium text-amber-700 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+      title={`Mở trong Não MSX: ${rel}`}
+      onClick={(event) => {
+        event.stopPropagation();
+        try {
+          sessionStorage.setItem("msx-brain-pending", rel);
+        } catch {
+          /* ignore */
+        }
+        window.dispatchEvent(new CustomEvent("msx-brain-open-file", { detail: { rel } }));
+        if (navigate) {
+          void navigate.navigate({ to: "/msx-brain" }).catch(() => undefined);
+        }
+      }}
+    >
+      📎 {fname}
+    </button>
+  );
+}

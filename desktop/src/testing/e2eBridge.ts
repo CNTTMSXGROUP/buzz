@@ -11772,6 +11772,9 @@ export function maybeInstallE2eTauriMocks() {
         }
         return "# Demo\n\nnội dung demo não";
       }
+      case "brain_create_ghinhanh": {
+        return "1. Thu Thập/GHI NHANH — test.md";
+      }
       case "brain_create_nao": {
         const c = payload as { id?: string };
         return (c?.id ?? "kho-test").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 20) || "kho-test";

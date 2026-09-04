@@ -2,7 +2,7 @@ import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
-import { MSX_VAULT_ROOT_DEFAULT } from "@/features/msx-brain/lib/vaultRoot";
+import { getVaultRoot } from "@/features/msx-brain/lib/vaultRoot";
 import { useMyPubkey } from "@/features/msx-brain/lib/useMyPubkey";
 
 const BrainPanel = React.lazy(async () => {
@@ -18,7 +18,7 @@ function MsxBrainRouteComponent() {
   const pubkey = useMyPubkey();
   return (
     <React.Suspense fallback={<ViewLoadingFallback kind="agents" />}>
-      <BrainPanel vaultRoot={MSX_VAULT_ROOT_DEFAULT} myPubkey={pubkey} />
+      <BrainPanel vaultRoot={getVaultRoot()} myPubkey={pubkey} />
     </React.Suspense>
   );
 }

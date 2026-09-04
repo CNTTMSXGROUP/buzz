@@ -3,4 +3,5 @@ export type BrainEntry = {
   rel_path: string;
   is_dir: boolean;
   area: string;
+  mtime?: number;
 };

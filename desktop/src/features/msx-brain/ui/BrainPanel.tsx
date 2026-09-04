@@ -1,5 +1,5 @@
-import { Brain, Check, ChevronDown, File as FileIcon, FolderOpen, Send, Settings, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Brain, Check, ChevronDown, File as FileIcon, FolderOpen, Plus, Send, Settings, X } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
 import { sendApprove } from "../lib/approve";
 import { listShareableChannels, shareToChannel } from "../lib/shareToChannel";
 import { useBrainTabs } from "../lib/useBrainTabs";
@@ -16,6 +16,8 @@ export function BrainPanel({
 }) {
   const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoDefs, naoChon, setNaoChon, refresh, addNaoDef } =
     useBrainTabs(vaultRoot, myPubkey);
+  const openRef = React.useRef(open);
+  openRef.current = open;
   const [status, setStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
   const [shareNote, setShareNote] = useState("");
@@ -30,6 +32,9 @@ export function BrainPanel({
   });
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState("");
+  const [quickOpen, setQuickOpen] = useState(false);
+  const [quickTitle, setQuickTitle] = useState("");
+  const [quickBody, setQuickBody] = useState("");
   const shareRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -91,13 +96,21 @@ export function BrainPanel({
     }
   }
 
+  const [previewShare, setPreviewShare] = useState<{ channelId: string; channelName: string } | null>(null);
+
   async function handleShare(channelId: string, channelName: string) {
     if (!active) return;
     setShareOpen(false);
+    setPreviewShare({ channelId, channelName }); // xem trước trước khi gửi
+  }
+
+  async function confirmShare() {
+    if (!active || !previewShare) return;
     try {
-      await shareToChannel(channelId, active.name, active.content, { note: shareNote });
-      setStatus(`Đã gửi "${active.name}" vào #${channelName}.`);
+      await shareToChannel(previewShare.channelId, active.name, active.content, { note: shareNote });
+      setStatus(`Đã gửi "${active.name}" vào #${previewShare.channelName}.`);
       setShareNote("");
+      setPreviewShare(null);
     } catch (err) {
       setStatus(`Lỗi: ${String(err)}`);
     }
@@ -145,6 +158,15 @@ export function BrainPanel({
         )}
         <div className="flex-1" />
         {status && <span className="truncate text-xs text-muted-foreground">{status}</span>}
+        <button
+          type="button"
+          data-testid="msx-quick-button"
+          className="flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-accent"
+          onClick={() => setQuickOpen(true)}
+        >
+          <Plus className="h-3.5 w-3.5" />
+          Ghi nhanh
+        </button>
         <button
           type="button"
           aria-label="Quản trị phân quyền Não"
@@ -304,6 +326,99 @@ export function BrainPanel({
           </div>
         </div>
         </>
+      )}
+      {previewShare && active && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50">
+          <div className="flex max-h-[80vh] w-[32rem] max-w-[92vw] flex-col rounded-xl border bg-popover shadow-xl">
+            <div className="border-b px-4 py-2.5">
+              <div className="text-sm font-semibold">Xem trước khi gửi</div>
+              <div className="text-xs text-muted-foreground">
+                "{active.name}" → #{previewShare.channelName}
+              </div>
+            </div>
+            <div className="msx-md min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              <div className="mx-auto max-w-2xl text-sm">{active.content.slice(0, 3000)}</div>
+              {shareNote.trim() && (
+                <div className="mx-auto mt-2 max-w-2xl rounded-md bg-amber-500/10 px-3 py-2 text-sm">
+                  💬 {shareNote}
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 border-t px-4 py-2.5">
+              <button
+                type="button"
+                className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                onClick={() => setPreviewShare(null)}
+              >
+                Huỷ
+              </button>
+              <button
+                type="button"
+                data-testid="msx-share-confirm"
+                className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+                onClick={() => void confirmShare()}
+              >
+                Xác nhận gửi
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {quickOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50">
+          <div className="w-[28rem] max-w-[90vw] rounded-xl border bg-popover p-4 shadow-xl">
+            <div className="mb-2 text-sm font-semibold">Ghi nhanh vào {naoChon ? `não "${naoChon.id}"` : "não"}</div>
+            <input
+              autoFocus
+              value={quickTitle}
+              onChange={(ev) => setQuickTitle(ev.target.value)}
+              placeholder="Tiêu đề…"
+              className="mb-2 w-full rounded-md border bg-transparent px-2.5 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring"
+            />
+            <textarea
+              value={quickBody}
+              onChange={(ev) => setQuickBody(ev.target.value)}
+              placeholder="Nội dung…"
+              rows={5}
+              className="mb-3 w-full rounded-md border bg-transparent px-2.5 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                onClick={() => setQuickOpen(false)}
+              >
+                Huỷ
+              </button>
+              <button
+                type="button"
+                data-testid="msx-quick-save"
+                className="rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+                onClick={() => void (async () => {
+                  try {
+                    const { invoke } = await import("@tauri-apps/api/core");
+                    const naoPath = naoChon?.path ?? "";
+                    await invoke("brain_create_ghinhanh", {
+                      root: vaultRoot,
+                      naoRel: naoPath,
+                      title: quickTitle,
+                      body: quickBody,
+                    });
+                    setQuickOpen(false);
+                    setQuickTitle("");
+                    setQuickBody("");
+                    setStatus("Đã ghi nhanh vào 1. Thu Thập.");
+                    await refresh();
+                  } catch (err) {
+                    setStatus(`Lỗi: ${String(err)}`);
+                  }
+                })()}
+              >
+                Lưu vào Thu Thập
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

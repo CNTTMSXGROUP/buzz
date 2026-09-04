@@ -99,6 +99,41 @@ test("PICKER: search lọc file toàn não, breadcrumb quay lại", async ({ pag
   await expect(composer.getByText("📎 demo")).toBeVisible();
 });
 
+test("SHARE: xem trước trước khi gửi (modal preview + xác nhận)", async ({ page }) => {
+  await openBrain(page);
+  await page.locator("button[title='2. Tinh Lọc']").click();
+  await page.locator("button[title='demo.md']").click();
+  await page.getByTestId("msx-share-button").click();
+  await page.getByText("#marketing", { exact: true }).click();
+  await expect(page.getByText("Xem trước khi gửi")).toBeVisible();
+  await expect(page.getByText("nội dung demo não")).toBeVisible();
+  await page.getByTestId("msx-share-confirm").click();
+});
+
+test("QUICK: nút Ghi nhanh mở dialog, lưu vào Thu Thập", async ({ page }) => {
+  await openBrain(page);
+  await page.getByTestId("msx-quick-button").click();
+  await page.locator("input[placeholder='Tiêu đề…']").fill("Ghi nhanh test e2e");
+  await page.locator("textarea[placeholder='Nội dung…']").fill("nội dung test");
+  await page.getByTestId("msx-quick-save").click();
+});
+
+test("SEARCH PANEL: tìm trong não ngay trên cây", async ({ page }) => {
+  await openBrain(page);
+  await page.getByPlaceholder("Tìm trong não…").fill("demo");
+  await expect(page.getByText("demo.md")).toBeVisible();
+  await expect(page.getByText("notes.txt")).toHaveCount(0);
+});
+
+test("CHIP: bấm chip trong preview mở đúng file (event bus)", async ({ page }) => {
+  await openBrain(page);
+  // chip mở file qua event msx-brain-open-file — panel đã nghe (không cần navigate)
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent("msx-brain-open-file", { detail: { rel: "2. Tinh Lọc/demo.md" } }));
+  });
+  await expect(page.getByText("nội dung demo não")).toBeVisible();
+});
+
 test("chuột phải tên Não MSX hiện input đổi tên", async ({ page }) => {
   await openBrain(page);
   const title = page.locator("span.select-none", { hasText: "Não MSX" });

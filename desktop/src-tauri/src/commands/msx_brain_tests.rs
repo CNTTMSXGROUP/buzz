@@ -119,6 +119,20 @@ fn test_create_nao_validate_va_tao_pipeline() {
 }
 
 #[test]
+fn test_create_ghinhanh_chi_trong_thu_thap() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("Nao Bo Phan/mkt/1. Thu Thập")).unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
+    // ok
+    let rel = super::brain_create_ghinhanh(root.clone(), "Nao Bo Phan/mkt".into(), "Kế hoạch A".into(), "nội dung".into()).unwrap();
+    assert!(rel.ends_with("GHI NHANH — Kế hoạch A.md"));
+    // trùng -> từ chối
+    assert!(super::brain_create_ghinhanh(root.clone(), "Nao Bo Phan/mkt".into(), "Kế hoạch A".into(), "x".into()).is_err());
+    // traversal -> từ chối
+    assert!(super::brain_create_ghinhanh(root, "../ngoai".into(), "T".into(), "x".into()).is_err());
+}
+
+#[test]
 #[ignore] // chạy manual: cargo test verify_real_vault -- --ignored (cần vault thật trên máy)
 fn verify_real_vault() {
     let root = "/Users/qthang/Library/CloudStorage/GoogleDrive-aios.msxgroup@gmail.com/Drive của tôi/MSXGROUP_AIOS_BRAIN";

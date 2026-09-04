@@ -19,6 +19,7 @@ pub struct BrainEntry {
     pub rel_path: String,
     pub is_dir: bool,
     pub area: String,
+    pub mtime: u64,
 }
 
 /// Thư mục ẩn khỏi cây (không phải cấm đọc — `_meta` cần cho config/app).
@@ -103,11 +104,19 @@ fn walk(root: &Path, dir: &Path, khu: &str, out: &mut Vec<BrainEntry>) {
         if !khu_ok(&rel, khu) {
             continue;
         }
+        let mtime = p
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         out.push(BrainEntry {
             name: name.clone(),
             rel_path: rel.clone(),
             is_dir,
             area: first_area(&rel),
+            mtime,
         });
         if is_dir {
             walk(root, &p, khu, out);
@@ -272,6 +281,48 @@ pub fn brain_create_nao(root: String, id: String, parent_rel: String) -> Result<
     fs::write(&meta_path, serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     Ok(clean)
+}
+
+
+/// Tạo GHI NHANH trong `*/1. Thu Thập/` của não (đường dẫn tương đối từ root).
+/// Chỉ cho phép ghi đúng mẫu `GHI NHANH — <slug>.md`, slug ASCII-hoá an toàn.
+#[tauri::command]
+pub fn brain_create_ghinhanh(root: String, nao_rel: String, title: String, body: String) -> Result<String, String> {
+    let root_canon = Path::new(&root).canonicalize().map_err(|e| e.to_string())?;
+    let dir_canon = root_canon.join(&nao_rel).join("1. Thu Thập").canonicalize().unwrap_or_else(|_| root_canon.join(&nao_rel).join("1. Thu Thập"));
+    if !dir_canon.starts_with(&root_canon) {
+        return Err("forbidden".into());
+    }
+    fs::create_dir_all(&dir_canon).map_err(|e| e.to_string())?;
+    let slug: String = title
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect::<String>()
+        .chars()
+        .take(60)
+        .collect();
+    if slug.is_empty() {
+        return Err("Tiêu đề trống".into());
+    }
+    let now = chrono::Local::now();
+    let fname = format!("GHI NHANH — {slug}.md");
+    let full = dir_canon.join(&fname);
+    if full.exists() {
+        return Err(format!("Đã có \"{fname}\""));
+    }
+    let content = format!(
+        "---\ncreated: {}\nloai: ghi-nhanh\ntrang-thai: chua-xu-ly\ntags: [thu-thap, tu-app]\n---\n# {}\n\n{}\n",
+        now.format("%Y-%m-%d"),
+        title.trim(),
+        body.trim()
+    );
+    fs::write(&full, content).map_err(|e| e.to_string())?;
+    Ok(full
+        .strip_prefix(&root_canon)
+        .unwrap_or(&full)
+        .to_string_lossy()
+        .replace('\\', "/"))
 }
 
 #[path = "msx_brain_tests.rs"]

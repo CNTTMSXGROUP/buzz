@@ -526,6 +526,7 @@ pub fn run() {
             commands::msx_brain::brain_write_meta,
             commands::msx_brain::brain_read_bytes,
             commands::msx_brain::brain_create_nao,
+            commands::msx_brain::brain_create_ghinhanh,
             commands::msx_brain::brain_stat,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,

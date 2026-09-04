@@ -1,4 +1,5 @@
-import { Pencil, Plus, Save, Trash2 } from "lucide-react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { FolderOpen, Pencil, Plus, Save, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { loadNaoCon } from "../lib/useBrainTabs";
@@ -45,11 +46,24 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
   const [status, setStatus] = useState<string | null>(null);
   const [isOwner, setIsOwner] = useState(false);
   const [newNao, setNewNao] = useState("");
+  const [newNaoParent, setNewNaoParent] = useState("Nao Bo Phan");
+  const [dirChoices, setDirChoices] = useState<string[]>(["Nao Bo Phan"]);
 
   async function reload() {
     const [loaded, nao] = await Promise.all([readMeta(vaultRoot), loadNaoCon(vaultRoot)]);
     setCfg(loaded);
     setNaoList(nao);
+    // thư mục ứng viên đặt não: root + Nao Bo Phan + các thư mục cấp 1
+    try {
+      const all = await invoke<Array<{ rel_path: string; is_dir: boolean }>>("brain_list_tree", {
+        root: vaultRoot,
+        khu: "*",
+      });
+      const dirs = all.filter((e) => e.is_dir && !e.rel_path.includes("/")).map((e) => e.rel_path);
+      setDirChoices(["", ...dirs]);
+    } catch {
+      /* giữ mặc định */
+    }
     const me = loaded?.nguoi?.find((u) => u.pubkey === myPubkey);
     setIsOwner(me?.vai_tro === "chu");
   }
@@ -60,11 +74,34 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
 
   async function handleCreateNao() {
     try {
-      const created = await invoke<string>("brain_create_nao", { root: vaultRoot, id: newNao });
+      const created = await invoke<string>("brain_create_nao", {
+        root: vaultRoot,
+        id: newNao,
+        parentRel: newNaoParent,
+      });
       setNewNao("");
       await reload();
       setStatus(`Đã tạo não con "${created}" — tick chọn cho người cần xem.`);
       window.dispatchEvent(new CustomEvent("msx-brain-nao-added", { detail: { id: created } }));
+    } catch (err) {
+      setStatus(`Lỗi: ${String(err)}`);
+    }
+  }
+
+  async function handlePickFolder() {
+    try {
+      const picked = await openDialog({ directory: true, multiple: false, title: "Chọn thư mục chứa não con", defaultPath: vaultRoot });
+      if (typeof picked !== "string") return;
+      // chỉ chấp nhận folder nằm trong vault
+      const norm = picked.replace(/\\/g, "/");
+      const root = vaultRoot.replace(/\\/g, "/");
+      if (norm === root) {
+        setNewNaoParent("");
+      } else if (norm.startsWith(root + "/")) {
+        setNewNaoParent(norm.slice(root.length + 1));
+      } else {
+        setStatus("Thư mục phải nằm trong vault Não chủ.");
+      }
     } catch (err) {
       setStatus(`Lỗi: ${String(err)}`);
     }
@@ -125,6 +162,29 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
               if (ev.key === "Enter") void handleCreateNao();
             }}
           />
+          <select
+            className="max-w-44 rounded border bg-transparent px-1.5 py-1 text-xs"
+            value={newNaoParent}
+            onChange={(ev) => setNewNaoParent(ev.target.value)}
+            title="Thư mục cha đặt não con (trong vault)"
+          >
+            <option value="">— gốc vault —</option>
+            {dirChoices
+              .filter((d) => d !== "")
+              .map((d) => (
+                <option key={d} value={d}>
+                  trong {d}
+                </option>
+              ))}
+          </select>
+          <button
+            type="button"
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            onClick={() => void handlePickFolder()}
+            title="Mở hộp thoại chọn thư mục trong vault"
+          >
+            <FolderOpen className="h-3.5 w-3.5" /> Chọn folder…
+          </button>
           <button
             type="button"
             className="flex items-center gap-1 rounded-md bg-amber-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-700"

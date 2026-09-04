@@ -961,7 +961,13 @@ function MessageComposerImpl({
                       richText.editor
                         ?.chain()
                         .focus()
-                        .insertContent(`[nao:${entry.rel_path}]`)
+                        .insertContent({
+                          type: "naoFile",
+                          attrs: {
+                            relPath: entry.rel_path,
+                            name: entry.name.replace(/\.md$/i, ""),
+                          },
+                        })
                         .run()
                     }
                   />

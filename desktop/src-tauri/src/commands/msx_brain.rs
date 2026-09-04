@@ -60,13 +60,17 @@ pub fn khu_ok(rel_path: &str, khu: &str) -> bool {
     if common {
         return true;
     }
-    // nhiều não con / khu: "chung,mkt" — khớp prefix "Nao Bo Phan/<ten>/"
+    // nhiều não / khu: "chung,mkt" hoặc prefix thật "4. Kiến Tạo/..."
     for k in khu.split(',') {
         let k = k.trim();
         if k.is_empty() {
             continue;
         }
-        if rel_path.starts_with(k) || rel_path.starts_with(&format!("Nao Bo Phan/{k}/")) {
+        if rel_path == k || rel_path.starts_with(&format!("{k}/")) {
+            return true;
+        }
+        // back-compat id não cũ -> Nao Bo Phan/<id>/
+        if rel_path.starts_with(&format!("Nao Bo Phan/{k}/")) {
             return true;
         }
     }
@@ -207,7 +211,7 @@ pub struct BrainStat {
 /// Tạo não con mới: chỉ cho id `a-z0-9-` ≤ 20 ký tự, tạo đúng 3 file mẫu
 /// (README + .keep hai thư mục pipeline), update `danh_sach` trong config.
 #[tauri::command]
-pub fn brain_create_nao(root: String, id: String) -> Result<String, String> {
+pub fn brain_create_nao(root: String, id: String, parent_rel: String) -> Result<String, String> {
     let clean: String = id
         .trim()
         .to_lowercase()
@@ -221,7 +225,13 @@ pub fn brain_create_nao(root: String, id: String) -> Result<String, String> {
         return Err("Tên não phải có ít nhất 1 chữ cái/số (a-z, 0-9, -)".into());
     }
     let root_canon = Path::new(&root).canonicalize().map_err(|e| e.to_string())?;
-    let nao_dir = root_canon.join("Nao Bo Phan").join(&clean);
+    // parent phải là thư mục hợp lệ NẰM TRONG root (chống traversal)
+    let parent_canon = root_canon.join(&parent_rel).canonicalize().map_err(|_| "Thư mục cha không hợp lệ".to_string())?;
+    if !parent_canon.starts_with(&root_canon) || !parent_canon.is_dir() {
+        return Err("Thư mục cha không hợp lệ".to_string());
+    }
+    let rel_parent = parent_canon.strip_prefix(&root_canon).unwrap().to_string_lossy().replace('\\', "/");
+    let nao_dir = parent_canon.join(&clean);
     if nao_dir.exists() {
         return Err(format!("Não \"{clean}\" đã có"));
     }
@@ -244,8 +254,20 @@ pub fn brain_create_nao(root: String, id: String) -> Result<String, String> {
         .pointer_mut("/nao_con/danh_sach")
         .and_then(|v| v.as_array_mut())
         .ok_or("config thiếu nao_con.danh_sach".to_string())?;
-    if !list.iter().any(|v| v.as_str() == Some(clean.as_str())) {
-        list.push(serde_json::Value::String(clean.clone()));
+    let rel_path = if rel_parent.is_empty() {
+        clean.clone()
+    } else {
+        format!("{rel_parent}/{clean}")
+    };
+    let exists = list.iter().any(|v| {
+        v.as_str() == Some(clean.as_str())
+            || v.get("id").and_then(|x| x.as_str()) == Some(clean.as_str())
+    });
+    if !exists {
+        let mut m = serde_json::Map::new();
+        m.insert("id".into(), serde_json::Value::String(clean.clone()));
+        m.insert("path".into(), serde_json::Value::String(rel_path));
+        list.push(serde_json::Value::Object(m));
     }
     fs::write(&meta_path, serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;

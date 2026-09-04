@@ -1,6 +1,7 @@
 import { ChevronDown, ChevronRight, File, Folder } from "lucide-react";
 import { Fragment, useState } from "react";
 import type { BrainEntry } from "../types";
+import { filterByNao, type NaoDef } from "../lib/naoDefs";
 
 type TreeProps = {
   entry: BrainEntry;
@@ -47,22 +48,15 @@ export function FileTree({
   selectedPath,
   onOpen,
   naoChon,
+  allPaths,
 }: {
   entries: BrainEntry[];
   selectedPath: string | null;
   onOpen: (e: BrainEntry) => void;
-  naoChon?: string | null;
+  naoChon: NaoDef | null;
+  allPaths: string[];
 }) {
-  // lọc theo não con đang chọn: chỉ hiện "Nao Bo Phan/<naoChon>/..." + mọi thứ ngoài Nao Bo Phan
-  const visible = naoChon
-    ? entries.filter(
-        (e) =>
-          !e.rel_path.startsWith("Nao Bo Phan/") ||
-          e.rel_path.startsWith(`Nao Bo Phan/${naoChon}/`) ||
-          e.rel_path === "Nao Bo Phan" ||
-          e.rel_path === `Nao Bo Phan/${naoChon}`,
-      )
-    : entries;
+  const visible = filterByNao(entries, naoChon, allPaths);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const byParent = new Map<string, BrainEntry[]>();

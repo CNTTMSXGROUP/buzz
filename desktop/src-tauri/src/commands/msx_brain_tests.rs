@@ -92,22 +92,30 @@ fn test_write_meta_chi_ghi_dung_file_va_validate_json() {
 fn test_create_nao_validate_va_tao_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir_all(tmp.path().join("_meta")).unwrap();
+    fs::create_dir_all(tmp.path().join("Nao Bo Phan")).unwrap();
     fs::write(
         tmp.path().join("_meta/nguoi-dung.json"),
         r#"{"nguoi":[], "nao_con": {"danh_sach": ["chung"]}}"#,
     )
     .unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
     // tên rỗng -> từ chối
-    assert!(super::brain_create_nao(tmp.path().to_string_lossy().to_string(), "!!!".into()).is_err());
-    // tạo ok
-    // "Kho Vận" -> slug ASCII "khovn" (bỏ dấu cách + ký tự lạ — hành vi đúng an toàn)
-    let ok = super::brain_create_nao(tmp.path().to_string_lossy().to_string(), "Kho Vận".into());
-    assert_eq!(ok.unwrap(), "khovn");
+    assert!(super::brain_create_nao(root.clone(), "!!!".into(), "".into()).is_err());
+    // "Kho Vận" -> slug ASCII "khovn", tạo trong Nao Bo Phan
+    assert_eq!(
+        super::brain_create_nao(root.clone(), "Kho Vận".into(), "Nao Bo Phan".into()).unwrap(),
+        "khovn"
+    );
     assert!(tmp.path().join("Nao Bo Phan/khovn/1. Thu Thập").is_dir());
     assert!(tmp.path().join("Nao Bo Phan/khovn/2. Tinh Lọc/Kiến Thức Nguồn").is_dir());
     assert!(tmp.path().join("Nao Bo Phan/khovn/README.md").exists());
     // tạo trùng -> từ chối
-    assert!(super::brain_create_nao(tmp.path().to_string_lossy().to_string(), "khovn".into()).is_err());
+    assert!(super::brain_create_nao(root.clone(), "khovn".into(), "Nao Bo Phan".into()).is_err());
+    // parent ngoài root -> từ chối (traversal)
+    assert!(super::brain_create_nao(root.clone(), "x".into(), "../ngoai".into()).is_err());
+    // config đã thêm {id, path}
+    let raw = fs::read_to_string(tmp.path().join("_meta/nguoi-dung.json")).unwrap();
+    assert!(raw.contains("Nao Bo Phan/khovn"));
 }
 
 #[test]

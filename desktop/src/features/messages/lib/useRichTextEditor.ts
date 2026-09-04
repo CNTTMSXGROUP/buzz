@@ -3,6 +3,7 @@ import * as React from "react";
 import { Markdown as TiptapMarkdown } from "tiptap-markdown";
 import { useEditor, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { NaoFileNode } from "@/features/msx-brain/lib/naoFileNode";
 import Placeholder from "@tiptap/extension-placeholder";
 import Link from "@tiptap/extension-link";
 import { Extension, type KeyboardShortcutCommand } from "@tiptap/core";
@@ -217,6 +218,8 @@ export function useRichTextEditor({
           // below with custom options (autolink, openOnClick, etc.).
           link: false,
         }),
+        // MSX Brain: chip đính kèm file não trong composer.
+        NaoFileNode,
         // macOS text fields traditionally support a small set of Emacs-style
         // Control shortcuts. Keep movement and kill-line scoped to the current
         // hard-break-delimited line rather than the whole ProseMirror block.

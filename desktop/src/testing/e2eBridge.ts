@@ -11767,9 +11767,21 @@ export function maybeInstallE2eTauriMocks() {
           return JSON.stringify({
             vai_tro: { chu: { doc: ["*"], ghi: ["*"], duyet: true } },
             nguoi: [{ ten: "E2E Owner", pubkey: MOCK_IDENTITY_PUBKEY, vai_tro: "chu", khu: "*" }],
+            nao_con: { danh_sach: [{ id: "chung", path: "Nao" }, { id: "mkt", path: "Nao Bo Phan/mkt" }] },
           });
         }
         return "# Demo\n\nnội dung demo não";
+      }
+      case "brain_create_nao": {
+        const c = payload as { id?: string };
+        return (c?.id ?? "kho-test").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 20) || "kho-test";
+      }
+      case "brain_read_bytes": {
+        const q = payload as { relPath?: string };
+        if (q?.relPath === "1. Thu Thập/ảnh.png") {
+          return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        }
+        return "";
       }
       case "brain_stat": {
         return { size: 123, is_dir: false };

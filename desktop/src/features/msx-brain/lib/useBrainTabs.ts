@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { BrainEntry } from "../types";
 import { loadBrainRole } from "./permissions";
+import { loadNaoDefs, type NaoDef } from "./naoDefs";
 
 export type BrainTab = {
   relPath: string;
@@ -25,20 +26,10 @@ export function kindOf(name: string): BrainTab["kind"] {
   return "other";
 }
 
-/** Danh sách não con từ config (fallback mặc định). */
+/** Danh sách não từ config — giữ export cũ cho tương thích. */
 export async function loadNaoCon(root: string): Promise<string[]> {
-  try {
-    const raw = await invoke<string>("brain_read_file", {
-      root,
-      relPath: "_meta/nguoi-dung.json",
-      khu: "*",
-    });
-    const cfg = JSON.parse(raw) as { nao_con?: { danh_sach?: string[] } };
-    if (cfg.nao_con?.danh_sach?.length) return cfg.nao_con.danh_sach;
-  } catch {
-    /* fallback */
-  }
-  return ["chung", "mkt", "tech", "sale"];
+  const defs = await loadNaoDefs(root);
+  return defs.map((d) => d.id);
 }
 
 export function useBrainTabs(vaultRoot: string, myPubkey: string) {
@@ -46,16 +37,17 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
   const [tabs, setTabs] = useState<BrainTab[]>([]);
   const [activePath, setActivePath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [naoCon, setNaoCon] = useState<string[]>([]);
-  const [naoChon, setNaoChon] = useState<string>("chung");
+  const [naoDefs, setNaoDefs] = useState<NaoDef[]>([]);
+  const [naoChon, setNaoChon] = useState<NaoDef | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [role, nao] = await Promise.all([
+      const [role, defs] = await Promise.all([
         loadBrainRole(vaultRoot, myPubkey),
-        loadNaoCon(vaultRoot),
+        loadNaoDefs(vaultRoot),
       ]);
-      setNaoCon(nao);
+      setNaoDefs(defs);
+      setNaoChon((prev) => prev ?? defs[0] ?? null);
       const khu = role?.khu ?? "__khong_co_quyen__";
       setEntries(await invoke<BrainEntry[]>("brain_list_tree", { root: vaultRoot, khu }));
       setError(null);
@@ -146,8 +138,16 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
     openByName,
     refresh,
     setActivePath,
-    naoCon,
+    naoCon: defs0(defsSafe()),
+    naoDefs,
     naoChon,
     setNaoChon,
   };
+
+  function defsSafe(): NaoDef[] {
+    return naoDefs;
+  }
+  function defs0(d: NaoDef[]): string[] {
+    return d.map((x) => x.id);
+  }
 }

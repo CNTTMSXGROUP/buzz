@@ -55,7 +55,9 @@ test("nút 🧠 trong composer mở picker não, chọn file chèn token [nao:]"
   await page.getByText("2. Tinh Lọc").click();
   await page.getByText("demo.md").click();
   const composer = page.getByTestId("message-composer").locator(".ProseMirror");
-  await expect(composer).toContainText("[nao:2. Tinh Lọc/demo.md]");
+  // chip TipTap gọn "📎 demo" (không còn token text dài) — data attr giữ relPath
+  await expect(composer.getByText("📎 demo")).toBeVisible();
+  await expect(composer.locator('[data-naofile][data-rel-path="2. Tinh Lọc/demo.md"]')).toBeVisible();
 });
 
 test("PICKER: menu chọn file nằm trong viewport, không tràn phải", async ({ page }) => {
@@ -77,7 +79,9 @@ test("PICKER: menu chọn file nằm trong viewport, không tràn phải", async
   await page.getByText("2. Tinh Lọc").click();
   await page.getByText("demo.md").click();
   const composer = page.getByTestId("message-composer").locator(".ProseMirror");
-  await expect(composer).toContainText("[nao:2. Tinh Lọc/demo.md]");
+  // chip TipTap gọn "📎 demo" (không còn token text dài) — data attr giữ relPath
+  await expect(composer.getByText("📎 demo")).toBeVisible();
+  await expect(composer.locator('[data-naofile][data-rel-path="2. Tinh Lọc/demo.md"]')).toBeVisible();
 });
 
 test("chuột phải tên Não MSX hiện input đổi tên", async ({ page }) => {
@@ -167,9 +171,10 @@ test("VSCode: mở md + txt → 2 tab, chuyển + đóng tab", async ({ page }) 
   await page.getByText("demo.md").click();
   await page.getByText("1. Thu Thập").click();
   await page.getByText("notes.txt").click();
-  // 2 tab
-  await expect(page.getByRole("button", { name: "demo.md" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "notes.txt" })).toBeVisible();
+  // 2 tab trong tab bar
+  const tabbar = page.locator("div.border-b.bg-muted\/30, div:has(> div.group.flex)");
+  await expect(page.getByRole("button", { name: "demo.md", exact: true }).nth(1)).toBeVisible();
+  await expect(page.getByRole("button", { name: "notes.txt", exact: true }).nth(1)).toBeVisible();
   // nội dung text viewer
   await expect(page.getByText("dòng 1 ghi chú")).toBeVisible();
   // đóng tab active → quay về tab còn lại

@@ -14,7 +14,7 @@ export function BrainPanel({
   vaultRoot: string;
   myPubkey: string;
 }) {
-  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoCon, naoChon, setNaoChon, refresh } =
+  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoDefs, naoChon, setNaoChon, refresh } =
     useBrainTabs(vaultRoot, myPubkey);
   const [status, setStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
@@ -42,11 +42,9 @@ export function BrainPanel({
 
   // chip [nao:...] / [[wiki]] từ tin nhắn hoặc preview → mở tab
   useEffect(() => {
-    function onNaoAdded(ev: Event) {
-      const id = (ev as CustomEvent<{ id: string }>).detail?.id;
-      void refresh().then(() => {
-        if (id) setNaoChon(id);
-      });
+    function onNaoAdded() {
+      // refresh: chip bar hiện não mới; naoChon giữ nguyên (user bấm chọn)
+      void refresh();
     }
     window.addEventListener("msx-brain-nao-added", onNaoAdded);
     async function onOpenFile(ev: Event) {
@@ -212,18 +210,19 @@ export function BrainPanel({
         <>
         <div className="flex items-center gap-1.5 border-b px-3 py-1.5">
           <span className="text-xs text-muted-foreground">Não con:</span>
-          {naoCon.map((n) => (
+          {naoDefs.map((d) => (
             <button
-              key={n}
+              key={d.id}
               type="button"
+              title={d.path}
               className={`rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors ${
-                naoChon === n
+                naoChon?.id === d.id
                   ? "bg-amber-500/20 text-amber-700 dark:text-amber-400"
                   : "text-muted-foreground hover:bg-accent"
               }`}
-              onClick={() => setNaoChon(n)}
+              onClick={() => setNaoChon(d)}
             >
-              {n}
+              🧠 {d.id}
             </button>
           ))}
         </div>
@@ -234,6 +233,7 @@ export function BrainPanel({
               selectedPath={activePath}
               onOpen={(e) => void open(e.rel_path)}
               naoChon={naoChon}
+              allPaths={naoDefs.map((d) => d.path)}
             />
           </div>
           <div className="flex min-w-0 flex-1 flex-col overflow-hidden">

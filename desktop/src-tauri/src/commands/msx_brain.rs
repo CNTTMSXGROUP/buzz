@@ -325,5 +325,72 @@ pub fn brain_create_ghinhanh(root: String, nao_rel: String, title: String, body:
         .replace('\\', "/"))
 }
 
+
+#[derive(Serialize)]
+pub struct BrainHit {
+    pub rel_path: String,
+    pub name: String,
+    pub snippet: String,
+}
+
+/// Tìm chuỗi trong nội dung file text của não (giới hạn 50 kết quả, mỗi file 200KB).
+#[tauri::command]
+pub fn brain_search(root: String, khu: String, query: String) -> Result<Vec<BrainHit>, String> {
+    let q = query.trim().to_lowercase();
+    if q.len() < 2 {
+        return Ok(vec![]);
+    }
+    let root_canon = Path::new(&root).canonicalize().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    search_dir(&root_canon, &root_canon, &khu, &q, &mut out);
+    out.truncate(50);
+    Ok(out)
+}
+
+fn search_dir(root: &Path, dir: &Path, khu: &str, q: &str, out: &mut Vec<BrainHit>) {
+    if out.len() >= 50 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        if out.len() >= 50 {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if BLOCKED_DIRS.contains(&name.as_str()) || HIDDEN_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let p = entry.path();
+        let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+        if p.is_dir() {
+            search_dir(root, &p, khu, q, out);
+            continue;
+        }
+        let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+        if !matches!(ext.as_str(), "md" | "markdown" | "txt" | "json" | "yaml" | "yml" | "canvas") {
+            continue;
+        }
+        if !khu_ok(&rel, khu) || !can_read(&rel) {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&p) else { continue };
+        if meta.len() > 200_000 {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&p) else { continue };
+        let lower = text.to_lowercase();
+        if let Some(pos) = lower.find(q) {
+            let start = pos.saturating_sub(60);
+            let end = (pos + q.len() + 60).min(text.len());
+            let mut snippet: String = text.get(start..end).unwrap_or("").chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            snippet = snippet.replace('\n', " ");
+            let name_owned = name.clone();
+            out.push(BrainHit { rel_path: rel, name: name_owned, snippet: snippet.trim().to_string() });
+        }
+    }
+}
+
 #[path = "msx_brain_tests.rs"]
 mod tests;

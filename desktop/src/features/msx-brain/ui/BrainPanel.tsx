@@ -1,4 +1,4 @@
-import { Brain, Check, ChevronDown, File as FileIcon, FolderOpen, Plus, Send, Settings, X } from "lucide-react";
+import { Brain, Check, ChevronDown, File as FileIcon, FolderOpen, Plus, RefreshCw, Send, Settings, X } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import { sendApprove } from "../lib/approve";
 import { listShareableChannels, shareToChannel } from "../lib/shareToChannel";
@@ -14,7 +14,7 @@ export function BrainPanel({
   vaultRoot: string;
   myPubkey: string;
 }) {
-  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoDefs, naoChon, setNaoChon, refresh, addNaoDef } =
+  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoDefs, naoChon, setNaoChon, refresh, addNaoDef, khu } =
     useBrainTabs(vaultRoot, myPubkey);
   const openRef = React.useRef(open);
   openRef.current = open;
@@ -160,6 +160,15 @@ export function BrainPanel({
         {status && <span className="truncate text-xs text-muted-foreground">{status}</span>}
         <button
           type="button"
+          aria-label="Tải lại cây thư mục"
+          data-testid="msx-refresh-button"
+          className="rounded-md p-1.5 transition-colors hover:bg-accent"
+          onClick={() => void refresh()}
+        >
+          <RefreshCw className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
           data-testid="msx-quick-button"
           className="flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-accent"
           onClick={() => setQuickOpen(true)}
@@ -257,6 +266,8 @@ export function BrainPanel({
               onOpen={(e) => void open(e.rel_path)}
               naoChon={naoChon}
               allPaths={naoDefs.map((d) => d.path)}
+              vaultRoot={vaultRoot}
+              khu={khu}
             />
           </div>
           <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -398,17 +409,33 @@ export function BrainPanel({
                   try {
                     const { invoke } = await import("@tauri-apps/api/core");
                     const naoPath = naoChon?.path ?? "";
-                    await invoke("brain_create_ghinhanh", {
+                    const rel = await invoke<string>("brain_create_ghinhanh", {
                       root: vaultRoot,
                       naoRel: naoPath,
                       title: quickTitle,
                       body: quickBody,
                     });
                     setQuickOpen(false);
+                    setStatus(`Đã ghi nhanh vào 1. Thu Thập (${rel}).`);
                     setQuickTitle("");
                     setQuickBody("");
-                    setStatus("Đã ghi nhanh vào 1. Thu Thập.");
                     await refresh();
+                    // báo cho sếp biết để duyệt
+                    try {
+                      const { listShareableChannels } = await import("../lib/shareToChannel");
+                      const { sendChannelMessage } = await import("@/shared/api/tauriMessages");
+                      const channels = await listShareableChannels();
+                      const dh = channels.find((c) => c.name === "dieu-hanh");
+                      if (dh) {
+                        const who = myPubkey ? myPubkey.slice(0, 8) : "app";
+                        await sendChannelMessage(
+                          dh.id,
+                          `📥 Ghi nhanh mới từ app (bởi ${who}): **${quickTitle}** — vào não "${naoChon?.id ?? ""}". Sếp gõ \`!duyet ${quickTitle}\` để duyệt.`,
+                        );
+                      }
+                    } catch {
+                      /* báo kênh là phụ — file đã lưu là chính */
+                    }
                   } catch (err) {
                     setStatus(`Lỗi: ${String(err)}`);
                   }

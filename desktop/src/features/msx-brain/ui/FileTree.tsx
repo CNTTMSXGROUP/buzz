@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, File, Folder, Search } from "lucide-react";
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import type { BrainEntry } from "../types";
 import { filterByNao, type NaoDef } from "../lib/naoDefs";
 
@@ -57,19 +57,48 @@ export function FileTree({
   onOpen,
   naoChon,
   allPaths,
+  vaultRoot,
+  khu,
 }: {
   entries: BrainEntry[];
   selectedPath: string | null;
   onOpen: (e: BrainEntry) => void;
   naoChon: NaoDef | null;
   allPaths: string[];
+  vaultRoot: string;
+  khu: string;
 }) {
+  const [mode, setMode] = useState<"ten" | "noidung">("ten");
+  const [hits, setHits] = useState<Array<{ rel_path: string; name: string; snippet: string }> | null>(null);
+  const [searching, setSearching] = useState(false);
   const [query, setQuery] = useState("");
   const visible = filterByNao(entries, naoChon, allPaths);
   const q = query.trim().toLowerCase();
-  const searched = q
+  const searched = q && mode === "ten"
     ? visible.filter((e) => !e.is_dir && e.name.toLowerCase().includes(q)).slice(0, 40)
     : null;
+
+  useEffect(() => {
+    if (mode !== "noidung" || q.length < 2) {
+      setHits(null);
+      return;
+    }
+    setSearching(true);
+    const t = setTimeout(() => {
+      import("@tauri-apps/api/core")
+        .then(({ invoke }) =>
+          invoke<Array<{ rel_path: string; name: string; snippet: string }>>("brain_search", {
+            root: vaultRoot,
+            khu,
+            query: query.trim(),
+          }),
+        )
+        .then((r) => setHits(r))
+        .catch(() => setHits([]))
+        .finally(() => setSearching(false));
+    }, 350);
+    return () => clearTimeout(t);
+  }, [query, mode, vaultRoot, khu]);
   const recent = useMemo(() => {
     if (q) return [];
     return visible
@@ -113,9 +142,106 @@ export function FileTree({
     ));
   }
 
+  const showSearch = q.length > 0;
+  const showContent = mode === "noidung" && showSearch;
+
+  function renderSearchName() {
+    if (!searched || !searched.length) {
+      return <div className="p-4 text-sm text-muted-foreground">Không thấy "{query}"</div>;
+    }
+    return (
+      <>
+        {searched.map((e) => (
+          <button
+            key={e.rel_path}
+            type="button"
+            onClick={() => onOpen(e)}
+            className="flex w-full min-w-0 items-center gap-1.5 truncate rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent"
+            title={e.rel_path}
+          >
+            <File className="h-4 w-4 shrink-0 text-sky-500" />
+            <span className="min-w-0 flex-1 truncate">{e.name}</span>
+            <span className="shrink-0 truncate text-[11px] text-muted-foreground">{parentLabel(e.rel_path)}</span>
+          </button>
+        ))}
+      </>
+    );
+  }
+
+  function renderSearchContent() {
+    if (searching) {
+      return <div className="p-4 text-sm text-muted-foreground">Đang tìm…</div>;
+    }
+    if (!hits?.length) {
+      return <div className="p-4 text-sm text-muted-foreground">Không thấy "{query}" trong nội dung</div>;
+    }
+    return (
+      <>
+        {hits.map((h) => (
+          <button
+            key={h.rel_path}
+            type="button"
+            onClick={() => onOpen({ name: h.name, rel_path: h.rel_path, is_dir: false, area: "" })}
+            className="mb-1 block w-full min-w-0 rounded-md px-2 py-1.5 text-left hover:bg-accent"
+            title={h.rel_path}
+          >
+            <div className="truncate text-sm font-medium">📄 {h.name}</div>
+            <div className="truncate text-xs text-muted-foreground">…{h.snippet}…</div>
+          </button>
+        ))}
+      </>
+    );
+  }
+
+  function renderTree() {
+    return (
+      <>
+        {recent.length > 0 && (
+          <div className="mb-1">
+            <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+              🕘 Mới cập nhật
+            </div>
+            {recent.map((e) => (
+              <button
+                key={e.rel_path}
+                type="button"
+                onClick={() => onOpen(e)}
+                className={`flex w-full min-w-0 items-center gap-1.5 truncate rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent ${
+                  selectedPath === e.rel_path ? "bg-accent font-medium" : ""
+                }`}
+                title={e.rel_path}
+              >
+                <File className="h-4 w-4 shrink-0 text-emerald-500" />
+                <span className="min-w-0 flex-1 truncate">{e.name}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {renderLevel("", 0)}
+        {!q && (byParent.get("") ?? []).length === 0 && (
+          <div className="p-4 text-sm text-muted-foreground">Không có tài liệu nào bạn được xem.</div>
+        )}
+      </>
+    );
+  }
+
   return (
     <div className="flex h-full w-full flex-col overflow-hidden">
       <div className="border-b p-2">
+        <div className="mb-1.5 flex gap-1">
+          {(["ten", "noidung"] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => setMode(m)}
+              className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                mode === m ? "bg-amber-500/20 text-amber-700 dark:text-amber-400" : "text-muted-foreground hover:bg-accent"
+              }`}
+            >
+              {m === "ten" ? "Tên file" : "Nội dung"}
+            </button>
+          ))}
+        </div>
         <div className="relative">
           <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
@@ -127,53 +253,7 @@ export function FileTree({
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-2">
-      {searched ? (
-        searched.length ? (
-          searched.map((e) => (
-            <button
-              key={e.rel_path}
-              type="button"
-              onClick={() => onOpen(e)}
-              className="flex w-full min-w-0 items-center gap-1.5 truncate rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent"
-              title={e.rel_path}
-            >
-              <File className="h-4 w-4 shrink-0 text-sky-500" />
-              <span className="min-w-0 flex-1 truncate">{e.name}</span>
-              <span className="shrink-0 truncate text-[11px] text-muted-foreground">{parentLabel(e.rel_path)}</span>
-            </button>
-          ))
-        ) : (
-          <div className="p-4 text-sm text-muted-foreground">Không thấy "{query}"</div>
-        )
-      ) : (
-        <>
-          {recent.length > 0 && (
-            <div className="mb-1">
-              <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                🕘 Mới cập nhật
-              </div>
-              {recent.map((e) => (
-                <button
-                  key={e.rel_path}
-                  type="button"
-                  onClick={() => onOpen(e)}
-                  className={`flex w-full min-w-0 items-center gap-1.5 truncate rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent ${
-                    selectedPath === e.rel_path ? "bg-accent font-medium" : ""
-                  }`}
-                  title={e.rel_path}
-                >
-                  <File className="h-4 w-4 shrink-0 text-emerald-500" />
-                  <span className="min-w-0 flex-1 truncate">{e.name}</span>
-                </button>
-              ))}
-            </div>
-          )}
-          {renderLevel("", 0)}
-          {!q && (byParent.get("") ?? []).length === 0 && (
-            <div className="p-4 text-sm text-muted-foreground">Không có tài liệu nào bạn được xem.</div>
-          )}
-        </>
-      )}
+        {showSearch ? (showContent ? renderSearchContent() : renderSearchName()) : renderTree()}
       </div>
     </div>
   );

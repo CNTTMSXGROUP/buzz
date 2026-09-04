@@ -45,6 +45,8 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
   const [draft, setDraft] = useState<BrainUser | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [isOwner, setIsOwner] = useState(false);
+  const [vaultInput, setVaultInput] = useState(vaultRoot);
+  const [vaultCheck, setVaultCheck] = useState<string | null>(null);
   const [newNao, setNewNao] = useState("");
   const [newNaoParent, setNewNaoParent] = useState("Nao Bo Phan");
   const [dirChoices, setDirChoices] = useState<string[]>(["Nao Bo Phan"]);
@@ -135,6 +137,49 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-5 text-sm">
+      <div className="rounded-xl border p-3">
+        <div className="mb-1 text-xs font-medium">📁 Vault Não đang dùng</div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className="min-w-64 flex-1 rounded-md border bg-transparent px-2 py-1.5 font-mono text-xs"
+            value={vaultInput}
+            onChange={(ev) => setVaultInput(ev.target.value)}
+            placeholder="/đường/dẫn/tới/vault…"
+          />
+          <button
+            type="button"
+            className="rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent"
+            onClick={() => void (async () => {
+              try {
+                await invoke<string>("brain_read_file", { root: vaultInput.trim(), relPath: "_meta/nguoi-dung.json", khu: "*" });
+                setVaultCheck("✅ Đọc được config — vault hợp lệ.");
+              } catch (err) {
+                setVaultCheck(`❌ Không dùng được: ${String(err)}`);
+              }
+            })()}
+          >
+            Kiểm tra
+          </button>
+          <button
+            type="button"
+            className="rounded-md bg-amber-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+            onClick={() => {
+              try {
+                localStorage.setItem("msx-brain-vault-root", vaultInput.trim());
+                setVaultCheck("Đã lưu — tải lại panel để dùng vault mới.");
+              } catch {
+                setVaultCheck("❌ Không lưu được.");
+              }
+            }}
+          >
+            Dùng vault này
+          </button>
+        </div>
+        {vaultCheck && <p className="mt-1.5 text-xs text-muted-foreground">{vaultCheck}</p>}
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Mỗi máy trỏ đúng thư mục vault đã sync của mình. Đổi xong tải lại panel (đóng/mở tab Não).
+        </p>
+      </div>
       <div>
         <h2 className="text-base font-semibold">Quản trị phân quyền Não</h2>
         <p className="mt-0.5 text-xs text-muted-foreground">

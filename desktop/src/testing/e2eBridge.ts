@@ -11772,6 +11772,14 @@ export function maybeInstallE2eTauriMocks() {
         }
         return "# Demo\n\nnội dung demo não";
       }
+      case "brain_search": {
+        const sq = payload as { query?: string };
+        const ql = (sq?.query ?? "").toLowerCase();
+        if (ql && "demo.md".includes(ql)) {
+          return [{ rel_path: "2. Tinh Lọc/demo.md", name: "demo.md", snippet: "nội dung demo não" }];
+        }
+        return [];
+      }
       case "brain_create_ghinhanh": {
         return "1. Thu Thập/GHI NHANH — test.md";
       }

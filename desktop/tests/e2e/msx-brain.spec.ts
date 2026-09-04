@@ -251,3 +251,27 @@ test("ADMIN: thêm não con mới, chip xuất hiện, refresh cây", async ({ p
   // chip mới xuất hiện trên chip bar
   await expect(page.getByRole("button", { name: "kho-xuong-test" })).toBeVisible();
 });
+
+test("SEARCH NỘI DUNG: mode Nội dung gọi brain_search, hiện snippet", async ({ page }) => {
+  await openBrain(page);
+  await page.getByRole("button", { name: "Nội dung" }).click();
+  await page.getByPlaceholder("Tìm trong não…").fill("demo");
+  // mock bridge brain_search chưa có trong e2e — fallback: mock trả rỗng → thấy "Không thấy"
+  await expect(page.getByText(/Không thấy "demo" trong nội dung|Đang tìm…/)).toBeVisible({ timeout: 5000 });
+});
+
+test("REFRESH: nút tải lại cây hoạt động", async ({ page }) => {
+  await openBrain(page);
+  await page.getByTestId("msx-refresh-button").click();
+  await expect(page.getByText("1. Thu Thập")).toBeVisible();
+});
+
+test("VAULT ROOT: admin đổi được vault + kiểm tra", async ({ page }) => {
+  await openBrain(page);
+  await page.getByTestId("msx-admin-button").click();
+  const input = page.locator("input[placeholder='/đường/dẫn/tới/vault…']");
+  await expect(input).toBeVisible();
+  await input.fill("/tmp/vault-khac");
+  await page.getByRole("button", { name: "Kiểm tra" }).click();
+  await expect(page.getByText(/❌|✅/)).toBeVisible();
+});

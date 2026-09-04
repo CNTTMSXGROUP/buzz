@@ -39,6 +39,7 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
   const [error, setError] = useState<string | null>(null);
   const [naoDefs, setNaoDefs] = useState<NaoDef[]>([]);
   const [naoChon, setNaoChon] = useState<NaoDef | null>(null);
+  const [khu, setKhu] = useState("__khong_co_quyen__");
 
   const refresh = useCallback(async () => {
     try {
@@ -48,6 +49,7 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
       ]);
       setNaoDefs(defs);
       setNaoChon((prev) => prev ?? defs[0] ?? null);
+      if (role) setKhu(role.khu);
       const khu = role?.khu ?? "__khong_co_quyen__";
       setEntries(await invoke<BrainEntry[]>("brain_list_tree", { root: vaultRoot, khu }));
       setError(null);
@@ -148,6 +150,7 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
     naoChon,
     setNaoChon,
     addNaoDef,
+    khu,
   };
 
   function defsSafe(): NaoDef[] {

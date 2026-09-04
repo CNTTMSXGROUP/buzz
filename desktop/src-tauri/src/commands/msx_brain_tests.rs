@@ -133,6 +133,22 @@ fn test_create_ghinhanh_chi_trong_thu_thap() {
 }
 
 #[test]
+fn test_search_tim_noi_dung_ton_trong_quyen() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("a.md"), "kế hoạch livestream cuối tuần").unwrap();
+    fs::write(tmp.path().join("b.md"), "không liên quan").unwrap();
+    fs::create_dir_all(tmp.path().join("_mat")).unwrap();
+    fs::write(tmp.path().join("_mat/s.md"), "livestream bí mật").unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
+    let hits = super::brain_search(root.clone(), "*".into(), "livestream".into()).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].rel_path.ends_with("a.md"));
+    assert!(hits[0].snippet.contains("livestream"));
+    // query ngắn -> rỗng
+    assert!(super::brain_search(root, "*".into(), "a".into()).unwrap().is_empty());
+}
+
+#[test]
 #[ignore] // chạy manual: cargo test verify_real_vault -- --ignored (cần vault thật trên máy)
 fn verify_real_vault() {
     let root = "/Users/qthang/Library/CloudStorage/GoogleDrive-aios.msxgroup@gmail.com/Drive của tôi/MSXGROUP_AIOS_BRAIN";

@@ -44,16 +44,31 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
   const [draft, setDraft] = useState<BrainUser | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [isOwner, setIsOwner] = useState(false);
+  const [newNao, setNewNao] = useState("");
+
+  async function reload() {
+    const [loaded, nao] = await Promise.all([readMeta(vaultRoot), loadNaoCon(vaultRoot)]);
+    setCfg(loaded);
+    setNaoList(nao);
+    const me = loaded?.nguoi?.find((u) => u.pubkey === myPubkey);
+    setIsOwner(me?.vai_tro === "chu");
+  }
 
   useEffect(() => {
-    void (async () => {
-      const [loaded, nao] = await Promise.all([readMeta(vaultRoot), loadNaoCon(vaultRoot)]);
-      setCfg(loaded);
-      setNaoList(nao);
-      const me = loaded?.nguoi?.find((u) => u.pubkey === myPubkey);
-      setIsOwner(me?.vai_tro === "chu");
-    })();
+    void reload();
   }, [vaultRoot, myPubkey]);
+
+  async function handleCreateNao() {
+    try {
+      const created = await invoke<string>("brain_create_nao", { root: vaultRoot, id: newNao });
+      setNewNao("");
+      await reload();
+      setStatus(`Đã tạo não con "${created}" — tick chọn cho người cần xem.`);
+      window.dispatchEvent(new CustomEvent("msx-brain-nao-added", { detail: { id: created } }));
+    } catch (err) {
+      setStatus(`Lỗi: ${String(err)}`);
+    }
+  }
 
   async function save() {
     if (!cfg) return;
@@ -95,6 +110,31 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
       {!isOwner && (
         <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
           Chỉ chủ não (vai trò "chu") mới được sửa. Xem ở chế độ chỉ đọc.
+        </div>
+      )}
+
+      {isOwner && (
+        <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed px-3 py-2">
+          <span className="text-xs font-medium">Não con mới:</span>
+          <input
+            className="w-36 rounded border bg-transparent px-1.5 py-1 text-xs"
+            placeholder="vd: kho-van"
+            value={newNao}
+            onChange={(ev) => setNewNao(ev.target.value)}
+            onKeyDown={(ev) => {
+              if (ev.key === "Enter") void handleCreateNao();
+            }}
+          />
+          <button
+            type="button"
+            className="flex items-center gap-1 rounded-md bg-amber-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-700"
+            onClick={() => void handleCreateNao()}
+          >
+            <Plus className="h-3.5 w-3.5" /> Thêm não
+          </button>
+          <span className="text-[11px] text-muted-foreground">
+            Tự tạo thư mục pipeline + đăng ký danh sách.
+          </span>
         </div>
       )}
 

@@ -183,3 +183,16 @@ test("mock ảnh mở viewer ảnh", async ({ page }) => {
   await page.getByText("ảnh.png").click();
   await expect(page.locator("img[alt='ảnh.png']")).toBeVisible();
 });
+
+test("ADMIN: thêm não con mới, chip xuất hiện, refresh cây", async ({ page }) => {
+  await openBrain(page);
+  await page.getByTestId("msx-admin-button").click();
+  await expect(page.getByText("Quản trị phân quyền Não")).toBeVisible();
+  const nameInput = page.getByPlaceholder("vd: kho-van");
+  await expect(nameInput).toBeVisible();
+  await nameInput.fill("kho-xuong-test");
+  await page.getByRole("button", { name: "Thêm não" }).click();
+  await expect(page.getByText('Đã tạo não con "kho-xuong-test"')).toBeVisible();
+  // chip mới xuất hiện trên chip bar
+  await expect(page.getByRole("button", { name: "kho-xuong-test" })).toBeVisible();
+});

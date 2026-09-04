@@ -14,7 +14,7 @@ export function BrainPanel({
   vaultRoot: string;
   myPubkey: string;
 }) {
-  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoCon, naoChon, setNaoChon } =
+  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoCon, naoChon, setNaoChon, refresh } =
     useBrainTabs(vaultRoot, myPubkey);
   const [status, setStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
@@ -42,6 +42,13 @@ export function BrainPanel({
 
   // chip [nao:...] / [[wiki]] từ tin nhắn hoặc preview → mở tab
   useEffect(() => {
+    function onNaoAdded(ev: Event) {
+      const id = (ev as CustomEvent<{ id: string }>).detail?.id;
+      void refresh().then(() => {
+        if (id) setNaoChon(id);
+      });
+    }
+    window.addEventListener("msx-brain-nao-added", onNaoAdded);
     async function onOpenFile(ev: Event) {
       const rel = (ev as CustomEvent<{ rel: string }>).detail?.rel;
       if (rel) {

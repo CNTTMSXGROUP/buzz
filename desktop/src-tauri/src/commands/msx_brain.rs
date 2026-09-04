@@ -203,5 +203,54 @@ pub struct BrainStat {
     pub is_dir: bool,
 }
 
+
+/// Tạo não con mới: chỉ cho id `a-z0-9-` ≤ 20 ký tự, tạo đúng 3 file mẫu
+/// (README + .keep hai thư mục pipeline), update `danh_sach` trong config.
+#[tauri::command]
+pub fn brain_create_nao(root: String, id: String) -> Result<String, String> {
+    let clean: String = id
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect::<String>()
+        .chars()
+        .take(20)
+        .collect();
+    if clean.is_empty() {
+        return Err("Tên não phải có ít nhất 1 chữ cái/số (a-z, 0-9, -)".into());
+    }
+    let root_canon = Path::new(&root).canonicalize().map_err(|e| e.to_string())?;
+    let nao_dir = root_canon.join("Nao Bo Phan").join(&clean);
+    if nao_dir.exists() {
+        return Err(format!("Não \"{clean}\" đã có"));
+    }
+    for sub in ["1. Thu Thập", "2. Tinh Lọc/Kiến Thức Nguồn"].iter() {
+        fs::create_dir_all(nao_dir.join(sub)).map_err(|e| e.to_string())?;
+    }
+    fs::write(
+        nao_dir.join("README.md"),
+        format!(
+            "# Não {clean}\n\nNão con của bộ phận {clean} trong Não chủ MSXGROUP.\n\nPipeline: `1. Thu Thập` (!dex từ Buzz) → `2. Tinh Lọc/Kiến Thức Nguồn` (sau !duyet).\n\nQuyền đọc cấu hình trong panel **⚙ Quản trị** của app (mục nao_con).\n"
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    // update danh_sach trong config
+    let meta_path = root_canon.join("_meta/nguoi-dung.json");
+    let raw = fs::read_to_string(&meta_path).map_err(|e| e.to_string())?;
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("JSON lỗi: {e}"))?;
+    let list = cfg
+        .pointer_mut("/nao_con/danh_sach")
+        .and_then(|v| v.as_array_mut())
+        .ok_or("config thiếu nao_con.danh_sach".to_string())?;
+    if !list.iter().any(|v| v.as_str() == Some(clean.as_str())) {
+        list.push(serde_json::Value::String(clean.clone()));
+    }
+    fs::write(&meta_path, serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(clean)
+}
+
 #[path = "msx_brain_tests.rs"]
 mod tests;

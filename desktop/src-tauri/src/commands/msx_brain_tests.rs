@@ -89,6 +89,28 @@ fn test_write_meta_chi_ghi_dung_file_va_validate_json() {
 }
 
 #[test]
+fn test_create_nao_validate_va_tao_pipeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("_meta")).unwrap();
+    fs::write(
+        tmp.path().join("_meta/nguoi-dung.json"),
+        r#"{"nguoi":[], "nao_con": {"danh_sach": ["chung"]}}"#,
+    )
+    .unwrap();
+    // tên rỗng -> từ chối
+    assert!(super::brain_create_nao(tmp.path().to_string_lossy().to_string(), "!!!".into()).is_err());
+    // tạo ok
+    // "Kho Vận" -> slug ASCII "khovn" (bỏ dấu cách + ký tự lạ — hành vi đúng an toàn)
+    let ok = super::brain_create_nao(tmp.path().to_string_lossy().to_string(), "Kho Vận".into());
+    assert_eq!(ok.unwrap(), "khovn");
+    assert!(tmp.path().join("Nao Bo Phan/khovn/1. Thu Thập").is_dir());
+    assert!(tmp.path().join("Nao Bo Phan/khovn/2. Tinh Lọc/Kiến Thức Nguồn").is_dir());
+    assert!(tmp.path().join("Nao Bo Phan/khovn/README.md").exists());
+    // tạo trùng -> từ chối
+    assert!(super::brain_create_nao(tmp.path().to_string_lossy().to_string(), "khovn".into()).is_err());
+}
+
+#[test]
 #[ignore] // chạy manual: cargo test verify_real_vault -- --ignored (cần vault thật trên máy)
 fn verify_real_vault() {
     let root = "/Users/qthang/Library/CloudStorage/GoogleDrive-aios.msxgroup@gmail.com/Drive của tôi/MSXGROUP_AIOS_BRAIN";

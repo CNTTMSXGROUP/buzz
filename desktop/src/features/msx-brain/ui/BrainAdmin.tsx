@@ -73,16 +73,21 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
   }, [vaultRoot, myPubkey]);
 
   async function handleCreateNao() {
+    const parent = newNaoParent;
     try {
       const created = await invoke<string>("brain_create_nao", {
         root: vaultRoot,
         id: newNao,
-        parentRel: newNaoParent,
+        parentRel: parent,
       });
       setNewNao("");
       await reload();
       setStatus(`Đã tạo não con "${created}" — tick chọn cho người cần xem.`);
-      window.dispatchEvent(new CustomEvent("msx-brain-nao-added", { detail: { id: created } }));
+      window.dispatchEvent(
+        new CustomEvent("msx-brain-nao-added", {
+          detail: { id: created, path: parent ? `${parent}/${created}` : created },
+        }),
+      );
     } catch (err) {
       setStatus(`Lỗi: ${String(err)}`);
     }
@@ -129,9 +134,14 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
     return <div className="p-4 text-sm text-muted-foreground">Không đọc được config.</div>;
 
   return (
-    <div className="p-4 text-sm">
+    <div className="mx-auto max-w-5xl space-y-4 p-5 text-sm">
+      <div>
+        <h2 className="text-base font-semibold">Quản trị phân quyền Não</h2>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          Ai được xem não nào. Thay đổi có hiệu lực ngay sau khi bấm Lưu.
+        </p>
+      </div>
       <div className="mb-3 flex items-center gap-2">
-        <span className="font-semibold">Quản trị phân quyền Não</span>
         {status && <span className="text-xs text-muted-foreground">{status}</span>}
         <div className="flex-1" />
         {isOwner && (
@@ -151,7 +161,9 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
       )}
 
       {isOwner && (
-        <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed px-3 py-2">
+        <div className="rounded-xl border border-dashed bg-muted/20 p-3">
+          <div className="mb-2 text-xs font-medium">＋ Thêm não con mới</div>
+          <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-medium">Não con mới:</span>
           <input
             className="w-36 rounded border bg-transparent px-1.5 py-1 text-xs"
@@ -192,13 +204,15 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
           >
             <Plus className="h-3.5 w-3.5" /> Thêm não
           </button>
-          <span className="text-[11px] text-muted-foreground">
-            Tự tạo thư mục pipeline + đăng ký danh sách.
-          </span>
+          </div>
+          <p className="mt-1.5 text-[11px] text-muted-foreground">
+            Tự tạo thư mục pipeline + đăng ký danh sách. Sau đó tick chọn cho người cần xem.
+          </p>
         </div>
       )}
 
-      <table className="w-full border-collapse">
+      <div className="overflow-hidden rounded-xl border">
+        <table className="w-full border-collapse bg-background">
         <thead>
           <tr className="border-b text-left text-xs text-muted-foreground">
             <th className="py-1.5 pr-2">Tên</th>
@@ -208,7 +222,7 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
             {isOwner && <th />}
           </tr>
         </thead>
-        <tbody>
+        <tbody className="[&>tr:last-child]:border-0">
           {(cfg.nguoi ?? []).map((u, i) => (
             <tr key={u.pubkey} className="border-b align-top">
               {editing === i && draft ? (
@@ -340,6 +354,7 @@ export function BrainAdmin({ vaultRoot }: { vaultRoot: string }) {
           ))}
         </tbody>
       </table>
+      </div>
       {isOwner && (
         <button
           type="button"

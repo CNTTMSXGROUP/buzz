@@ -51,7 +51,7 @@ test("nút 🧠 trong composer mở picker não, chọn file chèn token [nao:]"
   const attachBtn = page.getByRole("button", { name: "Đính kèm tài liệu từ Não MSX" });
   await expect(attachBtn).toBeVisible();
   await attachBtn.click();
-  await expect(page.getByText("Não MSX — chọn tài liệu")).toBeVisible();
+  await expect(page.getByPlaceholder("Tìm tài liệu…")).toBeVisible();
   await page.getByText("2. Tinh Lọc").click();
   await page.getByText("demo.md").click();
   const composer = page.getByTestId("message-composer").locator(".ProseMirror");
@@ -68,7 +68,7 @@ test("PICKER: menu chọn file nằm trong viewport, không tràn phải", async
   const attachBtn = page.getByRole("button", { name: "Đính kèm tài liệu từ Não MSX" });
   await expect(attachBtn).toBeVisible();
   await attachBtn.click();
-  const menu = page.getByText("Não MSX — chọn tài liệu");
+  const menu = page.getByPlaceholder("Tìm tài liệu…");
   await expect(menu).toBeVisible();
   const menuBox = await menu.boundingBox();
   const vp = page.viewportSize()!;
@@ -82,6 +82,21 @@ test("PICKER: menu chọn file nằm trong viewport, không tràn phải", async
   // chip TipTap gọn "📎 demo" (không còn token text dài) — data attr giữ relPath
   await expect(composer.getByText("📎 demo")).toBeVisible();
   await expect(composer.locator('[data-naofile][data-rel-path="2. Tinh Lọc/demo.md"]')).toBeVisible();
+});
+
+test("PICKER: search lọc file toàn não, breadcrumb quay lại", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("general", { exact: true }).first().click();
+  await page.getByRole("button", { name: "Đính kèm tài liệu từ Não MSX" }).click();
+  const search = page.getByPlaceholder("Tìm tài liệu…");
+  await expect(search).toBeVisible();
+  await search.fill("demo");
+  // chỉ file khớp tên còn lại (dir không khớp) — parent path xám vẫn hiện kèm file
+  await expect(page.getByText("demo.md")).toBeVisible();
+  await expect(page.getByText("notes.txt")).toHaveCount(0);
+  await page.getByText("demo.md").click();
+  const composer = page.getByTestId("message-composer").locator(".ProseMirror");
+  await expect(composer.getByText("📎 demo")).toBeVisible();
 });
 
 test("chuột phải tên Não MSX hiện input đổi tên", async ({ page }) => {
@@ -167,10 +182,10 @@ test("LAYOUT: panel + pane trái nằm trong viewport (chẩn đoán tràn)", as
 
 test("VSCode: mở md + txt → 2 tab, chuyển + đóng tab", async ({ page }) => {
   await openBrain(page);
-  await page.getByText("2. Tinh Lọc").click();
-  await page.getByText("demo.md").click();
-  await page.getByText("1. Thu Thập").click();
-  await page.getByText("notes.txt").click();
+  await page.locator("button[title='2. Tinh Lọc']").click();
+  await page.locator("button[title='demo.md']").click();
+  await page.locator("button[title='1. Thu Thập']").click();
+  await page.locator("button[title='notes.txt']").click();
   // 2 tab trong tab bar
   const tabbar = page.locator("div.border-b.bg-muted\/30, div:has(> div.group.flex)");
   await expect(page.getByRole("button", { name: "demo.md", exact: true }).nth(1)).toBeVisible();
@@ -184,8 +199,8 @@ test("VSCode: mở md + txt → 2 tab, chuyển + đóng tab", async ({ page }) 
 
 test("mock ảnh mở viewer ảnh", async ({ page }) => {
   await openBrain(page);
-  await page.getByText("1. Thu Thập").click();
-  await page.getByText("ảnh.png").click();
+  await page.locator("button[title='1. Thu Thập']").click();
+  await page.locator("button[title='ảnh.png']").click();
   await expect(page.locator("img[alt='ảnh.png']")).toBeVisible();
 });
 

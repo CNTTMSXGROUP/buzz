@@ -14,7 +14,7 @@ export function BrainPanel({
   vaultRoot: string;
   myPubkey: string;
 }) {
-  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoDefs, naoChon, setNaoChon, refresh } =
+  const { entries, tabs, activePath, error, open, close, openByName, setActivePath, naoDefs, naoChon, setNaoChon, refresh, addNaoDef } =
     useBrainTabs(vaultRoot, myPubkey);
   const [status, setStatus] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
@@ -42,8 +42,9 @@ export function BrainPanel({
 
   // chip [nao:...] / [[wiki]] từ tin nhắn hoặc preview → mở tab
   useEffect(() => {
-    function onNaoAdded() {
-      // refresh: chip bar hiện não mới; naoChon giữ nguyên (user bấm chọn)
+    function onNaoAdded(ev: Event) {
+      const detail = (ev as CustomEvent<{ id: string; path: string }>).detail;
+      if (detail?.id) addNaoDef(detail.id, detail.path || detail.id);
       void refresh();
     }
     window.addEventListener("msx-brain-nao-added", onNaoAdded);

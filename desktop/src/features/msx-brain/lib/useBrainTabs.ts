@@ -101,6 +101,11 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
     [tabs, vaultRoot, myPubkey],
   );
 
+  const addNaoDef = useCallback((id: string, path: string) => {
+    setNaoDefs((prev) => (prev.some((d) => d.id === id) ? prev : [...prev, { id, path }]));
+    setNaoChon({ id, path });
+  }, []);
+
   const close = useCallback(
     (relPath: string) => {
       setTabs((prev) => {
@@ -142,6 +147,7 @@ export function useBrainTabs(vaultRoot: string, myPubkey: string) {
     naoDefs,
     naoChon,
     setNaoChon,
+    addNaoDef,
   };
 
   function defsSafe(): NaoDef[] {

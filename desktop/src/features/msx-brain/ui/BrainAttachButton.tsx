@@ -1,26 +1,43 @@
-import { Brain, ChevronRight, File, Folder, Loader2 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Brain, ChevronRight, File, Folder, Loader2, Search, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { BrainEntry } from "../types";
 import { MSX_VAULT_ROOT_DEFAULT } from "../lib/vaultRoot";
-import { canReadPath, loadBrainRole } from "../lib/permissions";
+import { loadBrainRole } from "../lib/permissions";
 import { useMyPubkey } from "../lib/useMyPubkey";
 
 type Props = {
   disabled?: boolean;
-  /** Gọi khi chọn file — Composer sẽ chèn token vào tin nhắn. */
+  /** Gọi khi chọn file — Composer chèn NaoFile node gọn. */
   onPick: (entry: BrainEntry) => void;
 };
 
-/** Nút 🧠 trong composer chat: chọn file não → chèn token [nao:rel_path] vào tin nhắn. */
+const MENU_W = 320;
+const MARGIN = 8;
+
+function getRoot(): string {
+  try {
+    return localStorage.getItem("msx-brain-vault-root") ?? MSX_VAULT_ROOT_DEFAULT;
+  } catch {
+    return MSX_VAULT_ROOT_DEFAULT;
+  }
+}
+
+function parentOf(rel: string): string {
+  return rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
+}
+
+/** Picker chọn tài liệu não trong composer: search + breadcrumb + điều hướng thư mục. */
 export function BrainAttachButton({ disabled, onPick }: Props) {
   const pubkey = useMyPubkey();
   const [open, setOpen] = useState(false);
-  const [entries, setEntries] = useState<BrainEntry[] | null>(null);
+  const [all, setAll] = useState<BrainEntry[] | null>(null);
   const [cwd, setCwd] = useState("");
+  const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
   const [menuPos, setMenuPos] = useState<{ left: number; bottom: number } | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     function onDoc(ev: MouseEvent) {
@@ -30,30 +47,17 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
     return () => document.removeEventListener("mousedown", onDoc);
   }, []);
 
-  async function loadDir(dir: string) {
+  async function ensureLoaded() {
+    if (all !== null) return;
     setLoading(true);
-    setCwd(dir);
     try {
       const root = getRoot();
       const role = await loadBrainRole(root, pubkey);
       const khu = role?.khu ?? "__khong_co_quyen__";
-      const all = await invoke<BrainEntry[]>("brain_list_tree", { root, khu });
-      setEntries(all.filter((e) => parentOf(e.rel_path) === dir));
+      setAll(await invoke<BrainEntry[]>("brain_list_tree", { root, khu }));
     } finally {
       setLoading(false);
     }
-  }
-
-  function getRoot(): string {
-    try {
-      return localStorage.getItem("msx-brain-vault-root") ?? MSX_VAULT_ROOT_DEFAULT;
-    } catch {
-      return MSX_VAULT_ROOT_DEFAULT;
-    }
-  }
-
-  function parentOf(rel: string): string {
-    return rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
   }
 
   async function toggle() {
@@ -62,25 +66,43 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
     if (next) {
       const rect = ref.current?.getBoundingClientRect();
       if (rect) {
-        const MENU_W = 320;
-        const MARGIN = 8;
-        // clamp ngang: ưu tiên thẳng hàng mép trái nút, tràn phải thì lùi vào
         const left = Math.max(MARGIN, Math.min(rect.left, window.innerWidth - MENU_W - MARGIN));
-        // clamp dọc: menu mở lên trên; nếu không đủ chỗ thì mở xuống dưới nút
-        const bottom = window.innerHeight - rect.top + 6;
-        setMenuPos({ left, bottom });
+        setMenuPos({ left, bottom: window.innerHeight - rect.top + 6 });
       }
-      if (entries === null) await loadDir("");
+      setQuery("");
+      setCwd("");
+      await ensureLoaded();
+      setTimeout(() => searchRef.current?.focus(), 50);
     }
   }
 
+  const crumbs = cwd ? cwd.split("/") : [];
+
+  const shown = useMemo(() => {
+    if (!all) return [];
+    const q = query.trim().toLowerCase();
+    if (q) {
+      // search toàn não theo tên file
+      return all
+        .filter((e) => !e.is_dir && e.name.toLowerCase().includes(q))
+        .slice(0, 30);
+    }
+    return all.filter((e) => parentOf(e.rel_path) === cwd);
+  }, [all, cwd, query]);
+
   function pick(e: BrainEntry) {
     if (e.is_dir) {
-      void loadDir(e.rel_path);
+      setCwd(e.rel_path);
+      setQuery("");
       return;
     }
     onPick(e);
     setOpen(false);
+  }
+
+  function goCrumb(i: number) {
+    setCwd(i < 0 ? "" : crumbs.slice(0, i + 1).join("/"));
+    setQuery("");
   }
 
   return (
@@ -96,24 +118,56 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
       </button>
       {open && menuPos && (
         <div
-          className="fixed z-[100] w-80 max-h-[60vh] overflow-y-auto rounded-lg border bg-popover shadow-lg"
-          style={{ left: menuPos.left, bottom: menuPos.bottom }}
+          className="fixed z-[100] flex max-h-[60vh] flex-col overflow-hidden rounded-xl border bg-popover shadow-xl"
+          style={{ left: menuPos.left, bottom: menuPos.bottom, width: MENU_W }}
         >
-          <div className="border-b px-3 py-2 text-xs font-semibold">
-            {cwd === "" ? "Não MSX — chọn tài liệu" : `Não MSX / ${cwd}`}
-            {cwd !== "" && (
+          <div className="border-b px-3 pb-2 pt-2.5">
+            <div className="relative mb-1.5">
+              <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <input
+                ref={searchRef}
+                value={query}
+                onChange={(ev) => setQuery(ev.target.value)}
+                placeholder="Tìm tài liệu…"
+                className="w-full rounded-md border bg-transparent py-1.5 pl-8 pr-7 text-sm outline-none focus:ring-1 focus:ring-ring"
+              />
+              {query && (
+                <button
+                  type="button"
+                  aria-label="Xoá tìm kiếm"
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 hover:bg-accent"
+                  onClick={() => setQuery("")}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-1 overflow-x-auto text-xs text-muted-foreground">
               <button
                 type="button"
-                className="float-right text-muted-foreground hover:text-foreground"
-                onClick={() => void loadDir(parentOf(cwd))}
+                className={`shrink-0 rounded px-1.5 py-0.5 hover:bg-accent ${cwd === "" && !query ? "font-medium text-foreground" : ""}`}
+                onClick={() => goCrumb(-1)}
               >
-                …quay lại
+                Não MSX
               </button>
-            )}
+              {crumbs.map((c, i) => (
+                <span key={`${i}-${c}`} className="flex shrink-0 items-center gap-1">
+                  <span>/</span>
+                  <button
+                    type="button"
+                    className={`rounded px-1.5 py-0.5 hover:bg-accent ${i === crumbs.length - 1 ? "font-medium text-foreground" : ""}`}
+                    onClick={() => goCrumb(i)}
+                  >
+                    {c}
+                  </button>
+                </span>
+              ))}
+              {query && <span className="shrink-0 italic">· tìm "{query}"</span>}
+            </div>
           </div>
-          <div className="max-h-72 overflow-y-auto p-1">
-            {entries?.length ? (
-              entries.map((e) => (
+          <div className="min-h-0 flex-1 overflow-y-auto p-1">
+            {shown.length ? (
+              shown.map((e) => (
                 <button
                   key={e.rel_path}
                   type="button"
@@ -125,24 +179,31 @@ export function BrainAttachButton({ disabled, onPick }: Props) {
                   ) : (
                     <File className="h-4 w-4 shrink-0 text-sky-500" />
                   )}
-                  <span className="truncate">{e.name}</span>
-                  {e.is_dir && <ChevronRight className="ml-auto h-3 w-3 text-muted-foreground" />}
+                  <span className="min-w-0 flex-1 truncate" title={e.rel_path}>
+                    {e.name}
+                  </span>
+                  {e.is_dir ? (
+                    <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  ) : (
+                    query && (
+                      <span className="shrink-0 truncate text-[11px] text-muted-foreground">
+                        {parentOf(e.rel_path)}
+                      </span>
+                    )
+                  )}
                 </button>
               ))
             ) : (
-              <div className="px-3 py-4 text-sm text-muted-foreground">Thư mục trống</div>
+              <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                {query ? `Không thấy "${query}"` : "Thư mục trống"}
+              </div>
             )}
           </div>
-          <div className="border-t px-3 py-1.5 text-[10px] text-muted-foreground">
-            Chọn file .md để đính kèm token xem trong panel Não MSX
+          <div className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
+            Chọn file → chèn chip gọn vào tin nhắn
           </div>
         </div>
       )}
     </div>
   );
-}
-
-export function brainTokenFor(entry: BrainEntry): string {
-  void canReadPath; // giữ import để tree-shake ổn định
-  return `[nao:${entry.rel_path}]`;
 }
